@@ -1,33 +1,34 @@
-"""Configuration management — loads credentials from ~/.handoff/config.json.
-
-Nemo reuses the same config format as handoff for compatibility.
-"""
+"""Configuration management — loads credentials from ~/.nemo/config.json."""
 
 from __future__ import annotations
 
 import json
 import os
+from typing import Any
 
-CONFIG_FILE = os.path.expanduser("~/.handoff/config.json")
-DB_BASE = os.path.expanduser("~/.handoff/projects")
-TMP_DIR = os.environ.get("HANDOFF_TMP_DIR", "/tmp/handoff")
-
-
-def load_config(profile: str | None = None) -> dict:
-  """Load the full config dict for a profile."""
-  if profile and profile != "default":
-    path = os.path.expanduser(f"~/.handoff/profiles/{profile}.json")
-  else:
-    path = CONFIG_FILE
-  if not os.path.isfile(path):
-    return {}
-  with open(path) as f:
-    return json.load(f)
+CONFIG_DIR = os.path.expanduser("~/.nemo")
+CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
+# Fallback to legacy handoff config for migration
+_LEGACY_CONFIG = os.path.expanduser("~/.handoff/config.json")
+DB_BASE = os.path.join(CONFIG_DIR, "projects")
+TMP_DIR = os.environ.get("NEMO_TMP_DIR", "/tmp/nemo")
 
 
-def load_credentials(profile: str | None = None) -> dict | None:
-  """Load app_id, app_secret, email from config."""
-  cfg = load_config(profile)
+def load_config() -> dict[str, Any]:
+  """Load the full config dict. Falls back to legacy ~/.handoff/ path."""
+  for path in (CONFIG_FILE, _LEGACY_CONFIG):
+    if os.path.isfile(path):
+      with open(path) as f:
+        return json.load(f)
+  return {}
+
+
+def load_credentials() -> dict[str, str] | None:
+  """Load app_id, app_secret, email from config.
+
+  Returns dict with keys {app_id, app_secret, email} or None if missing.
+  """
+  cfg = load_config()
   app_id = cfg.get("app_id")
   app_secret = cfg.get("app_secret")
   if not app_id or not app_secret:
@@ -39,33 +40,7 @@ def load_credentials(profile: str | None = None) -> dict | None:
   }
 
 
-def load_worker_url(profile: str | None = None) -> str:
-  """Load the Cloudflare Worker URL."""
-  cfg = load_config(profile)
-  return cfg.get("worker_url", "")
-
-
-def load_api_key(profile: str | None = None) -> str:
-  """Load the Worker API key."""
-  cfg = load_config(profile)
-  return cfg.get("worker_api_key", "")
-
-
-def resolve_profile(explicit: str | None = None) -> str:
-  """Resolve the active profile name."""
-  if explicit:
-    return explicit
-  env = os.environ.get("HANDOFF_PROFILE")
-  if env:
-    return env
-  default_file = os.path.expanduser("~/.handoff/default_profile")
-  if os.path.isfile(default_file):
-    with open(default_file) as f:
-      return f.read().strip() or "default"
-  return "default"
-
-
 def tmp_dir() -> str:
-  """Return the handoff temp directory, creating it if needed."""
+  """Return the nemo temp directory, creating it if needed."""
   os.makedirs(TMP_DIR, exist_ok=True)
   return TMP_DIR

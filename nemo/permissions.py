@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import logging
 import os
+from typing import Any, Callable
 
 log = logging.getLogger(__name__)
 
@@ -24,7 +25,7 @@ AUTO_APPROVE_PATTERNS = {
 }
 
 
-def is_auto_approve(tool_name: str, tool_input: dict) -> bool:
+def is_auto_approve(tool_name: str, tool_input: dict[str, Any]) -> bool:
   """Check if a tool call should be auto-approved."""
   if tool_name != "Bash":
     return False
@@ -32,7 +33,7 @@ def is_auto_approve(tool_name: str, tool_input: dict) -> bool:
   return any(pat in cmd for pat in AUTO_APPROVE_PATTERNS)
 
 
-def format_tool(tool_name: str, tool_input: dict) -> str:
+def format_tool(tool_name: str, tool_input: dict[str, Any]) -> str:
   """Format tool for permission card body."""
   if tool_name == "Bash":
     desc = tool_input.get("description", "")
@@ -48,7 +49,12 @@ def format_tool(tool_name: str, tool_input: dict) -> str:
   return f"**{tool_name}**"
 
 
-def build_permission_handler(credentials: dict, chat_id: str, db, events_source):
+def build_permission_handler(
+  credentials: dict[str, str],
+  chat_id: str,
+  db: Any,
+  events_source: Any,
+) -> Callable[..., Any]:
   """Build an async can_use_tool handler for the SDK.
 
   events_source: an object with async next_message() that returns the next
@@ -57,7 +63,7 @@ def build_permission_handler(credentials: dict, chat_id: str, db, events_source)
   """
   from claude_agent_sdk import PermissionResultAllow, PermissionResultDeny
 
-  async def can_use_tool(tool_name, tool_input, _context):
+  async def can_use_tool(tool_name: str, tool_input: dict[str, Any], _context: Any) -> Any:
     # Auto-approve internals
     if is_auto_approve(tool_name, tool_input):
       return PermissionResultAllow()
@@ -82,10 +88,37 @@ def build_permission_handler(credentials: dict, chat_id: str, db, events_source)
     )
     msg_id = send_card(token, chat_id, card)
 
-    # Wait for text reply
+    # Wait for text reply (skip non-message events like card actions)
+    import time as _time
     from .monitor import is_permission_reply
-    reply = await events_source.next_message(timeout=300)
-    decision = is_permission_reply(reply.get("text", "")) if reply else None
+    decision = None
+    deadline = _time.time() + 300
+    _pending: list[Any] = []
+    while decision is None:
+      remaining = deadline - _time.time()
+      if remaining <= 0:
+        break
+      reply = await events_source.next_message(timeout=remaining)
+      if reply is None:
+        break
+      reply_text = getattr(reply, "text", "")
+      event_type = getattr(reply, "event_type", "")
+      reply_chat = getattr(reply, "chat_id", "")
+      # Scope to this session's chat
+      if reply_chat and reply_chat != chat_id:
+        _pending.append(reply)
+        continue
+      # Skip card action events — only process text messages
+      if event_type == "card.action.trigger":
+        continue
+      decision = is_permission_reply(reply_text)
+      if decision is None:
+        # Not a permission reply — re-queue so it isn't lost
+        _pending.append(reply)
+
+    # Re-queue any consumed non-permission messages
+    for msg in _pending:
+      events_source.push_back(msg)
 
     if decision is None:
       decision = "deny"  # Timeout or unrecognized = deny

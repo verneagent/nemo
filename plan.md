@@ -5,7 +5,7 @@
 Rewrite `handoff_agent.py` as a standalone executable. Key changes:
 - Replace Cloudflare Worker relay with Lark WebSocket 长连接
 - Replace 3-card system (Working + Response + Done) with unified turn card
-- Replace card button interactions with text-based commands
+- Keep card buttons (Approve/Deny, Stop) — Lark persistent connection supports callbacks
 - Clean module separation (currently 1,329-line monolith + 7 shared modules)
 
 ## Architecture Comparison
@@ -24,11 +24,44 @@ polling, `handoff_worker.py`, `permission_core.py`, `permission_bridge.py`
 ### After (Nemo)
 
 ```
-Lark → WebSocket Gateway (长连接) → Agent (direct)
+Lark → Persistent Connection (长连接) → Agent (direct)
+  ├── Message events (im.message.receive_v1)
+  ├── Reaction events (im.message.reaction.created_v1)
+  └── Card action callbacks (card.action.trigger)
 Agent → Lark IM API → Lark Group
 ```
 
 Dependencies: Lark app credentials only. Zero infrastructure.
+Card action callbacks (Approve/Deny buttons, Stop button) arrive through the
+same persistent connection — no HTTP webhook endpoint needed.
+
+### Decoupled Architecture
+
+Agent and Channel are independent layers connected through abstract interfaces.
+This allows swapping either side without touching the other.
+
+```
+┌─────────────┐     ┌───────────────────┐     ┌──────────────┐
+│   Channel    │────▶│   Core (nemo/)    │────▶│    Agent     │
+│  (Lark, ...) │◀────│  orchestration    │◀────│ (Claude SDK) │
+└─────────────┘     └───────────────────┘     └──────────────┘
+```
+
+**Channel interface** — how Nemo talks to the outside world:
+- `receive()` → incoming message/action
+- `send_card()` / `update_card()` → send or update a rich message
+- `send_text()` → send plain text
+- `download_image()` / `download_file()` → fetch media
+- `request_permission()` → show approve/deny UI, return decision
+
+**Agent interface** — how Nemo runs coding tasks:
+- `run_turn(prompt, on_event)` → execute one agent turn
+- `interrupt()` → cancel running turn
+- `reset()` → new conversation
+
+Lark is the first Channel implementation. Claude Agent SDK is the first Agent
+implementation. The core orchestration (`agent.py`) only depends on these
+interfaces, not on Lark or Claude SDK directly.
 
 ## Phase 1: Lark Event Subscription (`nemo/lark/events.py`)
 
@@ -41,12 +74,17 @@ Lark provides a WebSocket gateway for event subscription. The client:
 2. Connects and receives events as JSON frames
 3. Auto-reconnects on disconnect
 
-### Events to Subscribe
+### Events & Callbacks to Receive
 
-| Event | Purpose |
+| Type | Purpose |
 |---|---|
 | `im.message.receive_v1` | New messages in the group |
 | `im.message.reaction.created_v1` | Emoji reactions |
+| `card.action.trigger` | Card button clicks (Approve/Deny, Stop) |
+
+Lark's persistent connection supports BOTH events and card action callbacks
+(confirmed: Lark developer console → Callback Configuration → "Receive
+callbacks through persistent connection" is the recommended mode).
 
 ### Interface
 
@@ -161,13 +199,15 @@ The PostToolUse hook in CLI mode adds a 4th "Working" V2 card.
 │   - `Read: config.py`      │
 │   - `Edit: main.py`        │
 │   - `Bash: npm test`       │
+│                             │
+│ [ Stop ]                    │  ← card action button
 └─────────────────────────────┘
 ```
 
 - Grey header with escalating title (Working → Working hard → ...)
 - Current tool action in body
 - Past tools in `collapsible_panel` (collapsed by default)
-- No Stop button (user sends `/esc` instead)
+- Stop button (card action arrives via persistent connection)
 
 #### Phase: Response
 
@@ -352,7 +392,7 @@ No thread, no separate WebSocket — just async task coordination.
 
 ## Phase 6: Permission Bridge (`nemo/permissions.py`)
 
-Text-based instead of card-button-based.
+Card-button-based, same UX as handoff — but without the Worker relay.
 
 ### Current Flow (handoff_agent.py)
 
@@ -365,29 +405,35 @@ Depends on: `permission_core.py`, `permission_bridge.py`, Worker, card action ca
 
 ### New Flow (Nemo)
 
-1. Send a **read-only card** showing the tool and asking for approval
-2. Wait for the user's text reply: "y", "n", "always"
-3. PATCH card to show decision
-4. No card buttons, no Worker callback, no polling
+1. Send card with Approve/Deny/Approve All buttons (same UX)
+2. User taps button → Lark sends `card.action.trigger` via persistent connection
+3. `LarkEventStream` receives the callback directly (no Worker)
+4. PATCH card to show decision (green/red)
+5. Also supports text replies ("y"/"n") as fallback
 
 ```python
 async def request_permission(tool_name, tool_input, events, token, chat_id):
-  # Send permission info card (read-only, no buttons)
-  card = build_permission_card(tool_name, tool_input)
+  # Send permission card with buttons
+  nonce = uuid4()[:8]
+  card = build_permission_card(tool_name, tool_input, nonce=nonce)
   msg_id = send_card(token, chat_id, card)
 
-  # Wait for text reply
-  reply = await events.next_message(timeout=300)
-  decision = parse_decision(reply.text)  # "y"→allow, "n"→deny, "always"→always
-
-  # Update card
-  if decision == "allow" or decision == "always":
-    update_card(token, msg_id, approved_card(tool_name, tool_input))
-  else:
-    update_card(token, msg_id, denied_card(tool_name, tool_input))
-
-  return decision
+  # Wait for card action OR text reply via event stream
+  while True:
+    event = await events.next_event(timeout=300)
+    if event is None:
+      return "deny"  # Timeout
+    if event.event_type == "card.action.trigger":
+      if event.raw.get("nonce") == nonce:
+        return event.raw.get("action", "deny")
+    if event.event_type == "im.message.receive_v1":
+      decision = parse_text_decision(event.text)
+      if decision:
+        return decision
 ```
+
+The Stop button on the Working card also arrives as `card.action.trigger`
+through the persistent connection. No separate callback endpoint needed.
 
 ### Source Reference
 
@@ -459,7 +505,7 @@ class Database:
 
 ### DB Location
 
-Same path as handoff: `~/.handoff/projects/<hash>/handoff-data.db`
+Same path as handoff: `~/.nemo/projects/<hash>/handoff-data.db`
 This allows coexistence — nemo and handoff can share the same DB.
 
 ### Source Reference
@@ -468,7 +514,7 @@ This allows coexistence — nemo and handoff can share the same DB.
 
 ## Phase 9: Config (`nemo/config.py`)
 
-Reuse `~/.handoff/config.json` format. Only fields needed:
+Reuse `~/.nemo/config.json` format. Only fields needed:
 
 | Field | Required | Purpose |
 |---|---|---|
@@ -535,9 +581,11 @@ nemo = "nemo.__main__:main"
    flow. `lark-cli event +subscribe` uses it — check its implementation for
    reference. The REST endpoint may be `/callback/ws/endpoint` or similar.
 
-2. **Card action via WebSocket**: Research confirms card action callbacks
-   (`card.action.trigger`) are HTTP-only. If we later want interactive buttons,
-   we'd need to add a callback server. For now, text-based is the design choice.
+2. **Card action via persistent connection**: Confirmed that Lark's persistent
+   connection mode supports card action callbacks (`card.action.trigger`).
+   The Lark developer console shows "Receive callbacks through persistent
+   connection (Recommended)" as the default. Need to verify the exact
+   message format for card actions arriving via WebSocket.
 
 3. **Multi-session takeover**: Without the Worker's takeover endpoint, we rely
    on the DB. On startup, check if another session owns the chat_id, deactivate

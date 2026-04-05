@@ -1,64 +1,95 @@
-"""Message filtering and prompt building."""
+"""Message filtering and prompt building.
+
+Works with both LarkEvent objects and plain dicts via _get() helper.
+"""
 
 from __future__ import annotations
 
 import json
 import re
+from typing import Any
 
 
-def build_prompt(replies: list[dict]) -> str:
-  """Build a prompt string from Lark reply dicts.
+def _get(obj: Any, key: str, default: Any = "") -> Any:
+  """Get attribute or dict key — works with LarkEvent or dict."""
+  if isinstance(obj, dict):
+    return obj.get(key, default)
+  return getattr(obj, key, default)
+
+
+def build_prompt(replies: list[Any]) -> str:
+  """Build a prompt string from messages.
 
   If any reply has media (image/file) or parent_id, return JSON.
   Otherwise, join plain text.
   """
   has_media = any(
-    r.get("image_key") or r.get("file_key")
-    or r.get("msg_type") in ("image", "file")
+    _get(r, "image_key") or _get(r, "file_key")
+    or _get(r, "msg_type") in ("image", "file")
     for r in replies
   )
-  if has_media or any(r.get("parent_id") for r in replies):
-    return json.dumps(replies, ensure_ascii=False, indent=2)
+  if has_media or any(_get(r, "parent_id") for r in replies):
+    # Convert to dicts for JSON serialization
+    dicts: list[dict[str, Any]] = []
+    for r in replies:
+      if isinstance(r, dict):
+        dicts.append(r)
+      elif hasattr(r, "__dict__"):
+        dicts.append({k: v for k, v in r.__dict__.items() if v})
+      else:
+        dicts.append({"text": str(r)})
+    return json.dumps(dicts, ensure_ascii=False, indent=2)
 
-  texts = [r.get("text", "").strip() for r in replies if r.get("text")]
-  return "\n".join(texts) if texts else json.dumps(replies, ensure_ascii=False)
+  texts = [_get(r, "text", "").strip() for r in replies if _get(r, "text")]
+  if texts:
+    return "\n".join(texts)
+  # Fallback to JSON
+  dicts: list[dict[str, Any]] = []
+  for r in replies:
+    if isinstance(r, dict):
+      dicts.append(r)
+    elif hasattr(r, "__dict__"):
+      dicts.append({k: v for k, v in r.__dict__.items() if v})
+    else:
+      dicts.append({"text": str(r)})
+  return json.dumps(dicts, ensure_ascii=False)
 
 
-def strip_mentions(text: str, replies: list[dict]) -> str:
+def strip_mentions(text: str, replies: list[Any]) -> str:
   """Remove @-mention markers from text."""
   for r in replies:
-    for m in (r.get("mentions") or []):
-      key = m.get("key", "")
+    for m in (_get(r, "mentions") or []):
+      key = m.get("key", "") if isinstance(m, dict) else getattr(m, "key", "")
       if key:
         text = text.replace(key, "")
   return re.sub(r"\s+", " ", text).strip()
 
 
-def filter_self_bot(replies: list[dict], bot_open_id: str) -> list[dict]:
+def filter_self_bot(replies: list[Any], bot_open_id: str) -> list[Any]:
   """Remove messages sent by the bot itself."""
   if not bot_open_id:
     return replies
-  return [r for r in replies if r.get("sender_id") != bot_open_id]
+  return [r for r in replies if _get(r, "sender_id") != bot_open_id]
 
 
-def filter_by_operator(replies: list[dict], operator_open_id: str) -> list[dict]:
+def filter_by_operator(replies: list[Any], operator_open_id: str) -> list[Any]:
   """Keep only messages from the operator."""
   if not operator_open_id:
     return replies
-  return [r for r in replies if r.get("sender_id") == operator_open_id]
+  return [r for r in replies if _get(r, "sender_id") == operator_open_id]
 
 
 def filter_by_allowed_senders(
-  replies: list[dict],
+  replies: list[Any],
   operator_open_id: str,
   member_roles: dict[str, str],
-) -> list[dict]:
+) -> list[Any]:
   """Keep messages from operator, coowners, and guests."""
   if not operator_open_id:
     return replies
   result = []
   for r in replies:
-    sid = r.get("sender_id", "")
+    sid = _get(r, "sender_id", "")
     if sid == operator_open_id:
       result.append(r)
     elif sid in member_roles:
@@ -66,23 +97,23 @@ def filter_by_allowed_senders(
   return result
 
 
-def filter_bot_interactions(replies: list[dict], bot_open_id: str) -> list[dict]:
+def filter_bot_interactions(replies: list[Any], bot_open_id: str) -> list[Any]:
   """In need_mention mode, keep only bot-directed messages."""
   if not bot_open_id:
     return replies
   result = []
   for r in replies:
-    # @-mention
-    mentions = r.get("mentions") or []
-    if any(m.get("id") == bot_open_id for m in mentions):
+    mentions = _get(r, "mentions") or []
+    if any(
+      (m.get("id") if isinstance(m, dict) else getattr(m, "id", "")) == bot_open_id
+      for m in mentions
+    ):
       result.append(r)
       continue
-    # Reply to bot message
-    if r.get("parent_id"):
+    if _get(r, "parent_id"):
       result.append(r)
       continue
-    # Reaction/sticker
-    if r.get("msg_type") in ("reaction", "sticker"):
+    if _get(r, "msg_type") in ("reaction", "sticker"):
       result.append(r)
       continue
   return result

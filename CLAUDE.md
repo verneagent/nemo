@@ -38,20 +38,20 @@ Nemo daemon
   ↕ Claude Agent SDK (coding execution)
 ```
 
-Zero infrastructure. The daemon connects directly to Lark's WebSocket gateway
-for event subscription (`im.message.receive_v1`, reactions) and uses the IM API
-for sending responses. No public URL, no webhook, no Worker needed.
+Zero infrastructure. The daemon connects directly to Lark's persistent
+connection gateway for events (`im.message.receive_v1`, reactions) AND
+card action callbacks (`card.action.trigger`). Uses the IM API for sending
+responses. No public URL, no webhook, no Worker needed.
 
 ## Key Design Decisions
 
 1. **No Cloudflare Worker** — Lark WebSocket 长连接 replaces the entire
    Worker + Durable Object + polling stack. Events arrive directly.
 
-2. **No card buttons** — Card action callbacks require an HTTP webhook URL,
-   which reintroduces the need for infrastructure. Instead:
-   - Permission approval: user replies "y" / "n" to permission messages
-   - Stop: user sends `/esc`
-   - Cards are still used for display (Working, Done, status) but are read-only
+2. **Card buttons via persistent connection** — Lark's persistent connection
+   mode supports card action callbacks (`card.action.trigger`), so interactive
+   buttons (Approve/Deny, Stop) work without any HTTP webhook endpoint.
+   Permission cards and Stop buttons behave the same as in handoff.
 
 3. **One card per turn** — A single Card V2 evolves through Working → Response
    → Done via PATCH. Tool history lives in a `collapsible_panel`, always
@@ -66,28 +66,60 @@ for sending responses. No public URL, no webhook, no Worker needed.
 
 ## Config
 
-Reuses `~/.handoff/config.json` for Lark credentials (app_id, app_secret, email).
+Uses `~/.nemo/config.json` for Lark credentials (app_id, app_secret, email).
 No worker_url or worker_api_key needed.
 
 ## Module Layout
 
+Agent and Channel are decoupled — core orchestration depends on abstract
+interfaces, not on Lark or Claude SDK directly.
+
 ```
 nemo/
 ├── __main__.py      # CLI entry point
-├── agent.py         # Main event loop & orchestration
-├── turn.py          # SDK turn execution & message streaming
-├── cards.py         # Unified turn card (V2 with collapsible panels)
-├── monitor.py       # Concurrent signal watcher during SDK turns
-├── permissions.py   # Text-based permission bridge (no card buttons)
-├── commands.py      # Built-in commands (/clear, /model, /cd, etc.)
-├── messages.py      # Message filtering & prompt building
-├── lark/
+├── core.py          # Main loop & orchestration (channel/agent agnostic)
+├── channel.py       # Channel interface (abstract)
+├── agent.py         # Agent interface (abstract)
+├── lark/            # Lark channel implementation
+│   ├── channel.py   # LarkChannel (implements Channel)
+│   ├── cards.py     # Card V2 builder (Working/Response/Done)
 │   ├── api.py       # Lark IM API client (send, update, download)
 │   ├── auth.py      # Tenant token management
 │   └── events.py    # Lark WebSocket event subscription (长连接)
+├── claude/          # Claude agent implementation
+│   ├── agent.py     # ClaudeAgent (implements Agent)
+│   └── turn.py      # SDK turn execution & event streaming
+├── commands.py      # Built-in commands (/clear, /model, /cd, etc.)
+├── messages.py      # Message filtering & prompt building
 ├── db.py            # SQLite session & message storage
 └── config.py        # Credentials & configuration
 ```
+
+## Lark WebSocket (Verified)
+
+### Connection
+- Use `lark-oapi` Python SDK: `lark.ws.Client(app_id, app_secret, event_handler=handler, domain=lark.LARK_DOMAIN)`
+- Must set `domain=lark.LARK_DOMAIN` (international version), otherwise defaults to feishu.cn and fails with "Incorrect domain name"
+- Connects to `wss://msg-frontier-sg.larksuite.com/ws/v2`
+
+### Event & Callback Registration
+- Events (messages, reactions): `register_p2_im_message_receive_v1(handler)`
+- Card actions (button clicks): `register_p2_card_action_trigger(handler)` — note: p2 not p1
+- Both arrive through the same WebSocket connection
+
+### Console Configuration (via lark-console)
+- Event subscription mode: `POST /developers/v1/event/switch/{appId}` with `{"eventMode": 4}`
+- Card callback mode: `POST /developers/v1/callback/switch/{appId}` with `{"callbackMode": 4}`
+- Mode 4 = persistent connection (WebSocket). Mode 1 = HTTP. (Not mode 2 as documented elsewhere)
+- These are two separate endpoints — both must be set independently
+
+### Card V2 Notes
+- V2 does NOT support `{"tag": "action"}` wrapper — put buttons directly in elements or inside `column_set`
+- Buttons go inside `{"tag": "column_set"}` → `{"tag": "column"}` → `{"tag": "button"}`
+
+### Nemo App
+- App ID: `cli_a9583021bef89ed4`
+- P2P chat_id (with owner): `oc_6731728a1d02fcb97c67a16806d5c6b0`
 
 ## Reference: Current handoff_agent.py
 

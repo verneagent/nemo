@@ -52,7 +52,6 @@ def main():
   parser.add_argument("--chat-id", required=True, help="Lark chat ID")
   parser.add_argument("--project-dir", required=True, help="Project directory")
   parser.add_argument("--model", default="claude-opus-4-6", help="Model to use")
-  parser.add_argument("--profile", default=None, help="Config profile name")
   parser.add_argument("--verbose", "-v", action="store_true", help="Debug logging")
   args = parser.parse_args()
 
@@ -68,7 +67,7 @@ def main():
     return 1
 
   from .agent import main_loop
-  return asyncio.run(main_loop(args.chat_id, project_dir, args.model, args.profile))
+  return asyncio.run(main_loop(args.chat_id, project_dir, args.model))
 
 
 if __name__ == "__main__":

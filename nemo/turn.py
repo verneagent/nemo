@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Callable
+from typing import Any, Callable
 
 from .cards import ToolRecord, tool_use_summary
 
@@ -56,7 +56,7 @@ class TaskDoneEvent:
 class DoneEvent:
   """Turn completed."""
   cost: float
-  usage: dict
+  usage: dict[str, Any]
 
 
 @dataclass
@@ -76,12 +76,12 @@ TurnEvent = (
 # ---------------------------------------------------------------------------
 
 async def run_turn(
-  client,
+  client: Any,
   prompt: str,
   on_event: Callable[[TurnEvent], None],
-  stale_tasks: set | None = None,
+  stale_tasks: set[str] | None = None,
   _retry: int = 0,
-) -> tuple[float, dict]:
+) -> tuple[float, dict[str, Any]]:
   """Send prompt to SDK client, stream responses, emit events.
 
   Returns (cost, usage_dict).
@@ -98,7 +98,7 @@ async def run_turn(
   await client.query(prompt)
 
   cost = 0.0
-  usage: dict = {}
+  usage: dict[str, Any] = {}
   pending_tasks: set[str] = set()
   working_started = False
   found_stale = False
@@ -180,7 +180,6 @@ async def run_turn(
   # If stale notification contaminated this turn, re-query
   if found_stale and _retry < MAX_RETRIES:
     log.info("Stale turn — re-querying (retry %d/%d)", _retry + 1, MAX_RETRIES)
-    on_event(DoneEvent(cost=cost, usage=usage))
     return await run_turn(
       client, prompt, on_event,
       stale_tasks=stale_tasks, _retry=_retry + 1,

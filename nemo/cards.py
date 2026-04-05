@@ -14,6 +14,7 @@ from __future__ import annotations
 import os
 import time
 from dataclasses import dataclass, field
+from typing import Any
 
 
 # ---------------------------------------------------------------------------
@@ -52,7 +53,7 @@ def _elapsed_text(elapsed: int) -> str:
   return f"{elapsed // 60}m {elapsed % 60}s"
 
 
-def _usage_text(usage: dict) -> str:
+def _usage_text(usage: dict[str, Any]) -> str:
   parts = []
   inp = usage.get("input_tokens")
   out = usage.get("output_tokens")
@@ -67,7 +68,7 @@ def _usage_text(usage: dict) -> str:
 # Tool summary extraction
 # ---------------------------------------------------------------------------
 
-def tool_use_summary(tool_name: str, tool_input: dict) -> str:
+def tool_use_summary(tool_name: str, tool_input: dict[str, Any]) -> str:
   """Build a one-line summary from a ToolUseBlock."""
   if tool_name == "Bash":
     desc = tool_input.get("description", "")
@@ -104,7 +105,7 @@ def tool_use_summary(tool_name: str, tool_input: dict) -> str:
 # Card V2 builders
 # ---------------------------------------------------------------------------
 
-def _collapsible_tools(tools: list[ToolRecord], label: str = "Tools") -> dict:
+def _collapsible_tools(tools: list[ToolRecord], label: str = "Tools") -> dict[str, Any]:
   """Build a collapsible_panel element with tool history."""
   lines = []
   for t in tools:
@@ -124,10 +125,30 @@ def _collapsible_tools(tools: list[ToolRecord], label: str = "Tools") -> dict:
   }
 
 
-def _note_element(text: str) -> dict:
+def _note_element(text: str) -> dict[str, Any]:
   return {
     "tag": "note",
     "elements": [{"tag": "plain_text", "content": text}],
+  }
+
+
+def _stop_button(chat_id: str = "") -> dict[str, Any]:
+  """Build a Stop button inside a column_set (Card V2 compatible)."""
+  return {
+    "tag": "column_set",
+    "flex_mode": "none",
+    "background_style": "default",
+    "columns": [{
+      "tag": "column",
+      "width": "auto",
+      "vertical_align": "top",
+      "elements": [{
+        "tag": "button",
+        "text": {"tag": "plain_text", "content": "Stop"},
+        "type": "danger",
+        "value": {"action": "stop", "chat_id": chat_id},
+      }],
+    }],
   }
 
 
@@ -138,15 +159,15 @@ def build_turn_card(
   tools: list[ToolRecord] | None = None,
   current_tool: str = "",
   elapsed: int = 0,
-  usage: dict | None = None,
+  usage: dict[str, Any] | None = None,
   chat_id: str = "",
-) -> dict:
+) -> dict[str, Any]:
   """Build a unified turn card for any phase.
 
   phase: "working" | "response" | "done"
   """
   tools = tools or []
-  elements: list[dict] = []
+  elements: list[dict[str, Any]] = []
 
   if phase == "working":
     # Body: current tool action
@@ -156,9 +177,11 @@ def build_turn_card(
     past_tools = tools[:-1] if len(tools) > 1 else []
     if past_tools:
       elements.append(_collapsible_tools(past_tools, "Previous tools"))
+    # Stop button
+    elements.append(_stop_button(chat_id))
     # Header
     title = _elapsed_title(elapsed)
-    header: dict | None = {
+    header: dict[str, Any] | None = {
       "title": {"tag": "plain_text", "content": title},
       "template": "grey",
     }
@@ -195,7 +218,7 @@ def build_turn_card(
   else:
     raise ValueError(f"Unknown phase: {phase}")
 
-  card: dict = {
+  card: dict[str, Any] = {
     "schema": "2.0",
     "config": {"update_multi": True},
     "body": {"direction": "vertical", "elements": elements},
@@ -209,6 +232,32 @@ def build_turn_card(
 # Simple card builders (for commands, errors, status)
 # ---------------------------------------------------------------------------
 
+def _buttons_row(
+  buttons: list[tuple[str, str, str]],
+  chat_id: str = "",
+) -> dict[str, Any]:
+  """Build a column_set row of buttons (Card V2 compatible)."""
+  columns: list[dict[str, Any]] = []
+  for label, action_value, button_type in buttons:
+    columns.append({
+      "tag": "column",
+      "width": "auto",
+      "vertical_align": "top",
+      "elements": [{
+        "tag": "button",
+        "text": {"tag": "plain_text", "content": label},
+        "type": button_type,
+        "value": {"action": action_value, "chat_id": chat_id},
+      }],
+    })
+  return {
+    "tag": "column_set",
+    "flex_mode": "none",
+    "background_style": "default",
+    "columns": columns,
+  }
+
+
 def build_card(
   title: str,
   body: str = "",
@@ -216,38 +265,30 @@ def build_card(
   buttons: list[tuple[str, str, str]] | None = None,
   chat_id: str = "",
   note: str = "",
-) -> dict:
-  """Build a simple Card V1 for non-turn messages."""
-  elements: list[dict] = []
+) -> dict[str, Any]:
+  """Build a simple Card V2 for non-turn messages."""
+  elements: list[dict[str, Any]] = []
   if body and body.strip():
-    elements.append({
-      "tag": "div",
-      "text": {"content": body, "tag": "lark_md"},
-    })
+    elements.append({"tag": "markdown", "content": body})
   if buttons:
-    actions = []
-    for label, action_value, button_type in buttons:
-      actions.append({
-        "tag": "button",
-        "text": {"tag": "plain_text", "content": label},
-        "type": button_type,
-        "value": {"action": action_value, "chat_id": chat_id},
-      })
-    elements.append({"tag": "action", "actions": actions})
+    elements.append(_buttons_row(buttons, chat_id))
   if note:
     elements.append(_note_element(note))
-  return {
+  card: dict[str, Any] = {
+    "schema": "2.0",
+    "config": {"update_multi": True},
     "header": {
       "title": {"tag": "plain_text", "content": title},
       "template": color,
     },
-    "elements": elements,
+    "body": {"direction": "vertical", "elements": elements},
   }
+  return card
 
 
-def build_markdown_card(content: str, title: str = "", color: str = "") -> dict:
+def build_markdown_card(content: str, title: str = "", color: str = "") -> dict[str, Any]:
   """Build a Card V2 with markdown content."""
-  card: dict = {
+  card: dict[str, Any] = {
     "schema": "2.0",
     "config": {"update_multi": True},
     "body": {
@@ -256,7 +297,8 @@ def build_markdown_card(content: str, title: str = "", color: str = "") -> dict:
     },
   }
   if title:
-    card["header"] = {"title": {"tag": "plain_text", "content": title}}
+    header: dict[str, Any] = {"title": {"tag": "plain_text", "content": title}}
     if color:
-      card["header"]["template"] = color
+      header["template"] = color
+    card["header"] = header
   return card

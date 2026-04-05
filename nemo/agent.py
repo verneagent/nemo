@@ -21,11 +21,11 @@ import uuid
 
 from . import cards, commands, messages, monitor
 from .cards import ToolRecord
-from .config import load_credentials, resolve_profile
+from .config import load_credentials
 from .db import Database
 from .lark import api as lark_api
 from .lark import auth as lark_auth
-from .lark.events import LarkEventStream
+from .lark.events import LarkEvent, LarkEventStream
 from .permissions import build_permission_handler
 from .turn import (
   DoneEvent, TextEvent, ToolProgressEvent, ToolStartEvent, run_turn,
@@ -58,7 +58,6 @@ async def main_loop(
   chat_id: str,
   project_dir: str,
   model: str,
-  profile: str | None = None,
 ) -> int:
   """Run the agent main loop."""
   session_id = str(uuid.uuid4())
@@ -66,8 +65,7 @@ async def main_loop(
   os.environ["HANDOFF_PROJECT_DIR"] = project_dir
   os.environ["HANDOFF_SESSION_TOOL"] = "Claude Agent SDK"
 
-  resolved_profile = resolve_profile(explicit=profile)
-  credentials = load_credentials(resolved_profile)
+  credentials = load_credentials()
   if not credentials:
     log.error("No credentials configured")
     return 1
@@ -99,13 +97,13 @@ async def main_loop(
     log.warning("Stale cleanup error: %s", e)
 
   # Detect need_mention
-  need_mention = False
+  need_mention = True
   try:
     members = lark_api.get_chat_members(token, chat_id)
     human_count = sum(1 for m in members if m.get("member_id") != bot_open_id)
     need_mention = human_count > 1
-  except Exception:
-    pass
+  except Exception as e:
+    log.warning("Failed to detect need_mention, defaulting to True: %s", e)
 
   # Activate session
   db.activate(
@@ -113,7 +111,6 @@ async def main_loop(
     operator_open_id=operator_open_id,
     bot_open_id=bot_open_id,
     need_mention=need_mention,
-    config_profile=resolved_profile,
   )
   log.info("Session %s activated for chat %s", session_id, chat_id)
 
@@ -148,6 +145,7 @@ async def main_loop(
   def handle_sig(_sig, _frame):
     nonlocal running
     running = False
+    events.push_back(LarkEvent())
 
   signal.signal(signal.SIGINT, handle_sig)
   signal.signal(signal.SIGTERM, handle_sig)
@@ -171,14 +169,22 @@ async def main_loop(
       if reply is None:
         continue  # Timeout, keep waiting
 
+      # Skip card action events at top level (handled during turns)
+      if reply.event_type == "card.action.trigger":
+        continue
+
+      # Scope to this session's chat (WebSocket receives all chats)
+      if reply.chat_id and reply.chat_id != chat_id:
+        continue
+
       # Filter
-      sender = reply.get("sender_id", "")
+      sender = reply.sender_id
       if bot_open_id and sender == bot_open_id:
         continue  # Skip own messages
       if not monitor.is_authorized(sender, operator_open_id):
         continue
 
-      text = reply.get("text", "").strip()
+      text = reply.text.strip()
       if not text:
         continue
 
@@ -189,13 +195,13 @@ async def main_loop(
 
       # Acknowledge receipt
       try:
-        lark_api.add_reaction(token, reply.get("message_id", ""), "EYES")
+        lark_api.add_reaction(token, reply.message_id, "EYES")
       except Exception:
         pass
       db.record_received(
         chat_id=chat_id, text=text,
-        source_message_id=reply.get("message_id", ""),
-        message_time=reply.get("create_time", ""),
+        source_message_id=reply.message_id,
+        message_time=reply.create_time,
       )
 
       # Command dispatch
@@ -318,20 +324,35 @@ async def main_loop(
       # Concurrent signal watcher: read events during SDK execution
       signal_detected = None
 
+      _pending_msgs: list = []
+
       async def _watch_signals():
         nonlocal signal_detected
         while not sdk_task.done():
           msg = await events.next_message(timeout=5)
           if msg is None:
             continue
-          msg_text = msg.get("text", "")
-          mentions = msg.get("mentions")
+          # Scope to this session's chat
+          if msg.chat_id and msg.chat_id != chat_id:
+            continue
+          # Handle Stop button card action (check authorization)
+          if msg.event_type == "card.action.trigger":
+            action = msg.action_value.get("action", "")
+            if action == "stop" and monitor.is_authorized(
+                msg.operator_id, operator_open_id):
+              signal_detected = "esc"
+              return
+            continue
+          msg_text = msg.text
+          mentions = msg.mentions
           if monitor.is_esc(msg_text, mentions):
             signal_detected = "esc"
             return
           if monitor.is_handback(msg_text, mentions):
             signal_detected = "handback"
             return
+          # Re-queue non-signal messages so they aren't lost
+          _pending_msgs.append(msg)
 
       watcher = asyncio.create_task(_watch_signals())
 
@@ -369,7 +390,11 @@ async def main_loop(
           await watcher
         except asyncio.CancelledError:
           pass
-        cost, usage = sdk_task.result()
+        sdk_task.result()
+
+      # Re-queue any messages consumed during the turn
+      for pending in _pending_msgs:
+        events.push_back(pending)
 
     except KeyboardInterrupt:
       running = False

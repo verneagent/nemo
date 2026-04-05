@@ -14,13 +14,13 @@ from __future__ import annotations
 import re
 
 
-def is_esc(text: str, mentions: list | None = None) -> bool:
+def is_esc(text: str, mentions: list[dict[str, str]] | None = None) -> bool:
   """Check if a message is an /esc command."""
   t = _strip_mentions(text, mentions)
   return t in ("/esc", "esc", "cancel", "取消")
 
 
-def is_handback(text: str, mentions: list | None = None) -> bool:
+def is_handback(text: str, mentions: list[dict[str, str]] | None = None) -> bool:
   """Check if a message is a handback command."""
   t = _strip_mentions(text, mentions)
   return t in ("handback", "hand back", "handback dissolve", "hand back dissolve")
@@ -44,7 +44,7 @@ def is_permission_reply(text: str) -> str | None:
 def is_authorized(
   sender_id: str,
   operator_open_id: str,
-  member_roles: dict | None = None,
+  member_roles: dict[str, str] | None = None,
 ) -> bool:
   """Check if a sender is authorized (operator or coowner)."""
   if not operator_open_id:
@@ -56,7 +56,7 @@ def is_authorized(
   return False
 
 
-def _strip_mentions(text: str, mentions: list | None = None) -> str:
+def _strip_mentions(text: str, mentions: list[dict[str, str]] | None = None) -> str:
   t = text.strip().lower()
   for m in (mentions or []):
     key = m.get("key", "")

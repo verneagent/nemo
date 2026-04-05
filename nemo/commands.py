@@ -32,7 +32,7 @@ def try_dispatch(text: str, ctx: AgentContext) -> tuple[bool, str | None]:
     return True, "__clear__"
 
   # /model
-  if t.startswith("/model") or t.startswith("model "):
+  if t.startswith("/model"):
     parts = text.strip().split(None, 1)
     if len(parts) >= 2:
       new_model = parts[1].strip()
@@ -44,7 +44,7 @@ def try_dispatch(text: str, ctx: AgentContext) -> tuple[bool, str | None]:
     return True, "__esc__"
 
   # /cd
-  if t.startswith("/cd ") or t.startswith("cd "):
+  if t.startswith("/cd "):
     parts = text.strip().split(None, 1)
     if len(parts) >= 2:
       new_dir = os.path.expanduser(parts[1].strip())
