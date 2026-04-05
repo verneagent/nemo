@@ -50,7 +50,7 @@ def main():
     description="Lark-connected coding agent daemon",
   )
   parser.add_argument("--chat-id", required=True, help="Lark chat ID")
-  parser.add_argument("--project-dir", required=True, help="Project directory")
+  parser.add_argument("--project-dir", default=".", help="Project directory (default: cwd)")
   parser.add_argument("--model", default="claude-opus-4-6", help="Model to use")
   parser.add_argument("--verbose", "-v", action="store_true", help="Debug logging")
   args = parser.parse_args()
