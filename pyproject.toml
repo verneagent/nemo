@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "nemo"
+version = "0.1.0"
+description = "Lark-connected coding agent daemon powered by Claude Agent SDK"
+requires-python = ">=3.10"
+dependencies = [
+  "claude-agent-sdk",
+]
+
+[project.scripts]
+nemo = "nemo.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["nemo*"]

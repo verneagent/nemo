@@ -1,0 +1,111 @@
+"""Text-based permission bridge — no card buttons needed.
+
+When the SDK wants to run a tool that needs approval:
+1. Send a read-only card showing the tool description
+2. Wait for the user's text reply: "y"/"n"/"always"
+3. PATCH card to show decision
+4. Return Allow/Deny to the SDK
+
+No card action callbacks, no Worker, no polling.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+
+log = logging.getLogger(__name__)
+
+# Tools that are always auto-approved (internal operations)
+AUTO_APPROVE_PATTERNS = {
+  "handoff_ops.py", "send_to_group.py", "wait_for_reply.py",
+  "send_and_wait.py", "iterm2_silence.py", "end_and_cleanup.py",
+  "start_and_wait.py", "preflight.py", "enter_handoff.py",
+}
+
+
+def is_auto_approve(tool_name: str, tool_input: dict) -> bool:
+  """Check if a tool call should be auto-approved."""
+  if tool_name != "Bash":
+    return False
+  cmd = tool_input.get("command", "")
+  return any(pat in cmd for pat in AUTO_APPROVE_PATTERNS)
+
+
+def format_tool(tool_name: str, tool_input: dict) -> str:
+  """Format tool for permission card body."""
+  if tool_name == "Bash":
+    desc = tool_input.get("description", "")
+    cmd = tool_input.get("command", "")
+    label = desc or cmd
+    if len(label) > 200:
+      label = label[:197] + "..."
+    return f"**Bash**: `{label}`"
+  if tool_name in ("Edit", "Write", "Read"):
+    fp = tool_input.get("file_path", "")
+    name = os.path.basename(fp) if fp else "file"
+    return f"**{tool_name}**: `{name}`"
+  return f"**{tool_name}**"
+
+
+def build_permission_handler(credentials: dict, chat_id: str, db, events_source):
+  """Build an async can_use_tool handler for the SDK.
+
+  events_source: an object with async next_message() that returns the next
+  Lark message from the operator. This is how we receive "y"/"n" replies
+  without card buttons.
+  """
+  from claude_agent_sdk import PermissionResultAllow, PermissionResultDeny
+
+  async def can_use_tool(tool_name, tool_input, _context):
+    # Auto-approve internals
+    if is_auto_approve(tool_name, tool_input):
+      return PermissionResultAllow()
+
+    # Check autoapprove setting
+    session = db.get_current_session()
+    if session and session.get("autoapprove"):
+      return PermissionResultAllow()
+
+    # Send permission info card (read-only, no buttons)
+    from .lark.auth import get_token
+    from .lark.api import send_card, update_card
+    from .cards import build_card
+
+    token = get_token(credentials["app_id"], credentials["app_secret"])
+    body = format_tool(tool_name, tool_input)
+
+    card = build_card(
+      "⚠️ Permission Request",
+      body=f"{body}\n\nReply **y** to approve, **n** to deny, **always** to approve all",
+      color="yellow",
+    )
+    msg_id = send_card(token, chat_id, card)
+
+    # Wait for text reply
+    from .monitor import is_permission_reply
+    reply = await events_source.next_message(timeout=300)
+    decision = is_permission_reply(reply.get("text", "")) if reply else None
+
+    if decision is None:
+      decision = "deny"  # Timeout or unrecognized = deny
+
+    # Update card with decision
+    try:
+      token = get_token(credentials["app_id"], credentials["app_secret"])
+      if decision in ("allow", "always"):
+        update_card(token, msg_id, build_card(
+          "✓ Approved", body=body, color="green"))
+        if decision == "always":
+          db.set_autoapprove(chat_id, True)
+      else:
+        update_card(token, msg_id, build_card(
+          "✗ Denied", body=body, color="red"))
+    except Exception:
+      pass
+
+    if decision in ("allow", "always"):
+      return PermissionResultAllow()
+    return PermissionResultDeny()
+
+  return can_use_tool
