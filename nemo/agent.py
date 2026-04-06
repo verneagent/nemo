@@ -175,20 +175,24 @@ async def main_loop(
     bot_open_id=bot_open_id,
     need_mention=need_mention,
   )
-  log.info("Session %s activated for chat %s", session_id, chat_id)
+  log.info("Session %s activated (chat=%s bot=%s operator=%s need_mention=%s)",
+           session_id, chat_id, bot_open_id[:16] if bot_open_id else "?",
+           operator_open_id[:16] if operator_open_id else "?", need_mention)
 
   # Connect to Lark event stream
   events = LarkEventStream(credentials["app_id"], credentials["app_secret"])
   await events.connect()
 
   # Send start card
+  log.info("Sending start card to %s", chat_id)
   start_card = cards.build_card(
     f"Nemo ({model})",
     body="Agent ready. Send a message to begin.",
     color="blue",
   )
   try:
-    lark_api.send_card(token, chat_id, start_card)
+    msg_id = lark_api.send_card(token, chat_id, start_card)
+    log.info("Start card sent: %s", msg_id)
   except Exception as e:
     log.warning("Start card failed: %s", e)
 
@@ -237,12 +241,17 @@ async def main_loop(
       if reply is None:
         continue  # Timeout, keep waiting
 
+      log.debug("Event: type=%s chat=%s sender=%s msg_type=%s text=%r",
+                reply.event_type, reply.chat_id, reply.sender_id,
+                reply.msg_type, reply.text[:80] if reply.text else "")
+
       # Skip card action events at top level (handled during turns)
       if reply.event_type == "card.action.trigger":
         continue
 
       # Scope to this session's chat (WebSocket receives all chats)
       if reply.chat_id and reply.chat_id != chat_id:
+        log.debug("Skipping: wrong chat %s (expected %s)", reply.chat_id, chat_id)
         continue
 
       # Ignore sticker messages
@@ -252,8 +261,10 @@ async def main_loop(
       # Filter
       sender = reply.sender_id
       if bot_open_id and sender == bot_open_id:
+        log.debug("Skipping: own message from bot %s", sender)
         continue  # Skip own messages
       if not monitor.is_authorized(sender, operator_open_id):
+        log.debug("Skipping: unauthorized sender %s (operator=%s)", sender, operator_open_id)
         continue
 
       # Sidecar mode: only respond to bot interactions
@@ -264,11 +275,13 @@ async def main_loop(
 
       text = reply.text.strip()
       if not text:
+        log.debug("Skipping: empty text")
         continue
 
       # Strip @-mention markers
       user_message = messages.strip_mentions(text, [reply])
       if not user_message:
+        log.debug("Skipping: empty after stripping mentions")
         continue
 
       # Acknowledge receipt with THINKING reaction

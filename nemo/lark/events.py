@@ -190,7 +190,9 @@ class LarkEventStream:
         "header": {"event_type": "im.message.receive_v1"},
         "event": _model_to_dict(data.event) if hasattr(data, 'event') else {},
       }
+      log.debug("WS raw event: %s", json.dumps(event_payload, ensure_ascii=False, default=str)[:500])
       parsed = parse_event(event_payload)
+      log.debug("WS parsed: chat=%s sender=%s text=%r", parsed.chat_id, parsed.sender_id, parsed.text[:80] if parsed.text else "")
       loop.call_soon_threadsafe(self._queue.put_nowait, parsed)
 
     def _on_card_action(data: P2CardActionTrigger) -> P2CardActionTriggerResponse:
