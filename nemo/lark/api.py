@@ -112,6 +112,24 @@ def get_chat_info(token: str, chat_id: str) -> dict[str, Any]:
   return data.get("data", {})
 
 
+def list_bot_chats(token: str) -> list[dict[str, Any]]:
+  """List all chat groups the bot belongs to."""
+  url = f"{BASE_URL}/im/v1/chats?user_id_type=open_id"
+  chats: list[dict[str, Any]] = []
+  page_token = ""
+  for _ in range(50):  # safety limit
+    req_url = url + (f"&page_token={page_token}" if page_token else "")
+    data = _request(req_url, token)
+    if data.get("code") != 0:
+      break
+    items = data.get("data", {}).get("items", [])
+    chats.extend(items)
+    if not data.get("data", {}).get("has_more"):
+      break
+    page_token = data["data"].get("page_token", "")
+  return chats
+
+
 def get_chat_members(token: str, chat_id: str) -> list[dict[str, Any]]:
   """Get all members of a chat group."""
   url = f"{BASE_URL}/im/v1/chats/{chat_id}/members?member_id_type=open_id"

@@ -6,24 +6,25 @@ from unittest import mock
 from nemo.__main__ import main
 
 
-def test_missing_chat_id():
-  """Should exit with error if --chat-id is missing."""
+def test_no_chat_id_no_credentials():
+  """Without --chat-id and no credentials, should return 1."""
   with mock.patch("sys.argv", ["nemo", "--project-dir", "/tmp"]):
-    try:
-      main()
-      assert False, "Should have raised SystemExit"
-    except SystemExit as e:
-      assert e.code == 2  # argparse error
+    with mock.patch("nemo.__main__._ensure_sdk"):
+      with mock.patch("nemo.config.load_credentials", return_value=None):
+        result = main()
+        assert result == 1
 
 
-def test_missing_project_dir():
-  """Should exit with error if --project-dir is missing."""
-  with mock.patch("sys.argv", ["nemo", "--chat-id", "oc_123"]):
-    try:
-      main()
-      assert False, "Should have raised SystemExit"
-    except SystemExit as e:
-      assert e.code == 2
+def test_no_chat_id_no_matching_group(tmp_path):
+  """Without --chat-id and no matching group, should return 1."""
+  with mock.patch("sys.argv", ["nemo", "--project-dir", str(tmp_path)]):
+    with mock.patch("nemo.__main__._ensure_sdk"):
+      with mock.patch("nemo.config.load_credentials",
+                      return_value={"app_id": "a", "app_secret": "s", "email": ""}):
+        with mock.patch("nemo.lark.auth.get_token", return_value="tok"):
+          with mock.patch("nemo.workspace.discover_chat_id", return_value=None):
+            result = main()
+            assert result == 1
 
 
 def test_invalid_project_dir():
