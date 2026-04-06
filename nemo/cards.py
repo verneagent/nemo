@@ -174,13 +174,15 @@ def build_turn_card(
   elements: list[dict[str, Any]] = []
 
   if phase == "working":
-    # Body: current tool action
+    # Body: latest intermediate text (Claude's current thinking)
+    if body:
+      elements.append({"tag": "markdown", "content": body})
+    # Current tool action
     if current_tool:
       elements.append({"tag": "markdown", "content": f"`{current_tool}`"})
-    # Collapsible tool history (only if >1 tool, current is always the last)
-    past_tools = tools[:-1] if len(tools) > 1 else []
-    if past_tools:
-      elements.append(_collapsible_tools(past_tools, "Previous tools"))
+    # All tools in collapsible
+    if tools:
+      elements.append(_collapsible_tools(tools))
     # Stop button
     elements.append(_stop_button(chat_id))
     # Header
@@ -189,15 +191,6 @@ def build_turn_card(
       "title": {"tag": "plain_text", "content": title},
       "template": "grey",
     }
-
-  elif phase == "response":
-    # Body: response markdown
-    if body:
-      elements.append({"tag": "markdown", "content": body})
-    # All tools in collapsible
-    if tools:
-      elements.append(_collapsible_tools(tools))
-    header = None  # No header for response-only
 
   elif phase == "done":
     # Body: response markdown

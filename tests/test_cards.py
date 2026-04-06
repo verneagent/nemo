@@ -100,14 +100,25 @@ def test_working_card_stop_button_has_chat_id():
 
 
 # ---------------------------------------------------------------------------
-# build_turn_card — response phase
+# build_turn_card — working phase with body (intermediate text)
 # ---------------------------------------------------------------------------
 
-def test_response_card():
-  card = build_turn_card("response", body="Here is the answer.")
-  assert "header" not in card  # No header for response
+def test_working_card_with_body():
+  card = build_turn_card("working", body="Thinking about this...", elapsed=5)
   elements = card["body"]["elements"]
-  assert elements[0]["content"] == "Here is the answer."
+  # First element should be the body markdown
+  assert elements[0]["tag"] == "markdown"
+  assert elements[0]["content"] == "Thinking about this..."
+
+
+def test_working_card_with_body_and_tool():
+  card = build_turn_card(
+    "working", body="Let me check.", current_tool="Read: foo.py", elapsed=5,
+  )
+  elements = card["body"]["elements"]
+  # body markdown, then tool markdown, then stop button
+  assert elements[0]["content"] == "Let me check."
+  assert "`Read: foo.py`" in elements[1]["content"]
 
 
 # ---------------------------------------------------------------------------
@@ -151,6 +162,15 @@ def test_done_card_with_tools():
 def test_invalid_phase_raises():
   try:
     build_turn_card("invalid")
+    assert False, "Should raise ValueError"
+  except ValueError:
+    pass
+
+
+def test_response_phase_removed():
+  """Response phase no longer exists — should raise."""
+  try:
+    build_turn_card("response")
     assert False, "Should raise ValueError"
   except ValueError:
     pass

@@ -371,7 +371,6 @@ async def main_loop(
         continue
 
       # --- Run SDK turn ---
-      status_tab.update_status(token, chat_id, model, "working")
       log.info("Processing: %s", user_message[:80])
       ctx.msg_count += 1
 
@@ -385,55 +384,52 @@ async def main_loop(
         nonlocal _turn_card_id
         token = lark_auth.get_token(credentials["app_id"], credentials["app_secret"])
 
-        if isinstance(event, ToolStartEvent):
+        def _ensure_card():
+          """Create working card if it doesn't exist yet."""
+          nonlocal _turn_card_id
+          if _turn_card_id:
+            return
           _clear_ack()
-          _turn_tools.append(event.tool)
-          card = cards.build_turn_card(
-            "working",
-            current_tool=event.tool.summary,
-            tools=_turn_tools,
-            chat_id=chat_id,
-          )
+          card = cards.build_turn_card("working", chat_id=chat_id)
           try:
             _turn_card_id = lark_api.send_card(token, chat_id, card)
             db.set_working(session_id, _turn_card_id)
           except Exception as e:
             log.error("Working card error: %s", e)
 
-        elif isinstance(event, ToolProgressEvent):
+        def _update_working(**kwargs):
+          """Update the working card with current state."""
+          if not _turn_card_id:
+            return
+          elapsed = int(time.time() - _turn_start)
+          latest_text = _turn_texts[-1] if _turn_texts else ""
+          card = cards.build_turn_card(
+            "working",
+            body=latest_text,
+            tools=_turn_tools,
+            elapsed=elapsed,
+            chat_id=chat_id,
+            **kwargs,
+          )
+          try:
+            lark_api.update_card(token, _turn_card_id, card)
+          except Exception:
+            pass
+
+        if isinstance(event, (ToolStartEvent, ToolProgressEvent)):
           _turn_tools.append(event.tool)
-          if _turn_card_id:
-            elapsed = int(time.time() - _turn_start)
-            card = cards.build_turn_card(
-              "working",
-              current_tool=event.tool.summary,
-              tools=_turn_tools,
-              elapsed=elapsed,
-              chat_id=chat_id,
-            )
-            try:
-              lark_api.update_card(token, _turn_card_id, card)
-            except Exception:
-              pass
+          _ensure_card()
+          _update_working(current_tool=event.tool.summary)
 
         elif isinstance(event, TextEvent):
-          _clear_ack()
           _turn_texts.append(event.text)
-          merged = "\n\n---\n\n".join(_turn_texts)
-          if _turn_card_id:
-            card = cards.build_turn_card(
-              "response", body=merged, tools=_turn_tools)
-            try:
-              lark_api.update_card(token, _turn_card_id, card)
-            except Exception:
-              _send_response(token, chat_id, event.text, db)
-          else:
-            _turn_card_id = _send_response(token, chat_id, merged, db)
+          _ensure_card()
+          _update_working()
 
         elif isinstance(event, DoneEvent):
           elapsed = int(time.time() - _turn_start)
+          merged = "\n\n---\n\n".join(_turn_texts) if _turn_texts else ""
           if _turn_card_id:
-            merged = "\n\n---\n\n".join(_turn_texts) if _turn_texts else ""
             card = cards.build_turn_card(
               "done", body=merged, tools=_turn_tools,
               elapsed=elapsed, usage=event.usage,
@@ -443,6 +439,10 @@ async def main_loop(
             except Exception:
               pass
             db.clear_working(session_id)
+          else:
+            # Pure text response with no tools and no card created
+            if merged:
+              _send_response(token, chat_id, merged, db)
           ctx.total_cost += event.cost
 
       # Run SDK turn as async task, watch event stream for signals
@@ -530,7 +530,6 @@ async def main_loop(
       # Re-queue any messages consumed during the turn
       for pending in _pending_msgs:
         events.push_back(pending)
-      status_tab.update_status(token, chat_id, model, "idle")
 
     except KeyboardInterrupt:
       running = False
