@@ -30,7 +30,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
   "rules": {},
 }
 
-_VALID_KEYS = {"guests", "autoapprove", "filter", "rules"}
+_VALID_KEYS = {"guests", "autoapprove", "filter", "rules", "active_pid"}
 
 
 # ---------------------------------------------------------------------------

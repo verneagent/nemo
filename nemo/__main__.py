@@ -76,17 +76,14 @@ def main():
 
   chat_id = args.chat_id
   if not chat_id:
-    # Auto-discover chat from workspace tag in group descriptions
+    # Auto-discover idle chat or create a new one
     from .lark.auth import get_token
-    from .workspace import discover_chat_id
+    from .workspace import discover_or_create_chat
     token = get_token(credentials["app_id"], credentials["app_secret"])
-    chat_id = discover_chat_id(token, project_dir)
+    chat_id = discover_or_create_chat(token, project_dir,
+                                      email=credentials.get("email", ""))
     if not chat_id:
-      from .workspace import get_workspace_id
-      ws_id = get_workspace_id(project_dir)
-      print(f"Error: No Lark group found for workspace: {ws_id}", file=sys.stderr)
-      print("Create a group with this in the description:", file=sys.stderr)
-      print(f"  workspace:{ws_id}", file=sys.stderr)
+      print("Error: Failed to find or create Lark group", file=sys.stderr)
       return 1
 
   # Preflight checks

@@ -150,10 +150,11 @@ async def main_loop(
   except Exception as e:
     log.warning("Stale cleanup error: %s", e)
 
-  # Ensure workspace tag in group description (skip in sidecar mode)
+  # Ensure workspace tag and claim group (skip in sidecar mode)
   if not sidecar:
-    from .workspace import ensure_workspace_tag
+    from .workspace import ensure_workspace_tag, claim_group
     ensure_workspace_tag(token, chat_id, project_dir)
+    claim_group(token, chat_id)
 
   # Detect need_mention
   if sidecar:
@@ -510,6 +511,9 @@ async def main_loop(
   await events.close()
   db.deactivate(session_id)
   db.close()
+  if not sidecar:
+    from .workspace import release_group
+    release_group(token, chat_id)
   log.info("Agent stopped.")
   return 0
 

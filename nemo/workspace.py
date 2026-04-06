@@ -3,6 +3,10 @@
 The workspace ID is `{machine}-{folder}` and is stored in the Lark
 group description as `workspace:{id}`. This lets nemo auto-discover
 which chat to connect to based on the current project directory.
+
+Groups are tracked as idle/occupied via `active_pid` in the config card.
+On startup nemo picks an idle group (or creates one). On shutdown it
+clears the PID to mark the group idle again.
 """
 
 from __future__ import annotations
@@ -55,10 +59,19 @@ def _workspace_tag_matches(desc: str, tag: str) -> bool:
     start = end
 
 
-def discover_chat_id(token: str, project_dir: str) -> str | None:
-  """Find the Lark chat tagged with this project's workspace ID.
+def _is_pid_alive(pid: int) -> bool:
+  """Check if a process with the given PID is still running."""
+  try:
+    os.kill(pid, 0)
+    return True
+  except (OSError, ProcessLookupError):
+    return False
 
-  Returns chat_id if found, None otherwise.
+
+def _find_workspace_groups(token: str, project_dir: str) -> list[dict[str, str]]:
+  """Find all Lark groups tagged with this project's workspace ID.
+
+  Returns list of {"chat_id": ..., "name": ...}.
   """
   from .lark import api as lark_api
 
@@ -70,8 +83,9 @@ def discover_chat_id(token: str, project_dir: str) -> str | None:
     chats = lark_api.list_bot_chats(token)
   except Exception as e:
     log.error("Failed to list bot chats: %s", e)
-    return None
+    return []
 
+  matches: list[dict[str, str]] = []
   for chat in chats:
     chat_id = chat.get("chat_id", "")
     if not chat_id:
@@ -80,14 +94,159 @@ def discover_chat_id(token: str, project_dir: str) -> str | None:
       info = lark_api.get_chat_info(token, chat_id)
       desc = info.get("description") or ""
       if _workspace_tag_matches(desc, workspace_tag):
-        log.info("Found chat %s (%s)", chat_id, info.get("name", ""))
-        return chat_id
+        matches.append({"chat_id": chat_id, "name": info.get("name", "")})
     except Exception as e:
       log.debug("Failed to inspect chat %s: %s", chat_id, e)
       continue
+  return matches
 
-  log.warning("No chat found for workspace %s", workspace_id)
+
+def _is_group_idle(token: str, chat_id: str) -> bool:
+  """Check if a group is idle (no active nemo process occupying it).
+
+  Reads the config card's active_pid field. Idle if:
+  - No config card / no active_pid
+  - active_pid is 0
+  - The PID process is no longer running
+  """
+  from .group_config import load_config
+
+  try:
+    config = load_config(token, chat_id)
+  except Exception:
+    return True  # Can't read config → treat as idle
+
+  pid = config.get("active_pid", 0)
+  if not pid:
+    return True
+  return not _is_pid_alive(int(pid))
+
+
+def discover_chat_id(token: str, project_dir: str) -> str | None:
+  """Find an idle Lark chat tagged with this project's workspace ID.
+
+  Scans all matching groups, returns the first idle one (no active PID).
+  Returns chat_id if found, None otherwise.
+  """
+  groups = _find_workspace_groups(token, project_dir)
+  for g in groups:
+    chat_id = g["chat_id"]
+    if _is_group_idle(token, chat_id):
+      log.info("Found idle chat %s (%s)", chat_id, g.get("name", ""))
+      return chat_id
+    else:
+      log.info("Chat %s (%s) is occupied, skipping", chat_id, g.get("name", ""))
+  if groups:
+    log.info("All %d groups are occupied", len(groups))
   return None
+
+
+def auto_create_chat(token: str, project_dir: str,
+                     email: str = "",
+                     existing_names: list[str] | None = None) -> str | None:
+  """Create a new Lark group for this workspace.
+
+  Creates the group, adds the operator (by email), writes workspace tag,
+  and pins a default config card. Returns the new chat_id or None on failure.
+  """
+  from .lark import api as lark_api
+
+  workspace_id = get_workspace_id(project_dir)
+  workspace_tag = f"workspace:{workspace_id}"
+  folder_name = os.path.basename(os.path.abspath(project_dir))
+  group_name = _compute_group_name(folder_name, existing_names or [])
+
+  # Resolve operator open_id from email
+  user_ids: list[str] = []
+  if email:
+    try:
+      open_id = lark_api.lookup_open_id_by_email(token, email)
+      if open_id:
+        user_ids.append(open_id)
+      else:
+        log.warning("Could not resolve email %s to open_id", email)
+    except Exception as e:
+      log.warning("Failed to resolve email: %s", e)
+
+  try:
+    chat_id = lark_api.create_chat(
+      token, group_name, description=workspace_tag, user_ids=user_ids,
+    )
+    log.info("Created group %s (%s)", chat_id, group_name)
+  except Exception as e:
+    log.error("Failed to create group: %s", e)
+    return None
+
+  # Pin default config card
+  try:
+    from .group_config import DEFAULT_CONFIG, save_config
+    save_config(token, chat_id, dict(DEFAULT_CONFIG))
+    log.info("Pinned default config card in %s", chat_id)
+  except Exception as e:
+    log.warning("Failed to pin config card: %s", e)
+
+  return chat_id
+
+
+def _compute_group_name(folder_name: str, existing_names: list[str]) -> str:
+  """Compute a numbered group name: Nemo · foo, Nemo · foo 2, etc."""
+  base = f"Nemo · {folder_name}"
+  if base not in existing_names:
+    return base
+  n = 2
+  while f"{base} {n}" in existing_names:
+    n += 1
+  return f"{base} {n}"
+
+
+def discover_or_create_chat(token: str, project_dir: str,
+                            email: str = "") -> str | None:
+  """Find an idle group or create a new one.
+
+  1. Find all groups matching this workspace tag
+  2. Pick the first idle one (no active PID)
+  3. If all occupied or none exist, create a new group
+  """
+  groups = _find_workspace_groups(token, project_dir)
+  for g in groups:
+    chat_id = g["chat_id"]
+    if _is_group_idle(token, chat_id):
+      log.info("Reusing idle chat %s (%s)", chat_id, g.get("name", ""))
+      return chat_id
+    else:
+      log.info("Chat %s (%s) is occupied, skipping", chat_id, g.get("name", ""))
+
+  # All occupied or none found → create new
+  existing_names = [g.get("name", "") for g in groups]
+  log.info("Creating new group (existing: %d, all occupied)", len(groups))
+  return auto_create_chat(token, project_dir, email=email,
+                          existing_names=existing_names)
+
+
+def claim_group(token: str, chat_id: str) -> None:
+  """Mark this group as occupied by writing our PID to the config card."""
+  from .group_config import load_config, save_config
+
+  try:
+    config = load_config(token, chat_id)
+    config["active_pid"] = os.getpid()
+    save_config(token, chat_id, config)
+    log.info("Claimed group %s (pid=%d)", chat_id, os.getpid())
+  except Exception as e:
+    log.warning("Failed to claim group: %s", e)
+
+
+def release_group(token: str, chat_id: str) -> None:
+  """Mark this group as idle by clearing the active_pid."""
+  from .group_config import load_config, save_config
+
+  try:
+    config = load_config(token, chat_id)
+    config["active_pid"] = 0
+    save_config(token, chat_id, config)
+    log.info("Released group %s", chat_id)
+  except Exception as e:
+    log.warning("Failed to release group: %s", e)
 
 
 def ensure_workspace_tag(token: str, chat_id: str, project_dir: str) -> None:
