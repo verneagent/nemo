@@ -192,6 +192,10 @@ async def main_loop(
   except Exception as e:
     log.warning("Start card failed: %s", e)
 
+  # Status tab — green idle
+  from . import status_tab
+  status_tab.update_status(token, chat_id, model, "idle")
+
   # Init SDK client
   from claude_agent_sdk import ClaudeSDKClient
   session_id_ref = [session_id]
@@ -354,6 +358,7 @@ async def main_loop(
         continue
 
       # --- Run SDK turn ---
+      status_tab.update_status(token, chat_id, model, "working")
       log.info("Processing: %s", user_message[:80])
       ctx.msg_count += 1
 
@@ -512,6 +517,7 @@ async def main_loop(
       # Re-queue any messages consumed during the turn
       for pending in _pending_msgs:
         events.push_back(pending)
+      status_tab.update_status(token, chat_id, model, "idle")
 
     except KeyboardInterrupt:
       running = False
@@ -535,6 +541,7 @@ async def main_loop(
   if not sidecar:
     from .workspace import release_group
     release_group(token, chat_id)
+    status_tab.update_status(token, chat_id, model, "stopped")
   if _dissolve_on_exit:
     try:
       token = lark_auth.get_token(credentials["app_id"], credentials["app_secret"])

@@ -416,6 +416,23 @@ def delete_chat_tab(token: str, chat_id: str, tab_ids: list[str]) -> None:
     raise RuntimeError(f"Failed to delete chat tabs: {data}")
 
 
+def update_chat_tab(token: str, chat_id: str, tab_id: str,
+                    name: str, url: str) -> None:
+  """Update an existing chat tab."""
+  api_url = f"{BASE_URL}/im/v1/chats/{chat_id}/chat_tabs/update_tabs"
+  payload = {
+    "chat_tabs": [{
+      "tab_id": tab_id,
+      "tab_name": name,
+      "tab_type": "url",
+      "tab_content": {"url": url},
+    }],
+  }
+  data = _request(api_url, token, payload)
+  if data.get("code") != 0:
+    raise RuntimeError(f"Failed to update chat tab: {data}")
+
+
 def list_chat_tabs(token: str, chat_id: str) -> list[dict[str, Any]]:
   """List all tabs in chat."""
   api_url = f"{BASE_URL}/im/v1/chats/{chat_id}/chat_tabs"
