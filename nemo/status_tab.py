@@ -1,11 +1,10 @@
-"""Status tab — show agent/WebSocket status as a chat tab.
+"""Status tabs — show model and WebSocket status as separate chat tabs.
 
-Uses a URL tab with emoji prefix to indicate state:
-  🟢 Nemo (model) — connected, idle
-  🟡 Nemo (model) — working
-  🔴 Nemo (model) — disconnected / stopped
+Two tabs:
+  1. Model tab: shows the model name (e.g. "claude-opus-4-6")
+  2. WS status tab: emoji only (🟢 idle, 🟡 working, 🔴 stopped)
 
-The tab is identified by its URL containing `?type=nemo-status`,
+Tabs are identified by URL markers (?type=nemo-status, ?type=nemo-model),
 not by parsing the tab name.
 """
 
@@ -17,54 +16,71 @@ from typing import Any
 log = logging.getLogger(__name__)
 
 _BASE_URL = "https://github.com/verneagent/nemo"
-_TAB_MARKER = "type=nemo-status"
-TAB_URL = f"{_BASE_URL}?{_TAB_MARKER}"
+_STATUS_MARKER = "type=nemo-status"
+_MODEL_MARKER = "type=nemo-model"
+TAB_URL = f"{_BASE_URL}?{_STATUS_MARKER}"
+MODEL_TAB_URL = f"{_BASE_URL}?{_MODEL_MARKER}"
+
+_STATUS_EMOJI = {
+  "idle": "🟢",
+  "working": "🟡",
+  "stopped": "🔴",
+}
 
 
-def _find_nemo_tab(tabs: list[dict[str, Any]]) -> dict[str, Any] | None:
-  """Find the existing Nemo status tab by URL marker."""
+def _find_tab_by_marker(tabs: list[dict[str, Any]], marker: str) -> dict[str, Any] | None:
+  """Find a tab by URL marker."""
   for tab in tabs:
     url = (tab.get("tab_content") or {}).get("url", "")
-    if _TAB_MARKER in url:
+    if marker in url:
       return tab
   return None
 
 
-def _tab_name(model: str, status: str) -> str:
-  if status == "working":
-    return f"🟡 Nemo ({model})"
-  if status == "stopped":
-    return f"🔴 Nemo ({model})"
-  return f"🟢 Nemo ({model})"
-
 
 def update_status(token: str, chat_id: str, model: str,
                   status: str = "idle") -> None:
-  """Create or update the status tab. status: idle, working, stopped."""
+  """Create or update both tabs. status: idle, working, stopped."""
   from .lark import api as lark_api
 
-  name = _tab_name(model, status)
+  emoji = _STATUS_EMOJI.get(status, "🟢")
   try:
     tabs = lark_api.list_chat_tabs(token, chat_id)
-    existing = _find_nemo_tab(tabs)
-    if existing:
-      tab_id = existing.get("tab_id", "")
-      if existing.get("tab_name") != name and tab_id:
-        lark_api.update_chat_tab(token, chat_id, tab_id, name, TAB_URL)
+
+    # --- Status tab (emoji only) ---
+    status_tab = _find_tab_by_marker(tabs, _STATUS_MARKER)
+    if status_tab:
+      tab_id = status_tab.get("tab_id", "")
+      if status_tab.get("tab_name") != emoji and tab_id:
+        lark_api.update_chat_tab(token, chat_id, tab_id, emoji, TAB_URL)
     else:
-      lark_api.create_chat_tab(token, chat_id, name, TAB_URL)
+      lark_api.create_chat_tab(token, chat_id, emoji, TAB_URL)
+
+    # --- Model tab (model name) ---
+    model_tab = _find_tab_by_marker(tabs, _MODEL_MARKER)
+    if not model_tab:
+      lark_api.create_chat_tab(token, chat_id, model, MODEL_TAB_URL)
+    elif model_tab.get("tab_name") != model:
+      tab_id = model_tab.get("tab_id", "")
+      if tab_id:
+        lark_api.update_chat_tab(token, chat_id, tab_id, model, MODEL_TAB_URL)
+
   except Exception as e:
     log.warning("Status tab update failed: %s", e)
 
 
 def remove_tab(token: str, chat_id: str) -> None:
-  """Remove the Nemo status tab."""
+  """Remove both Nemo tabs."""
   from .lark import api as lark_api
 
   try:
     tabs = lark_api.list_chat_tabs(token, chat_id)
-    existing = _find_nemo_tab(tabs)
-    if existing and existing.get("tab_id"):
-      lark_api.delete_chat_tab(token, chat_id, [existing["tab_id"]])
+    tab_ids = []
+    for marker in (_STATUS_MARKER, _MODEL_MARKER):
+      tab = _find_tab_by_marker(tabs, marker)
+      if tab and tab.get("tab_id"):
+        tab_ids.append(tab["tab_id"])
+    if tab_ids:
+      lark_api.delete_chat_tab(token, chat_id, tab_ids)
   except Exception as e:
     log.warning("Status tab removal failed: %s", e)
