@@ -539,13 +539,14 @@ async def main_loop(
         try:
           sdk_task.result()
         except TimeoutError:
-          log.error("SDK turn timed out — restarting client")
+          log.error("SDK turn timed out — interrupted, context preserved")
           token = lark_auth.get_token(credentials["app_id"], credentials["app_secret"])
-          # Update working card to show error
+          # Update working card to show timeout
           if _turn_card_id:
             elapsed = int(time.time() - _turn_start)
             err_card = cards.build_turn_card(
-              "done", body="**Error:** Turn timed out — SDK stopped responding.",
+              "done",
+              body="**Timed out** — SDK stopped responding. Interrupted, context preserved.",
               tools=_turn_tools, elapsed=elapsed,
             )
             try:
@@ -555,9 +556,9 @@ async def main_loop(
             db.clear_working(session_id)
           else:
             _send_response(token, chat_id,
-                           "**Error:** Turn timed out — SDK stopped responding.", db)
+                           "**Timed out** — SDK stopped responding. Context preserved, send another message to continue.", db)
           _clear_ack()
-          await _restart_client()
+          # Don't restart client — context is preserved in the CLI session
           for pending in _pending_msgs:
             events.push_back(pending)
           continue

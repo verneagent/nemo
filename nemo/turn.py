@@ -117,8 +117,26 @@ async def run_turn(
     except StopAsyncIteration:
       break
     except asyncio.TimeoutError:
-      log.error("receive_response() heartbeat timeout (%ds) — turn stuck",
+      log.error("receive_response() heartbeat timeout (%ds) — interrupting",
                 HEARTBEAT_TIMEOUT)
+      # Try to interrupt gracefully — CLI should send ResultMessage
+      try:
+        await client.interrupt()
+        message = await asyncio.wait_for(
+          response.__anext__(), timeout=30)
+        # Drain remaining messages after interrupt
+        while True:
+          try:
+            message = await asyncio.wait_for(
+              response.__anext__(), timeout=10)
+            if isinstance(message, ResultMessage):
+              cost = getattr(message, "total_cost_usd", 0) or 0.0
+              usage = getattr(message, "usage", None) or {}
+              break
+          except (StopAsyncIteration, asyncio.TimeoutError):
+            break
+      except (StopAsyncIteration, asyncio.TimeoutError, Exception) as e:
+        log.error("Interrupt also failed: %s", e)
       timed_out = True
       break
 
