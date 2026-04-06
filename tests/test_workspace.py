@@ -218,16 +218,16 @@ def test_is_group_idle_config_error():
 # ---------------------------------------------------------------------------
 
 def test_compute_group_name_first():
-  assert _compute_group_name("myapp", []) == "Nemo · myapp"
+  assert _compute_group_name("myapp", "Mac", []) == "myapp@Mac"
 
 
 def test_compute_group_name_second():
-  assert _compute_group_name("myapp", ["Nemo · myapp"]) == "Nemo · myapp 2"
+  assert _compute_group_name("myapp", "Mac", ["myapp@Mac"]) == "myapp2@Mac"
 
 
 def test_compute_group_name_skip():
-  existing = ["Nemo · myapp", "Nemo · myapp 2"]
-  assert _compute_group_name("myapp", existing) == "Nemo · myapp 3"
+  existing = ["myapp@Mac", "myapp2@Mac"]
+  assert _compute_group_name("myapp", "Mac", existing) == "myapp3@Mac"
 
 
 # ---------------------------------------------------------------------------

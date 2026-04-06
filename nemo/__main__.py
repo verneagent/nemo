@@ -85,6 +85,7 @@ def main():
     if not chat_id:
       print("Error: Failed to find or create Lark group", file=sys.stderr)
       return 1
+    logging.getLogger("nemo").info("Using chat: %s", chat_id)
 
   # Preflight checks
   from .preflight import run_preflight

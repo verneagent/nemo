@@ -154,7 +154,8 @@ def auto_create_chat(token: str, project_dir: str,
   workspace_id = get_workspace_id(project_dir)
   workspace_tag = f"workspace:{workspace_id}"
   folder_name = os.path.basename(os.path.abspath(project_dir))
-  group_name = _compute_group_name(folder_name, existing_names or [])
+  machine = get_machine_name()
+  group_name = _compute_group_name(folder_name, machine, existing_names or [])
 
   # Resolve operator open_id from email
   user_ids: list[str] = []
@@ -188,15 +189,27 @@ def auto_create_chat(token: str, project_dir: str,
   return chat_id
 
 
-def _compute_group_name(folder_name: str, existing_names: list[str]) -> str:
-  """Compute a numbered group name: Nemo · foo, Nemo · foo 2, etc."""
-  base = f"Nemo · {folder_name}"
+def _compute_group_name(folder_name: str, machine: str,
+                        existing_names: list[str]) -> str:
+  """Compute a numbered group name: foo@machine, foo2@machine, etc."""
+  base = f"{folder_name}@{machine}"
   if base not in existing_names:
     return base
-  n = 2
-  while f"{base} {n}" in existing_names:
-    n += 1
-  return f"{base} {n}"
+  # Find highest suffix
+  max_n = 1
+  for name in existing_names:
+    if name == base:
+      continue
+    prefix = folder_name
+    suffix = f"@{machine}"
+    if name.startswith(prefix) and name.endswith(suffix):
+      mid = name[len(prefix):-len(suffix)]
+      try:
+        n = int(mid)
+        max_n = max(max_n, n)
+      except ValueError:
+        pass
+  return f"{folder_name}{max_n + 1}@{machine}"
 
 
 def discover_or_create_chat(token: str, project_dir: str,
