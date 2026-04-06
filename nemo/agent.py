@@ -632,6 +632,9 @@ def _build_sdk_options(
     "HANDOFF_SESSION_ID": session_id_ref[0],
     "HANDOFF_PROJECT_DIR": project_dir,
     "HANDOFF_SESSION_TOOL": "Claude Agent SDK",
+    # Enable CLI's built-in stream watchdog — aborts stalled API streams
+    "CLAUDE_ENABLE_STREAM_WATCHDOG": "1",
+    "CLAUDE_STREAM_IDLE_TIMEOUT_MS": "90000",  # 90s, CLI default
   }
   for key in ("HANDOFF_TMP_DIR", "http_proxy", "https_proxy", "all_proxy"):
     val = os.environ.get(key)
