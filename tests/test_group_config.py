@@ -1,7 +1,9 @@
-"""Tests for nemo.group_config — pinned text message configuration."""
+"""Tests for nemo.group_config — pinned text message configuration (YAML)."""
 
 import json
 from unittest import mock
+
+import yaml
 
 from nemo.group_config import (
   _build_config_text, _parse_config_text,
@@ -21,8 +23,8 @@ def test_build_config_text():
   config = {"autoapprove": True, "guests": []}
   text = _build_config_text(config)
   assert text.startswith(CONFIG_MARKER)
-  json_part = text[len(CONFIG_MARKER):].strip()
-  assert json.loads(json_part)["autoapprove"] is True
+  yaml_part = text[len(CONFIG_MARKER):].strip()
+  assert yaml.safe_load(yaml_part)["autoapprove"] is True
 
 
 def test_parse_config_text_valid():
@@ -43,8 +45,8 @@ def test_parse_config_text_no_marker():
   assert _parse_config_text(msg) is None
 
 
-def test_parse_config_text_invalid_json():
-  msg = _text_msg(f"{CONFIG_MARKER}\nnot json")
+def test_parse_config_text_invalid_yaml():
+  msg = _text_msg(f"{CONFIG_MARKER}\n: : : bad")
   assert _parse_config_text(msg) is None
 
 
@@ -56,6 +58,7 @@ def test_parse_config_text_no_valid_keys():
 def test_parse_config_text_empty():
   assert _parse_config_text({}) is None
   assert _parse_config_text({"msg_type": "text", "body": {}}) is None
+
 
 
 def test_load_config_found():

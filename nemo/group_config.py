@@ -1,7 +1,7 @@
 """Group configuration via pinned text message.
 
 Stores persistent group-level config (guests, autoapprove, filter, rules)
-as JSON inside a pinned text message. The marker prefix "__nemo_config__"
+as YAML inside a pinned text message. The marker prefix "__nemo_config__"
 identifies it.
 
 NOTE: We use text messages instead of cards because Lark's get_message API
@@ -9,12 +9,13 @@ returns degraded content for interactive (card) messages, losing the original
 body. Text messages preserve their content reliably.
 
 Config schema:
-{
-  "guests": [{"open_id": "ou_xxx", "name": "Alice", "role": "coowner"}],
-  "autoapprove": false,
-  "filter": "concise",
-  "rules": {}
-}
+  guests:
+    - open_id: ou_xxx
+      name: Alice
+      role: coowner
+  autoapprove: false
+  filter: concise
+  rules: {}
 """
 
 from __future__ import annotations
@@ -22,6 +23,8 @@ from __future__ import annotations
 import json
 import logging
 from typing import Any
+
+import yaml
 
 log = logging.getLogger(__name__)
 
@@ -38,16 +41,16 @@ _VALID_KEYS = {"guests", "autoapprove", "filter", "rules", "active_pid"}
 
 
 # ---------------------------------------------------------------------------
-# Text message format: "__nemo_config__\n{json}"
+# Text message format: "__nemo_config__\n<yaml>"
 # ---------------------------------------------------------------------------
 
 def _build_config_text(config: dict[str, Any]) -> str:
-  """Encode config as a text message string."""
-  return f"{CONFIG_MARKER}\n{json.dumps(config)}"
+  """Encode config as a text message string (YAML)."""
+  return f"{CONFIG_MARKER}\n{yaml.dump(config, default_flow_style=False, allow_unicode=True).rstrip()}"
 
 
 def _parse_config_text(msg: dict[str, Any]) -> dict[str, Any] | None:
-  """Extract config JSON from a pinned text message.
+  """Extract config from a pinned text message (YAML).
 
   Expected msg format from get_message API:
     {"msg_type": "text", "body": {"content": '{"text": "..."}' }}
@@ -62,8 +65,8 @@ def _parse_config_text(msg: dict[str, Any]) -> dict[str, Any] | None:
     text = json.loads(content_raw).get("text", "")
     if not text.startswith(CONFIG_MARKER):
       return None
-    json_str = text[len(CONFIG_MARKER):].strip()
-    config = json.loads(json_str)
+    payload = text[len(CONFIG_MARKER):].strip()
+    config = yaml.safe_load(payload)
     if not isinstance(config, dict):
       return None
     if not _VALID_KEYS & set(config.keys()):

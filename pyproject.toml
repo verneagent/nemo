@@ -17,6 +17,7 @@ classifiers = [
 dependencies = [
   "claude-agent-sdk",
   "lark-oapi>=1.3.0",
+  "pyyaml>=6.0",
 ]
 
 [project.urls]
