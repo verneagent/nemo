@@ -66,13 +66,13 @@ def main():
     format=log_format,
     datefmt=log_datefmt,
   )
-  # Add file handler — one log per chat, rotated
+  # Per-process log file (created immediately at startup)
   from .config import CONFIG_DIR
+  from logging.handlers import RotatingFileHandler
   log_dir = os.path.join(CONFIG_DIR, "logs")
   os.makedirs(log_dir, exist_ok=True)
-  from logging.handlers import RotatingFileHandler
   fh = RotatingFileHandler(
-    os.path.join(log_dir, "nemo.log"),
+    os.path.join(log_dir, f"nemo-{os.getpid()}.log"),
     maxBytes=5 * 1024 * 1024,  # 5 MB
     backupCount=3,
   )
