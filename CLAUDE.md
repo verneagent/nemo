@@ -116,6 +116,84 @@ nemo/
 ### Card V2 Notes
 - V2 does NOT support `{"tag": "action"}` wrapper — put buttons directly in elements or inside `column_set`
 - Buttons go inside `{"tag": "column_set"}` → `{"tag": "column"}` → `{"tag": "button"}`
+- V2 does NOT support `{"tag": "note"}` — use `{"tag": "markdown", "text_size": "notation"}` with `<font color='grey'>` instead
+- `collapsible_panel` header must use `{"title": {"tag": "plain_text", ...}}`, NOT a bare `{"tag": "markdown", ...}`
+- `get_message` API returns degraded content for cards — the original body is lost. Do NOT store data in card body if you need to read it back. Use text messages for persistent data.
+
+## Self-Debugging with User Identity
+
+When debugging nemo, you need to send messages **as the user** (not the bot) to trigger `im.message.receive_v1` events. Bot-sent messages do NOT trigger WS events for the same bot.
+
+### Setup: lark-cli user OAuth
+
+```bash
+# 1. Ensure app has im:message.send_as_user scope (via lark-console)
+node ~/.claude/skills/lark-console/scripts/console_api.mjs scopes find <appId> send_as_user
+node ~/.claude/skills/lark-console/scripts/console_api.mjs scopes add <appId> <scopeId>
+node ~/.claude/skills/lark-console/scripts/console_api.mjs version publish <appId> --version X.Y.Z --notes "Add send_as_user"
+
+# 2. Login as user with the scope
+lark-cli auth login --scope "im:message.send_as_user"
+# This opens a browser link — user must authorize
+
+# 3. Verify scope
+lark-cli auth check --scope "im:message.send_as_user"
+```
+
+### Sending messages as user
+
+**Known bug**: `lark-cli api --as user POST /im/v1/messages` silently crashes (exit 1, no output). Use the Python device flow workaround instead:
+
+```python
+# Device flow to get user access token (bypasses lark-cli encryption)
+import json, urllib.request, urllib.parse, time
+
+with open("~/.nemo/config.json") as f:
+    nemo = json.load(f)
+app_id, app_secret = nemo["app_id"], nemo["app_secret"]
+
+# Step 1: Device authorization
+body = f"client_id={app_id}&client_secret={app_secret}&scope=im:message.send_as_user".encode()
+req = urllib.request.Request(
+    "https://accounts.larksuite.com/oauth/v1/device_authorization",
+    data=body, headers={"Content-Type": "application/x-www-form-urlencoded"}
+)
+resp = json.loads(urllib.request.urlopen(req).read())
+device_code = resp["device_code"]
+# Show verification_uri_complete to user — they must open it and authorize
+
+# Step 2: Poll for token (after user authorizes)
+token_url = "https://open.larksuite.com/open-apis/authen/v2/oauth/token"
+payload = json.dumps({
+    "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+    "device_code": device_code,
+    "client_id": app_id, "client_secret": app_secret,
+}).encode()
+# Poll every 5s until access_token appears in response
+
+# Step 3: Send message as user
+req = urllib.request.Request(
+    "https://open.larksuite.com/open-apis/im/v1/messages?receive_id_type=chat_id",
+    data=json.dumps({
+        "receive_id": "<chat_id>",
+        "msg_type": "text",
+        "content": json.dumps({"text": "hello nemo"})
+    }).encode(),
+    headers={
+        "Authorization": f"Bearer {user_access_token}",
+        "Content-Type": "application/json"
+    }
+)
+```
+
+### What to verify during self-debug
+
+1. **WS connection**: nemo log shows `= connection is OPEN`
+2. **Event receipt**: Send user message, log shows `WS parsed: chat=... sender=... text=...`
+3. **Start card**: Log shows `Start card sent: om_xxx`
+4. **SDK turn**: Log shows Claude response within ~5s
+5. **Done card update**: No `230099` error (Card V2 compat)
+6. **Config persistence**: Only 1 pinned config message (text type, not card)
 
 ### Nemo App
 - App ID: `cli_a9583021bef89ed4`
