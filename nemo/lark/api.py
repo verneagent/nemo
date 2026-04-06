@@ -435,7 +435,7 @@ def update_chat_tab(token: str, chat_id: str, tab_id: str,
 
 def list_chat_tabs(token: str, chat_id: str) -> list[dict[str, Any]]:
   """List all tabs in chat."""
-  api_url = f"{BASE_URL}/im/v1/chats/{chat_id}/chat_tabs"
+  api_url = f"{BASE_URL}/im/v1/chats/{chat_id}/chat_tabs/list_tabs"
   data = _request(api_url, token)
   if data.get("code") == 0:
     return data.get("data", {}).get("chat_tabs", [])
