@@ -238,11 +238,21 @@ def download_file(token: str, message_id: str, file_key: str,
   return path
 
 
-def add_reaction(token: str, message_id: str, emoji_type: str) -> None:
-  """Add an emoji reaction to a message."""
+def add_reaction(token: str, message_id: str, emoji_type: str) -> str:
+  """Add an emoji reaction to a message. Returns reaction_id."""
   url = f"{BASE_URL}/im/v1/messages/{message_id}/reactions"
   try:
-    _request(url, token, {"reaction_type": {"emoji_type": emoji_type}})
+    data = _request(url, token, {"reaction_type": {"emoji_type": emoji_type}})
+    return data.get("data", {}).get("reaction_id", "")
+  except Exception:
+    return ""
+
+
+def remove_reaction(token: str, message_id: str, reaction_id: str) -> None:
+  """Remove a reaction from a message."""
+  url = f"{BASE_URL}/im/v1/messages/{message_id}/reactions/{reaction_id}"
+  try:
+    _request(url, token, method="DELETE")
   except Exception:
     pass
 

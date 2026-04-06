@@ -20,8 +20,6 @@ def test_is_esc_with_mentions():
 def test_is_exit():
   assert is_exit("/exit")
   assert is_exit("exit")
-  assert is_exit("handback")
-  assert is_exit("hand back")
   assert not is_exit("hello")
   assert not is_exit("/dissolve")
 
@@ -29,9 +27,7 @@ def test_is_exit():
 def test_is_dissolve():
   assert is_dissolve("/dissolve")
   assert is_dissolve("dissolve")
-  assert is_dissolve("handback dissolve")
-  assert is_dissolve("hand back dissolve")
-  assert not is_dissolve("handback")
+  assert not is_dissolve("exit")
   assert not is_dissolve("hello")
 
 

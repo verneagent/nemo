@@ -93,20 +93,14 @@ def test_exit():
   assert resp == "__exit__"
 
 
-def test_exit_handback_compat():
-  handled, resp = try_dispatch("handback", _ctx())
-  assert handled
-  assert resp == "__exit__"
-
-
 def test_dissolve():
   handled, resp = try_dispatch("/dissolve", _ctx())
   assert handled
   assert resp == "__dissolve__"
 
 
-def test_dissolve_handback_compat():
-  handled, resp = try_dispatch("handback dissolve", _ctx())
+def test_dissolve_plain():
+  handled, resp = try_dispatch("dissolve", _ctx())
   assert handled
   assert resp == "__dissolve__"
 

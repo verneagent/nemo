@@ -267,16 +267,20 @@ async def main_loop(
       if not user_message:
         continue
 
-      # Acknowledge receipt
-      try:
-        lark_api.add_reaction(token, reply.message_id, "EYES")
-      except Exception:
-        pass
+      # Acknowledge receipt with THINKING reaction
+      ack_msg_id = reply.message_id
+      ack_reaction_id = lark_api.add_reaction(token, ack_msg_id, "THINKING")
       db.record_received(
         chat_id=chat_id, text=text,
         source_message_id=reply.message_id,
         message_time=reply.create_time,
       )
+
+      def _clear_ack():
+        nonlocal ack_reaction_id
+        if ack_reaction_id and ack_msg_id:
+          lark_api.remove_reaction(token, ack_msg_id, ack_reaction_id)
+          ack_reaction_id = ""
 
       # Command dispatch
       handled, response = commands.try_dispatch(user_message, ctx)
@@ -346,6 +350,7 @@ async def main_loop(
           break
         elif response:
           _send_response(token, chat_id, response, db)
+        _clear_ack()
         continue
 
       # --- Run SDK turn ---
@@ -363,6 +368,7 @@ async def main_loop(
         token = lark_auth.get_token(credentials["app_id"], credentials["app_secret"])
 
         if isinstance(event, ToolStartEvent):
+          _clear_ack()
           _turn_tools.append(event.tool)
           card = cards.build_turn_card(
             "working",
@@ -393,6 +399,7 @@ async def main_loop(
               pass
 
         elif isinstance(event, TextEvent):
+          _clear_ack()
           _turn_texts.append(event.text)
           merged = "\n\n---\n\n".join(_turn_texts)
           if _turn_card_id:

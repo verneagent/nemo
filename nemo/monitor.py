@@ -23,13 +23,13 @@ def is_esc(text: str, mentions: list[dict[str, str]] | None = None) -> bool:
 def is_exit(text: str, mentions: list[dict[str, str]] | None = None) -> bool:
   """Check if a message is an /exit command."""
   t = _strip_mentions(text, mentions)
-  return t in ("/exit", "exit", "handback", "hand back")
+  return t in ("/exit", "exit")
 
 
 def is_dissolve(text: str, mentions: list[dict[str, str]] | None = None) -> bool:
   """Check if a message is a /dissolve command."""
   t = _strip_mentions(text, mentions)
-  return t in ("/dissolve", "dissolve", "handback dissolve", "hand back dissolve")
+  return t in ("/dissolve", "dissolve")
 
 
 def is_permission_reply(text: str) -> str | None:

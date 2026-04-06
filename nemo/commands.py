@@ -155,12 +155,12 @@ def try_dispatch(text: str, ctx: AgentContext) -> tuple[bool, str | None]:
       return True, f"__guest_remove__:{name}"
     return True, "Usage: `/guest list`, `/guest add <name>`, `/guest remove <name>`"
 
-  # /exit — stop agent, keep group
-  if t in ("/exit", "exit", "handback", "hand back"):
-    return True, "__exit__"
-
-  # /dissolve — stop agent, dissolve group
-  if t in ("/dissolve", "dissolve", "handback dissolve", "hand back dissolve"):
+  # /dissolve — stop agent, dissolve group (check before /exit to avoid prefix match)
+  if t in ("/dissolve", "dissolve"):
     return True, "__dissolve__"
+
+  # /exit — stop agent, keep group
+  if t in ("/exit", "exit"):
+    return True, "__exit__"
 
   return False, None
