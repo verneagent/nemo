@@ -121,17 +121,17 @@ def test_ensure_workspace_tag_empty_description():
 # ---------------------------------------------------------------------------
 
 def test_auto_create_chat_success():
-  """Should create group, resolve email, and pin config."""
+  """Should create group, add user separately, and pin config."""
   with mock.patch("nemo.workspace.get_machine_name", return_value="Mac"):
     with mock.patch("nemo.lark.api.lookup_open_id_by_email", return_value="ou_123"):
       with mock.patch("nemo.lark.api.create_chat", return_value="oc_new") as mock_create:
-        with mock.patch("nemo.group_config.save_config") as mock_save:
-          result = auto_create_chat("tok", "/tmp/proj", email="a@b.com")
+        with mock.patch("nemo.lark.api.add_chat_members") as mock_add:
+          with mock.patch("nemo.group_config.save_config") as mock_save:
+            result = auto_create_chat("tok", "/tmp/proj", email="a@b.com")
   assert result == "oc_new"
   mock_create.assert_called_once()
-  call_kwargs = mock_create.call_args
-  assert call_kwargs[1]["user_ids"] == ["ou_123"]
-  assert "workspace:Mac-tmp-proj" in call_kwargs[1]["description"]
+  assert "workspace:Mac-tmp-proj" in mock_create.call_args[1]["description"]
+  mock_add.assert_called_once_with("tok", "oc_new", ["ou_123"])
   mock_save.assert_called_once()
 
 
@@ -148,11 +148,12 @@ def test_auto_create_chat_email_resolve_fails():
   """Should still create group if email resolution fails."""
   with mock.patch("nemo.workspace.get_machine_name", return_value="Mac"):
     with mock.patch("nemo.lark.api.lookup_open_id_by_email", return_value=None):
-      with mock.patch("nemo.lark.api.create_chat", return_value="oc_new") as mock_create:
-        with mock.patch("nemo.group_config.save_config"):
-          result = auto_create_chat("tok", "/tmp/proj", email="a@b.com")
+      with mock.patch("nemo.lark.api.create_chat", return_value="oc_new"):
+        with mock.patch("nemo.lark.api.add_chat_members") as mock_add:
+          with mock.patch("nemo.group_config.save_config"):
+            result = auto_create_chat("tok", "/tmp/proj", email="a@b.com")
   assert result == "oc_new"
-  assert mock_create.call_args[1]["user_ids"] == []
+  mock_add.assert_not_called()
 
 
 def test_auto_create_chat_create_fails():

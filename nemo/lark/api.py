@@ -447,15 +447,19 @@ def list_chat_tabs(token: str, chat_id: str) -> list[dict[str, Any]]:
 # Create/dissolve chat
 # ---------------------------------------------------------------------------
 
-def create_chat(token: str, name: str, description: str = "",
-                user_ids: list[str] | None = None) -> str:
-  """Create a new group chat. Returns chat_id."""
-  url = f"{BASE_URL}/im/v1/chats?user_id_type=open_id"
-  payload: dict[str, Any] = {"name": name}
+def create_chat(token: str, name: str, description: str = "") -> str:
+  """Create a new group chat. Returns chat_id.
+
+  Bot is automatically a member as the creator.
+  Add users separately via add_chat_members.
+  """
+  url = f"{BASE_URL}/im/v1/chats"
+  payload: dict[str, Any] = {
+    "name": name,
+    "chat_mode": "group",
+  }
   if description:
     payload["description"] = description
-  if user_ids:
-    payload["user_id_list"] = user_ids
   data = _request(url, token, payload)
   if data.get("code") == 0:
     return data["data"]["chat_id"]
@@ -476,6 +480,7 @@ def add_chat_members(token: str, chat_id: str, user_ids: list[str]) -> None:
   data = _request(url, token, {"id_list": user_ids})
   if data.get("code") != 0:
     raise RuntimeError(f"Failed to add chat members: {data}")
+
 
 
 def remove_chat_members(token: str, chat_id: str, user_ids: list[str]) -> None:

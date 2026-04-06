@@ -147,7 +147,7 @@ def auto_create_chat(token: str, project_dir: str,
   """Create a new Lark group for this workspace.
 
   Creates the group, adds the operator (by email), writes workspace tag,
-  and pins a default config card. Returns the new chat_id or None on failure.
+  and pins a default config. Returns the new chat_id or None on failure.
   """
   from .lark import api as lark_api
 
@@ -157,28 +157,26 @@ def auto_create_chat(token: str, project_dir: str,
   machine = get_machine_name()
   group_name = _compute_group_name(folder_name, machine, existing_names or [])
 
-  # Resolve operator open_id from email
-  user_ids: list[str] = []
-  if email:
-    try:
-      open_id = lark_api.lookup_open_id_by_email(token, email)
-      if open_id:
-        user_ids.append(open_id)
-      else:
-        log.warning("Could not resolve email %s to open_id", email)
-    except Exception as e:
-      log.warning("Failed to resolve email: %s", e)
-
+  # Create group (bot is automatically a member as creator)
   try:
-    chat_id = lark_api.create_chat(
-      token, group_name, description=workspace_tag, user_ids=user_ids,
-    )
+    chat_id = lark_api.create_chat(token, group_name, description=workspace_tag)
     log.info("Created group %s (%s)", chat_id, group_name)
   except Exception as e:
     log.error("Failed to create group: %s", e)
     return None
 
-  # Pin default config card
+  # Add operator by email
+  if email:
+    try:
+      open_id = lark_api.lookup_open_id_by_email(token, email)
+      if open_id:
+        lark_api.add_chat_members(token, chat_id, [open_id])
+      else:
+        log.warning("Could not resolve email %s to open_id", email)
+    except Exception as e:
+      log.warning("Failed to add operator to group: %s", e)
+
+  # Pin default config
   try:
     from .group_config import DEFAULT_CONFIG, save_config
     save_config(token, chat_id, dict(DEFAULT_CONFIG))
