@@ -119,10 +119,10 @@ def test_done_card_basic():
   assert card["header"]["template"] == "green"
   assert card["header"]["title"]["content"] == "Done ✓"
   elements = card["body"]["elements"]
-  # Should have body markdown and note
   assert any(e["tag"] == "markdown" for e in elements)
-  note = [e for e in elements if e["tag"] == "note"][0]
-  assert "15s" in note["elements"][0]["content"]
+  # Footer note is now a markdown element with text_size="notation"
+  footer = [e for e in elements if e.get("text_size") == "notation"][0]
+  assert "15s" in footer["content"]
 
 
 def test_done_card_with_usage():
@@ -130,8 +130,8 @@ def test_done_card_with_usage():
     "done", body="Result.", elapsed=90,
     usage={"input_tokens": 5000, "output_tokens": 300},
   )
-  note = [e for e in card["body"]["elements"] if e["tag"] == "note"][0]
-  text = note["elements"][0]["content"]
+  footer = [e for e in card["body"]["elements"] if e.get("text_size") == "notation"][0]
+  text = footer["content"]
   assert "1m 30s" in text
   assert "5,000" in text
   assert "300" in text
@@ -187,8 +187,8 @@ def test_build_card_with_buttons():
 def test_build_card_with_note():
   card = build_card("Status", note="Session: abc123")
   elements = card["body"]["elements"]
-  note = [e for e in elements if e["tag"] == "note"][0]
-  assert "abc123" in note["elements"][0]["content"]
+  footer = [e for e in elements if e.get("text_size") == "notation"][0]
+  assert "abc123" in footer["content"]
 
 
 def test_build_card_empty_body():

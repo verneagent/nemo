@@ -82,7 +82,7 @@ def test_send_text_success():
 
 
 def test_get_bot_info():
-  data = {"code": 0, "data": {"bot": {"open_id": "ou_bot"}}}
+  data = {"code": 0, "bot": {"open_id": "ou_bot"}}
   with mock.patch("urllib.request.urlopen", return_value=_mock_response(data)):
     info = api.get_bot_info("tok")
   assert info["open_id"] == "ou_bot"

@@ -115,8 +115,10 @@ def _collapsible_tools(tools: list[ToolRecord], label: str = "Tools") -> dict[st
     "tag": "collapsible_panel",
     "expanded": False,
     "header": {
-      "tag": "markdown",
-      "content": f"**{label} ({len(tools)})**",
+      "title": {
+        "tag": "plain_text",
+        "content": f"{label} ({len(tools)})",
+      },
     },
     "vertical_spacing": "8px",
     "elements": [
@@ -126,9 +128,11 @@ def _collapsible_tools(tools: list[ToolRecord], label: str = "Tools") -> dict[st
 
 
 def _note_element(text: str) -> dict[str, Any]:
+  """Small footer text. Uses markdown instead of deprecated 'note' tag (V2)."""
   return {
-    "tag": "note",
-    "elements": [{"tag": "plain_text", "content": text}],
+    "tag": "markdown",
+    "content": f"<font color='grey'>{text}</font>",
+    "text_size": "notation",
   }
 
 
