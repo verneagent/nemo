@@ -287,7 +287,6 @@ async def main_loop(
                                   body=f"Context reset at {t}.", color="orange")
           lark_api.send_card(token, chat_id, card)
         elif response == "__esc__":
-          await _restart_client()
           _send_response(token, chat_id, "Operation cancelled.", db)
         elif response and response.startswith("__model__:"):
           new_model = response.split(":", 1)[1]
@@ -465,7 +464,6 @@ async def main_loop(
             await asyncio.wait_for(sdk_task, timeout=30)
           except Exception:
             sdk_task.cancel()
-            await _restart_client()
           token = lark_auth.get_token(credentials["app_id"], credentials["app_secret"])
           _send_response(token, chat_id, "Operation cancelled.", db)
 
