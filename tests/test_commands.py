@@ -87,16 +87,28 @@ def test_autoapprove_off():
   assert resp == "__autoapprove__:off"
 
 
-def test_handback():
+def test_exit():
+  handled, resp = try_dispatch("/exit", _ctx())
+  assert handled
+  assert resp == "__exit__"
+
+
+def test_exit_handback_compat():
   handled, resp = try_dispatch("handback", _ctx())
   assert handled
-  assert "__handback__:" in resp
+  assert resp == "__exit__"
 
 
-def test_handback_dissolve():
+def test_dissolve():
+  handled, resp = try_dispatch("/dissolve", _ctx())
+  assert handled
+  assert resp == "__dissolve__"
+
+
+def test_dissolve_handback_compat():
   handled, resp = try_dispatch("handback dissolve", _ctx())
   assert handled
-  assert "dissolve" in resp
+  assert resp == "__dissolve__"
 
 
 def test_not_a_command():

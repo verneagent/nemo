@@ -97,8 +97,9 @@ def try_dispatch(text: str, ctx: AgentContext) -> tuple[bool, str | None]:
       "| `/norm` | Manage group norms |\n"
       "| `/guest` | Manage guests |\n"
       "| `/diag` | Run diagnostics |\n"
+      "| `/exit` | Stop agent, keep group |\n"
+      "| `/dissolve` | Stop agent, dissolve group |\n"
       "| `/help` | This help |\n"
-      "| `handback` | Stop agent |\n"
       "| `autoapprove on/off` | Toggle auto-approve |"
     )
 
@@ -154,9 +155,12 @@ def try_dispatch(text: str, ctx: AgentContext) -> tuple[bool, str | None]:
       return True, f"__guest_remove__:{name}"
     return True, "Usage: `/guest list`, `/guest add <name>`, `/guest remove <name>`"
 
-  # handback
-  if t in ("handback", "hand back", "handback dissolve", "hand back dissolve"):
-    dissolve = "dissolve" in t
-    return True, f"__handback__:{'dissolve' if dissolve else 'normal'}"
+  # /exit — stop agent, keep group
+  if t in ("/exit", "exit", "handback", "hand back"):
+    return True, "__exit__"
+
+  # /dissolve — stop agent, dissolve group
+  if t in ("/dissolve", "dissolve", "handback dissolve", "hand back dissolve"):
+    return True, "__dissolve__"
 
   return False, None

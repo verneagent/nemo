@@ -203,6 +203,7 @@ async def main_loop(
   # Context
   ctx = commands.AgentContext(model, project_dir, time.time())
   running = True
+  _dissolve_on_exit = False
   _stale_tasks: set[str] = set()
 
   def handle_sig(_sig, _frame):
@@ -332,10 +333,15 @@ async def main_loop(
             _send_response(token, chat_id, f"Norm **{name}** not found.", db)
         elif response == "__diag__":
           _handle_diag(token, chat_id, credentials, project_dir, db)
-        elif response and response.startswith("__handback__:"):
-          body = "Agent stopped."
-          end_card = cards.build_card("Nemo — Stopped", body=body, color="blue")
+        elif response == "__exit__":
+          end_card = cards.build_card("Nemo — Stopped", body="Agent stopped.", color="blue")
           lark_api.send_card(token, chat_id, end_card)
+          running = False
+          break
+        elif response == "__dissolve__":
+          end_card = cards.build_card("Nemo — Dissolved", body="Agent stopped. Group will be dissolved.", color="red")
+          lark_api.send_card(token, chat_id, end_card)
+          _dissolve_on_exit = True
           running = False
           break
         elif response:
@@ -445,8 +451,11 @@ async def main_loop(
           if monitor.is_esc(msg_text, mentions):
             signal_detected = "esc"
             return
-          if monitor.is_handback(msg_text, mentions):
-            signal_detected = "handback"
+          if monitor.is_dissolve(msg_text, mentions):
+            signal_detected = "dissolve"
+            return
+          if monitor.is_exit(msg_text, mentions):
+            signal_detected = "exit"
             return
           # Re-queue non-signal messages so they aren't lost
           _pending_msgs.append(msg)
@@ -468,14 +477,19 @@ async def main_loop(
           token = lark_auth.get_token(credentials["app_id"], credentials["app_secret"])
           _send_response(token, chat_id, "Operation cancelled.", db)
 
-        elif signal_detected == "handback":
+        elif signal_detected in ("exit", "dissolve"):
           try:
             await client.interrupt()
             await asyncio.wait_for(sdk_task, timeout=10)
           except Exception:
             sdk_task.cancel()
           token = lark_auth.get_token(credentials["app_id"], credentials["app_secret"])
-          end_card = cards.build_card("Nemo — Stopped", body="Agent stopped.", color="blue")
+          if signal_detected == "dissolve":
+            end_card = cards.build_card("Nemo — Dissolved",
+                                        body="Agent stopped. Group will be dissolved.", color="red")
+            _dissolve_on_exit = True
+          else:
+            end_card = cards.build_card("Nemo — Stopped", body="Agent stopped.", color="blue")
           lark_api.send_card(token, chat_id, end_card)
           running = False
           break
@@ -514,6 +528,13 @@ async def main_loop(
   if not sidecar:
     from .workspace import release_group
     release_group(token, chat_id)
+  if _dissolve_on_exit:
+    try:
+      token = lark_auth.get_token(credentials["app_id"], credentials["app_secret"])
+      lark_api.dissolve_chat(token, chat_id)
+      log.info("Dissolved group %s", chat_id)
+    except Exception as e:
+      log.warning("Failed to dissolve group: %s", e)
   log.info("Agent stopped.")
   return 0
 

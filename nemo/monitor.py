@@ -20,10 +20,16 @@ def is_esc(text: str, mentions: list[dict[str, str]] | None = None) -> bool:
   return t in ("/esc", "esc", "cancel", "取消")
 
 
-def is_handback(text: str, mentions: list[dict[str, str]] | None = None) -> bool:
-  """Check if a message is a handback command."""
+def is_exit(text: str, mentions: list[dict[str, str]] | None = None) -> bool:
+  """Check if a message is an /exit command."""
   t = _strip_mentions(text, mentions)
-  return t in ("handback", "hand back", "handback dissolve", "hand back dissolve")
+  return t in ("/exit", "exit", "handback", "hand back")
+
+
+def is_dissolve(text: str, mentions: list[dict[str, str]] | None = None) -> bool:
+  """Check if a message is a /dissolve command."""
+  t = _strip_mentions(text, mentions)
+  return t in ("/dissolve", "dissolve", "handback dissolve", "hand back dissolve")
 
 
 def is_permission_reply(text: str) -> str | None:

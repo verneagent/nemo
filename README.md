@@ -74,8 +74,9 @@ Send these in the Lark group:
 | `/guest add/remove/list` | Manage guests |
 | `/diag` | Run diagnostics |
 | `/help` | Show help |
+| `/exit` | Stop agent, keep group |
+| `/dissolve` | Stop agent, dissolve group |
 | `autoapprove on/off` | Toggle auto-approve |
-| `handback` | Stop agent |
 
 ## Group Config
 
