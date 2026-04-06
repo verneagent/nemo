@@ -112,6 +112,53 @@ def get_chat_info(token: str, chat_id: str) -> dict[str, Any]:
   return data.get("data", {})
 
 
+def get_message(token: str, message_id: str) -> dict[str, Any]:
+  """Fetch a message by ID."""
+  url = f"{BASE_URL}/im/v1/messages/{message_id}"
+  data = _request(url, token)
+  if data.get("code") != 0:
+    return {}
+  return data.get("data", {})
+
+
+def delete_message(token: str, message_id: str) -> None:
+  """Delete a message."""
+  url = f"{BASE_URL}/im/v1/messages/{message_id}"
+  _request(url, token, method="DELETE")
+
+
+def create_pin(token: str, message_id: str) -> None:
+  """Pin a message in its chat."""
+  url = f"{BASE_URL}/im/v1/pins"
+  data = _request(url, token, {"message_id": message_id})
+  if data.get("code") != 0:
+    raise RuntimeError(f"Failed to pin message: {data}")
+
+
+def delete_pin(token: str, message_id: str) -> None:
+  """Unpin a message."""
+  url = f"{BASE_URL}/im/v1/pins/{message_id}"
+  _request(url, token, method="DELETE")
+
+
+def list_pins(token: str, chat_id: str) -> list[dict[str, Any]]:
+  """List all pinned messages in a chat."""
+  url = f"{BASE_URL}/im/v1/pins?chat_id={chat_id}"
+  pins: list[dict[str, Any]] = []
+  page_token = ""
+  for _ in range(10):
+    req_url = url + (f"&page_token={page_token}" if page_token else "")
+    data = _request(req_url, token)
+    if data.get("code") != 0:
+      break
+    items = data.get("data", {}).get("items", [])
+    pins.extend(items)
+    if not data.get("data", {}).get("has_more"):
+      break
+    page_token = data["data"].get("page_token", "")
+  return pins
+
+
 def update_chat_info(token: str, chat_id: str,
                      fields: dict[str, str]) -> None:
   """Update chat group info (e.g. description)."""
