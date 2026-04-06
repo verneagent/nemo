@@ -96,6 +96,10 @@ async def main_loop(
   except Exception as e:
     log.warning("Stale cleanup error: %s", e)
 
+  # Ensure workspace tag in group description
+  from .workspace import ensure_workspace_tag
+  ensure_workspace_tag(token, chat_id, project_dir)
+
   # Detect need_mention
   need_mention = True
   try:

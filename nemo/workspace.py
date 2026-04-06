@@ -88,3 +88,26 @@ def discover_chat_id(token: str, project_dir: str) -> str | None:
 
   log.warning("No chat found for workspace %s", workspace_id)
   return None
+
+
+def ensure_workspace_tag(token: str, chat_id: str, project_dir: str) -> None:
+  """Ensure the chat description contains the workspace tag.
+
+  If the tag is already present, do nothing. Otherwise append it.
+  """
+  from .lark import api as lark_api
+
+  workspace_id = get_workspace_id(project_dir)
+  workspace_tag = f"workspace:{workspace_id}"
+
+  try:
+    info = lark_api.get_chat_info(token, chat_id)
+    desc = info.get("description") or ""
+    if _workspace_tag_matches(desc, workspace_tag):
+      return  # Already tagged
+    # Append tag to existing description
+    new_desc = f"{desc}\n{workspace_tag}".strip() if desc.strip() else workspace_tag
+    lark_api.update_chat_info(token, chat_id, {"description": new_desc})
+    log.info("Tagged chat %s with %s", chat_id, workspace_tag)
+  except Exception as e:
+    log.warning("Failed to tag chat description: %s", e)

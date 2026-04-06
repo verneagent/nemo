@@ -112,6 +112,15 @@ def get_chat_info(token: str, chat_id: str) -> dict[str, Any]:
   return data.get("data", {})
 
 
+def update_chat_info(token: str, chat_id: str,
+                     fields: dict[str, str]) -> None:
+  """Update chat group info (e.g. description)."""
+  url = f"{BASE_URL}/im/v1/chats/{chat_id}"
+  data = _request(url, token, fields, method="PUT")
+  if data.get("code") != 0:
+    raise RuntimeError(f"Failed to update chat: {data}")
+
+
 def list_bot_chats(token: str) -> list[dict[str, Any]]:
   """List all chat groups the bot belongs to."""
   url = f"{BASE_URL}/im/v1/chats?user_id_type=open_id"
