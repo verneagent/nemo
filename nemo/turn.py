@@ -16,8 +16,10 @@ from .cards import ToolRecord, tool_use_summary
 log = logging.getLogger(__name__)
 
 MAX_RETRIES = 5
-# If receive_response() yields nothing for this long, assume the turn is stuck
-HEARTBEAT_TIMEOUT = 120  # seconds
+# If receive_response() yields nothing for this long, assume the turn is stuck.
+# SDK docs: "If no ResultMessage is received, the iterator continues indefinitely."
+# Must be generous — Agent spawning and complex edits can go quiet for minutes.
+HEARTBEAT_TIMEOUT = 300  # seconds
 
 
 # ---------------------------------------------------------------------------
