@@ -94,15 +94,65 @@ def try_dispatch(text: str, ctx: AgentContext) -> tuple[bool, str | None]:
       "| `/ping` | Status check |\n"
       "| `/cost` | Session API cost |\n"
       "| `/usage` | Plan usage limits |\n"
+      "| `/norm` | Manage group norms |\n"
+      "| `/guest` | Manage guests |\n"
+      "| `/diag` | Run diagnostics |\n"
       "| `/help` | This help |\n"
       "| `handback` | Stop agent |\n"
       "| `autoapprove on/off` | Toggle auto-approve |"
     )
 
+  # /norm
+  if t.startswith("/norm"):
+    parts = text.strip().split(None, 3)
+    if len(parts) >= 2:
+      sub = parts[1].lower()
+      if sub == "list":
+        return True, "__norm_list__"
+      if sub == "add" and len(parts) >= 4:
+        return True, f"__norm_add__:{parts[2]}:{parts[3]}"
+      if sub == "remove" and len(parts) >= 3:
+        return True, f"__norm_remove__:{parts[2]}"
+    return True, (
+      "**Norm Commands**\n\n"
+      "| Command | Description |\n"
+      "|---|---|\n"
+      "| `/norm add <name> <text>` | Add or update a norm |\n"
+      "| `/norm remove <name>` | Remove a norm |\n"
+      "| `/norm list` | List all norms |"
+    )
+
+  # /diag
+  if t in ("/diag", "diag"):
+    return True, "__diag__"
+
   # autoapprove
   if re.match(r"(auto[\s\-]*approve|autoapprove)\s+(on|off)", t):
     enabled = "on" in t.split()[-1]
     return True, f"__autoapprove__:{'on' if enabled else 'off'}"
+
+  # /guest
+  if t.startswith("/guest"):
+    parts = text.strip().split(None, 2)
+    if len(parts) < 2:
+      return True, (
+        "**Guest Commands**\n\n"
+        "| Command | Description |\n"
+        "|---|---|\n"
+        "| `/guest list` | List all guests |\n"
+        "| `/guest add <name>` | Add a guest |\n"
+        "| `/guest remove <name>` | Remove a guest |"
+      )
+    sub = parts[1].strip().lower()
+    if sub == "list":
+      return True, "__guest_list__"
+    if sub == "add" and len(parts) >= 3:
+      name = parts[2].strip()
+      return True, f"__guest_add__:{name}"
+    if sub == "remove" and len(parts) >= 3:
+      name = parts[2].strip()
+      return True, f"__guest_remove__:{name}"
+    return True, "Usage: `/guest list`, `/guest add <name>`, `/guest remove <name>`"
 
   # handback
   if t in ("handback", "hand back", "handback dissolve", "hand back dissolve"):

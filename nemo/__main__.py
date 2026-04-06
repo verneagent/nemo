@@ -52,6 +52,8 @@ def main():
   parser.add_argument("--chat-id", default="", help="Lark chat ID (auto-discovered if omitted)")
   parser.add_argument("--project-dir", default=".", help="Project directory (default: cwd)")
   parser.add_argument("--model", default="claude-opus-4-6", help="Model to use")
+  parser.add_argument("--sidecar", action="store_true", default=False,
+                      help="Sidecar mode: only respond to @mentions, replies, reactions")
   parser.add_argument("--verbose", "-v", action="store_true", help="Debug logging")
   args = parser.parse_args()
 
@@ -66,16 +68,17 @@ def main():
     print(f"Error: {project_dir} is not a directory", file=sys.stderr)
     return 1
 
+  from .config import load_credentials
+  credentials = load_credentials()
+  if not credentials:
+    print("Error: No credentials configured (~/.nemo/config.json)", file=sys.stderr)
+    return 1
+
   chat_id = args.chat_id
   if not chat_id:
     # Auto-discover chat from workspace tag in group descriptions
-    from .config import load_credentials
     from .lark.auth import get_token
     from .workspace import discover_chat_id
-    credentials = load_credentials()
-    if not credentials:
-      print("Error: No credentials configured (~/.nemo/config.json)", file=sys.stderr)
-      return 1
     token = get_token(credentials["app_id"], credentials["app_secret"])
     chat_id = discover_chat_id(token, project_dir)
     if not chat_id:
@@ -86,8 +89,17 @@ def main():
       print(f"  workspace:{ws_id}", file=sys.stderr)
       return 1
 
+  # Preflight checks
+  from .preflight import run_preflight
+  preflight_errors = run_preflight(credentials, chat_id)
+  if preflight_errors:
+    for err in preflight_errors:
+      print(f"Preflight error: {err}", file=sys.stderr)
+    return 1
+
   from .agent import main_loop
-  return asyncio.run(main_loop(chat_id, project_dir, args.model))
+  return asyncio.run(main_loop(chat_id, project_dir, args.model,
+                               sidecar=args.sidecar))
 
 
 if __name__ == "__main__":

@@ -2,6 +2,7 @@
 
 from nemo.cards import (
   ToolRecord, build_turn_card, build_card, build_markdown_card,
+  build_form_select, build_form_input,
   tool_use_summary, _elapsed_title, _elapsed_text, _usage_text,
 )
 
@@ -211,3 +212,64 @@ def test_markdown_card_with_title():
   card = build_markdown_card("Content", title="Info", color="purple")
   assert card["header"]["title"]["content"] == "Info"
   assert card["header"]["template"] == "purple"
+
+
+# ---------------------------------------------------------------------------
+# build_form_select
+# ---------------------------------------------------------------------------
+
+def test_form_select_basic():
+  options = [
+    {"text": "Option A", "value": "a"},
+    {"text": "Option B", "value": "b"},
+  ]
+  card = build_form_select("Pick one", options)
+  assert card["schema"] == "2.0"
+  assert card["header"]["title"]["content"] == "Pick one"
+  elements = card["body"]["elements"]
+  assert elements[0]["tag"] == "select_static"
+  assert len(elements[0]["options"]) == 2
+  assert elements[0]["options"][0]["value"] == "a"
+  assert elements[0]["options"][1]["text"]["content"] == "Option B"
+
+
+def test_form_select_with_chat_id():
+  card = build_form_select("Title", [{"text": "X", "value": "x"}], chat_id="oc_99")
+  select = card["body"]["elements"][0]
+  assert select["value"]["chat_id"] == "oc_99"
+
+
+def test_form_select_empty_options():
+  card = build_form_select("Empty", [])
+  assert card["body"]["elements"][0]["options"] == []
+
+
+# ---------------------------------------------------------------------------
+# build_form_input
+# ---------------------------------------------------------------------------
+
+def test_form_input_basic():
+  card = build_form_input("Enter name")
+  assert card["schema"] == "2.0"
+  assert card["header"]["title"]["content"] == "Enter name"
+  elements = card["body"]["elements"]
+  assert elements[0]["tag"] == "input"
+  assert elements[0]["name"] == "user_input"
+
+
+def test_form_input_placeholder():
+  card = build_form_input("Question", placeholder="Type your answer")
+  inp = card["body"]["elements"][0]
+  assert inp["placeholder"]["content"] == "Type your answer"
+
+
+def test_form_input_default_placeholder():
+  card = build_form_input("Question")
+  inp = card["body"]["elements"][0]
+  assert inp["placeholder"]["content"] == "Type here..."
+
+
+def test_form_input_with_chat_id():
+  card = build_form_input("Q", chat_id="oc_42")
+  inp = card["body"]["elements"][0]
+  assert inp["value"]["chat_id"] == "oc_42"

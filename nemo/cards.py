@@ -286,6 +286,58 @@ def build_card(
   return card
 
 
+def build_form_select(title: str, options: list[dict[str, str]],
+                      chat_id: str = "") -> dict[str, Any]:
+  """Build a card with select dropdown.
+
+  Each option should have 'text' and 'value' keys.
+  """
+  select_options = [
+    {"text": {"tag": "plain_text", "content": opt["text"]},
+     "value": opt["value"]}
+    for opt in options
+  ]
+  elements: list[dict[str, Any]] = [
+    {
+      "tag": "select_static",
+      "placeholder": {"tag": "plain_text", "content": "Select..."},
+      "options": select_options,
+      "value": {"action": "form_select", "chat_id": chat_id},
+    },
+  ]
+  return {
+    "schema": "2.0",
+    "config": {"update_multi": True},
+    "header": {
+      "title": {"tag": "plain_text", "content": title},
+      "template": "blue",
+    },
+    "body": {"direction": "vertical", "elements": elements},
+  }
+
+
+def build_form_input(title: str, placeholder: str = "",
+                     chat_id: str = "") -> dict[str, Any]:
+  """Build a card with text input."""
+  elements: list[dict[str, Any]] = [
+    {
+      "tag": "input",
+      "name": "user_input",
+      "placeholder": {"tag": "plain_text", "content": placeholder or "Type here..."},
+      "value": {"action": "form_input", "chat_id": chat_id},
+    },
+  ]
+  return {
+    "schema": "2.0",
+    "config": {"update_multi": True},
+    "header": {
+      "title": {"tag": "plain_text", "content": title},
+      "template": "blue",
+    },
+    "body": {"direction": "vertical", "elements": elements},
+  }
+
+
 def build_markdown_card(content: str, title: str = "", color: str = "") -> dict[str, Any]:
   """Build a Card V2 with markdown content."""
   card: dict[str, Any] = {

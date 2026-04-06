@@ -131,3 +131,53 @@ def test_slash_cd_matches(tmp_path):
   handled, resp = try_dispatch(f"/cd {tmp_path}", _ctx())
   assert handled
   assert "__cd__:" in resp
+
+
+# ---------------------------------------------------------------------------
+# /norm commands
+# ---------------------------------------------------------------------------
+
+def test_norm_add():
+  handled, resp = try_dispatch("/norm add brevity Keep it short", _ctx())
+  assert handled
+  assert resp == "__norm_add__:brevity:Keep it short"
+
+
+def test_norm_remove():
+  handled, resp = try_dispatch("/norm remove brevity", _ctx())
+  assert handled
+  assert resp == "__norm_remove__:brevity"
+
+
+def test_norm_list():
+  handled, resp = try_dispatch("/norm list", _ctx())
+  assert handled
+  assert resp == "__norm_list__"
+
+
+def test_norm_help():
+  handled, resp = try_dispatch("/norm", _ctx())
+  assert handled
+  assert "Norm Commands" in resp
+
+
+def test_norm_help_unknown_sub():
+  handled, resp = try_dispatch("/norm unknown", _ctx())
+  assert handled
+  assert "Norm Commands" in resp
+
+
+# ---------------------------------------------------------------------------
+# /diag command
+# ---------------------------------------------------------------------------
+
+def test_diag():
+  handled, resp = try_dispatch("/diag", _ctx())
+  assert handled
+  assert resp == "__diag__"
+
+
+def test_diag_bare():
+  handled, resp = try_dispatch("diag", _ctx())
+  assert handled
+  assert resp == "__diag__"

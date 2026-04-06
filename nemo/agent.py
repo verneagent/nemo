@@ -50,6 +50,59 @@ def _send_response(token: str, chat_id: str, text: str, db: Database) -> str | N
     return None
 
 
+def _handle_diag(
+  token: str, chat_id: str,
+  credentials: dict, project_dir: str,
+  db: Database,
+) -> None:
+  """Run diagnostics and send results as a card."""
+  results: list[str] = []
+
+  # Check token refresh
+  try:
+    new_token = lark_auth.get_token(credentials["app_id"], credentials["app_secret"])
+    results.append("Token refresh: OK")
+  except Exception as e:
+    results.append(f"Token refresh: FAIL ({e})")
+    new_token = token
+
+  # Check send/receive
+  try:
+    test_card = cards.build_card("Diag", body="test", color="grey")
+    msg_id = lark_api.send_card(new_token, chat_id, test_card)
+    if msg_id:
+      results.append("Send card: OK")
+      try:
+        lark_api.delete_message(new_token, msg_id)
+      except Exception:
+        pass
+    else:
+      results.append("Send card: FAIL (no msg_id)")
+  except Exception as e:
+    results.append(f"Send card: FAIL ({e})")
+
+  # Check workspace tag
+  try:
+    from .workspace import get_workspace_id
+    ws_id = get_workspace_id(project_dir)
+    info = lark_api.get_chat_info(new_token, chat_id)
+    desc = info.get("description", "")
+    tag = f"workspace:{ws_id}"
+    if tag in desc:
+      results.append(f"Workspace tag: OK ({ws_id})")
+    else:
+      results.append(f"Workspace tag: MISSING ({ws_id})")
+  except Exception as e:
+    results.append(f"Workspace tag: FAIL ({e})")
+
+  body = "\n".join(f"- {r}" for r in results)
+  diag_card = cards.build_card("Diagnostics", body=body, color="blue")
+  try:
+    lark_api.send_card(new_token, chat_id, diag_card)
+  except Exception as e:
+    log.error("Failed to send diag card: %s", e)
+
+
 # ---------------------------------------------------------------------------
 # Main loop
 # ---------------------------------------------------------------------------
@@ -58,6 +111,7 @@ async def main_loop(
   chat_id: str,
   project_dir: str,
   model: str,
+  sidecar: bool = False,
 ) -> int:
   """Run the agent main loop."""
   session_id = str(uuid.uuid4())
@@ -96,18 +150,22 @@ async def main_loop(
   except Exception as e:
     log.warning("Stale cleanup error: %s", e)
 
-  # Ensure workspace tag in group description
-  from .workspace import ensure_workspace_tag
-  ensure_workspace_tag(token, chat_id, project_dir)
+  # Ensure workspace tag in group description (skip in sidecar mode)
+  if not sidecar:
+    from .workspace import ensure_workspace_tag
+    ensure_workspace_tag(token, chat_id, project_dir)
 
   # Detect need_mention
-  need_mention = True
-  try:
-    members = lark_api.get_chat_members(token, chat_id)
-    human_count = sum(1 for m in members if m.get("member_id") != bot_open_id)
-    need_mention = human_count > 1
-  except Exception as e:
-    log.warning("Failed to detect need_mention, defaulting to True: %s", e)
+  if sidecar:
+    need_mention = True
+  else:
+    need_mention = True
+    try:
+      members = lark_api.get_chat_members(token, chat_id)
+      human_count = sum(1 for m in members if m.get("member_id") != bot_open_id)
+      need_mention = human_count > 1
+    except Exception as e:
+      log.warning("Failed to detect need_mention, defaulting to True: %s", e)
 
   # Activate session
   db.activate(
@@ -181,12 +239,22 @@ async def main_loop(
       if reply.chat_id and reply.chat_id != chat_id:
         continue
 
+      # Ignore sticker messages
+      if getattr(reply, "msg_type", "") == "sticker":
+        continue
+
       # Filter
       sender = reply.sender_id
       if bot_open_id and sender == bot_open_id:
         continue  # Skip own messages
       if not monitor.is_authorized(sender, operator_open_id):
         continue
+
+      # Sidecar mode: only respond to bot interactions
+      if sidecar and bot_open_id:
+        kept = messages.filter_bot_interactions([reply], bot_open_id)
+        if not kept:
+          continue
 
       text = reply.text.strip()
       if not text:
@@ -239,6 +307,31 @@ async def main_loop(
           db.set_autoapprove(chat_id, enabled)
           _send_response(token, chat_id,
                          f"Auto-approve **{'enabled' if enabled else 'disabled'}**.", db)
+        elif response == "__norm_list__":
+          from .norms import get_norms, format_norms_prompt
+          norms = get_norms(token, chat_id)
+          if norms:
+            lines = [f"**Group Norms**\n"]
+            for name, text in norms.items():
+              lines.append(f"- **{name}**: {text}")
+            _send_response(token, chat_id, "\n".join(lines), db)
+          else:
+            _send_response(token, chat_id, "No norms configured.", db)
+        elif response and response.startswith("__norm_add__:"):
+          from .norms import add_norm
+          _, rest = response.split(":", 1)
+          name, text = rest.split(":", 1)
+          add_norm(token, chat_id, name, text)
+          _send_response(token, chat_id, f"Norm **{name}** added.", db)
+        elif response and response.startswith("__norm_remove__:"):
+          from .norms import remove_norm
+          name = response.split(":", 1)[1]
+          if remove_norm(token, chat_id, name):
+            _send_response(token, chat_id, f"Norm **{name}** removed.", db)
+          else:
+            _send_response(token, chat_id, f"Norm **{name}** not found.", db)
+        elif response == "__diag__":
+          _handle_diag(token, chat_id, credentials, project_dir, db)
         elif response and response.startswith("__handback__:"):
           body = "Agent stopped."
           end_card = cards.build_card("Nemo — Stopped", body=body, color="blue")

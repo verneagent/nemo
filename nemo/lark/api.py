@@ -245,3 +245,245 @@ def add_reaction(token: str, message_id: str, emoji_type: str) -> None:
     _request(url, token, {"reaction_type": {"emoji_type": emoji_type}})
   except Exception:
     pass
+
+
+# ---------------------------------------------------------------------------
+# Multipart upload helper
+# ---------------------------------------------------------------------------
+
+def _multipart_upload(url: str, token: str, fields: dict[str, str],
+                      file_field: str, file_path: str,
+                      timeout: int = 60) -> dict[str, Any]:
+  """Upload a file using multipart/form-data via urllib."""
+  import mimetypes
+  import uuid
+  boundary = uuid.uuid4().hex
+  lines: list[bytes] = []
+  for key, value in fields.items():
+    lines.append(f"--{boundary}\r\n".encode())
+    lines.append(f"Content-Disposition: form-data; name=\"{key}\"\r\n\r\n".encode())
+    lines.append(f"{value}\r\n".encode())
+  file_name = os.path.basename(file_path)
+  mime_type = mimetypes.guess_type(file_path)[0] or "application/octet-stream"
+  lines.append(f"--{boundary}\r\n".encode())
+  lines.append(
+    f"Content-Disposition: form-data; name=\"{file_field}\"; "
+    f"filename=\"{file_name}\"\r\n".encode()
+  )
+  lines.append(f"Content-Type: {mime_type}\r\n\r\n".encode())
+  with open(file_path, "rb") as f:
+    lines.append(f.read())
+  lines.append(f"\r\n--{boundary}--\r\n".encode())
+  body = b"".join(lines)
+  req = urllib.request.Request(url, data=body, method="POST", headers={
+    "Authorization": f"Bearer {token}",
+    "Content-Type": f"multipart/form-data; boundary={boundary}",
+  })
+  try:
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+      return json.loads(resp.read())
+  except urllib.error.HTTPError as e:
+    try:
+      return json.loads(e.read())
+    except Exception:
+      raise e
+
+
+# ---------------------------------------------------------------------------
+# Image upload & send
+# ---------------------------------------------------------------------------
+
+def upload_image(token: str, path: str) -> str:
+  """Upload an image to Lark. Returns image_key."""
+  url = f"{BASE_URL}/im/v1/images"
+  data = _multipart_upload(url, token, {"image_type": "message"}, "image", path)
+  if data.get("code") == 0:
+    return data["data"]["image_key"]
+  raise RuntimeError(f"Failed to upload image: {data}")
+
+
+def send_image(token: str, chat_id: str, image_key: str) -> str:
+  """Send an image message. Returns message_id."""
+  url = f"{BASE_URL}/im/v1/messages?receive_id_type=chat_id"
+  payload = {
+    "receive_id": chat_id,
+    "msg_type": "image",
+    "content": json.dumps({"image_key": image_key}),
+  }
+  data = _request(url, token, payload)
+  if data.get("code") == 0:
+    return data["data"]["message_id"]
+  raise RuntimeError(f"Failed to send image: {data}")
+
+
+# ---------------------------------------------------------------------------
+# File upload & send
+# ---------------------------------------------------------------------------
+
+def upload_file(token: str, path: str, file_type: str = "stream") -> str:
+  """Upload a file to Lark. Returns file_key."""
+  url = f"{BASE_URL}/im/v1/files"
+  file_name = os.path.basename(path)
+  data = _multipart_upload(
+    url, token, {"file_type": file_type, "file_name": file_name}, "file", path,
+  )
+  if data.get("code") == 0:
+    return data["data"]["file_key"]
+  raise RuntimeError(f"Failed to upload file: {data}")
+
+
+def send_file(token: str, chat_id: str, file_key: str) -> str:
+  """Send a file message. Returns message_id."""
+  url = f"{BASE_URL}/im/v1/messages?receive_id_type=chat_id"
+  payload = {
+    "receive_id": chat_id,
+    "msg_type": "file",
+    "content": json.dumps({"file_key": file_key}),
+  }
+  data = _request(url, token, payload)
+  if data.get("code") == 0:
+    return data["data"]["message_id"]
+  raise RuntimeError(f"Failed to send file: {data}")
+
+
+# ---------------------------------------------------------------------------
+# Reply message (thread)
+# ---------------------------------------------------------------------------
+
+def reply_message(token: str, message_id: str, text: str) -> str:
+  """Reply to a specific message (creates thread). Returns message_id."""
+  url = f"{BASE_URL}/im/v1/messages/{message_id}/reply"
+  payload = {
+    "msg_type": "text",
+    "content": json.dumps({"text": text}),
+  }
+  data = _request(url, token, payload)
+  if data.get("code") == 0:
+    return data["data"]["message_id"]
+  raise RuntimeError(f"Failed to reply message: {data}")
+
+
+def reply_card(token: str, message_id: str, card: dict[str, Any]) -> str:
+  """Reply to a message with a card. Returns message_id."""
+  url = f"{BASE_URL}/im/v1/messages/{message_id}/reply"
+  payload = {
+    "msg_type": "interactive",
+    "content": json.dumps(card),
+  }
+  data = _request(url, token, payload)
+  if data.get("code") == 0:
+    return data["data"]["message_id"]
+  raise RuntimeError(f"Failed to reply card: {data}")
+
+
+# ---------------------------------------------------------------------------
+# Chat tabs
+# ---------------------------------------------------------------------------
+
+def create_chat_tab(token: str, chat_id: str, name: str, url: str) -> str:
+  """Create a URL tab in chat. Returns tab_id."""
+  api_url = f"{BASE_URL}/im/v1/chats/{chat_id}/chat_tabs"
+  payload = {
+    "chat_tabs": [{
+      "tab_type": "url",
+      "tab_name": name,
+      "tab_content": {"url": url},
+    }],
+  }
+  data = _request(api_url, token, payload)
+  if data.get("code") == 0:
+    tabs = data.get("data", {}).get("chat_tabs", [])
+    if tabs:
+      return tabs[0]["tab_id"]
+  raise RuntimeError(f"Failed to create chat tab: {data}")
+
+
+def delete_chat_tab(token: str, chat_id: str, tab_ids: list[str]) -> None:
+  """Delete chat tabs."""
+  api_url = f"{BASE_URL}/im/v1/chats/{chat_id}/chat_tabs/delete_tabs"
+  data = _request(api_url, token, {"tab_ids": tab_ids})
+  if data.get("code") != 0:
+    raise RuntimeError(f"Failed to delete chat tabs: {data}")
+
+
+def list_chat_tabs(token: str, chat_id: str) -> list[dict[str, Any]]:
+  """List all tabs in chat."""
+  api_url = f"{BASE_URL}/im/v1/chats/{chat_id}/chat_tabs"
+  data = _request(api_url, token)
+  if data.get("code") == 0:
+    return data.get("data", {}).get("chat_tabs", [])
+  raise RuntimeError(f"Failed to list chat tabs: {data}")
+
+
+# ---------------------------------------------------------------------------
+# Create/dissolve chat
+# ---------------------------------------------------------------------------
+
+def create_chat(token: str, name: str, description: str = "",
+                user_ids: list[str] | None = None) -> str:
+  """Create a new group chat. Returns chat_id."""
+  url = f"{BASE_URL}/im/v1/chats?user_id_type=open_id"
+  payload: dict[str, Any] = {"name": name}
+  if description:
+    payload["description"] = description
+  if user_ids:
+    payload["user_id_list"] = user_ids
+  data = _request(url, token, payload)
+  if data.get("code") == 0:
+    return data["data"]["chat_id"]
+  raise RuntimeError(f"Failed to create chat: {data}")
+
+
+def dissolve_chat(token: str, chat_id: str) -> None:
+  """Dissolve/delete a group chat."""
+  url = f"{BASE_URL}/im/v1/chats/{chat_id}"
+  data = _request(url, token, method="DELETE")
+  if data.get("code") != 0:
+    raise RuntimeError(f"Failed to dissolve chat: {data}")
+
+
+def add_chat_members(token: str, chat_id: str, user_ids: list[str]) -> None:
+  """Add members to a chat."""
+  url = f"{BASE_URL}/im/v1/chats/{chat_id}/members?member_id_type=open_id"
+  data = _request(url, token, {"id_list": user_ids})
+  if data.get("code") != 0:
+    raise RuntimeError(f"Failed to add chat members: {data}")
+
+
+def remove_chat_members(token: str, chat_id: str, user_ids: list[str]) -> None:
+  """Remove members from a chat."""
+  url = f"{BASE_URL}/im/v1/chats/{chat_id}/members?member_id_type=open_id"
+  data = _request(url, token, {"id_list": user_ids}, method="DELETE")
+  if data.get("code") != 0:
+    raise RuntimeError(f"Failed to remove chat members: {data}")
+
+
+# ---------------------------------------------------------------------------
+# Sticker
+# ---------------------------------------------------------------------------
+
+def send_sticker(token: str, chat_id: str, sticker_id: str) -> str:
+  """Send a sticker message. Returns message_id."""
+  url = f"{BASE_URL}/im/v1/messages?receive_id_type=chat_id"
+  payload = {
+    "receive_id": chat_id,
+    "msg_type": "sticker",
+    "content": json.dumps({"file_key": sticker_id}),
+  }
+  data = _request(url, token, payload)
+  if data.get("code") == 0:
+    return data["data"]["message_id"]
+  raise RuntimeError(f"Failed to send sticker: {data}")
+
+
+def reply_sticker(token: str, message_id: str, sticker_id: str) -> str:
+  """Reply with a sticker. Returns message_id."""
+  url = f"{BASE_URL}/im/v1/messages/{message_id}/reply"
+  payload = {
+    "msg_type": "sticker",
+    "content": json.dumps({"file_key": sticker_id}),
+  }
+  data = _request(url, token, payload)
+  if data.get("code") == 0:
+    return data["data"]["message_id"]
+  raise RuntimeError(f"Failed to reply sticker: {data}")
