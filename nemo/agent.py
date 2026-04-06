@@ -457,8 +457,18 @@ async def main_loop(
       async def _watch_signals():
         nonlocal signal_detected
         while not sdk_task.done():
+          # If permission handler is reading the queue, yield to it
+          if events.permission_active:
+            await asyncio.sleep(0.2)
+            continue
           msg = await events.next_message(timeout=5)
           if msg is None:
+            continue
+          # Double-check: if permission became active while we waited,
+          # push back the message so permission handler can read it
+          if events.permission_active:
+            events.push_back(msg)
+            await asyncio.sleep(0.1)
             continue
           # Scope to this session's chat
           if msg.chat_id and msg.chat_id != chat_id:
@@ -604,6 +614,9 @@ def _build_sdk_options(
 
   perm_handler = build_permission_handler(credentials, chat_id, db, events)
 
+  def _stderr_handler(line: str) -> None:
+    log.debug("[sdk-stderr] %s", line.rstrip())
+
   return ClaudeAgentOptions(
     allowed_tools=["Skill", "Read", "Write", "Edit", "Bash", "Glob", "Grep"],
     setting_sources=["user", "project"],
@@ -616,6 +629,7 @@ def _build_sdk_options(
     cwd=project_dir,
     model=model,
     env=env,
+    stderr=_stderr_handler,
     can_use_tool=perm_handler,
     hooks={},
   )

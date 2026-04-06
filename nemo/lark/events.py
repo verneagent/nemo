@@ -178,6 +178,7 @@ class LarkEventStream:
     self._running = False
     self._ws_client: Any = None
     self._ws_thread: threading.Thread | None = None
+    self.permission_active: bool = False  # Set by permission handler to pause watcher
 
   async def start(self) -> None:
     """Start the WebSocket connection in a background thread."""

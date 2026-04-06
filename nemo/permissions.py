@@ -89,32 +89,37 @@ def build_permission_handler(
     msg_id = send_card(token, chat_id, card)
 
     # Wait for text reply (skip non-message events like card actions)
+    # Set permission_active flag to pause the signal watcher
     import time as _time
     from .monitor import is_permission_reply
     decision = None
     deadline = _time.time() + 300
     _pending: list[Any] = []
-    while decision is None:
-      remaining = deadline - _time.time()
-      if remaining <= 0:
-        break
-      reply = await events_source.next_message(timeout=remaining)
-      if reply is None:
-        break
-      reply_text = getattr(reply, "text", "")
-      event_type = getattr(reply, "event_type", "")
-      reply_chat = getattr(reply, "chat_id", "")
-      # Scope to this session's chat
-      if reply_chat and reply_chat != chat_id:
-        _pending.append(reply)
-        continue
-      # Skip card action events — only process text messages
-      if event_type == "card.action.trigger":
-        continue
-      decision = is_permission_reply(reply_text)
-      if decision is None:
-        # Not a permission reply — re-queue so it isn't lost
-        _pending.append(reply)
+    events_source.permission_active = True
+    try:
+      while decision is None:
+        remaining = deadline - _time.time()
+        if remaining <= 0:
+          break
+        reply = await events_source.next_message(timeout=remaining)
+        if reply is None:
+          break
+        reply_text = getattr(reply, "text", "")
+        event_type = getattr(reply, "event_type", "")
+        reply_chat = getattr(reply, "chat_id", "")
+        # Scope to this session's chat
+        if reply_chat and reply_chat != chat_id:
+          _pending.append(reply)
+          continue
+        # Skip card action events — only process text messages
+        if event_type == "card.action.trigger":
+          continue
+        decision = is_permission_reply(reply_text)
+        if decision is None:
+          # Not a permission reply — re-queue so it isn't lost
+          _pending.append(reply)
+    finally:
+      events_source.permission_active = False
 
     # Re-queue any consumed non-permission messages
     for msg in _pending:
