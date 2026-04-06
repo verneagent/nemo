@@ -1,64 +1,71 @@
-"""Tests for nemo.group_config — pinned card configuration."""
+"""Tests for nemo.group_config — pinned text message configuration."""
 
 import json
 from unittest import mock
 
 from nemo.group_config import (
-  _build_config_card, _parse_config_from_card,
-  load_config, save_config, DEFAULT_CONFIG, CONFIG_TITLE,
+  _build_config_text, _parse_config_text,
+  load_config, save_config, DEFAULT_CONFIG, CONFIG_MARKER,
 )
 
 
-def test_build_config_card_structure():
-  config = {"autoapprove": True, "guests": [], "filter": "concise", "rules": {}}
-  card = _build_config_card(config)
-  assert card["header"]["title"]["content"] == CONFIG_TITLE
-  body = card["body"]["elements"][0]["content"]
-  assert "```json" in body
-  parsed = json.loads(body.strip().split("\n", 1)[1].rsplit("```", 1)[0])
-  assert parsed["autoapprove"] is True
+def _text_msg(text: str) -> dict:
+  """Build a fake get_message response for a text message."""
+  return {
+    "msg_type": "text",
+    "body": {"content": json.dumps({"text": text})},
+  }
 
 
-def test_parse_config_from_card_direct():
-  """Parse config from a card structure (as built)."""
+def test_build_config_text():
+  config = {"autoapprove": True, "guests": []}
+  text = _build_config_text(config)
+  assert text.startswith(CONFIG_MARKER)
+  json_part = text[len(CONFIG_MARKER):].strip()
+  assert json.loads(json_part)["autoapprove"] is True
+
+
+def test_parse_config_text_valid():
   config = {"autoapprove": False, "guests": []}
-  card = _build_config_card(config)
-  result = _parse_config_from_card(card)
+  text = _build_config_text(config)
+  msg = _text_msg(text)
+  result = _parse_config_text(msg)
   assert result is not None
   assert result["autoapprove"] is False
 
 
-def test_parse_config_from_get_message():
-  """Parse config from get_message API response (content as JSON string)."""
-  config = {"autoapprove": True, "guests": [], "filter": "concise", "rules": {}}
-  card = _build_config_card(config)
-  # get_message returns content as a JSON string
-  msg = {"content": json.dumps(card)}
-  result = _parse_config_from_card(msg)
-  assert result is not None
-  assert result["autoapprove"] is True
+def test_parse_config_text_not_text_msg():
+  assert _parse_config_text({"msg_type": "interactive"}) is None
 
 
-def test_parse_config_invalid():
-  assert _parse_config_from_card({}) is None
-  assert _parse_config_from_card({"body": {"elements": []}}) is None
+def test_parse_config_text_no_marker():
+  msg = _text_msg("hello world")
+  assert _parse_config_text(msg) is None
 
 
-def test_parse_config_not_config_card():
-  """A card without valid config keys should return None."""
-  msg = {"body": {"elements": [{"content": '```json\n{"random": 1}\n```'}]}}
-  assert _parse_config_from_card(msg) is None
+def test_parse_config_text_invalid_json():
+  msg = _text_msg(f"{CONFIG_MARKER}\nnot json")
+  assert _parse_config_text(msg) is None
+
+
+def test_parse_config_text_no_valid_keys():
+  msg = _text_msg(f'{CONFIG_MARKER}\n{{"random": 1}}')
+  assert _parse_config_text(msg) is None
+
+
+def test_parse_config_text_empty():
+  assert _parse_config_text({}) is None
+  assert _parse_config_text({"msg_type": "text", "body": {}}) is None
 
 
 def test_load_config_found():
   config = {"autoapprove": True, "guests": [], "filter": "verbose", "rules": {}}
-  card = _build_config_card(config)
+  text = _build_config_text(config)
+  msg = _text_msg(text)
   with mock.patch("nemo.lark.api.list_pins", return_value=[
-    {"pin": {"message_id": "msg_1"}},
+    {"message_id": "msg_1"},
   ]):
-    with mock.patch("nemo.lark.api.get_message", return_value={
-      "content": json.dumps(card),
-    }):
+    with mock.patch("nemo.lark.api.get_message", return_value=msg):
       result = load_config("tok", "oc_1")
   assert result["autoapprove"] is True
   assert result["filter"] == "verbose"
@@ -71,61 +78,44 @@ def test_load_config_not_found():
 
 
 def test_load_config_merges_defaults():
-  """Missing keys should be filled from defaults."""
   config = {"autoapprove": True}
-  card = _build_config_card(config)
+  text = _build_config_text(config)
+  msg = _text_msg(text)
   with mock.patch("nemo.lark.api.list_pins", return_value=[
-    {"pin": {"message_id": "msg_1"}},
+    {"message_id": "msg_1"},
   ]):
-    with mock.patch("nemo.lark.api.get_message", return_value={
-      "content": json.dumps(card),
-    }):
+    with mock.patch("nemo.lark.api.get_message", return_value=msg):
       result = load_config("tok", "oc_1")
   assert result["autoapprove"] is True
-  assert result["guests"] == []  # from default
-  assert result["filter"] == "concise"  # from default
+  assert result["guests"] == []
+  assert result["filter"] == "concise"
 
 
 def test_save_config_creates_new():
   config = {"autoapprove": True, "guests": [], "filter": "concise", "rules": {}}
   with mock.patch("nemo.lark.api.list_pins", return_value=[]):
-    with mock.patch("nemo.lark.api.send_card", return_value="msg_new"):
+    with mock.patch("nemo.lark.api.send_text", return_value="msg_new") as mock_send:
       with mock.patch("nemo.lark.api.create_pin") as mock_pin:
         msg_id = save_config("tok", "oc_1", config)
   assert msg_id == "msg_new"
   mock_pin.assert_called_once_with("tok", "msg_new")
+  # Verify the text contains the marker
+  sent_text = mock_send.call_args[0][2]
+  assert sent_text.startswith(CONFIG_MARKER)
 
 
 def test_save_config_updates_existing():
-  old_config = {"autoapprove": False, "guests": [], "filter": "concise", "rules": {}}
-  old_card = _build_config_card(old_config)
+  old_config = {"autoapprove": False, "guests": []}
+  old_text = _build_config_text(old_config)
+  old_msg = _text_msg(old_text)
   with mock.patch("nemo.lark.api.list_pins", return_value=[
-    {"pin": {"message_id": "msg_old"}},
+    {"message_id": "msg_old"},
   ]):
-    with mock.patch("nemo.lark.api.get_message", return_value={
-      "content": json.dumps(old_card),
-    }):
-      with mock.patch("nemo.lark.api.update_card") as mock_update:
-        new_config = {**old_config, "autoapprove": True}
-        msg_id = save_config("tok", "oc_1", new_config)
-  assert msg_id == "msg_old"
-  mock_update.assert_called_once()
-
-
-def test_save_config_recreates_on_expiry():
-  """When PATCH fails (card expired), should recreate."""
-  old_config = {"autoapprove": False, "guests": [], "filter": "concise", "rules": {}}
-  old_card = _build_config_card(old_config)
-  with mock.patch("nemo.lark.api.list_pins", return_value=[
-    {"pin": {"message_id": "msg_old"}},
-  ]):
-    with mock.patch("nemo.lark.api.get_message", return_value={
-      "content": json.dumps(old_card),
-    }):
-      with mock.patch("nemo.lark.api.update_card", side_effect=RuntimeError("expired")):
-        with mock.patch("nemo.lark.api.delete_pin"):
-          with mock.patch("nemo.lark.api.delete_message"):
-            with mock.patch("nemo.lark.api.send_card", return_value="msg_new"):
-              with mock.patch("nemo.lark.api.create_pin"):
-                msg_id = save_config("tok", "oc_1", {"autoapprove": True})
+    with mock.patch("nemo.lark.api.get_message", return_value=old_msg):
+      with mock.patch("nemo.lark.api.delete_pin"):
+        with mock.patch("nemo.lark.api.delete_message"):
+          with mock.patch("nemo.lark.api.send_text", return_value="msg_new"):
+            with mock.patch("nemo.lark.api.create_pin"):
+              new_config = {**old_config, "autoapprove": True}
+              msg_id = save_config("tok", "oc_1", new_config)
   assert msg_id == "msg_new"

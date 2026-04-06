@@ -1,8 +1,12 @@
-"""Group configuration via pinned Lark card.
+"""Group configuration via pinned text message.
 
 Stores persistent group-level config (guests, autoapprove, filter, rules)
-as JSON inside a pinned interactive card. The card title "__nemo_config__"
+as JSON inside a pinned text message. The marker prefix "__nemo_config__"
 identifies it.
+
+NOTE: We use text messages instead of cards because Lark's get_message API
+returns degraded content for interactive (card) messages, losing the original
+body. Text messages preserve their content reliably.
 
 Config schema:
 {
@@ -21,7 +25,7 @@ from typing import Any
 
 log = logging.getLogger(__name__)
 
-CONFIG_TITLE = "__nemo_config__"
+CONFIG_MARKER = "__nemo_config__"
 
 DEFAULT_CONFIG: dict[str, Any] = {
   "guests": [],
@@ -34,79 +38,37 @@ _VALID_KEYS = {"guests", "autoapprove", "filter", "rules", "active_pid"}
 
 
 # ---------------------------------------------------------------------------
-# Card builders / parsers
+# Text message format: "__nemo_config__\n{json}"
 # ---------------------------------------------------------------------------
 
-def _build_config_card(config: dict[str, Any]) -> dict[str, Any]:
-  """Build an interactive card containing the config JSON."""
-  body = f"```json\n{json.dumps(config, indent=2)}\n```"
-  return {
-    "schema": "2.0",
-    "config": {"update_multi": True},
-    "header": {
-      "title": {"tag": "plain_text", "content": CONFIG_TITLE},
-      "template": "indigo",
-    },
-    "body": {
-      "direction": "vertical",
-      "elements": [{"tag": "markdown", "content": body}],
-    },
-  }
+def _build_config_text(config: dict[str, Any]) -> str:
+  """Encode config as a text message string."""
+  return f"{CONFIG_MARKER}\n{json.dumps(config)}"
 
 
-def _parse_config_from_card(msg: dict[str, Any]) -> dict[str, Any] | None:
-  """Extract config JSON from a message's card content.
+def _parse_config_text(msg: dict[str, Any]) -> dict[str, Any] | None:
+  """Extract config JSON from a pinned text message.
 
-  Handles two formats:
-  1. Direct card dict (body.elements[0].content)
-  2. get_message API response (content is a JSON string containing the card)
-
-  Returns the config dict if valid, None otherwise.
+  Expected msg format from get_message API:
+    {"msg_type": "text", "body": {"content": '{"text": "..."}' }}
   """
   try:
-    content_str = ""
-
-    # Path 1: get_message API — content is a JSON string wrapping the card
-    card_content = msg.get("content", "")
-    if isinstance(card_content, str) and card_content.strip():
-      try:
-        card_json = json.loads(card_content)
-        elements = card_json.get("body", {}).get("elements", [])
-        if elements:
-          content_str = elements[0].get("content", "")
-      except (json.JSONDecodeError, KeyError):
-        pass
-
-    # Path 2: direct card dict — body.elements[0].content
-    if not content_str:
-      body = msg.get("body", {})
-      if isinstance(body, str):
-        body = json.loads(body)
-      elements = body.get("elements", []) if isinstance(body, dict) else []
-      if elements:
-        content_str = elements[0].get("content", "")
-
-    if not content_str:
+    if msg.get("msg_type") != "text":
       return None
-
-    # Strip markdown code fence
-    text = content_str.strip()
-    if text.startswith("```"):
-      lines = text.split("\n")
-      # Remove first and last line (fences)
-      lines = lines[1:]
-      if lines and lines[-1].strip() == "```":
-        lines = lines[:-1]
-      text = "\n".join(lines)
-
-    config = json.loads(text)
+    content_raw = msg.get("body", {}).get("content", "")
+    if not content_raw:
+      return None
+    # Content is JSON-encoded: {"text": "actual text"}
+    text = json.loads(content_raw).get("text", "")
+    if not text.startswith(CONFIG_MARKER):
+      return None
+    json_str = text[len(CONFIG_MARKER):].strip()
+    config = json.loads(json_str)
     if not isinstance(config, dict):
       return None
-    # Validate: must have at least one known key
     if not _VALID_KEYS & set(config.keys()):
       return None
     return config
-
   except Exception:
     return None
 
@@ -116,7 +78,7 @@ def _parse_config_from_card(msg: dict[str, Any]) -> dict[str, Any] | None:
 # ---------------------------------------------------------------------------
 
 def _find_config_pin(token: str, chat_id: str) -> tuple[str, dict[str, Any]] | None:
-  """Find the pinned config card. Returns (message_id, config) or None."""
+  """Find the pinned config message. Returns (message_id, config) or None."""
   from .lark import api as lark_api
 
   try:
@@ -126,12 +88,12 @@ def _find_config_pin(token: str, chat_id: str) -> tuple[str, dict[str, Any]] | N
     return None
 
   for pin in pins:
-    msg_id = pin.get("pin", {}).get("message_id", "")
+    msg_id = pin.get("message_id", "")
     if not msg_id:
       continue
     try:
       msg = lark_api.get_message(token, msg_id)
-      config = _parse_config_from_card(msg)
+      config = _parse_config_text(msg)
       if config is not None:
         return msg_id, config
     except Exception:
@@ -141,11 +103,11 @@ def _find_config_pin(token: str, chat_id: str) -> tuple[str, dict[str, Any]] | N
 
 def _create_config_pin(token: str, chat_id: str,
                        config: dict[str, Any]) -> str:
-  """Create a new config card and pin it. Returns message_id."""
+  """Create a new config text message and pin it. Returns message_id."""
   from .lark import api as lark_api
 
-  card = _build_config_card(config)
-  msg_id = lark_api.send_card(token, chat_id, card)
+  text = _build_config_text(config)
+  msg_id = lark_api.send_text(token, chat_id, text)
   lark_api.create_pin(token, msg_id)
   return msg_id
 
@@ -153,21 +115,16 @@ def _create_config_pin(token: str, chat_id: str,
 def _update_config_pin(token: str, chat_id: str,
                        pin_msg_id: str,
                        config: dict[str, Any]) -> str:
-  """Update existing config card. Recreates if PATCH fails (14-day expiry)."""
+  """Update existing config message. Deletes old and creates new."""
   from .lark import api as lark_api
 
-  card = _build_config_card(config)
+  # Text messages can't be PATCHed, so replace: unpin+delete old, create new
   try:
-    lark_api.update_card(token, pin_msg_id, card)
-    return pin_msg_id
-  except RuntimeError:
-    # Card expired, recreate
-    try:
-      lark_api.delete_pin(token, pin_msg_id)
-      lark_api.delete_message(token, pin_msg_id)
-    except Exception:
-      pass
-    return _create_config_pin(token, chat_id, config)
+    lark_api.delete_pin(token, pin_msg_id)
+    lark_api.delete_message(token, pin_msg_id)
+  except Exception:
+    pass
+  return _create_config_pin(token, chat_id, config)
 
 
 # ---------------------------------------------------------------------------
@@ -175,7 +132,7 @@ def _update_config_pin(token: str, chat_id: str,
 # ---------------------------------------------------------------------------
 
 def load_config(token: str, chat_id: str) -> dict[str, Any]:
-  """Load group config from pinned card. Returns default if none found."""
+  """Load group config from pinned message. Returns default if none found."""
   result = _find_config_pin(token, chat_id)
   if result is not None:
     _msg_id, config = result
@@ -186,7 +143,7 @@ def load_config(token: str, chat_id: str) -> dict[str, Any]:
 
 
 def save_config(token: str, chat_id: str, config: dict[str, Any]) -> str:
-  """Save config to pinned card. Creates or updates. Returns message_id."""
+  """Save config to pinned message. Creates or replaces. Returns message_id."""
   result = _find_config_pin(token, chat_id)
   if result is not None:
     pin_msg_id, _old = result

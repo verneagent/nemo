@@ -113,12 +113,13 @@ def get_chat_info(token: str, chat_id: str) -> dict[str, Any]:
 
 
 def get_message(token: str, message_id: str) -> dict[str, Any]:
-  """Fetch a message by ID."""
+  """Fetch a message by ID. Returns the message item dict."""
   url = f"{BASE_URL}/im/v1/messages/{message_id}"
   data = _request(url, token)
   if data.get("code") != 0:
     return {}
-  return data.get("data", {})
+  items = data.get("data", {}).get("items", [])
+  return items[0] if items else {}
 
 
 def delete_message(token: str, message_id: str) -> None:
