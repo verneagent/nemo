@@ -57,11 +57,28 @@ def main():
   parser.add_argument("--verbose", "-v", action="store_true", help="Debug logging")
   args = parser.parse_args()
 
+  # Log to both stderr and a persistent log file
+  log_level = logging.DEBUG if args.verbose else logging.INFO
+  log_format = "[nemo] [%(asctime)s] %(message)s"
+  log_datefmt = "%H:%M:%S"
   logging.basicConfig(
-    level=logging.DEBUG if args.verbose else logging.INFO,
-    format="[nemo] [%(asctime)s] %(message)s",
-    datefmt="%H:%M:%S",
+    level=log_level,
+    format=log_format,
+    datefmt=log_datefmt,
   )
+  # Add file handler — one log per chat, rotated
+  from .config import CONFIG_DIR
+  log_dir = os.path.join(CONFIG_DIR, "logs")
+  os.makedirs(log_dir, exist_ok=True)
+  from logging.handlers import RotatingFileHandler
+  fh = RotatingFileHandler(
+    os.path.join(log_dir, "nemo.log"),
+    maxBytes=5 * 1024 * 1024,  # 5 MB
+    backupCount=3,
+  )
+  fh.setLevel(log_level)
+  fh.setFormatter(logging.Formatter(log_format, datefmt=log_datefmt))
+  logging.getLogger().addHandler(fh)
 
   project_dir = os.path.abspath(args.project_dir)
   if not os.path.isdir(project_dir):
