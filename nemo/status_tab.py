@@ -65,8 +65,22 @@ def update_status(token: str, chat_id: str, model: str,
       if tab_id:
         lark_api.update_chat_tab(token, chat_id, tab_id, model, MODEL_TAB_URL)
 
+    # Move pin tab to the end
+    _sort_pin_last(token, chat_id)
+
   except Exception as e:
     log.warning("Status tab update failed: %s", e)
+
+
+def _sort_pin_last(token: str, chat_id: str) -> None:
+  """Re-order tabs so pin is last."""
+  from .lark import api as lark_api
+
+  tabs = lark_api.list_chat_tabs(token, chat_id)
+  non_pin = [t["tab_id"] for t in tabs if t.get("tab_type") != "pin"]
+  pin = [t["tab_id"] for t in tabs if t.get("tab_type") == "pin"]
+  if pin and tabs[-1].get("tab_type") != "pin":
+    lark_api.sort_chat_tabs(token, chat_id, non_pin + pin)
 
 
 def remove_tab(token: str, chat_id: str) -> None:

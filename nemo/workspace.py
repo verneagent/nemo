@@ -118,11 +118,20 @@ def _find_workspace_groups(token: str, project_dir: str) -> list[dict[str, str]]
 def _is_group_idle(token: str, chat_id: str) -> bool:
   """Check if a group is idle (no active nemo process occupying it).
 
-  Reads the config card's active_pid field. Idle if:
-  - No config card / no active_pid
-  - active_pid is 0
-  - The PID process is no longer running
+  Strategy:
+  1. If relay is configured, use heartbeat (works cross-device).
+  2. Fall back to PID-based check (local machine only).
   """
+  from .config import load_relay_config
+
+  relay_url, _ = load_relay_config()
+  if relay_url:
+    from . import relay as relay_client
+    alive = relay_client.is_alive(chat_id)
+    log.debug("Relay heartbeat for %s: alive=%s", chat_id, alive)
+    return not alive
+
+  # Fallback: PID-based (local machine only)
   from .group_config import load_config
 
   try:
@@ -248,10 +257,25 @@ def discover_or_create_chat(token: str, project_dir: str,
                           existing_names=existing_names)
 
 
-def claim_group(token: str, chat_id: str) -> None:
-  """Mark this group as occupied by writing our PID to the config card."""
+def claim_group(token: str, chat_id: str,
+                model: str = "", machine: str = "") -> None:
+  """Mark this group as occupied.
+
+  Sends relay heartbeat (cross-device) and writes PID to config card (local fallback).
+  """
+  from .config import load_relay_config
   from .group_config import load_config, save_config
 
+  # Relay heartbeat
+  relay_url, _ = load_relay_config()
+  if relay_url:
+    from . import relay as relay_client
+    if not machine:
+      machine = get_machine_name()
+    relay_client.send_heartbeat(chat_id, pid=os.getpid(),
+                                model=model, machine=machine)
+
+  # Config card PID (local fallback)
   try:
     config = load_config(token, chat_id)
     config["active_pid"] = os.getpid()
@@ -262,9 +286,20 @@ def claim_group(token: str, chat_id: str) -> None:
 
 
 def release_group(token: str, chat_id: str) -> None:
-  """Mark this group as idle by clearing the active_pid."""
+  """Mark this group as idle.
+
+  Releases relay heartbeat and clears PID in config card.
+  """
+  from .config import load_relay_config
   from .group_config import load_config, save_config
 
+  # Release relay heartbeat
+  relay_url, _ = load_relay_config()
+  if relay_url:
+    from . import relay as relay_client
+    relay_client.release_heartbeat(chat_id)
+
+  # Clear config card PID
   try:
     config = load_config(token, chat_id)
     config["active_pid"] = 0

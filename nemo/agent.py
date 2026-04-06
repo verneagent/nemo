@@ -44,10 +44,20 @@ def _send_response(token: str, chat_id: str, text: str, db: Database) -> str | N
   try:
     msg_id = lark_api.send_card(token, chat_id, card)
     db.record_sent(msg_id, text=text[:500], chat_id=chat_id)
+    _register_msg(msg_id, chat_id)
     return msg_id
   except Exception as e:
     log.error("Send error: %s", e)
     return None
+
+
+def _register_msg(msg_id: str, chat_id: str) -> None:
+  """Register message for reaction routing (relay only, best-effort)."""
+  from .config import load_relay_config
+  relay_url, _ = load_relay_config()
+  if relay_url and msg_id:
+    from . import relay as relay_client
+    relay_client.register_message(msg_id, chat_id)
 
 
 def _handle_diag(
@@ -154,7 +164,7 @@ async def main_loop(
   if not sidecar:
     from .workspace import ensure_workspace_tag, claim_group
     ensure_workspace_tag(token, chat_id, project_dir)
-    claim_group(token, chat_id)
+    claim_group(token, chat_id, model=model)
 
   # Detect need_mention
   if sidecar:
@@ -179,8 +189,14 @@ async def main_loop(
            session_id, chat_id, bot_open_id[:16] if bot_open_id else "?",
            operator_open_id[:16] if operator_open_id else "?", need_mention)
 
-  # Connect to Lark event stream
-  events = LarkEventStream(credentials["app_id"], credentials["app_secret"])
+  # Connect to event stream (relay if configured, otherwise lark-oapi WS)
+  from .config import load_relay_config
+  relay_url, relay_api_key = load_relay_config()
+  if relay_url:
+    from .relay_events import RelayEventStream
+    events = RelayEventStream(relay_url, relay_api_key, chat_id)
+  else:
+    events = LarkEventStream(credentials["app_id"], credentials["app_secret"])
   await events.connect()
 
   # Send start card
@@ -199,6 +215,24 @@ async def main_loop(
   # Status tab — green idle
   from . import status_tab
   status_tab.update_status(token, chat_id, model, "idle")
+
+  # Periodic heartbeat (relay-based idle detection)
+  _heartbeat_task: asyncio.Task | None = None
+  if not sidecar:
+    from .config import load_relay_config
+    relay_url, _ = load_relay_config()
+    if relay_url:
+      from . import relay as relay_client
+      from .workspace import get_machine_name
+
+      async def _heartbeat_loop():
+        while True:
+          await asyncio.sleep(30)
+          relay_client.send_heartbeat(
+            chat_id, pid=os.getpid(), model=model,
+            machine=get_machine_name())
+
+      _heartbeat_task = asyncio.create_task(_heartbeat_loop())
 
   # Init SDK client
   from claude_agent_sdk import ClaudeSDKClient
@@ -394,6 +428,7 @@ async def main_loop(
           try:
             _turn_card_id = lark_api.send_card(token, chat_id, card)
             db.set_working(session_id, _turn_card_id)
+            _register_msg(_turn_card_id, chat_id)
           except Exception as e:
             log.error("Working card error: %s", e)
 
@@ -476,7 +511,7 @@ async def main_loop(
           # Handle Stop button card action (check authorization)
           if msg.event_type == "card.action.trigger":
             action = msg.action_value.get("action", "")
-            if action == "stop" and monitor.is_authorized(
+            if action in ("stop", "__stop__") and monitor.is_authorized(
                 msg.operator_id, operator_open_id):
               signal_detected = "esc"
               return
@@ -579,6 +614,12 @@ async def main_loop(
       await asyncio.sleep(5)
 
   # Cleanup
+  if _heartbeat_task:
+    _heartbeat_task.cancel()
+    try:
+      await _heartbeat_task
+    except asyncio.CancelledError:
+      pass
   try:
     await client.__aexit__(None, None, None)
   except Exception:

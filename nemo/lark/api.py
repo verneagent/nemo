@@ -443,6 +443,14 @@ def list_chat_tabs(token: str, chat_id: str) -> list[dict[str, Any]]:
   raise RuntimeError(f"Failed to list chat tabs: {data}")
 
 
+def sort_chat_tabs(token: str, chat_id: str, tab_ids: list[str]) -> None:
+  """Sort chat tabs in the given order."""
+  api_url = f"{BASE_URL}/im/v1/chats/{chat_id}/chat_tabs/sort_tabs"
+  data = _request(api_url, token, {"tab_ids": tab_ids})
+  if data.get("code") != 0:
+    raise RuntimeError(f"Failed to sort chat tabs: {data}")
+
+
 # ---------------------------------------------------------------------------
 # Create/dissolve chat
 # ---------------------------------------------------------------------------

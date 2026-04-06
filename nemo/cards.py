@@ -150,7 +150,7 @@ def _stop_button(chat_id: str = "") -> dict[str, Any]:
         "tag": "button",
         "text": {"tag": "plain_text", "content": "Stop"},
         "type": "danger",
-        "value": {"action": "stop", "chat_id": chat_id},
+        "value": {"action": "__stop__", "chat_id": chat_id},
       }],
     }],
   }

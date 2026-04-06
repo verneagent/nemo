@@ -12,6 +12,8 @@ CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
 _LEGACY_CONFIG = os.path.expanduser("~/.handoff/config.json")
 DB_BASE = os.path.join(CONFIG_DIR, "projects")
 TMP_DIR = os.environ.get("NEMO_TMP_DIR", "/tmp/nemo")
+RELAY_URL = os.environ.get("NEMO_RELAY_URL", "")
+RELAY_API_KEY = os.environ.get("NEMO_RELAY_API_KEY", "")
 
 
 def load_config() -> dict[str, Any]:
@@ -21,6 +23,17 @@ def load_config() -> dict[str, Any]:
       with open(path) as f:
         return json.load(f)
   return {}
+
+
+def load_relay_config() -> tuple[str, str]:
+  """Load relay URL and API key from config or env.
+
+  Returns (relay_url, api_key). Either may be empty if not configured.
+  """
+  if RELAY_URL:
+    return RELAY_URL, RELAY_API_KEY
+  cfg = load_config()
+  return cfg.get("relay_url", ""), cfg.get("relay_api_key", "")
 
 
 def load_credentials() -> dict[str, str] | None:
