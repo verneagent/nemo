@@ -6,6 +6,7 @@ typed events instead of the old dual send_fn/working_fn pattern.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass
 from typing import Any, Callable
@@ -15,6 +16,8 @@ from .cards import ToolRecord, tool_use_summary
 log = logging.getLogger(__name__)
 
 MAX_RETRIES = 5
+# If receive_response() yields nothing for this long, assume the turn is stuck
+HEARTBEAT_TIMEOUT = 120  # seconds
 
 
 # ---------------------------------------------------------------------------
@@ -102,8 +105,21 @@ async def run_turn(
   pending_tasks: set[str] = set()
   working_started = False
   found_stale = False
+  timed_out = False
 
-  async for message in client.receive_response():
+  response = client.receive_response()
+  while True:
+    try:
+      message = await asyncio.wait_for(
+        response.__anext__(), timeout=HEARTBEAT_TIMEOUT)
+    except StopAsyncIteration:
+      break
+    except asyncio.TimeoutError:
+      log.error("receive_response() heartbeat timeout (%ds) — turn stuck",
+                HEARTBEAT_TIMEOUT)
+      timed_out = True
+      break
+
     # --- Stale task detection (SDK bug #788 workaround) ---
     if isinstance(message, TaskNotificationMessage) and message.task_id in stale_tasks:
       stale_tasks.discard(message.task_id)
@@ -176,6 +192,10 @@ async def run_turn(
         except Exception:
           pass
       pending_tasks.clear()
+
+  if timed_out:
+    on_event(ErrorEvent(message="Turn timed out — SDK stopped responding"))
+    raise TimeoutError("receive_response() heartbeat timeout")
 
   # If stale notification contaminated this turn, re-query
   if found_stale and _retry < MAX_RETRIES:

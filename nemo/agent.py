@@ -535,7 +535,32 @@ async def main_loop(
           await watcher
         except asyncio.CancelledError:
           pass
-        sdk_task.result()
+        # Check for timeout error from run_turn
+        try:
+          sdk_task.result()
+        except TimeoutError:
+          log.error("SDK turn timed out — restarting client")
+          token = lark_auth.get_token(credentials["app_id"], credentials["app_secret"])
+          # Update working card to show error
+          if _turn_card_id:
+            elapsed = int(time.time() - _turn_start)
+            err_card = cards.build_turn_card(
+              "done", body="**Error:** Turn timed out — SDK stopped responding.",
+              tools=_turn_tools, elapsed=elapsed,
+            )
+            try:
+              lark_api.update_card(token, _turn_card_id, err_card)
+            except Exception:
+              pass
+            db.clear_working(session_id)
+          else:
+            _send_response(token, chat_id,
+                           "**Error:** Turn timed out — SDK stopped responding.", db)
+          _clear_ack()
+          await _restart_client()
+          for pending in _pending_msgs:
+            events.push_back(pending)
+          continue
 
       # Re-queue any messages consumed during the turn
       for pending in _pending_msgs:
