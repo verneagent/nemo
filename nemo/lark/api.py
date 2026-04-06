@@ -88,7 +88,7 @@ def get_bot_info(token: str) -> dict[str, Any]:
   data = _request(url, token)
   if data.get("code") != 0:
     raise RuntimeError(f"Bot info error: {data}")
-  return data.get("data", {}).get("bot", {})
+  return data.get("bot", {})
 
 
 def lookup_open_id_by_email(token: str, email: str) -> str | None:
