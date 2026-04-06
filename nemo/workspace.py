@@ -60,12 +60,26 @@ def _workspace_tag_matches(desc: str, tag: str) -> bool:
 
 
 def _is_pid_alive(pid: int) -> bool:
-  """Check if a process with the given PID is still running."""
+  """Check if a nemo process with the given PID is still running.
+
+  Not just os.kill(pid, 0) — also verify the process is actually nemo,
+  not an unrelated process that reused the PID after nemo was killed.
+  """
   try:
     os.kill(pid, 0)
-    return True
   except (OSError, ProcessLookupError):
     return False
+  # PID exists — verify it's a nemo process
+  try:
+    import subprocess
+    result = subprocess.run(
+      ["ps", "-p", str(pid), "-o", "command="],
+      capture_output=True, text=True, timeout=5,
+    )
+    cmdline = result.stdout.strip()
+    return "nemo" in cmdline
+  except Exception:
+    return True  # Can't verify — assume alive to be safe
 
 
 def _find_workspace_groups(token: str, project_dir: str) -> list[dict[str, str]]:
