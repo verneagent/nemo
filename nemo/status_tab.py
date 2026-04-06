@@ -4,6 +4,9 @@ Uses a URL tab with emoji prefix to indicate state:
   🟢 Nemo (model) — connected, idle
   🟡 Nemo (model) — working
   🔴 Nemo (model) — disconnected / stopped
+
+The tab is identified by its URL containing `?type=nemo-status`,
+not by parsing the tab name.
 """
 
 from __future__ import annotations
@@ -13,26 +16,26 @@ from typing import Any
 
 log = logging.getLogger(__name__)
 
-TAB_URL = "https://github.com/verneagent/nemo"
-_TAB_PREFIX = "Nemo"
+_BASE_URL = "https://github.com/verneagent/nemo"
+_TAB_MARKER = "type=nemo-status"
+TAB_URL = f"{_BASE_URL}?{_TAB_MARKER}"
 
 
 def _find_nemo_tab(tabs: list[dict[str, Any]]) -> dict[str, Any] | None:
-  """Find the existing Nemo status tab."""
+  """Find the existing Nemo status tab by URL marker."""
   for tab in tabs:
-    name = tab.get("tab_name", "")
-    if name.startswith("🟢") or name.startswith("🟡") or name.startswith("🔴"):
-      if _TAB_PREFIX in name:
-        return tab
+    url = (tab.get("tab_content") or {}).get("url", "")
+    if _TAB_MARKER in url:
+      return tab
   return None
 
 
 def _tab_name(model: str, status: str) -> str:
   if status == "working":
-    return f"🟡 {_TAB_PREFIX} ({model})"
+    return f"🟡 Nemo ({model})"
   if status == "stopped":
-    return f"🔴 {_TAB_PREFIX} ({model})"
-  return f"🟢 {_TAB_PREFIX} ({model})"
+    return f"🔴 Nemo ({model})"
+  return f"🟢 Nemo ({model})"
 
 
 def update_status(token: str, chat_id: str, model: str,
