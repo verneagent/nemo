@@ -193,9 +193,29 @@ def build_turn_card(
     }
 
   elif phase == "done":
-    # Body: response markdown
+    # Body: response markdown in collapsible if long
     if body:
-      elements.append({"tag": "markdown", "content": body})
+      # Split on "---" separators (multi-text turns join with ---)
+      sections = [s.strip() for s in body.split("\n\n---\n\n")]
+      last_section = sections[-1] if sections else body
+      rest = "\n\n---\n\n".join(sections[:-1]) if len(sections) > 1 else ""
+
+      if not rest and len(body) <= 500:
+        # Single short response — show inline
+        elements.append({"tag": "markdown", "content": body})
+      else:
+        # Show last section (summary) inline, rest in collapsible
+        if rest:
+          elements.append({
+            "tag": "collapsible_panel",
+            "expanded": False,
+            "header": {
+              "title": {"tag": "plain_text", "content": "Details"},
+            },
+            "vertical_spacing": "8px",
+            "elements": [{"tag": "markdown", "content": rest}],
+          })
+        elements.append({"tag": "markdown", "content": last_section})
     # Tools in collapsible
     if tools:
       elements.append(_collapsible_tools(tools))

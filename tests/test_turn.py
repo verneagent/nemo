@@ -4,6 +4,8 @@ import asyncio
 from dataclasses import dataclass
 from unittest import mock
 
+import pytest
+
 from nemo.turn import (
   run_turn, ToolStartEvent, ToolProgressEvent, TextEvent,
   TaskStartedEvent, TaskDoneEvent, DoneEvent, ErrorEvent,
@@ -397,6 +399,7 @@ def test_heartbeat_timeout():
   asyncio.run(_run())
 
 
+@pytest.mark.slow
 def test_query_timeout():
   """Mock client.query() to be slow — anyio.fail_after(15) triggers."""
   events = []

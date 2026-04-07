@@ -15,11 +15,26 @@ A standalone executable that:
 python -m nemo --chat-id <ID> --project-dir <DIR> [--model claude-opus-4-6]
 ```
 
-Or installed via pip:
+Dev install (editable, code changes take effect immediately):
 ```
 pip install -e .
 nemo --chat-id <ID> --project-dir <DIR>
 ```
+
+Do NOT use `pipx install captain-nemo` on the dev machine — pipx freezes
+the published version and uses a separate venv (different SDK version).
+`pipx` is for end-user installs only.
+
+## Publishing to PyPI
+
+```bash
+# 1. Bump version in pyproject.toml
+# 2. Build and upload
+python3 -m build && twine upload dist/captain_nemo-X.Y.Z*
+```
+
+PyPI credentials are in `~/.pypirc`. Package name: `captain-nemo`.
+Users install via `pipx install captain-nemo`.
 
 ## What It Is NOT
 

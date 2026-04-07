@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 from typing import Any
 
 import yaml
@@ -38,6 +39,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
 }
 
 _VALID_KEYS = {"guests", "autoapprove", "filter", "rules", "active_pid"}
+_save_lock = threading.Lock()
 
 
 # ---------------------------------------------------------------------------
@@ -81,7 +83,11 @@ def _parse_config_text(msg: dict[str, Any]) -> dict[str, Any] | None:
 # ---------------------------------------------------------------------------
 
 def _find_config_pin(token: str, chat_id: str) -> tuple[str, dict[str, Any]] | None:
-  """Find the pinned config message. Returns (message_id, config) or None."""
+  """Find the pinned config message. Returns (message_id, config) or None.
+
+  If multiple config pins exist (from past failures), keeps the first and
+  cleans up the rest.
+  """
   from .lark import api as lark_api
 
   try:
@@ -90,6 +96,7 @@ def _find_config_pin(token: str, chat_id: str) -> tuple[str, dict[str, Any]] | N
     log.warning("Failed to list pins: %s", e)
     return None
 
+  found: tuple[str, dict[str, Any]] | None = None
   for pin in pins:
     msg_id = pin.get("message_id", "")
     if not msg_id:
@@ -98,10 +105,19 @@ def _find_config_pin(token: str, chat_id: str) -> tuple[str, dict[str, Any]] | N
       msg = lark_api.get_message(token, msg_id)
       config = _parse_config_text(msg)
       if config is not None:
-        return msg_id, config
+        if found is None:
+          found = (msg_id, config)
+        else:
+          # Duplicate — clean it up
+          log.info("Removing duplicate config pin: %s", msg_id)
+          try:
+            lark_api.delete_pin(token, msg_id)
+            lark_api.delete_message(token, msg_id)
+          except Exception:
+            pass
     except Exception:
       continue
-  return None
+  return found
 
 
 def _create_config_pin(token: str, chat_id: str,
@@ -147,11 +163,12 @@ def load_config(token: str, chat_id: str) -> dict[str, Any]:
 
 def save_config(token: str, chat_id: str, config: dict[str, Any]) -> str:
   """Save config to pinned message. Creates or replaces. Returns message_id."""
-  result = _find_config_pin(token, chat_id)
-  if result is not None:
-    pin_msg_id, _old = result
-    return _update_config_pin(token, chat_id, pin_msg_id, config)
-  return _create_config_pin(token, chat_id, config)
+  with _save_lock:
+    result = _find_config_pin(token, chat_id)
+    if result is not None:
+      pin_msg_id, _old = result
+      return _update_config_pin(token, chat_id, pin_msg_id, config)
+    return _create_config_pin(token, chat_id, config)
 
 
 def get_autoapprove(token: str, chat_id: str) -> bool:

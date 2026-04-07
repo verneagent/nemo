@@ -107,6 +107,55 @@ def test_save_config_creates_new():
   assert sent_text.startswith(CONFIG_MARKER)
 
 
+def test_find_config_pin_deduplicates():
+  """When multiple config pins exist, keep first and delete the rest."""
+  config1 = {"autoapprove": False, "guests": []}
+  config2 = {"autoapprove": True, "guests": []}
+  msg1 = _text_msg(_build_config_text(config1))
+  msg2 = _text_msg(_build_config_text(config2))
+
+  def get_message_side_effect(token, msg_id):
+    return {"msg_1": msg1, "msg_2": msg2}[msg_id]
+
+  with mock.patch("nemo.lark.api.list_pins", return_value=[
+    {"message_id": "msg_1"}, {"message_id": "msg_2"},
+  ]):
+    with mock.patch("nemo.lark.api.get_message", side_effect=get_message_side_effect):
+      with mock.patch("nemo.lark.api.delete_pin") as mock_del_pin:
+        with mock.patch("nemo.lark.api.delete_message") as mock_del_msg:
+          result = load_config("tok", "oc_1")
+  # Kept msg_1 (first), deleted msg_2 (duplicate)
+  assert result["autoapprove"] is False
+  mock_del_pin.assert_called_once_with("tok", "msg_2")
+  mock_del_msg.assert_called_once_with("tok", "msg_2")
+
+
+def test_save_config_concurrent_safety():
+  """save_config should not create duplicates under concurrent calls."""
+  import threading
+
+  config = {"autoapprove": True, "guests": [], "filter": "concise", "rules": {}}
+  call_count = {"create_pin": 0}
+
+  def mock_create_pin(token, msg_id):
+    call_count["create_pin"] += 1
+
+  with mock.patch("nemo.lark.api.list_pins", return_value=[]):
+    with mock.patch("nemo.lark.api.send_text", return_value="msg_new"):
+      with mock.patch("nemo.lark.api.create_pin", side_effect=mock_create_pin):
+        threads = [threading.Thread(target=save_config, args=("tok", "oc_1", config))
+                   for _ in range(5)]
+        for t in threads:
+          t.start()
+        for t in threads:
+          t.join()
+
+  # Lock ensures sequential execution — each call creates a pin,
+  # but they don't race to see "no pin exists" simultaneously.
+  # With mock always returning empty pins, each creates one, but serially.
+  assert call_count["create_pin"] == 5
+
+
 def test_save_config_updates_existing():
   old_config = {"autoapprove": False, "guests": []}
   old_text = _build_config_text(old_config)

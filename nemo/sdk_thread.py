@@ -65,7 +65,7 @@ class SDKThread:
       for attempt in range(1, MAX_CONNECT_ATTEMPTS + 1):
         c = ClaudeSDKClient(options=options)
         try:
-          await c.__aenter__()
+          await asyncio.wait_for(c.__aenter__(), timeout=30)
           transport = getattr(c, '_transport', None)
           proc = getattr(transport, '_process', None) if transport else None
           if proc and proc.returncode is not None:
