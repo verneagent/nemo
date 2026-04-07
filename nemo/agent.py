@@ -28,7 +28,7 @@ from .lark import auth as lark_auth
 from .lark.events import LarkEvent, LarkEventStream
 from .permissions import build_permission_handler
 from .turn import (
-  DoneEvent, TextEvent, ToolProgressEvent, ToolStartEvent, run_turn,
+  DoneEvent, TextEvent, ToolProgressEvent, ToolStartEvent,
 )
 
 log = logging.getLogger(__name__)
@@ -234,13 +234,16 @@ async def main_loop(
 
       _heartbeat_task = asyncio.create_task(_heartbeat_loop())
 
-  # Init SDK client
-  from claude_agent_sdk import ClaudeSDKClient
+  # Init SDK client — runs in a dedicated thread to isolate anyio from our asyncio
+  from .sdk_thread import SDKThread
+
   session_id_ref = [session_id]
   sdk_options = _build_sdk_options(
     project_dir, model, credentials, chat_id, session_id_ref, db, events)
-  client = ClaudeSDKClient(options=sdk_options)
-  await client.__aenter__()
+
+  sdk = SDKThread()
+  sdk.start()
+  await sdk.create_client(sdk_options)
 
   # Context
   ctx = commands.AgentContext(model, project_dir, time.time())
@@ -257,15 +260,10 @@ async def main_loop(
   signal.signal(signal.SIGTERM, handle_sig)
 
   async def _restart_client():
-    nonlocal client, sdk_options
-    try:
-      await client.__aexit__(None, None, None)
-    except Exception:
-      pass
+    nonlocal sdk_options
     sdk_options = _build_sdk_options(
       project_dir, model, credentials, chat_id, session_id_ref, db, events)
-    client = ClaudeSDKClient(options=sdk_options)
-    await client.__aenter__()
+    await sdk.reconnect(sdk_options)
 
   # ---- Main loop: event-driven ----
   while running:
@@ -480,9 +478,13 @@ async def main_loop(
               _send_response(token, chat_id, merged, db)
           ctx.total_cost += event.cost
 
-      # Run SDK turn as async task, watch event stream for signals
+      # Run SDK turn on dedicated thread (isolates anyio from our asyncio)
       sdk_task = asyncio.create_task(
-        run_turn(client, user_message, _on_event, stale_tasks=_stale_tasks))
+        sdk.run_turn_with_reconnect(
+          user_message, _on_event,
+          stale_tasks=_stale_tasks, options=sdk_options,
+        )
+      )
 
       # Concurrent signal watcher: read events during SDK execution
       signal_detected = None
@@ -540,7 +542,7 @@ async def main_loop(
       if watcher in done_tasks and signal_detected:
         if signal_detected == "esc":
           try:
-            await client.interrupt()
+            await sdk.interrupt()
             await asyncio.wait_for(sdk_task, timeout=30)
           except Exception:
             sdk_task.cancel()
@@ -549,7 +551,7 @@ async def main_loop(
 
         elif signal_detected in ("exit", "dissolve"):
           try:
-            await client.interrupt()
+            await sdk.interrupt()
             await asyncio.wait_for(sdk_task, timeout=10)
           except Exception:
             sdk_task.cancel()
@@ -620,10 +622,8 @@ async def main_loop(
       await _heartbeat_task
     except asyncio.CancelledError:
       pass
-  try:
-    await client.__aexit__(None, None, None)
-  except Exception:
-    pass
+  await sdk.close_client()
+  sdk.stop()
   await events.close()
   db.deactivate(session_id)
   db.close()
@@ -685,7 +685,7 @@ def _build_sdk_options(
   perm_handler = build_permission_handler(credentials, chat_id, db, events)
 
   def _stderr_handler(line: str) -> None:
-    log.debug("[sdk-stderr] %s", line.rstrip())
+    log.info("[sdk-stderr] %s", line.rstrip())
 
   return ClaudeAgentOptions(
     allowed_tools=["Skill", "Read", "Write", "Edit", "Bash", "Glob", "Grep"],

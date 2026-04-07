@@ -99,8 +99,11 @@ async def run_turn(
   if stale_tasks is None:
     stale_tasks = set()
 
+  import anyio as _anyio
   log.info("query() prompt=%d chars retry=%d", len(prompt), _retry)
-  await client.query(prompt)
+  with _anyio.fail_after(15):
+    await client.query(prompt)
+  log.info("query() sent to CLI")
 
   cost = 0.0
   usage: dict[str, Any] = {}
@@ -109,36 +112,32 @@ async def run_turn(
   found_stale = False
   timed_out = False
 
+  # The SDK uses anyio internally. Neither asyncio.wait_for nor anyio.fail_after
+  # can reliably cancel stuck anyio operations from asyncio context.
+  # Workaround: run __anext__() as a task and use asyncio.wait() with a
+  # separate sleep task as the timeout.  If the timeout wins, we just abandon
+  # the stuck task (it will be cleaned up when the client is closed).
+  FIRST_MSG_TIMEOUT = 30  # seconds
+  msg_count = 0
+
   response = client.receive_response()
   while True:
-    try:
-      message = await asyncio.wait_for(
-        response.__anext__(), timeout=HEARTBEAT_TIMEOUT)
-    except StopAsyncIteration:
-      break
-    except asyncio.TimeoutError:
-      log.error("receive_response() heartbeat timeout (%ds) — interrupting",
-                HEARTBEAT_TIMEOUT)
-      # Try to interrupt gracefully — CLI should send ResultMessage
-      try:
-        await client.interrupt()
-        message = await asyncio.wait_for(
-          response.__anext__(), timeout=30)
-        # Drain remaining messages after interrupt
-        while True:
-          try:
-            message = await asyncio.wait_for(
-              response.__anext__(), timeout=10)
-            if isinstance(message, ResultMessage):
-              cost = getattr(message, "total_cost_usd", 0) or 0.0
-              usage = getattr(message, "usage", None) or {}
-              break
-          except (StopAsyncIteration, asyncio.TimeoutError):
-            break
-      except (StopAsyncIteration, asyncio.TimeoutError, Exception) as e:
-        log.error("Interrupt also failed: %s", e)
+    timeout = FIRST_MSG_TIMEOUT if msg_count == 0 else HEARTBEAT_TIMEOUT
+    next_task = asyncio.ensure_future(response.__anext__())
+    done, _ = await asyncio.wait({next_task}, timeout=timeout)
+    if not done:
+      # Timeout — next_task is still pending
+      next_task.cancel()
+      log.error("receive_response() timeout (%ds, msgs=%d) — forcing reconnect",
+                timeout, msg_count)
       timed_out = True
       break
+    try:
+      message = next_task.result()
+    except StopAsyncIteration:
+      break
+    msg_count += 1
+    log.debug("turn msg: %s", type(message).__name__)
 
     # --- Stale task detection (SDK bug #788 workaround) ---
     if isinstance(message, TaskNotificationMessage) and message.task_id in stale_tasks:

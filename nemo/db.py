@@ -25,7 +25,7 @@ def _db_path(project_dir: str) -> str:
 
 def _connect(project_dir: str) -> sqlite3.Connection:
   path = _db_path(project_dir)
-  conn = sqlite3.connect(path, timeout=10)
+  conn = sqlite3.connect(path, timeout=10, check_same_thread=False)
   conn.execute("PRAGMA journal_mode=WAL")
   conn.execute("PRAGMA busy_timeout=5000")
   conn.row_factory = sqlite3.Row
