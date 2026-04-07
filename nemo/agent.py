@@ -693,7 +693,7 @@ def _build_sdk_options(
     log.info("[sdk-stderr] %s", line.rstrip())
 
   return ClaudeAgentOptions(
-    allowed_tools=["Skill", "Read", "Write", "Edit", "Bash", "Glob", "Grep"],
+    allowed_tools=["Agent", "Skill", "Read", "Write", "Edit", "Bash", "Glob", "Grep"],
     setting_sources=["user", "project"],
     permission_mode="default",
     system_prompt={

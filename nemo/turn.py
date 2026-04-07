@@ -150,6 +150,7 @@ async def run_turn(
       if isinstance(message, ResultMessage):
         cost = getattr(message, "total_cost_usd", 0) or 0.0
         usage = getattr(message, "usage", None) or {}
+        break  # Don't wait for StopAsyncIteration in stale path either
       continue
 
     # --- Normal message handling ---
