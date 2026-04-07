@@ -672,7 +672,10 @@ async def handle_poll(request: web.Request) -> web.Response:
         return web.json_response({"error": "missing key", "replies": [], "count": 0})
 
     since = request.query.get("since", "")
-    timeout = min(int(request.query.get("timeout", "25")), 55)
+    try:
+        timeout = min(int(request.query.get("timeout", "25")), 55)
+    except (ValueError, TypeError):
+        timeout = 25
 
     loop = asyncio.get_event_loop()
 

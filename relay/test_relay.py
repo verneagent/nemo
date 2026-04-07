@@ -20,7 +20,9 @@ os.environ["RELAY_DB"] = "/private/tmp/claude/test_relay.db"
 os.environ["RELAY_API_KEY"] = "test-key"
 os.environ["VERIFY_TOKENS"] = "tok1,tok2"
 
+import importlib
 import relay
+importlib.reload(relay)  # Re-read env vars in case another test changed them
 
 BASE = "http://127.0.0.1:19801"
 AUTH = {"Authorization": "Bearer test-key"}
@@ -34,6 +36,8 @@ class RelayTestCase(unittest.TestCase):
 
   @classmethod
   def setUpClass(cls):
+    # Ensure VERIFY_TOKENS is correct (may have been changed by other tests)
+    relay.VERIFY_TOKENS = {"tok1", "tok2"}
     if os.path.exists("/private/tmp/claude/test_relay.db"):
       os.remove("/private/tmp/claude/test_relay.db")
     relay._init_db()
@@ -1045,6 +1049,36 @@ class RelayTestCase(unittest.TestCase):
           self.assertEqual(e.status, 401)
 
     self._run_async(run())
+
+
+  # =====================================================
+  #  16. Error handling — malformed input
+  # =====================================================
+
+  def test_poll_non_numeric_timeout(self):
+    """Poll should not crash when timeout query param is non-numeric.
+    Server should default to a valid timeout instead of returning 500."""
+    self._push_text("oc_bad_timeout", "x", "110000", evt_id="evt_bad_to")
+    result = self._get("/poll/chat:oc_bad_timeout?timeout=abc&since=")
+    self.assertGreaterEqual(result["count"], 1)
+
+  def test_webhook_malformed_json(self):
+    """POST /webhook with non-JSON body should return 400."""
+    body = b"this is not json"
+    req = Request(self._url("/webhook"), data=body, method="POST")
+    req.add_header("Content-Type", "application/json")
+    with self.assertRaises(HTTPError) as ctx:
+      urlopen(req, timeout=5)
+    self.assertEqual(ctx.exception.code, 400)
+
+  def test_card_action_malformed_json(self):
+    """POST /card-action with non-JSON body should return 400."""
+    body = b"this is not json"
+    req = Request(self._url("/card-action"), data=body, method="POST")
+    req.add_header("Content-Type", "application/json")
+    with self.assertRaises(HTTPError) as ctx:
+      urlopen(req, timeout=5)
+    self.assertEqual(ctx.exception.code, 400)
 
 
 if __name__ == "__main__":
