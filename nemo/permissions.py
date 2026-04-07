@@ -60,20 +60,39 @@ def build_permission_handler(
   events_source: an object with async next_message() that returns the next
   Lark message from the operator. This is how we receive "y"/"n" replies
   without card buttons.
+
+  IMPORTANT: can_use_tool runs on the SDK thread's event loop (not the main
+  loop). The events_source queue is bound to the main loop, so we must
+  bridge calls via run_coroutine_threadsafe to avoid cross-loop hangs.
   """
+  import asyncio as _asyncio
+
   from claude_agent_sdk import PermissionResultAllow, PermissionResultDeny
+
+  # Capture the main loop at build time — this is called from the main loop.
+  _main_loop = _asyncio.get_event_loop()
+
+  async def _read_from_main_loop(timeout: float) -> Any:
+    """Read next message from events_source on the main loop."""
+    return await events_source.next_message(timeout=timeout)
+
+  def _set_permission_flag(active: bool) -> None:
+    events_source.permission_active = active
+
+  def _push_back_on_main(msg: Any) -> None:
+    events_source.push_back(msg)
 
   async def can_use_tool(tool_name: str, tool_input: dict[str, Any], _context: Any) -> Any:
     # Auto-approve internals
     if is_auto_approve(tool_name, tool_input):
       return PermissionResultAllow()
 
-    # Check autoapprove setting
+    # Check autoapprove setting (db uses check_same_thread=False, safe here)
     session = db.get_current_session()
     if session and session.get("autoapprove"):
       return PermissionResultAllow()
 
-    # Send permission info card (read-only, no buttons)
+    # Send permission info card (synchronous HTTP, safe from any thread)
     from .lark.auth import get_token
     from .lark.api import send_card, update_card
     from .cards import build_card
@@ -88,22 +107,46 @@ def build_permission_handler(
     )
     msg_id = send_card(token, chat_id, card)
 
-    # Wait for text reply (skip non-message events like card actions)
-    # Set permission_active flag to pause the signal watcher
+    # Wait for text reply — bridge to main loop for queue reads
     import time as _time
     from .monitor import is_permission_reply
     decision = None
     deadline = _time.time() + 300
     _pending: list[Any] = []
-    events_source.permission_active = True
+
+    # Detect if we're on the main loop (tests) vs SDK thread (production)
+    try:
+      _current_loop = _asyncio.get_running_loop()
+    except RuntimeError:
+      _current_loop = None
+    _on_main_loop = _current_loop is _main_loop
+
+    if _on_main_loop:
+      _set_permission_flag(True)
+    else:
+      _main_loop.call_soon_threadsafe(_set_permission_flag, True)
+
     try:
       while decision is None:
         remaining = deadline - _time.time()
         if remaining <= 0:
           break
-        reply = await events_source.next_message(timeout=remaining)
-        if reply is None:
+        timeout = min(remaining, 30)
+        try:
+          if _on_main_loop:
+            # Same loop — direct await
+            reply = await _read_from_main_loop(timeout)
+          else:
+            # Cross-thread — bridge via run_coroutine_threadsafe
+            future = _asyncio.run_coroutine_threadsafe(
+              _read_from_main_loop(timeout), _main_loop)
+            reply = await _asyncio.wrap_future(future)
+        except Exception:
           break
+        if reply is None:
+          if remaining <= 30:
+            break
+          continue
         reply_text = getattr(reply, "text", "")
         event_type = getattr(reply, "event_type", "")
         reply_chat = getattr(reply, "chat_id", "")
@@ -119,11 +162,17 @@ def build_permission_handler(
           # Not a permission reply — re-queue so it isn't lost
           _pending.append(reply)
     finally:
-      events_source.permission_active = False
+      if _on_main_loop:
+        _set_permission_flag(False)
+      else:
+        _main_loop.call_soon_threadsafe(_set_permission_flag, False)
 
     # Re-queue any consumed non-permission messages
     for msg in _pending:
-      events_source.push_back(msg)
+      if _on_main_loop:
+        _push_back_on_main(msg)
+      else:
+        _main_loop.call_soon_threadsafe(_push_back_on_main, msg)
 
     if decision is None:
       decision = "deny"  # Timeout or unrecognized = deny

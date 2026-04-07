@@ -108,13 +108,36 @@ def _make_fixtures(reply_text=None, timeout=False, autoapprove=False):
   return credentials, chat_id, db, events, sdk_mod
 
 
+def _run_with_handler(fixtures, tool_name="Bash", tool_input=None):
+  """Build handler and run can_use_tool inside an event loop.
+
+  build_permission_handler captures the current event loop at build time,
+  so both build and invocation must happen inside the same loop.
+  """
+  creds, chat_id, db, events, sdk = fixtures
+  if tool_input is None:
+    tool_input = {"command": "ls"}
+
+  async def _go():
+    handler = build_permission_handler(creds, chat_id, db, events)
+    return handler, await handler(tool_name, tool_input, None)
+
+  return asyncio.run(_go())
+
+
 def test_build_permission_handler_returns_callable():
   """build_permission_handler returns an async callable."""
   creds, chat_id, db, events, _sdk = _make_fixtures()
-  handler = build_permission_handler(creds, chat_id, db, events)
-  assert callable(handler)
   import inspect
-  assert inspect.iscoroutinefunction(handler)
+  loop = asyncio.new_event_loop()
+  asyncio.set_event_loop(loop)
+  try:
+    handler = build_permission_handler(creds, chat_id, db, events)
+    assert callable(handler)
+    assert inspect.iscoroutinefunction(handler)
+  finally:
+    asyncio.set_event_loop(None)
+    loop.close()
 
 
 @patch("nemo.cards.build_card", return_value={})
@@ -123,11 +146,8 @@ def test_build_permission_handler_returns_callable():
 @patch("nemo.lark.auth.get_token", return_value="tok_test")
 def test_can_use_tool_approve(_get_tok, _send, _update, _build):
   """Replying 'y' approves the tool (returns PermissionResultAllow)."""
-  creds, chat_id, db, events, sdk = _make_fixtures(reply_text="y")
-  handler = build_permission_handler(creds, chat_id, db, events)
-  result = asyncio.run(
-    handler("Bash", {"command": "rm -rf /"}, None)
-  )
+  fixtures = _make_fixtures(reply_text="y")
+  _, result = _run_with_handler(fixtures)
   assert type(result).__name__ == "PermissionResultAllow"
 
 
@@ -137,11 +157,8 @@ def test_can_use_tool_approve(_get_tok, _send, _update, _build):
 @patch("nemo.lark.auth.get_token", return_value="tok_test")
 def test_can_use_tool_deny(_get_tok, _send, _update, _build):
   """Replying 'n' denies the tool (returns PermissionResultDeny)."""
-  creds, chat_id, db, events, sdk = _make_fixtures(reply_text="n")
-  handler = build_permission_handler(creds, chat_id, db, events)
-  result = asyncio.run(
-    handler("Bash", {"command": "ls"}, None)
-  )
+  fixtures = _make_fixtures(reply_text="n")
+  _, result = _run_with_handler(fixtures)
   assert type(result).__name__ == "PermissionResultDeny"
 
 
@@ -151,11 +168,19 @@ def test_can_use_tool_deny(_get_tok, _send, _update, _build):
 @patch("nemo.lark.auth.get_token", return_value="tok_test")
 def test_can_use_tool_timeout(_get_tok, _send, _update, _build):
   """When next_message returns None (timeout), deny by default."""
-  creds, chat_id, db, events, sdk = _make_fixtures(timeout=True)
-  handler = build_permission_handler(creds, chat_id, db, events)
-  result = asyncio.run(
-    handler("Bash", {"command": "ls"}, None)
-  )
+  import time as _time
+  real_time = _time.time
+  call_count = 0
+
+  def fast_time():
+    nonlocal call_count
+    call_count += 1
+    # After a few calls, jump past the 300s deadline
+    return real_time() + (400 if call_count > 2 else 0)
+
+  fixtures = _make_fixtures(timeout=True)
+  with patch("time.time", side_effect=fast_time):
+    _, result = _run_with_handler(fixtures)
   assert type(result).__name__ == "PermissionResultDeny"
 
 
@@ -165,10 +190,8 @@ def test_can_use_tool_timeout(_get_tok, _send, _update, _build):
 @patch("nemo.lark.auth.get_token", return_value="tok_test")
 def test_can_use_tool_always(_get_tok, _send, _update, _build):
   """Replying 'always' approves and sets autoapprove in db."""
-  creds, chat_id, db, events, sdk = _make_fixtures(reply_text="always")
-  handler = build_permission_handler(creds, chat_id, db, events)
-  result = asyncio.run(
-    handler("Bash", {"command": "ls"}, None)
-  )
+  fixtures = _make_fixtures(reply_text="always")
+  creds, chat_id, db, events, sdk = fixtures
+  _, result = _run_with_handler(fixtures)
   assert type(result).__name__ == "PermissionResultAllow"
   db.set_autoapprove.assert_called_once_with(chat_id, True)

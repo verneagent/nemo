@@ -413,6 +413,10 @@ async def main_loop(
       _turn_start = time.time()
 
       def _on_event(event):
+        # Thread safety: this runs on the SDK thread. It mutates _turn_card_id,
+        # _turn_tools, _turn_texts. The main loop only reads these AFTER
+        # asyncio.wait({sdk_task, ...}) completes, which guarantees all
+        # _on_event calls have finished. No lock needed.
         nonlocal _turn_card_id
         token = lark_auth.get_token(credentials["app_id"], credentials["app_secret"])
 

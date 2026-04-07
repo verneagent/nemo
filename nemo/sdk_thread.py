@@ -131,16 +131,21 @@ class SDKThread:
     options: Any = None,
     max_attempts: int = 3,
   ) -> tuple[float, dict[str, Any]]:
-    """Run turn with automatic reconnect on timeout."""
+    """Run turn with automatic reconnect on timeout.
+
+    On timeout, reconnects and retries. On the last attempt, raises
+    immediately without wasting a reconnect.
+    """
     for attempt in range(max_attempts):
       try:
         return await self.run_turn(prompt, on_event, stale_tasks=stale_tasks)
       except TimeoutError:
-        log.warning("SDK turn hung (attempt %d/%d) — reconnecting", attempt + 1, max_attempts)
-        if options is None:
+        log.warning("SDK turn hung (attempt %d/%d)", attempt + 1, max_attempts)
+        if attempt == max_attempts - 1 or options is None:
           raise
+        log.info("Reconnecting...")
         await self.reconnect(options)
-    raise TimeoutError(f"SDK turn failed after {max_attempts} reconnect attempts")
+    raise TimeoutError(f"SDK turn failed after {max_attempts} attempts")
 
   async def interrupt(self) -> None:
     """Interrupt the current SDK turn."""

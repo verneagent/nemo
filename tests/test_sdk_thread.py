@@ -220,24 +220,19 @@ class TestRunTurnWithReconnect:
   # 6. Off-by-one: last reconnect actually runs a turn
   # ---------------------------------------------------------------------------
 
-  def test_last_reconnect_runs_turn(self, sdk_thread: SDKThread):
-    """With max_attempts=3, there should be 3 turn attempts total.
+  def test_no_reconnect_on_last_attempt(self, sdk_thread: SDKThread):
+    """With max_attempts=3, the last attempt raises without reconnecting.
 
-    The current implementation uses range(max_attempts) which gives attempts
-    0, 1, 2 — three iterations. On attempt 2 (the last), TimeoutError causes
-    reconnect, then the loop ends and raises TimeoutError WITHOUT retrying.
-    This is the off-by-one bug: the last reconnect is wasted.
+    Attempts 0 and 1 timeout → reconnect. Attempt 2 (last) timeout →
+    raises immediately, no wasted reconnect.
     """
     turn_calls = 0
     reconnect_calls = 0
-    expected = (1.0, {})
 
     async def fake_turn(prompt, on_event, stale_tasks=None):
       nonlocal turn_calls
       turn_calls += 1
-      if turn_calls < 4:
-        raise TimeoutError("hung")
-      return expected
+      raise TimeoutError("hung")
 
     async def fake_reconnect(options):
       nonlocal reconnect_calls
@@ -251,12 +246,10 @@ class TestRunTurnWithReconnect:
             options=mock.MagicMock(), max_attempts=3,
           ))
 
-    # With max_attempts=3, we get exactly 3 turn calls (attempts 0, 1, 2).
-    # After attempt 2 times out, reconnect runs but the loop ends — no 4th turn.
+    # 3 turn attempts total
     assert turn_calls == 3
-    # Reconnect is called after each timeout including the last one,
-    # but the loop exits before using that fresh connection.
-    assert reconnect_calls == 3
+    # Only 2 reconnects (after attempts 0 and 1, NOT after the last)
+    assert reconnect_calls == 2
 
   def test_succeeds_on_last_attempt(self, sdk_thread: SDKThread):
     """If the turn succeeds on the last attempt, result is returned."""
