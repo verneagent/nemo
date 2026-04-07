@@ -83,6 +83,9 @@ def build_permission_handler(
     events_source.push_back(msg)
 
   async def can_use_tool(tool_name: str, tool_input: dict[str, Any], _context: Any) -> Any:
+    log.debug("can_use_tool: %s %s", tool_name,
+              {k: str(v)[:80] for k, v in tool_input.items()})
+
     # Auto-approve internals
     if is_auto_approve(tool_name, tool_input):
       return PermissionResultAllow()

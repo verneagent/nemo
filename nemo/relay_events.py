@@ -96,6 +96,7 @@ class RelayEventStream:
         self._running = False
         self._bg_thread: threading.Thread | None = None
         self._since = ""
+        self._ws: Any = None  # Current WS connection (for force-close)
         self.permission_active: bool = False
 
     # --- WebSocket approach (preferred) ---
@@ -120,7 +121,8 @@ class RelayEventStream:
             try:
                 with ws_client.connect(self._ws_url(),
                                        additional_headers=headers,
-                                       close_timeout=5) as ws:
+                                       close_timeout=2) as ws:
+                    self._ws = ws  # Save for force-close on shutdown
                     log.info("WS connected to relay")
                     # Ping every 30s to keep alive
                     ws.recv_bufsize = 1024 * 1024
@@ -249,9 +251,16 @@ class RelayEventStream:
     async def close(self) -> None:
         """Stop the background connection."""
         self._running = False
+        # Force-close WebSocket to unblock recv()
+        ws = self._ws
+        if ws:
+            try:
+                ws.close()
+            except Exception:
+                pass
         await self._queue.put(LarkEvent(event_type="_stop"))
         if self._bg_thread:
-            self._bg_thread.join(timeout=5)
+            self._bg_thread.join(timeout=2)
         log.info("RelayEventStream stopped")
 
     async def next_message(self, timeout: float = 300) -> LarkEvent | None:

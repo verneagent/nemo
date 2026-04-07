@@ -627,15 +627,20 @@ async def main_loop(
       await _heartbeat_task
     except asyncio.CancelledError:
       pass
-  await sdk.close_client()
-  sdk.stop()
-  await events.close()
+  # Close SDK and event stream concurrently
+  await asyncio.gather(sdk.close_client(), events.close(), return_exceptions=True)
+  sdk.stop()  # Joins thread (up to 2s, but usually instant after close_client)
   db.deactivate(session_id)
   db.close()
   if not sidecar:
     from .workspace import release_group
-    release_group(token, chat_id)
-    status_tab.update_status(token, chat_id, model, "stopped")
+    # Run Lark API calls in a thread pool to avoid blocking
+    loop = asyncio.get_event_loop()
+    await asyncio.gather(
+      loop.run_in_executor(None, release_group, token, chat_id),
+      loop.run_in_executor(None, status_tab.update_status, token, chat_id, model, "stopped"),
+      return_exceptions=True,
+    )
   if _dissolve_on_exit:
     try:
       token = lark_auth.get_token(credentials["app_id"], credentials["app_secret"])
