@@ -137,7 +137,7 @@ async def run_turn(
     except StopAsyncIteration:
       break
     msg_count += 1
-    log.debug("turn msg: %s", type(message).__name__)
+    log.info("turn msg: %s", type(message).__name__)
 
     # --- Stale task detection (SDK bug #788 workaround) ---
     if isinstance(message, TaskNotificationMessage) and message.task_id in stale_tasks:
@@ -226,5 +226,6 @@ async def run_turn(
       stale_tasks=stale_tasks, _retry=_retry + 1,
     )
 
+  log.info("turn done (cost=%.4f)", cost)
   on_event(DoneEvent(cost=cost, usage=usage))
   return cost, usage

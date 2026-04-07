@@ -54,6 +54,9 @@ def main():
   parser.add_argument("--model", default="claude-opus-4-6", help="Model to use")
   parser.add_argument("--sidecar", action="store_true", default=False,
                       help="Sidecar mode: only respond to @mentions, replies, reactions")
+  parser.add_argument("--permission-mode", default="bypassPermissions",
+                      choices=["default", "acceptEdits", "plan", "bypassPermissions"],
+                      help="SDK permission mode (default: bypassPermissions)")
   parser.add_argument("--verbose", "-v", action="store_true", help="Debug logging")
   args = parser.parse_args()
 
@@ -123,7 +126,8 @@ def main():
 
   from .agent import main_loop
   return asyncio.run(main_loop(chat_id, project_dir, args.model,
-                               sidecar=args.sidecar))
+                               sidecar=args.sidecar,
+                               permission_mode=args.permission_mode))
 
 
 if __name__ == "__main__":

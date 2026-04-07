@@ -6,7 +6,7 @@ Wires together:
 - SDK turn execution (turn) — Claude Agent SDK
 - Signal monitoring (monitor) — /esc, handback detection
 - Card presentation (cards) — unified turn card
-- Permission bridge (permissions) — text-based approval
+- Permission bridge (permissions) — button card + reaction approval
 """
 
 from __future__ import annotations
@@ -122,6 +122,7 @@ async def main_loop(
   project_dir: str,
   model: str,
   sidecar: bool = False,
+  permission_mode: str = "bypassPermissions",
 ) -> int:
   """Run the agent main loop."""
   session_id = str(uuid.uuid4())
@@ -240,7 +241,8 @@ async def main_loop(
 
   session_id_ref = [session_id]
   sdk_options = _build_sdk_options(
-    project_dir, model, credentials, chat_id, session_id_ref, db, events)
+    project_dir, model, credentials, chat_id, session_id_ref, db, events,
+    permission_mode=permission_mode)
 
   sdk = SDKThread()
   sdk.start()
@@ -263,7 +265,8 @@ async def main_loop(
   async def _restart_client():
     nonlocal sdk_options
     sdk_options = _build_sdk_options(
-      project_dir, model, credentials, chat_id, session_id_ref, db, events)
+      project_dir, model, credentials, chat_id, session_id_ref, db, events,
+      permission_mode=permission_mode)
     await sdk.reconnect(sdk_options)
 
   # ---- Main loop: event-driven ----
@@ -661,6 +664,7 @@ def _build_sdk_options(
   session_id_ref: list[str],
   db: Database,
   events: LarkEventStream,
+  permission_mode: str = "bypassPermissions",
 ):
   from claude_agent_sdk import ClaudeAgentOptions
 
@@ -689,15 +693,22 @@ def _build_sdk_options(
     if val:
       env[key] = val
 
-  perm_handler = build_permission_handler(credentials, chat_id, db, events)
+  perm_handler = None
+  if permission_mode != "bypassPermissions":
+    perm_handler = build_permission_handler(credentials, chat_id, db, events)
 
   def _stderr_handler(line: str) -> None:
     log.info("[sdk-stderr] %s", line.rstrip())
 
-  return ClaudeAgentOptions(
+  # Cast str to the SDK's Literal type
+  from typing import cast
+  from claude_agent_sdk.types import PermissionMode
+  perm_mode = cast(PermissionMode, permission_mode)
+
+  opts: dict = dict(
     allowed_tools=["Agent", "Skill", "Read", "Write", "Edit", "Bash", "Glob", "Grep"],
     setting_sources=["user", "project"],
-    permission_mode="default",
+    permission_mode=perm_mode,
     system_prompt={
       "type": "preset",
       "preset": "claude_code",
@@ -707,6 +718,9 @@ def _build_sdk_options(
     model=model,
     env=env,
     stderr=_stderr_handler,
-    can_use_tool=perm_handler,
     hooks={},
   )
+  if perm_handler is not None:
+    opts["can_use_tool"] = perm_handler
+
+  return ClaudeAgentOptions(**opts)

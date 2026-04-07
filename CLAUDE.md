@@ -176,8 +176,8 @@ with open("~/.nemo/config.json") as f:
     nemo = json.load(f)
 app_id, app_secret = nemo["app_id"], nemo["app_secret"]
 
-# Step 1: Device authorization
-body = f"client_id={app_id}&client_secret={app_secret}&scope=im:message.send_as_user".encode()
+# Step 1: Device authorization (offline_access enables refresh_token)
+body = f"client_id={app_id}&client_secret={app_secret}&scope=im:message.send_as_user+offline_access".encode()
 req = urllib.request.Request(
     "https://accounts.larksuite.com/oauth/v1/device_authorization",
     data=body, headers={"Content-Type": "application/x-www-form-urlencoded"}
