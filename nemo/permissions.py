@@ -106,6 +106,7 @@ def build_permission_handler(
       color="yellow",
     )
     msg_id = send_card(token, chat_id, card)
+    log.info("Permission request: %s (card=%s)", tool_name, msg_id)
 
     # Wait for text reply — bridge to main loop for queue reads
     import time as _time
@@ -176,6 +177,8 @@ def build_permission_handler(
 
     if decision is None:
       decision = "deny"  # Timeout or unrecognized = deny
+
+    log.info("Permission decision: %s for %s", decision, tool_name)
 
     # Update card with decision
     try:

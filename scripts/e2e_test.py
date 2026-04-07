@@ -6,26 +6,26 @@ via the Lark IM API. Designed to be run by a human or AI agent after major
 code changes.
 
 Usage:
-    python3 scripts/e2e_test.py [--chat CHAT_ID] [--skip-sdk] [--verbose]
-    python3 scripts/e2e_test.py --stress     # only stale-task stress test
-    python3 scripts/e2e_test.py --project    # only multi-turn project test
+    python3 scripts/e2e_test.py                 # full run (all phases)
+    python3 scripts/e2e_test.py --skip-sdk       # commands only (fast)
+    python3 scripts/e2e_test.py --stress         # stale-task stress only
+    python3 scripts/e2e_test.py --project        # multi-turn project only
+    python3 scripts/e2e_test.py --perm           # permission flow only
+    python3 scripts/e2e_test.py --dual           # dual-instance only
+    python3 scripts/e2e_test.py --verbose        # debug nemo logging
+    python3 scripts/e2e_test.py --chat <ID>      # custom chat group
 
 Prerequisites:
-    - ~/.nemo/config.json (app_id, app_secret, relay_url)
-    - ~/.nemo/user_token.json (2h TTL — refreshed automatically if possible)
+    - ~/.nemo/config.json (app_id, app_secret, relay_url, email)
+    - ~/.nemo/user_token.json (2h TTL — refreshed automatically)
     - Relay server running (http://47.95.232.145)
-
-The script handles:
-    - Token refresh (fails gracefully if refresh_token expired)
-    - Starting/stopping nemo processes
-    - Evicting stale nemo instances
-    - Verifying responses via Lark API (not log files)
 """
 
 from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -58,7 +58,9 @@ class Colors:
   GREEN = "\033[92m"
   RED = "\033[91m"
   YELLOW = "\033[93m"
+  CYAN = "\033[96m"
   BOLD = "\033[1m"
+  DIM = "\033[2m"
   RESET = "\033[0m"
 
 
@@ -70,12 +72,12 @@ def _load_config() -> dict:
 def _load_user_token() -> str:
   with open(TOKEN_PATH) as f:
     tok = json.load(f)
-  # Check if expired
   saved = tok.get("saved_at", 0)
   expires = tok.get("expires_in", 7200)
   remaining = (saved + expires) - time.time()
   if remaining < 60:
-    print(f"{Colors.YELLOW}User token expired ({remaining:.0f}s remaining), refreshing...{Colors.RESET}")
+    print(f"{Colors.YELLOW}User token expired ({remaining:.0f}s remaining), "
+          f"refreshing...{Colors.RESET}")
     _refresh_token()
     with open(TOKEN_PATH) as f:
       tok = json.load(f)
@@ -83,7 +85,6 @@ def _load_user_token() -> str:
 
 
 def _refresh_token() -> None:
-  """Refresh user token using refresh_token grant."""
   cfg = _load_config()
   with open(TOKEN_PATH) as f:
     tok = json.load(f)
@@ -125,7 +126,8 @@ def send_msg(text: str, chat_id: str) -> str:
     "content": json.dumps({"text": text}),
   }).encode()
   req = urllib.request.Request(
-    f"https://open.larksuite.com/open-apis/im/v1/messages?receive_id_type=chat_id",
+    "https://open.larksuite.com/open-apis/im/v1/messages"
+    "?receive_id_type=chat_id",
     data=data, method="POST")
   req.add_header("Authorization", f"Bearer {token}")
   req.add_header("Content-Type", "application/json")
@@ -135,7 +137,7 @@ def send_msg(text: str, chat_id: str) -> str:
 
 
 def get_latest_bot_msg(chat_id: str, after: str = "0") -> dict | None:
-  """Get the latest bot message from the Lark group after a timestamp."""
+  """Get the latest bot message after a timestamp."""
   token = _get_bot_token()
   req = urllib.request.Request(
     f"https://open.larksuite.com/open-apis/im/v1/messages"
@@ -195,16 +197,79 @@ def wait_for_response(chat_id: str, after: str,
   return None, time.time() - start
 
 
-def read_log(pid: int, last_n: int = 50) -> str:
-  """Read recent lines from nemo's per-PID log file."""
-  log_path = os.path.join(LOG_DIR, f"nemo-{pid}.log")
-  try:
-    with open(log_path) as f:
-      lines = f.readlines()
-    return "".join(lines[-last_n:])
-  except FileNotFoundError:
-    return ""
+# ---------------------------------------------------------------------------
+# Log analyzer
+# ---------------------------------------------------------------------------
 
+class LogAnalyzer:
+  """Structured log file reader for a nemo instance."""
+
+  def __init__(self, pid: int):
+    self.pid = pid
+    self.path = os.path.join(LOG_DIR, f"nemo-{pid}.log")
+
+  def read(self, last_n: int = 200) -> str:
+    try:
+      with open(self.path) as f:
+        lines = f.readlines()
+      return "".join(lines[-last_n:])
+    except FileNotFoundError:
+      return ""
+
+  def lines(self, last_n: int = 200) -> list[str]:
+    try:
+      with open(self.path) as f:
+        return f.readlines()[-last_n:]
+    except FileNotFoundError:
+      return []
+
+  def count(self, pattern: str, last_n: int = 500) -> int:
+    """Count lines matching pattern (substring or regex)."""
+    return len(self.find(pattern, last_n))
+
+  def find(self, pattern: str, last_n: int = 500) -> list[str]:
+    """Find all lines matching pattern."""
+    lines = self.lines(last_n)
+    try:
+      rx = re.compile(pattern)
+      return [l for l in lines if rx.search(l)]
+    except re.error:
+      return [l for l in lines if pattern in l]
+
+  def wait_for(self, pattern: str, timeout: int = 30, poll: float = 1) -> bool:
+    """Poll log until pattern appears. Returns True if found."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+      if self.count(pattern, last_n=50) > 0:
+        return True
+      time.sleep(poll)
+    return False
+
+  def errors(self, last_n: int = 200) -> list[str]:
+    """Find ERROR-level log lines."""
+    return [l for l in self.lines(last_n) if " ERROR " in l or "Error:" in l]
+
+  def processing_sequence(self) -> list[str]:
+    """Extract ordered list of 'Processing: ...' messages."""
+    result = []
+    for line in self.lines(500):
+      m = re.search(r"Processing: (.+)", line)
+      if m:
+        result.append(m.group(1).strip())
+    return result
+
+  def dump_tail(self, n: int = 20, label: str = "") -> None:
+    """Print last N lines for debugging."""
+    tag = f" [{label}]" if label else ""
+    print(f"{Colors.DIM}    --- log tail{tag} ---{Colors.RESET}")
+    for line in self.lines(n):
+      print(f"    {Colors.DIM}{line.rstrip()}{Colors.RESET}")
+    print(f"{Colors.DIM}    --- end ---{Colors.RESET}")
+
+
+# ---------------------------------------------------------------------------
+# Process management
+# ---------------------------------------------------------------------------
 
 def start_nemo(chat_id: str, verbose: bool = False) -> int:
   """Start a nemo process. Returns PID."""
@@ -219,13 +284,8 @@ def start_nemo(chat_id: str, verbose: bool = False) -> int:
 
 def wait_for_ready(pid: int, timeout: int = 30) -> bool:
   """Wait for nemo to log 'SDK client connected'."""
-  deadline = time.time() + timeout
-  while time.time() < deadline:
-    log = read_log(pid)
-    if "SDK client connected" in log:
-      return True
-    time.sleep(1)
-  return False
+  log = LogAnalyzer(pid)
+  return log.wait_for("SDK client connected", timeout=timeout)
 
 
 def is_alive(pid: int) -> bool:
@@ -237,7 +297,6 @@ def is_alive(pid: int) -> bool:
 
 
 def wait_for_exit(pid: int, timeout: int = 25) -> bool:
-  """Wait for process to exit."""
   deadline = time.time() + timeout
   while time.time() < deadline:
     if not is_alive(pid):
@@ -247,13 +306,47 @@ def wait_for_exit(pid: int, timeout: int = 25) -> bool:
 
 
 def kill_nemo(pid: int) -> None:
-  """Kill nemo process."""
   try:
     os.kill(pid, signal.SIGTERM)
     if not wait_for_exit(pid, timeout=5):
       os.kill(pid, signal.SIGKILL)
   except (OSError, ProcessLookupError):
     pass
+
+
+# ---------------------------------------------------------------------------
+# Lark group management (for dual-instance test)
+# ---------------------------------------------------------------------------
+
+def create_temp_group(name: str) -> str | None:
+  """Create a temporary Lark group. Returns chat_id."""
+  from nemo.lark.api import create_chat, add_chat_members, lookup_open_id_by_email
+  token = _get_bot_token()
+  try:
+    chat_id = create_chat(token, name, description="E2E test temp group")
+  except Exception as e:
+    print(f"{Colors.RED}  Failed to create temp group: {e}{Colors.RESET}")
+    return None
+
+  # Add operator so they can send messages
+  cfg = _load_config()
+  email = cfg.get("email", "")
+  if email:
+    try:
+      open_id = lookup_open_id_by_email(token, email)
+      if open_id:
+        add_chat_members(token, chat_id, [open_id])
+    except Exception as e:
+      print(f"{Colors.YELLOW}  Failed to add operator to temp group: {e}{Colors.RESET}")
+  return chat_id
+
+
+def dissolve_temp_group(chat_id: str) -> None:
+  from nemo.lark.api import dissolve_chat
+  try:
+    dissolve_chat(_get_bot_token(), chat_id)
+  except Exception as e:
+    print(f"{Colors.YELLOW}  Failed to dissolve temp group: {e}{Colors.RESET}")
 
 
 # ---------------------------------------------------------------------------
@@ -315,21 +408,21 @@ def run_sdk_test(name: str, text: str, pid: int, chat_id: str,
   send_msg(text, chat_id)
   time.sleep(wait)
   msg = get_latest_bot_msg(chat_id, after=ts)
-  log = read_log(pid)
+  log = LogAnalyzer(pid)
   if msg and msg["time"] > ts:
-    if expect_log and expect_log not in log:
+    if expect_log and log.count(expect_log, last_n=30) == 0:
       result.ok(name, "card ok, log check skipped")
     else:
       result.ok(name)
   else:
     result.fail(name, "no response")
+    log.dump_tail(10, name)
 
 
 # ---------------------------------------------------------------------------
 # Phase 5: Stale Task Notification Stress Test
 # ---------------------------------------------------------------------------
 
-# Prompts designed to trigger multiple concurrent Agent spawns
 AGENT_PROMPTS = [
   (
     "Do these 3 tasks IN PARALLEL using separate agents (not sequentially):\n"
@@ -359,25 +452,27 @@ def run_stale_task_stress(pid: int, chat_id: str, result: TestResult,
                           rounds: int = 3) -> None:
   """Phase 5: trigger multi-agent turns and verify stale task handling."""
   print(f"{Colors.BOLD}Phase 5: Stale Task Stress Test{Colors.RESET}")
+  log = LogAnalyzer(pid)
 
-  # Enable auto-approve so Agent tool calls don't block on permissions
+  # Enable auto-approve so Agent tool calls don't block
   run_command_test("T20 autoapprove", "autoapprove on", chat_id, result, wait=5)
 
   for i in range(rounds):
     prompt = AGENT_PROMPTS[i % len(AGENT_PROMPTS)]
     tag = f"R{i+1}"
 
-    # Step 1: Send multi-agent prompt
+    # Step 1: multi-agent prompt
     print(f"  [{tag}] Sending multi-agent prompt...")
     ts = str(int(time.time() * 1000))
     send_msg(prompt, chat_id)
     msg, elapsed = wait_for_response(chat_id, after=ts, timeout=180)
     if not msg:
       result.fail(f"T21 multi-agent {tag}", "timeout 180s")
+      log.dump_tail(15, f"multi-agent {tag}")
       continue
     result.ok(f"T21 multi-agent {tag}", f"{elapsed:.0f}s")
 
-    # Step 2: Immediately send simple follow-up
+    # Step 2: immediate follow-up
     time.sleep(2)
     ts2 = str(int(time.time() * 1000))
     send_msg(f"What is {i+2}+{i+3}? Just the number, nothing else.", chat_id)
@@ -385,10 +480,7 @@ def run_stale_task_stress(pid: int, chat_id: str, result: TestResult,
 
     if not msg2:
       result.fail(f"T22 follow-up {tag}", "timeout — likely stale task hang")
-      # Check log for clues
-      log = read_log(pid, last_n=50)
-      if "Stale TaskNotification" in log:
-        print(f"    Log shows stale task detected but response hung")
+      log.dump_tail(15, f"follow-up {tag}")
       continue
 
     if elapsed2 > 45:
@@ -397,19 +489,18 @@ def run_stale_task_stress(pid: int, chat_id: str, result: TestResult,
     else:
       result.ok(f"T22 follow-up {tag}", f"{elapsed2:.0f}s")
 
-    # Step 3: Check for duplicate responses (should be exactly 1 card)
+    # Step 3: duplicate check
     msgs = get_bot_msgs(chat_id, after=ts2)
     if len(msgs) > 2:
-      result.fail(f"T23 no-dup {tag}", f"got {len(msgs)} bot messages (expect 1-2)")
+      result.fail(f"T23 no-dup {tag}", f"got {len(msgs)} bot msgs (expect 1-2)")
     else:
       result.ok(f"T23 no-dup {tag}", f"{len(msgs)} msg(s)")
 
-  # Summary: check log for stale task handling stats
-  log = read_log(pid, last_n=200)
+  # Summary from logs
   stale_count = log.count("Stale TaskNotification")
   requery_count = log.count("Stale turn")
-  task_started = log.count("TaskStartedEvent") + log.count("TaskStartedMessage")
-  detail = f"tasks={task_started} stale={stale_count} re-queries={requery_count}"
+  task_lines = log.find("TaskStarted")
+  detail = f"tasks={len(task_lines)} stale={stale_count} re-queries={requery_count}"
   if stale_count > 0:
     result.ok("T24 stale handling", detail)
   else:
@@ -455,7 +546,8 @@ PROJECT_STEPS = [
   },
   {
     "name": "T34 run tests",
-    "msg": "Run `python -m pytest test_calc.py -v` and fix any failures. Show final output.",
+    "msg": "Run `python -m pytest test_calc.py -v` and fix any failures. "
+           "Show final output.",
     "check_files": [],
     "timeout": 120,
   },
@@ -486,7 +578,7 @@ def run_project_flow(_pid: int, chat_id: str, result: TestResult) -> None:
   print(f"  Temp dir: {tmpdir}")
 
   try:
-    # T30: /cd to temp dir
+    # T30: /cd
     ts = str(int(time.time() * 1000))
     send_msg(f"/cd {tmpdir}", chat_id)
     msg, elapsed = wait_for_response(chat_id, after=ts, timeout=15)
@@ -496,16 +588,15 @@ def run_project_flow(_pid: int, chat_id: str, result: TestResult) -> None:
       result.fail("T30 /cd", "no response")
       return
 
-    # Enable auto-approve (Write/Edit/Bash need it)
-    run_command_test("T30a autoapprove", "autoapprove on", chat_id, result, wait=5)
+    # Enable auto-approve for Write/Edit/Bash
+    run_command_test("T30a autoapprove", "autoapprove on",
+                     chat_id, result, wait=5)
 
-    # Run each project step
     for step in PROJECT_STEPS:
       name = step["name"]
       ts = str(int(time.time() * 1000))
       print(f"  [{name}] Sending...")
       send_msg(step["msg"], chat_id)
-
       msg, elapsed = wait_for_response(
         chat_id, after=ts, timeout=step["timeout"])
 
@@ -513,44 +604,38 @@ def run_project_flow(_pid: int, chat_id: str, result: TestResult) -> None:
         result.fail(name, f"timeout after {step['timeout']}s")
         continue
 
-      # Check response timing
       if elapsed > step["timeout"] * 0.9:
         result.fail(name, f"nearly timed out ({elapsed:.0f}s)")
         continue
 
-      # Check expected files
       missing = [
         f for f in step.get("check_files", [])
         if not os.path.exists(os.path.join(tmpdir, f))
       ]
       if missing:
-        result.fail(name, f"missing files: {missing} ({elapsed:.0f}s)")
+        result.fail(name, f"missing: {missing} ({elapsed:.0f}s)")
       else:
         result.ok(name, f"{elapsed:.0f}s")
 
-      # Check for duplicate responses
-      msgs = get_bot_msgs(chat_id, after=ts)
-      if len(msgs) > 3:  # working card + done card + maybe ack
-        print(f"    {Colors.YELLOW}WARN: {len(msgs)} bot messages for this turn{Colors.RESET}")
-
-    # T36: verify project files exist
+    # T36: verify project files
     existing = [f for f in os.listdir(tmpdir) if f.endswith(".py")]
     if "main.py" in existing:
-      result.ok("T36 project files", f"{len(existing)} .py files: {existing}")
+      result.ok("T36 project files", f"{len(existing)} .py: {existing}")
     else:
-      result.fail("T36 project files", f"main.py not found, got: {existing}")
+      result.fail("T36 project files", f"main.py missing, got: {existing}")
 
-    # T37: context continuity — ask about previous work
+    # T37: context continuity
     ts = str(int(time.time() * 1000))
-    send_msg("What Python files exist in the current directory? Just list them.", chat_id)
+    send_msg("What Python files exist in the current directory? Just list them.",
+             chat_id)
     msg, elapsed = wait_for_response(chat_id, after=ts, timeout=30)
     if msg:
       result.ok("T37 context", f"{elapsed:.0f}s")
     else:
-      result.fail("T37 context", "no response — possible hang")
+      result.fail("T37 context", "no response")
 
-    # T38: rapid-fire — send 3 quick messages and verify 3 responses
-    print(f"  [T38] Rapid-fire test (3 messages)...")
+    # T38: rapid-fire
+    print(f"  [T38] Rapid-fire (3 messages)...")
     timestamps = []
     questions = [
       "How many lines is main.py? Just the number.",
@@ -561,24 +646,291 @@ def run_project_flow(_pid: int, chat_id: str, result: TestResult) -> None:
       ts = str(int(time.time() * 1000))
       timestamps.append(ts)
       send_msg(q, chat_id)
-      time.sleep(1)  # small gap so relay ordering is correct
+      time.sleep(1)
 
-    # Wait for all 3 responses
     time.sleep(45)
     all_ok = True
     for j, ts in enumerate(timestamps):
       msg = get_latest_bot_msg(chat_id, after=ts)
       if not msg:
-        result.fail(f"T38 rapid-fire Q{j+1}", "no response")
+        result.fail(f"T38 rapid Q{j+1}", "no response")
         all_ok = False
     if all_ok:
       result.ok("T38 rapid-fire", "all 3 responses received")
 
   finally:
-    # /cd back to original project dir
     send_msg(f"/cd {PROJECT_DIR}", chat_id)
     time.sleep(5)
-    # Cleanup temp dir
+    shutil.rmtree(tmpdir, ignore_errors=True)
+
+  print()
+
+
+# ---------------------------------------------------------------------------
+# Phase 7: Permission Flow
+# ---------------------------------------------------------------------------
+
+def run_permission_tests(pid: int, chat_id: str,
+                         result: TestResult) -> None:
+  """Phase 7: test approve / deny / always permission flow."""
+  print(f"{Colors.BOLD}Phase 7: Permission Flow{Colors.RESET}")
+  log = LogAnalyzer(pid)
+
+  tmpdir = tempfile.mkdtemp(prefix="nemo-perm-")
+  print(f"  Temp dir: {tmpdir}")
+
+  # Switch to temp dir
+  ts = str(int(time.time() * 1000))
+  send_msg(f"/cd {tmpdir}", chat_id)
+  wait_for_response(chat_id, after=ts, timeout=15)
+
+  # Ensure autoapprove is OFF
+  send_msg("autoapprove off", chat_id)
+  time.sleep(5)
+
+  try:
+    # T40: Approve ("y")
+    ts = str(int(time.time() * 1000))
+    send_msg(
+      "Create a file named approve_test.txt containing exactly 'approved'.",
+      chat_id)
+    # Wait for permission card in log
+    if log.wait_for("Permission request:", timeout=45):
+      time.sleep(1)
+      send_msg("y", chat_id)
+      msg, elapsed = wait_for_response(chat_id, after=ts, timeout=60)
+      if msg and os.path.exists(os.path.join(tmpdir, "approve_test.txt")):
+        result.ok("T40 perm approve", f"{elapsed:.0f}s")
+      elif msg:
+        result.fail("T40 perm approve", "responded but file not created")
+      else:
+        result.fail("T40 perm approve", "no response after approve")
+        log.dump_tail(15, "perm approve")
+    else:
+      # Permission wasn't requested — might have been auto-approved
+      msg, elapsed = wait_for_response(chat_id, after=ts, timeout=30)
+      if msg and os.path.exists(os.path.join(tmpdir, "approve_test.txt")):
+        result.ok("T40 perm approve", f"auto-approved ({elapsed:.0f}s)")
+      else:
+        result.fail("T40 perm approve", "no permission card and no result")
+        log.dump_tail(15, "perm approve")
+
+    # T41: Deny ("n")
+    ts = str(int(time.time() * 1000))
+    send_msg(
+      "Create a file named deny_test.txt containing 'should-not-exist'.",
+      chat_id)
+    if log.wait_for("Permission request:", timeout=45):
+      time.sleep(1)
+      send_msg("n", chat_id)
+      # Wait for turn to complete (denied turn should finish quickly)
+      time.sleep(15)
+      if not os.path.exists(os.path.join(tmpdir, "deny_test.txt")):
+        # Check log for denial
+        if log.count("Permission decision: deny", last_n=30) > 0:
+          result.ok("T41 perm deny", "denied, file not created")
+        else:
+          result.ok("T41 perm deny", "file not created (no deny log)")
+      else:
+        result.fail("T41 perm deny", "file should not exist!")
+    else:
+      result.skip("T41 perm deny", "no permission card appeared")
+
+    # Wait for any residual turn to finish
+    time.sleep(10)
+
+    # T42: Always ("always")
+    ts = str(int(time.time() * 1000))
+    send_msg(
+      "Create a file named always_test.txt containing 'always-approved'.",
+      chat_id)
+    if log.wait_for("Permission request:", timeout=45):
+      time.sleep(1)
+      send_msg("always", chat_id)
+      msg, elapsed = wait_for_response(chat_id, after=ts, timeout=60)
+      if msg and os.path.exists(os.path.join(tmpdir, "always_test.txt")):
+        result.ok("T42 perm always", f"{elapsed:.0f}s")
+      elif msg:
+        result.fail("T42 perm always", "responded but file not created")
+      else:
+        result.fail("T42 perm always", "no response")
+        log.dump_tail(15, "perm always")
+    else:
+      result.skip("T42 perm always", "no permission card appeared")
+
+    # T43: Auto-approve should be ON after "always"
+    ts = str(int(time.time() * 1000))
+    send_msg(
+      "Create a file named auto_test.txt containing 'auto-approved'.",
+      chat_id)
+    msg, elapsed = wait_for_response(chat_id, after=ts, timeout=45)
+    # Should NOT show permission card (auto-approved)
+    perm_after = log.count("Permission request:.*auto_test", last_n=20)
+    if msg and os.path.exists(os.path.join(tmpdir, "auto_test.txt")):
+      if perm_after == 0:
+        result.ok("T43 auto-approve", f"no prompt ({elapsed:.0f}s)")
+      else:
+        result.ok("T43 auto-approve", f"file created but still prompted ({elapsed:.0f}s)")
+    else:
+      result.fail("T43 auto-approve", "file not created or no response")
+
+    # Reset autoapprove
+    send_msg("autoapprove off", chat_id)
+    time.sleep(3)
+
+  finally:
+    send_msg(f"/cd {PROJECT_DIR}", chat_id)
+    time.sleep(5)
+    shutil.rmtree(tmpdir, ignore_errors=True)
+
+  print()
+
+
+# ---------------------------------------------------------------------------
+# Phase 8: Dual-Instance (same dir, two groups)
+# ---------------------------------------------------------------------------
+
+def run_dual_instance(chat_id_a: str, result: TestResult,
+                      verbose: bool = False) -> None:
+  """Phase 8: two nemo instances on same project dir, different groups."""
+  print(f"{Colors.BOLD}Phase 8: Dual-Instance Test{Colors.RESET}")
+
+  # T50: Create second group
+  chat_id_b = create_temp_group("nemo-e2e-dual")
+  if not chat_id_b:
+    result.fail("T50 create group B", "failed to create")
+    return
+  result.ok("T50 create group B", chat_id_b[:20])
+
+  pid_a = 0
+  pid_b = 0
+  tmpdir = tempfile.mkdtemp(prefix="nemo-dual-")
+  subprocess.run(["git", "init", tmpdir], capture_output=True)
+  subprocess.run(
+    ["git", "-C", tmpdir, "config", "user.email", "test@test.com"],
+    capture_output=True)
+  subprocess.run(
+    ["git", "-C", tmpdir, "config", "user.name", "Test"],
+    capture_output=True)
+  # Create a shared file to read
+  with open(os.path.join(tmpdir, "shared.txt"), "w") as f:
+    f.write("dual-instance test\n")
+
+  try:
+    # T51: Start two nemo instances (both use same project dir via /cd)
+    pid_a = start_nemo(chat_id_a, verbose=verbose)
+    pid_b = start_nemo(chat_id_b, verbose=verbose)
+    log_a = LogAnalyzer(pid_a)
+    log_b = LogAnalyzer(pid_b)
+    print(f"  Nemo A: PID={pid_a} chat={chat_id_a[:20]}")
+    print(f"  Nemo B: PID={pid_b} chat={chat_id_b[:20]}")
+
+    ready_a = wait_for_ready(pid_a, timeout=30)
+    ready_b = wait_for_ready(pid_b, timeout=30)
+    if ready_a and ready_b:
+      result.ok("T51 both started", f"A={pid_a} B={pid_b}")
+    else:
+      detail = f"A={'ok' if ready_a else 'FAIL'} B={'ok' if ready_b else 'FAIL'}"
+      result.fail("T51 both started", detail)
+      if not ready_a:
+        log_a.dump_tail(10, "nemo A")
+      if not ready_b:
+        log_b.dump_tail(10, "nemo B")
+      return
+
+    # /cd both to the shared tmpdir
+    for cid in [chat_id_a, chat_id_b]:
+      ts = str(int(time.time() * 1000))
+      send_msg(f"/cd {tmpdir}", cid)
+      wait_for_response(cid, after=ts, timeout=15)
+    # Enable autoapprove on both
+    for cid in [chat_id_a, chat_id_b]:
+      send_msg("autoapprove on", cid)
+      time.sleep(3)
+
+    # T52: Both respond to ping
+    ts_a = str(int(time.time() * 1000))
+    ts_b = str(int(time.time() * 1000))
+    send_msg("ping", chat_id_a)
+    send_msg("ping", chat_id_b)
+    time.sleep(5)
+    msg_a = get_latest_bot_msg(chat_id_a, after=ts_a)
+    msg_b = get_latest_bot_msg(chat_id_b, after=ts_b)
+    if msg_a and msg_b:
+      result.ok("T52 both ping")
+    else:
+      result.fail("T52 both ping",
+                  f"A={'ok' if msg_a else 'FAIL'} B={'ok' if msg_b else 'FAIL'}")
+
+    # T53: Concurrent reads
+    ts_a = str(int(time.time() * 1000))
+    ts_b = str(int(time.time() * 1000))
+    send_msg("Read shared.txt and tell me what it says.", chat_id_a)
+    send_msg("Read shared.txt and tell me what it says.", chat_id_b)
+    msg_a, el_a = wait_for_response(chat_id_a, after=ts_a, timeout=30)
+    msg_b, el_b = wait_for_response(chat_id_b, after=ts_b, timeout=30)
+    if msg_a and msg_b:
+      result.ok("T53 concurrent reads", f"A={el_a:.0f}s B={el_b:.0f}s")
+    else:
+      result.fail("T53 concurrent reads",
+                  f"A={'ok' if msg_a else 'FAIL'} B={'ok' if msg_b else 'FAIL'}")
+
+    # T54: Concurrent writes (different files)
+    ts_a = str(int(time.time() * 1000))
+    ts_b = str(int(time.time() * 1000))
+    send_msg("Create a file named from_a.txt containing 'written by A'.",
+             chat_id_a)
+    send_msg("Create a file named from_b.txt containing 'written by B'.",
+             chat_id_b)
+    msg_a, el_a = wait_for_response(chat_id_a, after=ts_a, timeout=60)
+    msg_b, el_b = wait_for_response(chat_id_b, after=ts_b, timeout=60)
+    file_a = os.path.exists(os.path.join(tmpdir, "from_a.txt"))
+    file_b = os.path.exists(os.path.join(tmpdir, "from_b.txt"))
+    if file_a and file_b:
+      result.ok("T54 concurrent writes",
+                f"both created (A={el_a:.0f}s B={el_b:.0f}s)")
+    else:
+      result.fail("T54 concurrent writes",
+                  f"A={file_a} B={file_b}")
+
+    # T55: Log isolation — each PID log should only have its own chat
+    errors_a = [l for l in log_a.lines(200) if chat_id_b in l]
+    errors_b = [l for l in log_b.lines(200) if chat_id_a in l]
+    if not errors_a and not errors_b:
+      result.ok("T55 log isolation", "no cross-chat entries")
+    else:
+      result.fail("T55 log isolation",
+                  f"A has {len(errors_a)} B-entries, "
+                  f"B has {len(errors_b)} A-entries")
+
+    # T56: No errors in either log
+    errs_a = log_a.errors()
+    errs_b = log_b.errors()
+    if not errs_a and not errs_b:
+      result.ok("T56 no errors", "both logs clean")
+    else:
+      detail = f"A={len(errs_a)} errors, B={len(errs_b)} errors"
+      result.fail("T56 no errors", detail)
+      if errs_a:
+        print(f"    Nemo A errors:")
+        for e in errs_a[:3]:
+          print(f"      {e.strip()}")
+      if errs_b:
+        print(f"    Nemo B errors:")
+        for e in errs_b[:3]:
+          print(f"      {e.strip()}")
+
+  finally:
+    # Cleanup
+    for cid, p in [(chat_id_a, pid_a), (chat_id_b, pid_b)]:
+      if p:
+        send_msg("/exit", cid)
+    time.sleep(5)
+    for p in [pid_a, pid_b]:
+      if p and is_alive(p):
+        if not wait_for_exit(p, timeout=20):
+          kill_nemo(p)
+    dissolve_temp_group(chat_id_b)
     shutil.rmtree(tmpdir, ignore_errors=True)
 
   print()
@@ -598,23 +950,30 @@ def main():
                       help="Run only stale-task stress test (Phase 5)")
   parser.add_argument("--project", action="store_true",
                       help="Run only multi-turn project test (Phase 6)")
+  parser.add_argument("--perm", action="store_true",
+                      help="Run only permission flow test (Phase 7)")
+  parser.add_argument("--dual", action="store_true",
+                      help="Run only dual-instance test (Phase 8)")
   parser.add_argument("--verbose", "-v", action="store_true",
                       help="Verbose nemo logging")
   args = parser.parse_args()
 
   chat_id = args.chat
   result = TestResult()
-  only_stress = args.stress
-  only_project = args.project
-  run_all = not only_stress and not only_project
+  single_phase = args.stress or args.project or args.perm or args.dual
+  run_all = not single_phase
 
   print(f"{Colors.BOLD}Nemo E2E Test Suite{Colors.RESET}")
   print(f"  Chat: {chat_id}")
   print(f"  Project: {PROJECT_DIR}")
-  if only_stress:
+  if args.stress:
     print(f"  Mode: stress test only")
-  elif only_project:
+  elif args.project:
     print(f"  Mode: project flow only")
+  elif args.perm:
+    print(f"  Mode: permission test only")
+  elif args.dual:
+    print(f"  Mode: dual-instance test only")
   print()
 
   # ---- Phase 0: Setup ----
@@ -634,12 +993,23 @@ def main():
     print(f"{Colors.RED}  User token: FAILED ({e}){Colors.RESET}")
     return 1
 
+  # Dual-instance manages its own processes
+  if args.dual:
+    print()
+    run_dual_instance(chat_id, result, verbose=args.verbose)
+    print()
+    ok = result.summary()
+    return 0 if ok else 1
+
+  # Start nemo for other phases
   print("  Starting nemo...")
   pid = start_nemo(chat_id, verbose=args.verbose)
   print(f"  PID: {pid}")
 
   if not wait_for_ready(pid, timeout=30):
-    print(f"{Colors.RED}  Nemo failed to start (no SDK connection in 30s){Colors.RESET}")
+    print(f"{Colors.RED}  Nemo failed to start (no SDK connection in 30s)"
+          f"{Colors.RESET}")
+    LogAnalyzer(pid).dump_tail(15, "startup")
     kill_nemo(pid)
     return 1
   print("  Nemo ready")
@@ -658,8 +1028,8 @@ def main():
 
       # ---- Phase 2: SDK Turns ----
       if args.skip_sdk:
-        for name in ["T06", "T07", "T08", "T09"]:
-          result.skip(name, "skipped by --skip-sdk")
+        for n in ["T06", "T07", "T08", "T09"]:
+          result.skip(n, "skipped by --skip-sdk")
       else:
         print(f"{Colors.BOLD}Phase 2: SDK Turns{Colors.RESET}")
         run_sdk_test("T06 simple question",
@@ -679,7 +1049,6 @@ def main():
       # ---- Phase 3: Signals ----
       print(f"{Colors.BOLD}Phase 3: Signals & Control{Colors.RESET}")
 
-      # T10: /esc
       if not args.skip_sdk:
         ts = str(int(time.time() * 1000))
         send_msg("Write a 500-word essay about Python history", chat_id)
@@ -697,17 +1066,14 @@ def main():
       else:
         result.skip("T10 /esc interrupt", "skipped by --skip-sdk")
 
-      # T11: /clear
       run_command_test("T11 /clear", "/clear", chat_id, result, wait=15)
 
-      # T12: post-clear turn
       if not args.skip_sdk:
         run_sdk_test("T12 post-clear turn", "Say hello",
                      pid, chat_id, result, wait=15)
       else:
         result.skip("T12 post-clear turn", "skipped by --skip-sdk")
 
-      # T16: empty message
       ts = str(int(time.time() * 1000))
       send_msg("   ", chat_id)
       time.sleep(3)
@@ -717,7 +1083,7 @@ def main():
       else:
         result.fail("T16 empty message", "got unexpected response")
 
-      # T13: /exit
+      # /exit
       ts = str(int(time.time() * 1000))
       send_msg("/exit", chat_id)
       exited = wait_for_exit(pid, timeout=25)
@@ -753,12 +1119,13 @@ def main():
       result.skip("T17 /dissolve", "destructive — manual only")
       print()
 
-      # For Phase 5 & 6 we need a fresh nemo instance
+      # ---- Phases 5-8: Advanced (need fresh nemo) ----
       if not args.skip_sdk:
-        print("  Starting fresh nemo for Phase 5 & 6...")
+        print("  Starting fresh nemo for advanced phases...")
         pid = start_nemo(chat_id, verbose=args.verbose)
         if not wait_for_ready(pid, timeout=30):
-          print(f"{Colors.RED}  Failed to start nemo for Phase 5{Colors.RESET}")
+          print(f"{Colors.RED}  Failed to start nemo for advanced phases"
+                f"{Colors.RESET}")
           result.summary()
           return 1 if result.failed else 0
         print(f"  PID: {pid}")
@@ -767,27 +1134,41 @@ def main():
         try:
           run_stale_task_stress(pid, chat_id, result)
           run_project_flow(pid, chat_id, result)
+          run_permission_tests(pid, chat_id, result)
         finally:
           send_msg("/exit", chat_id)
           if not wait_for_exit(pid, timeout=25):
             kill_nemo(pid)
+
+        # Phase 8: dual-instance (manages its own processes)
+        run_dual_instance(chat_id, result, verbose=args.verbose)
       else:
-        for name in ["T20-T24", "T30-T38"]:
+        for name in ["T20-T24", "T30-T38", "T40-T43", "T50-T56"]:
           result.skip(name, "skipped by --skip-sdk")
 
-    elif only_stress:
-      # Stress test only
-      run_stale_task_stress(pid, chat_id, result)
-      send_msg("/exit", chat_id)
-      if not wait_for_exit(pid, timeout=25):
-        kill_nemo(pid)
+    elif args.stress:
+      try:
+        run_stale_task_stress(pid, chat_id, result)
+      finally:
+        send_msg("/exit", chat_id)
+        if not wait_for_exit(pid, timeout=25):
+          kill_nemo(pid)
 
-    elif only_project:
-      # Project flow only
-      run_project_flow(pid, chat_id, result)
-      send_msg("/exit", chat_id)
-      if not wait_for_exit(pid, timeout=25):
-        kill_nemo(pid)
+    elif args.project:
+      try:
+        run_project_flow(pid, chat_id, result)
+      finally:
+        send_msg("/exit", chat_id)
+        if not wait_for_exit(pid, timeout=25):
+          kill_nemo(pid)
+
+    elif args.perm:
+      try:
+        run_permission_tests(pid, chat_id, result)
+      finally:
+        send_msg("/exit", chat_id)
+        if not wait_for_exit(pid, timeout=25):
+          kill_nemo(pid)
 
   except KeyboardInterrupt:
     print(f"\n{Colors.YELLOW}Interrupted{Colors.RESET}")
@@ -795,8 +1176,10 @@ def main():
     return 1
   except Exception as e:
     print(f"\n{Colors.RED}Unexpected error: {e}{Colors.RESET}")
+    import traceback
+    traceback.print_exc()
     kill_nemo(pid)
-    raise
+    return 1
 
   print()
   ok = result.summary()

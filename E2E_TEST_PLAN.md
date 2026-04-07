@@ -67,16 +67,33 @@ automatically thereafter (refresh_token lasts 30 days).
 | T36 | Project files check | 6 Project | — | main.py exists in temp dir |
 | T37 | Context continuity | 6 Project | 30s | Remembers what files it created |
 | T38 | Rapid-fire (3 msgs) | 6 Project | 45s | 3 quick messages → 3 responses |
+| T40 | Permission approve | 7 Perms | 60s | "y" approves Write, file created |
+| T41 | Permission deny | 7 Perms | 45s | "n" denies Write, file not created |
+| T42 | Permission always | 7 Perms | 60s | "always" approves + sets autoapprove |
+| T43 | Auto-approve verify | 7 Perms | 45s | Subsequent write needs no prompt |
+| T50 | Create group B | 8 Dual | — | Temp Lark group for second instance |
+| T51 | Both instances start | 8 Dual | 30s | Two nemo on same dir, different groups |
+| T52 | Both respond to ping | 8 Dual | 5s | Independent command handling |
+| T53 | Concurrent reads | 8 Dual | 30s | Both read same file simultaneously |
+| T54 | Concurrent writes | 8 Dual | 60s | Both write different files in same dir |
+| T55 | Log isolation | 8 Dual | — | Each PID log contains only its own chat |
+| T56 | No errors | 8 Dual | — | Neither log has ERROR entries |
 
 ## Verification Method
 
-All tests verify via **Lark bot API** (`GET /im/v1/messages` with
-`sort_type=ByCreateTimeDesc`), not log files. The script checks that a
-bot response card (`msg_type=interactive`) appears after the test message
-timestamp.
+Three verification layers, used by different test phases:
 
-Log files (`~/.nemo/logs/nemo-<PID>.log`) are used only for startup
-readiness detection (`SDK client connected`).
+1. **Lark API** (primary) — `GET /im/v1/messages` with `sort_type=ByCreateTimeDesc`.
+   Checks that a bot response card appears after the test message timestamp.
+   Used by all phases.
+
+2. **Log analysis** (`LogAnalyzer` class) — structured search over
+   `~/.nemo/logs/nemo-<PID>.log`. Used for permission flow detection
+   (`Permission request:`), stale task counting, error checking, and
+   startup readiness. The `wait_for()` method polls the log for a pattern.
+
+3. **File system** — direct file existence checks after write operations.
+   Used by Phase 6 (project files) and Phase 7 (permission approve/deny).
 
 ## Known Pitfalls
 
@@ -175,8 +192,33 @@ Write/Edit/Bash-write operations require user approval in `default`
 permission mode. The permission handler sends a card to Lark and waits
 up to 300s for reply. In automated testing, no one is there to approve.
 
-**Fix:** Send `autoapprove on` before Phase 5 and 6 tests. This sets
-a DB flag that auto-approves all permission requests.
+**Fix:** Send `autoapprove on` before Phase 5, 6, and 8 tests. Phase 7
+deliberately leaves autoapprove OFF to test the permission flow itself.
+
+### 11. Permission approval via user API messages
+
+The permission handler reads replies from the same event queue as the
+main loop (`events.next_message()`). User API messages arrive via relay
+→ WebSocket → queue, so sending "y" or "n" as a Lark message works as
+a permission reply.
+
+**Timing requirement:** The "y"/"n" must arrive AFTER the permission card
+is sent. The test uses `LogAnalyzer.wait_for("Permission request:")` to
+detect when the card was sent before replying. If sent too early, the
+message is consumed by `_watch_signals()` and re-queued as a regular
+message, not a permission reply.
+
+### 12. Dual-instance same-dir is safe for different files
+
+Two nemo instances sharing the same project directory work independently
+as long as they write different files. Each has its own:
+- PID log file (`nemo-<PID>.log`)
+- Lark group and relay WebSocket
+- SDK client session
+
+File conflicts (both writing the same file) are possible but not guarded
+against — this mirrors real-world behavior where two developers might
+edit the same codebase.
 
 ## Maintenance
 
