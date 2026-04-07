@@ -260,7 +260,7 @@ class RelayEventStream:
                 pass
         await self._queue.put(LarkEvent(event_type="_stop"))
         if self._bg_thread:
-            self._bg_thread.join(timeout=2)
+            self._bg_thread.join(timeout=1)
         log.info("RelayEventStream stopped")
 
     async def next_message(self, timeout: float = 300) -> LarkEvent | None:

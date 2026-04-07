@@ -620,27 +620,24 @@ async def main_loop(
         pass
       await asyncio.sleep(5)
 
-  # Cleanup
+  # Cleanup — all threads are daemon, so fire-and-forget is safe.
   if _heartbeat_task:
     _heartbeat_task.cancel()
     try:
       await _heartbeat_task
     except asyncio.CancelledError:
       pass
-  # Close SDK and event stream concurrently
-  await asyncio.gather(sdk.close_client(), events.close(), return_exceptions=True)
-  sdk.stop()  # Joins thread (up to 2s, but usually instant after close_client)
-  db.deactivate(session_id)
-  db.close()
+  # Close SDK, event stream, and Lark API calls all concurrently
+  loop = asyncio.get_event_loop()
+  cleanup: list = [sdk.close_client(), events.close()]
   if not sidecar:
     from .workspace import release_group
-    # Run Lark API calls in a thread pool to avoid blocking
-    loop = asyncio.get_event_loop()
-    await asyncio.gather(
-      loop.run_in_executor(None, release_group, token, chat_id),
-      loop.run_in_executor(None, status_tab.update_status, token, chat_id, model, "stopped"),
-      return_exceptions=True,
-    )
+    cleanup.append(loop.run_in_executor(None, release_group, token, chat_id))
+    cleanup.append(loop.run_in_executor(None, status_tab.update_status, token, chat_id, model, "stopped"))
+  await asyncio.gather(*cleanup, return_exceptions=True)
+  sdk.stop()
+  db.deactivate(session_id)
+  db.close()
   if _dissolve_on_exit:
     try:
       token = lark_auth.get_token(credentials["app_id"], credentials["app_secret"])

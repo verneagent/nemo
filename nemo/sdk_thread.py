@@ -165,5 +165,5 @@ class SDKThread:
     if self._loop:
       self._loop.call_soon_threadsafe(self._loop.stop)
     if self._thread:
-      self._thread.join(timeout=2)
+      self._thread.join(timeout=1)
     log.info("SDK thread stopped")
