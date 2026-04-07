@@ -1,347 +1,145 @@
-# Nemo End-to-End Test Plan
+# Nemo E2E Test Plan
 
-Real-world integration tests against a live nemo instance. Tests are executed
-by sending messages as a real Lark user and verifying responses via logs and
-Lark API.
+Automated end-to-end tests against a live nemo instance. Sends real Lark
+messages as a user, verifies responses via the Lark IM API.
 
-## Prerequisites
-
-- Nemo config at `~/.nemo/config.json` (app_id, app_secret, relay_url)
-- User token at `~/.nemo/user_token.json` (2h TTL, refresh before testing)
-- Test group: `oc_8183e1682019ddc0857a29074b3e2858` (nemo-test-1)
-- Relay server running at `http://47.95.232.145`
-
-## Phase 0: Setup
-
-### 0.1 Refresh user token
-
-```bash
-python3 -c "
-import json, requests
-cfg = json.load(open('$HOME/.nemo/config.json'))
-tok = json.load(open('$HOME/.nemo/user_token.json'))
-r = requests.post('https://open.larksuite.com/open-apis/authen/v2/oauth/token',
-  json={'grant_type': 'refresh_token', 'refresh_token': tok['refresh_token'],
-        'client_id': cfg['app_id'], 'client_secret': cfg['app_secret']})
-import time; d = r.json(); d['saved_at'] = time.time()
-json.dump(d, open('$HOME/.nemo/user_token.json', 'w'), indent=2)
-print('Refreshed, expires_in:', d.get('expires_in'))
-"
-```
-
-If refresh_token is also expired, use device flow (see CLAUDE.md).
-
-### 0.2 Start nemo
+## Quick Start
 
 ```bash
 cd ~/code/verneagent/nemo
-python3 -m nemo --chat oc_8183e1682019ddc0857a29074b3e2858 2>&1 &
-NEMO_PID=$!
-sleep 5
-tail -5 ~/.nemo/logs/nemo-$NEMO_PID.log
-# Verify: "Start card sent: om_xxx"
+python3 scripts/e2e_test.py                    # full run
+python3 scripts/e2e_test.py --skip-sdk         # commands only (fast)
+python3 scripts/e2e_test.py --verbose          # debug logging
+python3 scripts/e2e_test.py --chat <CHAT_ID>   # custom group
 ```
 
-### 0.3 Helper: send message as user
+The script handles token refresh, nemo start/stop, eviction of stale
+instances, and response verification — no manual setup needed beyond
+the prerequisites below.
 
-```bash
-send_msg() {
-  python3 -c "
-import json, requests
-t = json.load(open('$HOME/.nemo/user_token.json'))['access_token']
-r = requests.post('https://open.larksuite.com/open-apis/im/v1/messages',
-  params={'receive_id_type': 'chat_id'},
-  headers={'Authorization': f'Bearer {t}', 'Content-Type': 'application/json'},
-  json={'receive_id': 'oc_8183e1682019ddc0857a29074b3e2858', 'msg_type': 'text',
-        'content': json.dumps({'text': '$1'})})
-print(r.json().get('data',{}).get('message_id','?'))
-"
-}
-```
+## Prerequisites
 
-### 0.4 Helper: check logs
-
-```bash
-check_log() {
-  tail -${2:-30} ~/.nemo/logs/nemo-$NEMO_PID.log | grep -i "${1:-.}"
-}
-```
+- `~/.nemo/config.json` — app_id, app_secret, relay_url
+- `~/.nemo/user_token.json` — user OAuth token (2h TTL, auto-refreshed)
+- Relay server running (`relay_url` in config, default: `http://47.95.232.145`)
+- Test group: `oc_8183e1682019ddc0857a29074b3e2858` (nemo-test-1)
 
----
+### Token Setup (first time only)
 
-## Phase 1: Commands (no SDK)
+Run the device flow to obtain `user_token.json` — see CLAUDE.md
+"Self-Debugging with User Identity" section. The token refreshes
+automatically thereafter (refresh_token lasts 30 days).
 
-Built-in commands that don't trigger an SDK turn. Fast, deterministic.
-
-### T01: /ping
+## Test Matrix
 
-```bash
-send_msg "ping"
-sleep 3
-check_log "Pong"
-```
+| # | Test | Phase | Wait | What it checks |
+|---|------|-------|------|----------------|
+| T01 | ping | Commands | 5s | Basic command response (card) |
+| T02 | /help | Commands | 5s | Help card |
+| T03 | /model | Commands | 5s | Model info card |
+| T04 | /cost | Commands | 5s | Cost tracking card |
+| T05 | /diag | Commands | 8s | Diagnostics card |
+| T06 | Simple question | SDK | 15s | Full SDK turn lifecycle |
+| T07 | Bash tool | SDK | 20s | Tool use + working card |
+| T08 | Read tool | SDK | 20s | File read tool |
+| T09 | Multi-tool | SDK | 25s | Multiple tool calls in one turn |
+| T10 | /esc interrupt | Signals | 15s | Cancel in-progress turn |
+| T11 | /clear | Signals | 15s | Session reset + SDK reconnect |
+| T12 | Post-clear turn | SDK | 15s | SDK works after clear |
+| T13 | /exit | Signals | 25s | Graceful shutdown |
+| T14 | Restart | Recovery | 30s | Fresh start after exit |
+| T15 | Post-recovery turn | SDK | 15s | SDK works after restart |
+| T16 | Empty message | Edge | 3s | Whitespace ignored silently |
+| T17 | /dissolve | Destructive | — | Always skipped (manual only) |
 
-**Expect:**
-- Log: `Processing: ping`
-- Response card with Pong, model name, uptime, message count
-
-### T02: /help
+## Verification Method
 
-```bash
-send_msg "/help"
-sleep 3
-check_log "Commands"
-```
-
-**Expect:**
-- Log: `Processing: /help`
-- Response with command table
+All tests verify via **Lark bot API** (`GET /im/v1/messages` with
+`sort_type=ByCreateTimeDesc`), not log files. The script checks that a
+bot response card (`msg_type=interactive`) appears after the test message
+timestamp.
 
-### T03: /model (show)
+Log files (`~/.nemo/logs/nemo-<PID>.log`) are used only for startup
+readiness detection (`SDK client connected`).
 
-```bash
-send_msg "/model"
-sleep 3
-check_log "model"
-```
+## Known Pitfalls
 
-**Expect:**
-- Response showing current model name (e.g. `claude-sonnet-4-6`)
+Issues discovered during initial E2E development (2026-04-07). These are
+all fixed in the current codebase, but documented here so future
+developers understand why certain code exists.
 
-### T04: /cost
+### 1. ResultMessage must break the loop (turn.py)
 
-```bash
-send_msg "/cost"
-sleep 3
-check_log "Cost"
-```
+**Symptom:** Main loop hangs for 300s between turns.
 
-**Expect:**
-- Response with `$0.0000` (no turns yet)
+The SDK's `receive_response()` iterator doesn't raise `StopAsyncIteration`
+after `ResultMessage` — it continues indefinitely (SDK docs confirm this).
+Without an explicit `break` after handling `ResultMessage`, the loop waited
+for `HEARTBEAT_TIMEOUT` (300s) before giving up.
 
-### T05: /diag
-
-```bash
-send_msg "/diag"
-sleep 5
-check_log "Diagnostics\|diag"
-```
+**Fix:** `break` after `ResultMessage` in `turn.py` line ~214.
 
-**Expect:**
-- Token refresh: OK
-- Send card: OK
-- Workspace tag: OK or MISSING
-
----
-
-## Phase 2: SDK Turns
-
-Messages that trigger Claude Agent SDK execution. Verify the full
-Working card → tool calls → Done card lifecycle.
+### 2. Log handlers don't flush by default (__main__.py)
 
-### T06: Simple question
+**Symptom:** Log file appears empty or stale during E2E monitoring.
 
-```bash
-send_msg "What is 2+2?"
-sleep 15
-check_log "Processing\|turn msg\|DoneEvent"
-```
-
-**Expect:**
-- Log: `Processing: What is 2+2?`
-- Log: `turn msg: AssistantMessage` (SDK response)
-- Log: no errors
-- Group: Working card → Done card with answer
-
-### T07: Bash tool call
-
-```bash
-send_msg "List files in the current directory using ls"
-sleep 15
-check_log "ToolStart\|Bash"
-```
-
-**Expect:**
-- Log: `ToolStartEvent` with Bash tool
-- Working card shows `$ ls` or similar
-- Done card with file listing
-
-### T08: Read tool call
-
-```bash
-send_msg "Read the first 3 lines of pyproject.toml and tell me the project name"
-sleep 15
-check_log "ToolStart\|Read"
-```
-
-**Expect:**
-- Log: `ToolStartEvent` with Read tool
-- Done card with project name from pyproject.toml
-
-### T09: Multi-tool turn
-
-```bash
-send_msg "How many Python files are in the nemo/ directory? Use a command to count them."
-sleep 20
-check_log "ToolStart\|DoneEvent"
-```
-
-**Expect:**
-- Multiple tool calls in log
-- Collapsible panel in done card showing tool history
-- Correct file count in response
-
----
-
-## Phase 3: Signals & Control
-
-Test interruption, session reset, and graceful exit.
-
-### T10: /esc during turn
-
-```bash
-send_msg "Write a detailed 500-word essay about the history of Python programming"
-sleep 3
-send_msg "/esc"
-sleep 10
-check_log "interrupt\|cancel"
-```
-
-**Expect:**
-- Log: signal detected = esc
-- Log: `interrupt()` called
-- Response: "Operation cancelled."
-- Agent continues running (not exited)
-
-### T11: /clear (session reset)
-
-```bash
-send_msg "/clear"
-sleep 10
-check_log "Session Cleared\|create_client\|reconnect"
-```
-
-**Expect:**
-- SDK client recreated
-- Card: "Session Cleared"
-- Subsequent messages work normally
-
-### T12: Verify post-clear
-
-```bash
-send_msg "Say hello"
-sleep 15
-check_log "Processing: Say hello"
-```
-
-**Expect:**
-- Normal SDK turn after clear
-- Proves session reset worked
-
-### T13: /exit (graceful shutdown)
-
-```bash
-send_msg "/exit"
-sleep 5
-check_log "Agent stopped"
-# Verify process exited
-ps -p $NEMO_PID > /dev/null 2>&1 && echo "FAIL: still running" || echo "OK: exited"
-```
-
-**Expect:**
-- Card: "Nemo — Stopped"
-- Log: `Agent stopped.`
-- Process exits cleanly
-- Group remains (not dissolved)
-
----
-
-## Phase 4: Recovery & Edge Cases
-
-### T14: Stale session cleanup
-
-```bash
-# Start nemo again on the same group
-python3 -m nemo --chat oc_8183e1682019ddc0857a29074b3e2858 2>&1 &
-NEMO_PID=$!
-sleep 5
-check_log "Cleaning stale session\|Start card sent"
-```
-
-**Expect:**
-- Log: `Cleaning stale session <old_session_id>`
-- Start card sent successfully
-- Agent fully functional
-
-### T15: Post-recovery turn
-
-```bash
-send_msg "What is 3+3?"
-sleep 15
-check_log "Processing\|DoneEvent"
-```
-
-**Expect:**
-- Normal SDK turn works after stale session cleanup
-
-### T16: Empty/whitespace message
-
-```bash
-send_msg "   "
-sleep 3
-check_log "Skipping: empty"
-```
-
-**Expect:**
-- Log: `Skipping: empty text`
-- No card sent, no error
-
-### T17: /dissolve (shutdown + dissolve group)
-
-> **WARNING:** This dissolves the test group. Only run if you're prepared to
-> recreate it. Skip in routine testing.
-
-```bash
-send_msg "/dissolve"
-sleep 5
-check_log "Dissolved\|Agent stopped"
-```
-
-**Expect:**
-- Card: "Nemo — Dissolved"
-- Group dissolved via API
-- Process exits
-
----
-
-## Verification Checklist
-
-| # | Test | Status |
-|---|------|--------|
-| T01 | /ping | ☐ |
-| T02 | /help | ☐ |
-| T03 | /model | ☐ |
-| T04 | /cost | ☐ |
-| T05 | /diag | ☐ |
-| T06 | Simple question | ☐ |
-| T07 | Bash tool call | ☐ |
-| T08 | Read tool call | ☐ |
-| T09 | Multi-tool turn | ☐ |
-| T10 | /esc interrupt | ☐ |
-| T11 | /clear reset | ☐ |
-| T12 | Post-clear turn | ☐ |
-| T13 | /exit shutdown | ☐ |
-| T14 | Stale session cleanup | ☐ |
-| T15 | Post-recovery turn | ☐ |
-| T16 | Empty message | ☐ |
-| T17 | /dissolve (optional) | ☐ |
-
-## Notes
-
-- **Token TTL:** User token expires in 2 hours. Refresh before a full run.
-- **SDK turn timeout:** Allow 15-20s for SDK turns. Simple questions are faster.
-- **Log location:** `~/.nemo/logs/nemo-<PID>.log` (per-process).
-- **Reading group messages:** Use bot token to `GET /im/v1/messages` if
-  log verification is insufficient.
-- **T17 is destructive** — only run when specifically testing dissolve flow.
-  The test group must be recreated manually afterward.
+Python uses block buffering for stderr when redirected to a file (which
+happens when nemo runs in background). Both `StreamHandler` and
+`RotatingFileHandler` inherit this behavior.
+
+**Fix:** Wrap every handler's `emit()` to call `flush()` afterward via
+`_make_flushing()` helper.
+
+### 3. Competing nemo processes (workspace.py)
+
+**Symptom:** Two Pong responses to a single ping; duplicate cards.
+
+When starting nemo with `--chat`, the process skipped idle detection
+entirely (that code only ran in `discover_or_create_chat()`). A second
+instance would happily connect to the same group.
+
+**Fix:** `evict_existing()` runs before `claim_group()` — checks local
+PID first, then relay heartbeat. SIGTERM with SIGKILL fallback.
+
+### 4. User API messages DO trigger webhooks
+
+**Claim that was wrong:** "Messages sent via user token API don't trigger
+Lark webhook callbacks to the relay."
+
+**Reality:** They DO trigger webhooks. The initial test failure was caused
+by a truncated `sender_id` (`ou_1f03ce275afdf` vs full
+`ou_1f03ce275afdf3486d658740a39d0d8a`), which made nemo filter the message
+as unauthorized.
+
+**Implication:** The E2E test script works correctly by sending messages
+through the Lark user API — they arrive at nemo via the normal
+relay → WebSocket path.
+
+### 5. Sender ID must be exact
+
+Nemo's `is_authorized()` compares the sender's `open_id` from the relay
+event against the operator's full `open_id`. Any mismatch (truncation,
+wrong user) causes silent filtering with no error log at INFO level.
+Use `--verbose` to see `Skipping: unauthorized sender` debug messages.
+
+### 6. Shutdown takes ~15s
+
+`/exit` triggers SDK client cleanup (thread stop + WS close + group
+release). The 15s delay is normal — the E2E script allows 25s.
+
+### 7. Commands don't log "Processing:"
+
+Only SDK turns log `Processing: <message>`. Built-in commands (ping,
+help, model, etc.) respond directly without that log line. Don't use
+log-based verification for command tests — use the Lark API.
+
+## Maintenance
+
+When adding new commands or features:
+
+1. Add a test case to the appropriate phase in `scripts/e2e_test.py`
+2. Update the test matrix above
+3. Run the full suite: `python3 scripts/e2e_test.py`
+
+For quick smoke tests after minor changes, `--skip-sdk` runs only
+command tests in ~30 seconds.

@@ -162,8 +162,9 @@ async def main_loop(
 
   # Ensure workspace tag and claim group (skip in sidecar mode)
   if not sidecar:
-    from .workspace import ensure_workspace_tag, claim_group
+    from .workspace import ensure_workspace_tag, evict_existing, claim_group
     ensure_workspace_tag(token, chat_id, project_dir)
+    evict_existing(token, chat_id)
     claim_group(token, chat_id, model=model)
 
   # Detect need_mention

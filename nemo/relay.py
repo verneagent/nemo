@@ -63,6 +63,14 @@ def release_heartbeat(chat_id: str) -> None:
         log.warning("Heartbeat release failed: %s", e)
 
 
+def send_stop(chat_id: str) -> None:
+    """Send a stop signal to the agent occupying this chat via relay."""
+    try:
+        _relay_request("POST", f"/stop/chat:{chat_id}")
+    except Exception as e:
+        log.warning("Stop signal failed: %s", e)
+
+
 def register_message(message_id: str, chat_id: str) -> None:
     """Register a message→chat mapping for reaction routing."""
     try:

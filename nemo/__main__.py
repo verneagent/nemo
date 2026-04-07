@@ -66,18 +66,27 @@ def main():
     format=log_format,
     datefmt=log_datefmt,
   )
+  # Flush all handlers after every log line — Python buffers stderr when
+  # redirected to a file, making log-based monitoring unreliable.
+  for h in logging.getLogger().handlers:
+    _orig = h.emit
+    def _make_flushing(orig, handler):
+      def _flushing_emit(record):
+        orig(record)
+        handler.flush()
+      return _flushing_emit
+    h.emit = _make_flushing(_orig, h)
+
   # Per-process log file (created immediately at startup)
   from .config import CONFIG_DIR
   from logging.handlers import RotatingFileHandler
   log_dir = os.path.join(CONFIG_DIR, "logs")
   os.makedirs(log_dir, exist_ok=True)
-  fh = RotatingFileHandler(
-    os.path.join(log_dir, f"nemo-{os.getpid()}.log"),
-    maxBytes=5 * 1024 * 1024,  # 5 MB
-    backupCount=3,
-  )
+  log_path = os.path.join(log_dir, f"nemo-{os.getpid()}.log")
+  fh = RotatingFileHandler(log_path, maxBytes=5 * 1024 * 1024, backupCount=3)
   fh.setLevel(log_level)
   fh.setFormatter(logging.Formatter(log_format, datefmt=log_datefmt))
+  fh.emit = _make_flushing(fh.emit, fh)
   logging.getLogger().addHandler(fh)
 
   project_dir = os.path.abspath(args.project_dir)

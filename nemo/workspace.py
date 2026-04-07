@@ -257,6 +257,63 @@ def discover_or_create_chat(token: str, project_dir: str,
                           existing_names=existing_names)
 
 
+def evict_existing(token: str, chat_id: str) -> None:
+  """If another nemo process occupies this group, stop it before we start.
+
+  Checks both local PID and relay heartbeat. For local processes, sends
+  SIGTERM. For remote (relay-only), sends a stop signal via relay.
+  """
+  from .config import load_relay_config
+  from .group_config import load_config
+
+  my_pid = os.getpid()
+
+  # 1. Check local PID in config card
+  try:
+    config = load_config(token, chat_id)
+    old_pid = int(config.get("active_pid", 0))
+    if old_pid and old_pid != my_pid and _is_pid_alive(old_pid):
+      log.info("Stopping existing nemo process (pid=%d)", old_pid)
+      import signal as _signal
+      try:
+        os.kill(old_pid, _signal.SIGTERM)
+        # Wait up to 15s for it to exit
+        import time
+        for _ in range(30):
+          if not _is_pid_alive(old_pid):
+            log.info("Previous process (pid=%d) stopped", old_pid)
+            break
+          time.sleep(0.5)
+        else:
+          log.warning("Previous process (pid=%d) did not exit, killing", old_pid)
+          os.kill(old_pid, _signal.SIGKILL)
+      except OSError:
+        pass  # Already exited
+      return
+  except Exception as e:
+    log.debug("PID check failed: %s", e)
+
+  # 2. Check relay heartbeat (covers remote processes)
+  relay_url, _ = load_relay_config()
+  if relay_url:
+    from . import relay as relay_client
+    if relay_client.is_alive(chat_id):
+      log.info("Relay shows chat occupied — sending stop signal")
+      try:
+        relay_client.send_stop(chat_id)
+        # Wait for heartbeat to expire
+        import time
+        for _ in range(10):
+          time.sleep(1)
+          if not relay_client.is_alive(chat_id):
+            log.info("Previous agent released heartbeat")
+            break
+        else:
+          log.warning("Previous agent did not release heartbeat, proceeding anyway")
+      except Exception as e:
+        log.warning("Stop signal failed: %s", e)
+
+
 def claim_group(token: str, chat_id: str,
                 model: str = "", machine: str = "") -> None:
   """Mark this group as occupied.

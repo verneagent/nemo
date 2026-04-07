@@ -211,6 +211,7 @@ async def run_turn(
         except Exception:
           pass
       pending_tasks.clear()
+      break  # ResultMessage is the final message — don't wait for StopAsyncIteration
 
   if timed_out:
     on_event(ErrorEvent(message="Turn timed out — SDK stopped responding"))
