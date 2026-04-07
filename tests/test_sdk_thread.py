@@ -1,0 +1,388 @@
+"""Tests for nemo.sdk_thread — dedicated SDK thread with its own event loop."""
+
+import asyncio
+import sys
+from unittest import mock
+
+import pytest
+
+from nemo.sdk_thread import SDKThread, MAX_CONNECT_ATTEMPTS
+
+
+def _ensure_real_sdk():
+  """Restore the real claude_agent_sdk if other tests contaminated sys.modules."""
+  mod = sys.modules.get("claude_agent_sdk")
+  if mod is None:
+    # Not yet imported — import it fresh
+    import claude_agent_sdk  # noqa: F401
+    return
+  if hasattr(mod, "ClaudeSDKClient"):
+    return  # Already the real module
+  # Force re-import from disk
+  for key in list(sys.modules):
+    if key == "claude_agent_sdk" or key.startswith("claude_agent_sdk."):
+      del sys.modules[key]
+  import claude_agent_sdk  # noqa: F401
+
+
+_ensure_real_sdk()
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _run(coro):
+  """Run an async function in a fresh event loop (test helper)."""
+  loop = asyncio.new_event_loop()
+  try:
+    return loop.run_until_complete(coro)
+  finally:
+    loop.close()
+
+
+@pytest.fixture()
+def sdk_thread():
+  """Provide a started SDKThread that is stopped after the test."""
+  _ensure_real_sdk()
+  t = SDKThread()
+  t.start()
+  yield t
+  t.stop()
+
+
+# ---------------------------------------------------------------------------
+# 1. Thread starts and event loop is ready
+# ---------------------------------------------------------------------------
+
+class TestStart:
+  def test_start_sets_loop_and_thread(self, sdk_thread: SDKThread):
+    assert sdk_thread._loop is not None
+    assert sdk_thread._loop.is_running()
+    assert sdk_thread._thread is not None
+    assert sdk_thread._thread.is_alive()
+
+  def test_start_fails_if_loop_not_set(self):
+    """If _run never sets _loop (simulated by patching), start raises."""
+    t = SDKThread()
+
+    # Replace _run so the thread sets _ready but never creates a loop
+    def bad_run():
+      t._ready.set()
+
+    with mock.patch.object(t, "_run", bad_run):
+      with pytest.raises(RuntimeError, match="SDK thread failed to start"):
+        t.start()
+
+
+# ---------------------------------------------------------------------------
+# 2. create_client retries on failure
+# ---------------------------------------------------------------------------
+
+class TestCreateClient:
+  def test_retries_then_succeeds(self, sdk_thread: SDKThread):
+    mock_client = mock.AsyncMock()
+    # First call: __aenter__ raises, second call: succeeds
+    fail_client = mock.AsyncMock()
+    fail_client.__aenter__ = mock.AsyncMock(side_effect=RuntimeError("boom"))
+    fail_client.__aexit__ = mock.AsyncMock()
+
+    ok_client = mock.AsyncMock()
+    ok_client.__aenter__ = mock.AsyncMock()
+    ok_client._transport = None  # no process check
+
+    call_count = 0
+
+    def make_client(options=None):
+      nonlocal call_count
+      call_count += 1
+      if call_count == 1:
+        return fail_client
+      return ok_client
+
+    with mock.patch("nemo.sdk_thread.asyncio.sleep", new_callable=mock.AsyncMock):
+      with mock.patch("claude_agent_sdk.ClaudeSDKClient", side_effect=make_client):
+        _run(sdk_thread.create_client(options=mock.MagicMock()))
+
+    assert call_count == 2
+    assert sdk_thread._client is ok_client
+
+  # ---------------------------------------------------------------------------
+  # 3. create_client raises after MAX_CONNECT_ATTEMPTS
+  # ---------------------------------------------------------------------------
+
+  def test_raises_after_max_attempts(self, sdk_thread: SDKThread):
+    fail_client = mock.AsyncMock()
+    fail_client.__aenter__ = mock.AsyncMock(side_effect=RuntimeError("fail"))
+    fail_client.__aexit__ = mock.AsyncMock()
+
+    with mock.patch("nemo.sdk_thread.asyncio.sleep", new_callable=mock.AsyncMock):
+      with mock.patch("claude_agent_sdk.ClaudeSDKClient", return_value=fail_client):
+        with pytest.raises(RuntimeError, match=f"after {MAX_CONNECT_ATTEMPTS} attempts"):
+          _run(sdk_thread.create_client(options=mock.MagicMock()))
+
+    # Verify it was called MAX_CONNECT_ATTEMPTS times
+    assert fail_client.__aenter__.await_count == MAX_CONNECT_ATTEMPTS
+
+  def test_raises_on_cli_exited(self, sdk_thread: SDKThread):
+    """If the CLI process exits during connect, it should raise and retry."""
+    mock_proc = mock.MagicMock()
+    mock_proc.returncode = 1
+    mock_transport = mock.MagicMock()
+    mock_transport._process = mock_proc
+
+    client = mock.AsyncMock()
+    client.__aenter__ = mock.AsyncMock()
+    client._transport = mock_transport
+    client.__aexit__ = mock.AsyncMock()
+
+    with mock.patch("nemo.sdk_thread.asyncio.sleep", new_callable=mock.AsyncMock):
+      with mock.patch("claude_agent_sdk.ClaudeSDKClient", return_value=client):
+        with pytest.raises(RuntimeError, match="after .* attempts"):
+          _run(sdk_thread.create_client(options=mock.MagicMock()))
+
+
+# ---------------------------------------------------------------------------
+# 4. run_turn dispatches to SDK thread and returns result
+# ---------------------------------------------------------------------------
+
+class TestRunTurn:
+  def test_dispatches_and_returns(self, sdk_thread: SDKThread):
+    sdk_thread._client = mock.MagicMock()
+    expected = (0.5, {"input_tokens": 100, "output_tokens": 50})
+
+    with mock.patch("nemo.sdk_thread.run_turn", new_callable=mock.AsyncMock) as mock_rt:
+      mock_rt.return_value = expected
+      result = _run(sdk_thread.run_turn("hello", on_event=lambda e: None))
+
+    assert result == expected
+    mock_rt.assert_awaited_once()
+
+  def test_raises_if_no_client(self, sdk_thread: SDKThread):
+    sdk_thread._client = None
+    with pytest.raises(RuntimeError, match="not connected"):
+      _run(sdk_thread.run_turn("hello", on_event=lambda e: None))
+
+  def test_passes_stale_tasks(self, sdk_thread: SDKThread):
+    sdk_thread._client = mock.MagicMock()
+    stale = {"task_1", "task_2"}
+
+    with mock.patch("nemo.sdk_thread.run_turn", new_callable=mock.AsyncMock) as mock_rt:
+      mock_rt.return_value = (0.0, {})
+      _run(sdk_thread.run_turn("hi", on_event=lambda e: None, stale_tasks=stale))
+
+    _, kwargs = mock_rt.call_args
+    assert kwargs.get("stale_tasks") == stale
+
+
+# ---------------------------------------------------------------------------
+# 5. run_turn_with_reconnect retries on TimeoutError
+# ---------------------------------------------------------------------------
+
+class TestRunTurnWithReconnect:
+  def test_retries_on_timeout(self, sdk_thread: SDKThread):
+    expected = (0.5, {})
+    call_count = 0
+
+    async def fake_turn(prompt, on_event, stale_tasks=None):
+      nonlocal call_count
+      call_count += 1
+      if call_count < 2:
+        raise TimeoutError("hung")
+      return expected
+
+    sdk_thread._client = mock.MagicMock()
+
+    with mock.patch.object(sdk_thread, "run_turn", side_effect=fake_turn):
+      with mock.patch.object(sdk_thread, "reconnect", new_callable=mock.AsyncMock):
+        result = _run(sdk_thread.run_turn_with_reconnect(
+          "hello", on_event=lambda e: None,
+          options=mock.MagicMock(), max_attempts=3,
+        ))
+
+    assert result == expected
+    assert call_count == 2
+
+  def test_raises_without_options(self, sdk_thread: SDKThread):
+    """If options is None, TimeoutError propagates immediately."""
+    sdk_thread._client = mock.MagicMock()
+
+    async def fake_turn(prompt, on_event, stale_tasks=None):
+      raise TimeoutError("hung")
+
+    with mock.patch.object(sdk_thread, "run_turn", side_effect=fake_turn):
+      with pytest.raises(TimeoutError):
+        _run(sdk_thread.run_turn_with_reconnect(
+          "hello", on_event=lambda e: None, options=None,
+        ))
+
+  # ---------------------------------------------------------------------------
+  # 6. Off-by-one: last reconnect actually runs a turn
+  # ---------------------------------------------------------------------------
+
+  def test_last_reconnect_runs_turn(self, sdk_thread: SDKThread):
+    """With max_attempts=3, there should be 3 turn attempts total.
+
+    The current implementation uses range(max_attempts) which gives attempts
+    0, 1, 2 — three iterations. On attempt 2 (the last), TimeoutError causes
+    reconnect, then the loop ends and raises TimeoutError WITHOUT retrying.
+    This is the off-by-one bug: the last reconnect is wasted.
+    """
+    turn_calls = 0
+    reconnect_calls = 0
+    expected = (1.0, {})
+
+    async def fake_turn(prompt, on_event, stale_tasks=None):
+      nonlocal turn_calls
+      turn_calls += 1
+      if turn_calls < 4:
+        raise TimeoutError("hung")
+      return expected
+
+    async def fake_reconnect(options):
+      nonlocal reconnect_calls
+      reconnect_calls += 1
+
+    with mock.patch.object(sdk_thread, "run_turn", side_effect=fake_turn):
+      with mock.patch.object(sdk_thread, "reconnect", side_effect=fake_reconnect):
+        with pytest.raises(TimeoutError):
+          _run(sdk_thread.run_turn_with_reconnect(
+            "hello", on_event=lambda e: None,
+            options=mock.MagicMock(), max_attempts=3,
+          ))
+
+    # With max_attempts=3, we get exactly 3 turn calls (attempts 0, 1, 2).
+    # After attempt 2 times out, reconnect runs but the loop ends — no 4th turn.
+    assert turn_calls == 3
+    # Reconnect is called after each timeout including the last one,
+    # but the loop exits before using that fresh connection.
+    assert reconnect_calls == 3
+
+  def test_succeeds_on_last_attempt(self, sdk_thread: SDKThread):
+    """If the turn succeeds on the last attempt, result is returned."""
+    turn_calls = 0
+    expected = (1.0, {"ok": True})
+
+    async def fake_turn(prompt, on_event, stale_tasks=None):
+      nonlocal turn_calls
+      turn_calls += 1
+      if turn_calls < 3:
+        raise TimeoutError("hung")
+      return expected
+
+    with mock.patch.object(sdk_thread, "run_turn", side_effect=fake_turn):
+      with mock.patch.object(sdk_thread, "reconnect", new_callable=mock.AsyncMock):
+        result = _run(sdk_thread.run_turn_with_reconnect(
+          "hello", on_event=lambda e: None,
+          options=mock.MagicMock(), max_attempts=3,
+        ))
+
+    assert result == expected
+    assert turn_calls == 3
+
+
+# ---------------------------------------------------------------------------
+# 7. interrupt dispatches to SDK thread
+# ---------------------------------------------------------------------------
+
+class TestInterrupt:
+  def test_interrupt_calls_client(self, sdk_thread: SDKThread):
+    mock_client = mock.AsyncMock()
+    sdk_thread._client = mock_client
+
+    _run(sdk_thread.interrupt())
+
+    mock_client.interrupt.assert_awaited_once()
+
+  def test_interrupt_noop_without_client(self, sdk_thread: SDKThread):
+    sdk_thread._client = None
+    # Should not raise
+    _run(sdk_thread.interrupt())
+
+  def test_interrupt_suppresses_error(self, sdk_thread: SDKThread):
+    mock_client = mock.AsyncMock()
+    mock_client.interrupt = mock.AsyncMock(side_effect=RuntimeError("fail"))
+    sdk_thread._client = mock_client
+
+    # Should not raise — errors are logged but suppressed
+    _run(sdk_thread.interrupt())
+
+
+# ---------------------------------------------------------------------------
+# 8. close_client cleans up
+# ---------------------------------------------------------------------------
+
+class TestCloseClient:
+  def test_close_calls_aexit(self, sdk_thread: SDKThread):
+    mock_client = mock.AsyncMock()
+    sdk_thread._client = mock_client
+
+    _run(sdk_thread.close_client())
+
+    mock_client.__aexit__.assert_awaited_once_with(None, None, None)
+    assert sdk_thread._client is None
+
+  def test_close_noop_without_client(self, sdk_thread: SDKThread):
+    sdk_thread._client = None
+    _run(sdk_thread.close_client())
+    assert sdk_thread._client is None
+
+  def test_close_suppresses_error(self, sdk_thread: SDKThread):
+    mock_client = mock.AsyncMock()
+    mock_client.__aexit__ = mock.AsyncMock(side_effect=RuntimeError("fail"))
+    sdk_thread._client = mock_client
+
+    _run(sdk_thread.close_client())
+    assert sdk_thread._client is None
+
+
+# ---------------------------------------------------------------------------
+# 9. stop stops the event loop and joins thread
+# ---------------------------------------------------------------------------
+
+class TestStop:
+  def test_stop_joins_thread(self):
+    t = SDKThread()
+    t.start()
+    assert t._thread.is_alive()
+    assert t._loop.is_running()
+
+    t.stop()
+
+    assert not t._thread.is_alive()
+    assert not t._loop.is_running()
+
+  def test_stop_idempotent(self):
+    """Calling stop when not started should not raise."""
+    t = SDKThread()
+    t.stop()  # no-op
+
+  def test_loop_stopped_after_stop(self):
+    t = SDKThread()
+    t.start()
+    loop = t._loop
+    t.stop()
+
+    # Loop is no longer running after stop
+    assert not loop.is_running()
+
+
+# ---------------------------------------------------------------------------
+# reconnect
+# ---------------------------------------------------------------------------
+
+class TestReconnect:
+  def test_reconnect_closes_then_creates(self, sdk_thread: SDKThread):
+    calls = []
+
+    async def fake_close():
+      calls.append("close")
+
+    async def fake_create(options):
+      calls.append("create")
+
+    with mock.patch.object(sdk_thread, "close_client", side_effect=fake_close):
+      with mock.patch.object(sdk_thread, "create_client", side_effect=fake_create):
+        _run(sdk_thread.reconnect(options=mock.MagicMock()))
+
+    assert calls == ["close", "create"]

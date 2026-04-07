@@ -95,7 +95,7 @@ def test_working_card_stop_button_has_chat_id():
   elements = card["body"]["elements"]
   stop_btn = [e for e in elements if e.get("tag") == "column_set"][0]
   btn = stop_btn["columns"][0]["elements"][0]
-  assert btn["value"]["action"] == "stop"
+  assert btn["value"]["action"] == "__stop__"
   assert btn["value"]["chat_id"] == "oc_123"
 
 

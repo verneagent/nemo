@@ -201,10 +201,11 @@ def test_is_group_idle_dead_pid():
 
 def test_is_group_idle_live_pid():
   """active_pid points to live process → occupied."""
-  with mock.patch("nemo.group_config.load_config",
-                  return_value={"active_pid": 12345}):
-    with mock.patch("nemo.workspace._is_pid_alive", return_value=True):
-      assert _is_group_idle("tok", "oc_1") is False
+  with mock.patch("nemo.config.load_relay_config", return_value=("", "")):
+    with mock.patch("nemo.group_config.load_config",
+                    return_value={"active_pid": 12345}):
+      with mock.patch("nemo.workspace._is_pid_alive", return_value=True):
+        assert _is_group_idle("tok", "oc_1") is False
 
 
 def test_is_group_idle_config_error():

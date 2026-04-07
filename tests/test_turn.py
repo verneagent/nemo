@@ -307,3 +307,119 @@ def test_stale_task_retry_exhaustion():
       assert any(isinstance(e, DoneEvent) for e in events)
 
   asyncio.run(_run())
+
+
+def test_first_message_timeout():
+  """First message doesn't arrive within 30s — TimeoutError + ErrorEvent."""
+  events = []
+
+  class HangingClient:
+    async def query(self, _prompt):
+      pass
+
+    async def receive_response(self):
+      # Yield nothing — the async iterator hangs forever
+      await asyncio.Future()  # never resolves
+      # Make this a generator
+      yield  # pragma: no cover
+
+    async def stop_task(self, _task_id):
+      pass
+
+  async def _run():
+    with mock.patch.dict("sys.modules", _sdk_modules()):
+      client = HangingClient()
+      # Patch asyncio.wait to simulate timeout (empty done set)
+      original_wait = asyncio.wait
+
+      async def fake_wait(fs, **kwargs):
+        # Return empty done set, all pending — simulates timeout
+        return set(), set(fs)
+
+      with mock.patch("asyncio.wait", side_effect=fake_wait):
+        try:
+          await run_turn(client, "hello", events.append)
+          assert False, "Expected TimeoutError"
+        except TimeoutError:
+          pass
+    assert any(isinstance(e, ErrorEvent) for e in events)
+    error = next(e for e in events if isinstance(e, ErrorEvent))
+    assert "timed out" in error.message.lower()
+
+  asyncio.run(_run())
+
+
+def test_heartbeat_timeout():
+  """First message arrives, then second one times out at 300s."""
+  events = []
+  wait_call_count = 0
+
+  class OneMessageClient:
+    async def query(self, _prompt):
+      pass
+
+    async def receive_response(self):
+      yield FakeAssistantMessage(content=[FakeTextBlock(text="thinking...")])
+      # Second message hangs forever
+      await asyncio.Future()
+      yield  # pragma: no cover
+
+    async def stop_task(self, _task_id):
+      pass
+
+  async def _run():
+    nonlocal wait_call_count
+    with mock.patch.dict("sys.modules", _sdk_modules()):
+      client = OneMessageClient()
+      original_wait = asyncio.wait
+
+      async def fake_wait(fs, **kwargs):
+        nonlocal wait_call_count
+        wait_call_count += 1
+        if wait_call_count == 1:
+          # First call: let the message through
+          return await original_wait(fs, **kwargs)
+        else:
+          # Second call: simulate timeout
+          return set(), set(fs)
+
+      with mock.patch("asyncio.wait", side_effect=fake_wait):
+        try:
+          await run_turn(client, "hello", events.append)
+          assert False, "Expected TimeoutError"
+        except TimeoutError:
+          pass
+    # Should have the text event from first message
+    assert any(isinstance(e, TextEvent) and e.text == "thinking..." for e in events)
+    # Should have error event from timeout
+    assert any(isinstance(e, ErrorEvent) for e in events)
+
+  asyncio.run(_run())
+
+
+def test_query_timeout():
+  """Mock client.query() to be slow — anyio.fail_after(15) triggers."""
+  events = []
+
+  class SlowQueryClient:
+    async def query(self, _prompt):
+      await asyncio.sleep(60)  # way longer than 15s limit
+
+    async def receive_response(self):
+      yield FakeResultMessage()  # pragma: no cover
+
+    async def stop_task(self, _task_id):
+      pass
+
+  async def _run():
+    with mock.patch.dict("sys.modules", _sdk_modules()):
+      client = SlowQueryClient()
+      try:
+        await run_turn(client, "hello", events.append)
+        assert False, "Expected timeout"
+      except (TimeoutError, Exception) as exc:
+        # anyio.fail_after raises TimeoutError (via anyio.get_cancelled_exc_class
+        # or builtins.TimeoutError depending on backend)
+        assert "timed out" in str(type(exc).__name__).lower() or isinstance(exc, TimeoutError) or "cancel" in str(type(exc).__name__).lower(), f"Unexpected: {exc!r}"
+
+  asyncio.run(_run())

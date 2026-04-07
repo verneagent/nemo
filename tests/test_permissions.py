@@ -62,3 +62,113 @@ def test_format_tool_bash_long_description():
   # The label uses description when present, and gets truncated to 200 chars
   assert len(result) < 250
   assert "..." in result
+
+
+# ---------------------------------------------------------------------------
+# Tests for build_permission_handler / can_use_tool
+# ---------------------------------------------------------------------------
+import asyncio
+import sys
+import types
+from unittest.mock import AsyncMock, MagicMock, patch
+
+from nemo.permissions import build_permission_handler
+
+
+def _make_fixtures(reply_text=None, timeout=False, autoapprove=False):
+  """Create mock credentials, chat_id, db, events_source, and SDK results."""
+
+  # Mock SDK permission result classes
+  sdk_mod = types.ModuleType("claude_agent_sdk")
+  sdk_mod.PermissionResultAllow = type("PermissionResultAllow", (), {})
+  sdk_mod.PermissionResultDeny = type("PermissionResultDeny", (), {})
+  sys.modules["claude_agent_sdk"] = sdk_mod
+
+  credentials = {"app_id": "test_app", "app_secret": "test_secret"}
+  chat_id = "oc_test_chat"
+
+  db = MagicMock()
+  session = {"autoapprove": autoapprove}
+  db.get_current_session.return_value = session
+
+  events = MagicMock()
+  events.permission_active = False
+
+  if timeout:
+    events.next_message = AsyncMock(return_value=None)
+  elif reply_text is not None:
+    reply = MagicMock()
+    reply.text = reply_text
+    reply.event_type = "im.message.receive_v1"
+    reply.chat_id = chat_id
+    events.next_message = AsyncMock(return_value=reply)
+  else:
+    events.next_message = AsyncMock(return_value=None)
+
+  return credentials, chat_id, db, events, sdk_mod
+
+
+def test_build_permission_handler_returns_callable():
+  """build_permission_handler returns an async callable."""
+  creds, chat_id, db, events, _sdk = _make_fixtures()
+  handler = build_permission_handler(creds, chat_id, db, events)
+  assert callable(handler)
+  import inspect
+  assert inspect.iscoroutinefunction(handler)
+
+
+@patch("nemo.cards.build_card", return_value={})
+@patch("nemo.lark.api.update_card")
+@patch("nemo.lark.api.send_card", return_value="msg_001")
+@patch("nemo.lark.auth.get_token", return_value="tok_test")
+def test_can_use_tool_approve(_get_tok, _send, _update, _build):
+  """Replying 'y' approves the tool (returns PermissionResultAllow)."""
+  creds, chat_id, db, events, sdk = _make_fixtures(reply_text="y")
+  handler = build_permission_handler(creds, chat_id, db, events)
+  result = asyncio.run(
+    handler("Bash", {"command": "rm -rf /"}, None)
+  )
+  assert type(result).__name__ == "PermissionResultAllow"
+
+
+@patch("nemo.cards.build_card", return_value={})
+@patch("nemo.lark.api.update_card")
+@patch("nemo.lark.api.send_card", return_value="msg_001")
+@patch("nemo.lark.auth.get_token", return_value="tok_test")
+def test_can_use_tool_deny(_get_tok, _send, _update, _build):
+  """Replying 'n' denies the tool (returns PermissionResultDeny)."""
+  creds, chat_id, db, events, sdk = _make_fixtures(reply_text="n")
+  handler = build_permission_handler(creds, chat_id, db, events)
+  result = asyncio.run(
+    handler("Bash", {"command": "ls"}, None)
+  )
+  assert type(result).__name__ == "PermissionResultDeny"
+
+
+@patch("nemo.cards.build_card", return_value={})
+@patch("nemo.lark.api.update_card")
+@patch("nemo.lark.api.send_card", return_value="msg_001")
+@patch("nemo.lark.auth.get_token", return_value="tok_test")
+def test_can_use_tool_timeout(_get_tok, _send, _update, _build):
+  """When next_message returns None (timeout), deny by default."""
+  creds, chat_id, db, events, sdk = _make_fixtures(timeout=True)
+  handler = build_permission_handler(creds, chat_id, db, events)
+  result = asyncio.run(
+    handler("Bash", {"command": "ls"}, None)
+  )
+  assert type(result).__name__ == "PermissionResultDeny"
+
+
+@patch("nemo.cards.build_card", return_value={})
+@patch("nemo.lark.api.update_card")
+@patch("nemo.lark.api.send_card", return_value="msg_001")
+@patch("nemo.lark.auth.get_token", return_value="tok_test")
+def test_can_use_tool_always(_get_tok, _send, _update, _build):
+  """Replying 'always' approves and sets autoapprove in db."""
+  creds, chat_id, db, events, sdk = _make_fixtures(reply_text="always")
+  handler = build_permission_handler(creds, chat_id, db, events)
+  result = asyncio.run(
+    handler("Bash", {"command": "ls"}, None)
+  )
+  assert type(result).__name__ == "PermissionResultAllow"
+  db.set_autoapprove.assert_called_once_with(chat_id, True)
