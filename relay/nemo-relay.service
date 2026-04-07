@@ -1,0 +1,17 @@
+[Unit]
+Description=Nemo Relay Server
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/nemo-relay
+ExecStart=/usr/bin/python3 /opt/nemo-relay/relay.py
+Restart=always
+RestartSec=5
+Environment=RELAY_PORT=80
+Environment=RELAY_API_KEY=nemo-relay-key-2026
+Environment=VERIFY_TOKENS=r81tcMqYZBgjIMoqkR3SOgYJwl33cF52
+Environment=RELAY_DB=/opt/nemo-relay/relay.db
+
+[Install]
+WantedBy=multi-user.target

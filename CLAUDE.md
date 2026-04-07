@@ -7,10 +7,9 @@ Named after Captain Nemo — autonomous, persistent, remotely commanded.
 ## What It Is
 
 A standalone executable that:
-1. Connects to a Lark group via WebSocket long connection (长连接)
-2. Receives messages directly from Lark — no Cloudflare Worker, no webhook relay
-3. Runs Claude Agent SDK to process coding tasks
-4. Sends responses back via Lark IM API
+1. Receives Lark events via a Cloudflare Worker relay (or direct Lark 长连接 fallback)
+2. Runs Claude Agent SDK to process coding tasks
+3. Sends responses back via Lark IM API
 
 ```
 python -m nemo --chat-id <ID> --project-dir <DIR> [--model claude-opus-4-6]
@@ -25,74 +24,84 @@ nemo --chat-id <ID> --project-dir <DIR>
 ## What It Is NOT
 
 - Not a Claude Code skill (no SKILL.md, no hooks)
-- Not dependent on Cloudflare Worker or any external relay
 - Not a library — it's a daemon process
 
 ## Architecture
 
 ```
 Lark Group
-  ↕ Lark IM API (send/update messages)
+  ↕ Lark Webhook (HTTP callback)
+Relay Server (Aliyun SWAS 47.95.232.145, /opt/nemo-relay/relay.py)
+  ↕ aiohttp + SQLite — stores messages, supports WS + long-poll
 Nemo daemon
-  ↕ Lark WebSocket Gateway (receive events via 长连接)
-  ↕ Claude Agent SDK (coding execution)
+  ↕ RelayEventStream (WS /ws/chat:{chatId}) — receive events
+  ↕ Lark IM API — send/update messages
+  ↕ Claude Agent SDK — coding execution
 ```
 
-Zero infrastructure. The daemon connects directly to Lark's persistent
-connection gateway for events (`im.message.receive_v1`, reactions) AND
-card action callbacks (`card.action.trigger`). Uses the IM API for sending
-responses. No public URL, no webhook, no Worker needed.
+Lark's persistent connection (长连接) only allows one connection per app.
+The relay server (`/opt/nemo-relay/relay.py` on Aliyun) receives Lark
+webhooks, stores messages in SQLite, and fans out to nemo agents via
+WebSocket + long-poll. Single Python process, drop-in replacement for
+the CF Worker + Durable Objects stack used by handoff.
+
+If no relay is configured (`relay_url` absent from config), Nemo falls back
+to direct Lark 长连接 via `lark-oapi` SDK — but this blocks all other
+consumers of the same app's events.
 
 ## Key Design Decisions
 
-1. **No Cloudflare Worker** — Lark WebSocket 长连接 replaces the entire
-   Worker + Durable Object + polling stack. Events arrive directly.
+1. **Aliyun relay server** — Lark 长连接 is single-consumer per app.
+   The relay receives Lark webhooks, stores in SQLite, fans out to nemo
+   agents via WebSocket + long-poll. Code: `/opt/nemo-relay/relay.py`
+   on Aliyun SWAS (47.95.232.145). Access via `aliyun swas-open run-command`.
 
-2. **Card buttons via persistent connection** — Lark's persistent connection
-   mode supports card action callbacks (`card.action.trigger`), so interactive
-   buttons (Approve/Deny, Stop) work without any HTTP webhook endpoint.
-   Permission cards and Stop buttons behave the same as in handoff.
-
-3. **One card per turn** — A single Card V2 evolves through Working → Response
-   → Done via PATCH. Tool history lives in a `collapsible_panel`, always
+2. **One card per turn** — A single Card V2 evolves through Working →
+   Done via PATCH. Tool history lives in a `collapsible_panel`, always
    available. No message filter levels needed.
 
-4. **Single event callback** — `run_turn()` emits typed events (ToolStart,
+3. **Single event callback** — `run_turn()` emits typed events (ToolStart,
    Text, Done) through one callback, replacing the old dual send_fn/working_fn.
 
-5. **Event-driven loop** — Messages arrive via WebSocket push, not polling.
-   The main loop is `async for event in lark_ws:` rather than
+4. **Event-driven loop** — Messages arrive via WebSocket push, not polling.
+   The main loop waits on `events.next_message()` rather than
    `while True: poll()`.
 
 ## Config
 
-Uses `~/.nemo/config.json` for Lark credentials (app_id, app_secret, email).
-No worker_url or worker_api_key needed.
+Uses `~/.nemo/config.json` for Lark credentials and relay config:
+- `app_id`, `app_secret`, `email` — Lark app credentials
+- `relay_url`, `relay_api_key` — Aliyun relay server (or env: `NEMO_RELAY_URL`, `NEMO_RELAY_API_KEY`)
 
 ## Module Layout
-
-Agent and Channel are decoupled — core orchestration depends on abstract
-interfaces, not on Lark or Claude SDK directly.
 
 ```
 nemo/
 ├── __main__.py      # CLI entry point
-├── core.py          # Main loop & orchestration (channel/agent agnostic)
-├── channel.py       # Channel interface (abstract)
-├── agent.py         # Agent interface (abstract)
-├── lark/            # Lark channel implementation
-│   ├── channel.py   # LarkChannel (implements Channel)
-│   ├── cards.py     # Card V2 builder (Working/Response/Done)
-│   ├── api.py       # Lark IM API client (send, update, download)
-│   ├── auth.py      # Tenant token management
-│   └── events.py    # Lark WebSocket event subscription (长连接)
-├── claude/          # Claude agent implementation
-│   ├── agent.py     # ClaudeAgent (implements Agent)
-│   └── turn.py      # SDK turn execution & event streaming
+├── agent.py         # Main loop & orchestration
+├── turn.py          # SDK turn execution & event streaming
+├── sdk_thread.py    # Dedicated thread for SDK (isolates anyio)
+├── cards.py         # Card V2 builder (Working/Done)
 ├── commands.py      # Built-in commands (/clear, /model, /cd, etc.)
-├── messages.py      # Message filtering & prompt building
+├── config.py        # Credentials & configuration
 ├── db.py            # SQLite session & message storage
-└── config.py        # Credentials & configuration
+├── messages.py      # Message filtering & prompt building
+├── permissions.py   # Text-based permission bridge
+├── relay.py         # Relay client — heartbeat & message registration
+├── relay_events.py  # RelayEventStream — WS/poll from Cloudflare Worker
+├── workspace.py     # Workspace tag, group discovery, claim/release
+├── status_tab.py    # Lark group status tab management
+├── monitor.py       # Signal detection (/esc, /exit, /dissolve)
+├── group_config.py  # Group-level config (pinned messages)
+├── guests.py        # Guest user handling
+├── norms.py         # Group norms
+├── preflight.py     # Startup checks
+├── channel.py       # Channel interface (abstract)
+├── coding_agent.py  # Coding agent interface (abstract)
+└── lark/            # Lark API layer
+    ├── api.py       # Lark IM API client (send, update, download)
+    ├── auth.py      # Tenant token management
+    └── events.py    # LarkEventStream (direct 长连接 fallback)
 ```
 
 ## Lark WebSocket (Verified)
@@ -198,6 +207,78 @@ req = urllib.request.Request(
 ### Nemo App
 - App ID: `cli_a9583021bef89ed4`
 - P2P chat_id (with owner): `oc_6731728a1d02fcb97c67a16806d5c6b0`
+- Test group chat_id: `oc_8183e1682019ddc0857a29074b3e2858` (nemo-test-1)
+
+## Quick Test: Simulate User Messages
+
+User token at `~/.nemo/user_token.json` (2h TTL, refresh with device flow above).
+
+### 1. Start nemo
+
+```bash
+cd ~/code/verneagent/nemo
+python3 -m nemo --chat oc_8183e1682019ddc0857a29074b3e2858 2>&1 &
+NEMO_PID=$!
+# Wait for "Start card sent" in log
+tail -f ~/.nemo/logs/nemo-$NEMO_PID.log
+```
+
+### 2. Send message as user
+
+```python
+import json, requests
+token = json.load(open("~/.nemo/user_token.json"))["access_token"]
+chat_id = "oc_8183e1682019ddc0857a29074b3e2858"
+requests.post(
+    "https://open.larksuite.com/open-apis/im/v1/messages",
+    params={"receive_id_type": "chat_id"},
+    headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+    json={"receive_id": chat_id, "msg_type": "text",
+          "content": json.dumps({"text": "your message here"})},
+)
+```
+
+Or as a one-liner from another Claude session:
+```bash
+python3 -c "
+import json, requests
+t = json.load(open('$HOME/.nemo/user_token.json'))['access_token']
+requests.post('https://open.larksuite.com/open-apis/im/v1/messages',
+  params={'receive_id_type': 'chat_id'},
+  headers={'Authorization': f'Bearer {t}', 'Content-Type': 'application/json'},
+  json={'receive_id': 'oc_8183e1682019ddc0857a29074b3e2858', 'msg_type': 'text',
+        'content': json.dumps({'text': 'What is 2+2?'})})
+"
+```
+
+### 3. Check results
+
+```bash
+tail -20 ~/.nemo/logs/nemo-$NEMO_PID.log
+```
+
+Key log lines to look for:
+- `Processing: <message>` — message received from relay
+- `query() prompt=N chars` — sent to SDK
+- `turn msg: AssistantMessage` — got response
+- Card created/updated — visible in Lark group
+
+### Token refresh
+
+Token lasts 2 hours. If expired, re-run device flow (see above) or:
+```bash
+python3 -c "
+import json, requests
+cfg = json.load(open('$HOME/.nemo/config.json'))
+tok = json.load(open('$HOME/.nemo/user_token.json'))
+r = requests.post('https://open.larksuite.com/open-apis/authen/v2/oauth/token',
+  json={'grant_type': 'refresh_token', 'refresh_token': tok['refresh_token'],
+        'client_id': cfg['app_id'], 'client_secret': cfg['app_secret']})
+import time; d = r.json(); d['saved_at'] = time.time()
+json.dump(d, open('$HOME/.nemo/user_token.json', 'w'), indent=2)
+print('Refreshed, expires_in:', d.get('expires_in'))
+"
+```
 
 ## Reference: Current handoff_agent.py
 
