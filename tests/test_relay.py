@@ -111,3 +111,75 @@ def test_register_message_calls_post():
 def test_register_message_swallows_error():
     with patch("nemo.relay._relay_request", side_effect=Exception("fail")):
         register_message("om_msg1", "oc_chat1")  # Should not raise
+
+
+# ---------------------------------------------------------------------------
+# send_stop
+# ---------------------------------------------------------------------------
+
+from nemo.relay import send_stop
+
+
+def test_send_stop_calls_post():
+    with patch("nemo.relay._relay_request") as mock_req:
+        send_stop("oc_123")
+        mock_req.assert_called_once_with("POST", "/stop/chat:oc_123")
+
+
+def test_send_stop_swallows_error():
+    """Should not raise on failure."""
+    with patch("nemo.relay._relay_request", side_effect=Exception("fail")):
+        send_stop("oc_123")  # Should not raise
+
+
+# ---------------------------------------------------------------------------
+# _relay_request — edge cases
+# ---------------------------------------------------------------------------
+
+def test_relay_request_no_api_key():
+    """Should still work without API key (no Authorization header)."""
+    mock_resp = MagicMock()
+    mock_resp.read.return_value = b'{"ok": true}'
+    mock_resp.__enter__ = MagicMock(return_value=mock_resp)
+    mock_resp.__exit__ = MagicMock(return_value=False)
+
+    with patch("nemo.relay.load_relay_config",
+               return_value=("http://relay.test", "")):
+        with patch("nemo.relay.urllib.request.urlopen",
+                   return_value=mock_resp) as mock_open:
+            result = _relay_request("GET", "/test")
+            req = mock_open.call_args[0][0]
+            assert req.get_header("Authorization") is None
+            assert result == {"ok": True}
+
+
+def test_relay_request_with_data():
+    """Should encode data as JSON body."""
+    mock_resp = MagicMock()
+    mock_resp.read.return_value = b'{"ok": true}'
+    mock_resp.__enter__ = MagicMock(return_value=mock_resp)
+    mock_resp.__exit__ = MagicMock(return_value=False)
+
+    with patch("nemo.relay.load_relay_config",
+               return_value=("http://relay.test", "key")):
+        with patch("nemo.relay.urllib.request.urlopen",
+                   return_value=mock_resp) as mock_open:
+            _relay_request("POST", "/test", {"foo": "bar"})
+            req = mock_open.call_args[0][0]
+            assert req.data == b'{"foo": "bar"}'
+
+
+def test_relay_request_strips_trailing_slash():
+    """Trailing slash in relay_url should be stripped."""
+    mock_resp = MagicMock()
+    mock_resp.read.return_value = b'{"ok": true}'
+    mock_resp.__enter__ = MagicMock(return_value=mock_resp)
+    mock_resp.__exit__ = MagicMock(return_value=False)
+
+    with patch("nemo.relay.load_relay_config",
+               return_value=("http://relay.test/", "key")):
+        with patch("nemo.relay.urllib.request.urlopen",
+                   return_value=mock_resp) as mock_open:
+            _relay_request("GET", "/path")
+            req = mock_open.call_args[0][0]
+            assert req.full_url == "http://relay.test/path"

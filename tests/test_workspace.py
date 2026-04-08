@@ -305,3 +305,114 @@ def test_release_group_error_tolerant():
   with mock.patch("nemo.group_config.load_config",
                   side_effect=RuntimeError("fail")):
     release_group("tok", "oc_1")  # Should not raise
+
+
+# ---------------------------------------------------------------------------
+# evict_existing tests
+# ---------------------------------------------------------------------------
+
+from nemo.workspace import evict_existing
+
+
+def test_evict_existing_local_pid_alive():
+  """Should SIGTERM a live local process and wait for it to die."""
+  with mock.patch("nemo.group_config.load_config",
+                  return_value={"active_pid": 12345}):
+    with mock.patch("os.getpid", return_value=99999):
+      with mock.patch("nemo.workspace._is_pid_alive",
+                      side_effect=[True, False]):  # alive, then dead
+        with mock.patch("os.kill") as mock_kill:
+          with mock.patch("time.sleep"):
+            evict_existing("tok", "oc_1")
+  # Should have sent SIGTERM
+  import signal
+  mock_kill.assert_called_once_with(12345, signal.SIGTERM)
+
+
+def test_evict_existing_local_pid_needs_sigkill():
+  """Should escalate to SIGKILL if process doesn't stop."""
+  # _is_pid_alive: first call = True (in the if), then 30x True (in the loop), never dies
+  with mock.patch("nemo.group_config.load_config",
+                  return_value={"active_pid": 12345}):
+    with mock.patch("os.getpid", return_value=99999):
+      with mock.patch("nemo.workspace._is_pid_alive", return_value=True):
+        with mock.patch("os.kill") as mock_kill:
+          with mock.patch("time.sleep"):
+            evict_existing("tok", "oc_1")
+  import signal
+  calls = mock_kill.call_args_list
+  assert any(c[0] == (12345, signal.SIGTERM) for c in calls)
+  assert any(c[0] == (12345, signal.SIGKILL) for c in calls)
+
+
+def test_evict_existing_same_pid_skipped():
+  """Should not kill itself."""
+  my_pid = 42
+  with mock.patch("nemo.group_config.load_config",
+                  return_value={"active_pid": my_pid}):
+    with mock.patch("os.getpid", return_value=my_pid):
+      with mock.patch("os.kill") as mock_kill:
+        evict_existing("tok", "oc_1")
+  mock_kill.assert_not_called()
+
+
+def test_evict_existing_dead_pid_skipped():
+  """Should skip if the old PID is already dead."""
+  with mock.patch("nemo.group_config.load_config",
+                  return_value={"active_pid": 12345}):
+    with mock.patch("os.getpid", return_value=99999):
+      with mock.patch("nemo.workspace._is_pid_alive", return_value=False):
+        with mock.patch("os.kill") as mock_kill:
+          with mock.patch("nemo.config.load_relay_config", return_value=("", "")):
+            evict_existing("tok", "oc_1")
+  mock_kill.assert_not_called()
+
+
+def test_evict_existing_no_active_pid():
+  """Should check relay when no local PID."""
+  with mock.patch("nemo.group_config.load_config",
+                  return_value={"active_pid": 0}):
+    with mock.patch("os.getpid", return_value=99999):
+      with mock.patch("nemo.config.load_relay_config",
+                      return_value=("http://relay", "key")):
+        with mock.patch("nemo.relay.is_alive", return_value=False):
+          with mock.patch("nemo.relay.send_stop") as mock_stop:
+            evict_existing("tok", "oc_1")
+  mock_stop.assert_not_called()
+
+
+def test_evict_existing_relay_occupied():
+  """Should send stop via relay when heartbeat is alive."""
+  with mock.patch("nemo.group_config.load_config",
+                  return_value={"active_pid": 0}):
+    with mock.patch("os.getpid", return_value=99999):
+      with mock.patch("nemo.config.load_relay_config",
+                      return_value=("http://relay", "key")):
+        with mock.patch("nemo.relay.is_alive",
+                        side_effect=[True, True, False]):  # alive, alive, then dead
+          with mock.patch("nemo.relay.send_stop") as mock_stop:
+            with mock.patch("time.sleep"):
+              evict_existing("tok", "oc_1")
+  mock_stop.assert_called_once_with("oc_1")
+
+
+def test_evict_existing_relay_timeout():
+  """Should proceed even if relay agent never releases."""
+  with mock.patch("nemo.group_config.load_config",
+                  return_value={"active_pid": 0}):
+    with mock.patch("os.getpid", return_value=99999):
+      with mock.patch("nemo.config.load_relay_config",
+                      return_value=("http://relay", "key")):
+        with mock.patch("nemo.relay.is_alive", return_value=True):
+          with mock.patch("nemo.relay.send_stop"):
+            with mock.patch("time.sleep"):
+              evict_existing("tok", "oc_1")  # Should not raise
+
+
+def test_evict_existing_config_error():
+  """Should not crash if config read fails, proceed to relay check."""
+  with mock.patch("nemo.group_config.load_config",
+                  side_effect=RuntimeError("fail")):
+    with mock.patch("os.getpid", return_value=99999):
+      with mock.patch("nemo.config.load_relay_config", return_value=("", "")):
+        evict_existing("tok", "oc_1")  # Should not raise
