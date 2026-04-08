@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import faulthandler
 import logging
 import os
+import signal
 import sys
+import threading
 
 
 def _ensure_sdk():
@@ -85,6 +88,58 @@ def _daemonize():
   os.environ["NEMO_FOREGROUND"] = "1"
 
 
+def _setup_crash_diagnostics(log_path: str) -> None:
+  """Set up crash diagnostics: faulthandler, signal logging, watchdog.
+
+  Helps diagnose silent daemon deaths (SIGKILL, segfault, os._exit).
+  """
+  log = logging.getLogger("nemo")
+
+  # faulthandler: writes traceback on SIGSEGV/SIGABRT/SIGBUS
+  fh = open(log_path, "a")
+  faulthandler.enable(file=fh, all_threads=True)
+  # SIGUSR1: dump all thread tracebacks on demand (kill -USR1 <pid>)
+  faulthandler.register(signal.SIGUSR1, file=fh, all_threads=True)
+
+  # Log all catchable signals to detect what kills us
+  for sname in ("SIGHUP", "SIGTERM", "SIGINT", "SIGUSR1", "SIGUSR2",
+                "SIGPIPE", "SIGALRM", "SIGXCPU", "SIGXFSZ", "SIGVTALRM",
+                "SIGPROF"):
+    snum = getattr(signal, sname, None)
+    if snum is None:
+      continue
+    def _make_handler(name, num):
+      def _handler(signum, frame):
+        log.warning("Signal %s (%d) received", name, num)
+        if name in ("SIGTERM", "SIGHUP"):
+          signal.signal(num, signal.SIG_DFL)
+          os.kill(os.getpid(), num)
+      return _handler
+    signal.signal(snum, _make_handler(sname, snum))
+
+  # Watchdog: periodic heartbeat with thread/child status
+  import subprocess as _sp
+
+  def _watchdog():
+    import time
+    while True:
+      time.sleep(60)
+      threads = [t.name for t in threading.enumerate()]
+      try:
+        result = _sp.run(
+          ["pgrep", "-P", str(os.getpid())],
+          capture_output=True, text=True, timeout=5,
+        )
+        children = result.stdout.strip() or "none"
+      except Exception:
+        children = "?"
+      log.info("heartbeat pid=%d threads=%s children=%s",
+               os.getpid(), threads, children)
+
+  wd = threading.Thread(target=_watchdog, daemon=True, name="watchdog")
+  wd.start()
+
+
 def main():
   _ensure_sdk()
 
@@ -139,11 +194,11 @@ def main():
   log_dir = os.path.join(CONFIG_DIR, "logs")
   os.makedirs(log_dir, exist_ok=True)
   log_path = os.path.join(log_dir, f"nemo-{os.getpid()}.log")
-  fh = RotatingFileHandler(log_path, maxBytes=5 * 1024 * 1024, backupCount=3)
-  fh.setLevel(log_level)
-  fh.setFormatter(logging.Formatter(log_format, datefmt=log_datefmt))
-  fh.emit = _make_flushing(fh.emit, fh)
-  logging.getLogger().addHandler(fh)
+  rfh = RotatingFileHandler(log_path, maxBytes=5 * 1024 * 1024, backupCount=3)
+  rfh.setLevel(log_level)
+  rfh.setFormatter(logging.Formatter(log_format, datefmt=log_datefmt))
+  rfh.emit = _make_flushing(rfh.emit, rfh)
+  logging.getLogger().addHandler(rfh)
 
   project_dir = os.path.abspath(args.project_dir)
   if not os.path.isdir(project_dir):
@@ -198,9 +253,18 @@ def main():
       print(f"Preflight error: {err}", file=sys.stderr)
     return 1
 
+  # Crash diagnostics (faulthandler, signal logging, watchdog heartbeat)
+  _setup_crash_diagnostics(log_path)
+
   from .agent import main_loop
-  return asyncio.run(main_loop(chat_id, project_dir, args.model,
-                               permission_mode=args.permission_mode))
+  try:
+    return asyncio.run(main_loop(chat_id, project_dir, args.model,
+                                 permission_mode=args.permission_mode))
+  except KeyboardInterrupt:
+    return 0
+  except BaseException as e:
+    logging.getLogger("nemo").error("Fatal: %s: %s", type(e).__name__, e, exc_info=True)
+    return 1
 
 
 if __name__ == "__main__":

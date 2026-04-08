@@ -516,6 +516,7 @@ async def main_loop(
           _update_working()
 
         elif isinstance(event, DoneEvent):
+          _clear_ack()
           if event.session_id:
             _sdk_session_id = event.session_id
           if _turn_interrupt_phase:
@@ -687,6 +688,7 @@ async def main_loop(
 
       if watcher in done_tasks and signal_detected:
         if signal_detected in ("esc", "stop"):
+          _clear_ack()
           _update_interrupt_card("stopping")
           try:
             await agent.interrupt()
@@ -697,6 +699,7 @@ async def main_loop(
           _update_interrupt_card("stopped")
 
         elif signal_detected in ("exit", "dissolve"):
+          _clear_ack()
           try:
             await agent.interrupt()
             await asyncio.wait_for(sdk_task, timeout=10)
@@ -746,6 +749,9 @@ async def main_loop(
         channel.push_back(pending)
 
     except KeyboardInterrupt:
+      running = False
+    except asyncio.CancelledError:
+      log.warning("Loop cancelled (CancelledError)")
       running = False
     except Exception as e:
       log.error("Loop error: %s", e)
