@@ -160,6 +160,29 @@ def test_working_card_with_body_only():
   assert elements[0]["tag"] == "column_set"
 
 
+def test_stopping_card_preserves_working_content():
+  steps = [ThinkingStep("tool", "Read: a.py"), ThinkingStep("text", "Checking")]
+  card = build_turn_card("stopping", current_tool="Read: a.py", steps=steps)
+  assert card["header"]["title"]["content"] == "Stopping..."
+  assert card["header"]["template"] == "orange"
+  elements = card["body"]["elements"]
+  assert elements[0]["tag"] == "markdown"
+  assert "`Read: a.py`" in elements[0]["content"]
+  assert elements[1]["tag"] == "collapsible_panel"
+  assert not any(e["tag"] == "column_set" for e in elements)
+
+
+def test_stopped_card_preserves_working_content():
+  steps = [ThinkingStep("tool", "Edit: b.py")]
+  card = build_turn_card("stopped", current_tool="Edit: b.py", steps=steps)
+  assert card["header"]["title"]["content"] == "Stopped"
+  assert card["header"]["template"] == "grey"
+  elements = card["body"]["elements"]
+  assert elements[0]["tag"] == "markdown"
+  assert "`Edit: b.py`" in elements[0]["content"]
+  assert not any(e["tag"] == "column_set" for e in elements)
+
+
 # ---------------------------------------------------------------------------
 # build_turn_card — done phase
 # ---------------------------------------------------------------------------
