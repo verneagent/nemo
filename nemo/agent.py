@@ -539,6 +539,7 @@ async def main_loop(
           _update_working()
 
         elif isinstance(event, DoneEvent):
+          _clear_ack()
           if event.session_id:
             _sdk_session_id = event.session_id
           if _turn_interrupt_phase:
@@ -711,6 +712,7 @@ async def main_loop(
 
       if watcher in done_tasks and signal_detected:
         if signal_detected in ("esc", "stop"):
+          _clear_ack()
           _update_interrupt_card("stopping")
           try:
             await sdk.interrupt()
@@ -722,6 +724,7 @@ async def main_loop(
           _send_response(token, chat_id, "Operation cancelled.", db)
 
         elif signal_detected in ("exit", "dissolve"):
+          _clear_ack()
           try:
             await sdk.interrupt()
             await asyncio.wait_for(sdk_task, timeout=10)
