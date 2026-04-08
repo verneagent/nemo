@@ -46,6 +46,11 @@ class Channel(ABC):
     ...
 
   @abstractmethod
+  def push_back(self, message: IncomingMessage) -> None:
+    """Re-queue a message so it can be consumed again."""
+    ...
+
+  @abstractmethod
   async def send_card(self, chat_id: str, card: dict[str, Any]) -> str:
     """Send an interactive card. Returns message_id."""
     ...
@@ -97,4 +102,16 @@ class Channel(ABC):
   @abstractmethod
   async def get_chat_members(self, chat_id: str) -> list[dict[str, Any]]:
     """Get members of a chat."""
+    ...
+
+  @property
+  @abstractmethod
+  def permission_active(self) -> bool:
+    """Whether the permission bridge is currently consuming channel events."""
+    ...
+
+  @permission_active.setter
+  @abstractmethod
+  def permission_active(self, active: bool) -> None:
+    """Set whether the permission bridge is currently consuming channel events."""
     ...

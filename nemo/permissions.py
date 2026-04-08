@@ -122,13 +122,20 @@ def build_permission_handler(
 
   async def _read_from_main_loop(timeout: float) -> Any:
     """Read next message from events_source on the main loop."""
-    return await events_source.next_message(timeout=timeout)
+    reader = getattr(events_source, "next_message", None)
+    if callable(reader):
+      return await reader(timeout=timeout)
+    reader = getattr(events_source, "receive", None)
+    if callable(reader):
+      return await reader(timeout=timeout)
+    raise AttributeError("events_source must provide next_message() or receive()")
 
   def _set_permission_flag(active: bool) -> None:
     events_source.permission_active = active
 
   def _push_back_on_main(msg: Any) -> None:
-    events_source.push_back(msg)
+    if hasattr(events_source, "push_back"):
+      events_source.push_back(msg)
 
   async def can_use_tool(tool_name: str, tool_input: dict[str, Any], _context: Any) -> Any:
     log.debug("can_use_tool: %s %s", tool_name,

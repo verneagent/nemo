@@ -23,7 +23,8 @@ class CodingAgent(ABC):
     self,
     prompt: str,
     on_event: Callable[[TurnEvent], Any],
-  ) -> None:
+    stale_tasks: set[str] | None = None,
+  ) -> tuple[float, dict[str, Any]]:
     """Execute one agent turn with the given prompt.
 
     Calls on_event for each TurnEvent (tool use, text output, done, error).
@@ -37,13 +38,13 @@ class CodingAgent(ABC):
     ...
 
   @abstractmethod
-  async def reset(self) -> None:
-    """Reset conversation state (new conversation)."""
+  async def start(self, project_dir: str, model: str, resume: str = "") -> None:
+    """Initialize the agent (connect to SDK, etc.)."""
     ...
 
   @abstractmethod
-  async def start(self, project_dir: str, model: str) -> None:
-    """Initialize the agent (connect to SDK, etc.)."""
+  async def reset(self, project_dir: str, model: str, resume: str = "") -> None:
+    """Reset or reconnect the agent with updated runtime settings."""
     ...
 
   @abstractmethod
