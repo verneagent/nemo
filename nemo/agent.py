@@ -514,7 +514,8 @@ async def main_loop(
 
         elif isinstance(event, TextEvent):
           _turn_steps.append(cards.ThinkingStep("text", event.text))
-          _ensure_card()
+          # Don't create card for text-only responses — let them go as
+          # plain text messages. Only update if card already exists.
           _update_working()
 
         elif isinstance(event, DoneEvent):
