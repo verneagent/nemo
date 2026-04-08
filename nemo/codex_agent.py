@@ -108,7 +108,7 @@ class CodexCodingAgent(CodingAgent):
         if event_type == "turn.failed":
           error = self._coerce_json_object(event.get("error"))
           failure = str(error.get("message", "Codex turn failed"))
-          on_event(ErrorEvent(message=failure))
+          await self._emit_event(on_event, ErrorEvent(message=failure))
           break
         if event_type != "item.completed":
           continue
@@ -118,26 +118,29 @@ class CodexCodingAgent(CodingAgent):
         if item_type == "agent_message":
           text = str(item.get("text", "") or "")
           if text:
-            on_event(TextEvent(text=text))
+            await self._emit_event(on_event, TextEvent(text=text))
         else:
           summary = self._item_summary(item)
           if not summary:
             continue
           record = ToolRecord(name=item_type, summary=summary)
           if not saw_tool:
-            on_event(ToolStartEvent(tool=record))
+            await self._emit_event(on_event, ToolStartEvent(tool=record))
             saw_tool = True
           else:
-            on_event(ToolProgressEvent(tool=record))
+            await self._emit_event(on_event, ToolProgressEvent(tool=record))
 
       rc = await proc.wait()
       if failure is None and rc != 0 and not self._interrupted:
         failure = f"Codex sidecar exited with status {rc}"
-        on_event(ErrorEvent(message=failure))
+        await self._emit_event(on_event, ErrorEvent(message=failure))
       if failure is not None:
         raise RuntimeError(failure)
 
-      on_event(DoneEvent(cost=0.0, usage=usage, session_id=self._session_id))
+      await self._emit_event(
+        on_event,
+        DoneEvent(cost=0.0, usage=usage, session_id=self._session_id),
+      )
       return 0.0, usage
     finally:
       stderr_task.cancel()
@@ -198,6 +201,13 @@ class CodexCodingAgent(CodingAgent):
       if not raw:
         return
       log.info("[codex-stderr] %s", raw.decode(errors="replace").rstrip())
+
+  async def _emit_event(
+    self,
+    on_event: Callable[[TurnEvent], None],
+    event: TurnEvent,
+  ) -> None:
+    await asyncio.to_thread(on_event, event)
 
   def _ensure_runtime(self) -> None:
     if not shutil.which("node"):

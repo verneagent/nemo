@@ -118,6 +118,18 @@ class _FakeChannel:
     self._permission_active = active
 
 
+class _QueuedChannel(_FakeChannel):
+  def __init__(self, _chat_id, messages):
+    super().__init__(_chat_id)
+    self._messages = list(messages)
+
+  async def receive(self, timeout=300):
+    del timeout
+    if self._messages:
+      return self._messages.pop(0)
+    return None
+
+
 class _FakeAgent:
   def __init__(self, *_args, **_kwargs):
     pass
@@ -167,3 +179,58 @@ def test_text_only_turn_clears_thinking_reaction(tmp_path):
   assert result == 0
   add_reaction.assert_awaited_once_with("om_src", "THINKING")
   remove_reaction.assert_awaited_once_with("om_src", "r_thinking")
+
+
+def test_codex_provider_rejects_claude_model_switch(tmp_path):
+  from nemo.channel import IncomingMessage
+
+  class _TrackResetAgent(_FakeAgent):
+    def __init__(self):
+      self.reset = mock.AsyncMock()
+
+  agent = _TrackResetAgent()
+  queued = _QueuedChannel("oc_test", [
+    IncomingMessage(
+      event_type="im.message.receive_v1",
+      chat_id="oc_test",
+      sender_id="ou_user",
+      message_id="om_model",
+      msg_type="text",
+      text="/model claude-sonnet-4-6",
+      create_time="1",
+    ),
+    IncomingMessage(
+      event_type="im.message.receive_v1",
+      chat_id="oc_test",
+      sender_id="ou_user",
+      message_id="om_exit",
+      msg_type="text",
+      text="/exit",
+      create_time="2",
+    ),
+  ])
+
+  with mock.patch("nemo.agent.load_credentials", return_value={
+    "app_id": "app_id",
+    "app_secret": "app_secret",
+    "email": "user@example.com",
+  }), \
+       mock.patch("nemo.agent.Database", _FakeDB), \
+       mock.patch("nemo.agent.LarkChannel", return_value=queued), \
+       mock.patch("nemo.agent.build_coding_agent", return_value=agent), \
+       mock.patch("nemo.agent._send_response", new=mock.AsyncMock()) as send_response, \
+       mock.patch("nemo.group_config.load_config", return_value={}), \
+       mock.patch("nemo.config.load_relay_config", return_value=("", "")), \
+       mock.patch("signal.signal"):
+    result = asyncio.run(
+      main_loop("oc_test", str(tmp_path), "gpt-5-codex", provider="codex")
+    )
+
+  assert result == 0
+  agent.reset.assert_not_awaited()
+  send_response.assert_any_await(
+    queued,
+    "oc_test",
+    "Model **claude-sonnet-4-6** is not supported by provider **codex**.",
+    mock.ANY,
+  )

@@ -24,6 +24,17 @@ def default_model_for_provider(provider: AgentProvider) -> str:
   return _DEFAULT_MODEL_BY_PROVIDER[provider]
 
 
+def is_model_compatible(provider: AgentProvider, model: str) -> bool:
+  normalized = model.strip().lower()
+  if not normalized:
+    return False
+  if provider == "claude":
+    return not normalized.startswith(("gpt-", "o1", "o3", "o4", "codex"))
+  if provider == "codex":
+    return not normalized.startswith("claude-")
+  return False
+
+
 def build_coding_agent(
   provider: AgentProvider,
   credentials: dict[str, str],

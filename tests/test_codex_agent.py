@@ -6,7 +6,7 @@ import asyncio
 from pathlib import Path
 from unittest import mock
 
-from nemo.agent_factory import build_coding_agent, default_model_for_provider
+from nemo.agent_factory import build_coding_agent, default_model_for_provider, is_model_compatible
 from nemo.claude_agent import ClaudeCodingAgent
 from nemo.codex_agent import CodexCodingAgent, _SIDE_CAR_SCRIPT
 from nemo.turn import DoneEvent, TextEvent, ToolProgressEvent, ToolStartEvent
@@ -71,6 +71,13 @@ class _FakeProc:
 def test_default_model_for_provider():
   assert default_model_for_provider("claude") == "claude-opus-4-6"
   assert default_model_for_provider("codex") == "gpt-5-codex"
+
+
+def test_is_model_compatible():
+  assert is_model_compatible("claude", "claude-opus-4-6")
+  assert not is_model_compatible("claude", "gpt-5-codex")
+  assert is_model_compatible("codex", "gpt-5-codex")
+  assert not is_model_compatible("codex", "claude-sonnet-4-6")
 
 
 def test_build_coding_agent_returns_expected_class():

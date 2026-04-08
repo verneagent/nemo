@@ -20,7 +20,7 @@ import time
 import uuid
 
 from . import cards, commands, messages, monitor
-from .agent_factory import AgentProvider, build_coding_agent
+from .agent_factory import AgentProvider, build_coding_agent, is_model_compatible
 from .channel import IncomingMessage
 from .config import load_credentials
 from .db import Database
@@ -356,6 +356,15 @@ async def main_loop(
           await _send_response(channel, chat_id, "Operation cancelled.", db)
         elif response and response.startswith("__model__:"):
           new_model = response.split(":", 1)[1]
+          if not is_model_compatible(provider, new_model):
+            await _send_response(
+              channel,
+              chat_id,
+              f"Model **{new_model}** is not supported by provider **{provider}**.",
+              db,
+            )
+            await _clear_ack()
+            continue
           model = new_model
           ctx.model = model
           log.info("Model switch to %s (resume=%s)", model, _sdk_session_id[:8] if _sdk_session_id else "none")
