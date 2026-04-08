@@ -42,6 +42,23 @@ def _ensure_sdk():
   sys.exit(1)
 
 
+def _daemonize():
+  """Fork into background, detach from terminal."""
+  pid = os.fork()
+  if pid > 0:
+    print(f"nemo started (PID {pid})", file=sys.stderr)
+    sys.exit(0)
+  os.setsid()
+  # Redirect stdio to /dev/null (logs go to ~/.nemo/logs/)
+  devnull = os.open(os.devnull, os.O_RDWR)
+  os.dup2(devnull, 0)
+  os.dup2(devnull, 1)
+  os.dup2(devnull, 2)
+  os.close(devnull)
+  # Set env so child knows it's already daemonized
+  os.environ["NEMO_FOREGROUND"] = "1"
+
+
 def main():
   _ensure_sdk()
 
@@ -57,12 +74,18 @@ def main():
   parser.add_argument("--permission-mode", default="bypassPermissions",
                       choices=["default", "acceptEdits", "plan", "bypassPermissions"],
                       help="SDK permission mode (default: bypassPermissions)")
+  parser.add_argument("--foreground", "-f", action="store_true",
+                      help="Run in foreground (default: daemonize)")
   parser.add_argument("--verbose", "-v", action="store_true", help="Debug logging")
   args = parser.parse_args()
 
   # Set active profile before any config loading
   from .config import set_profile, profile_path
   set_profile(args.profile)
+
+  # Daemonize unless --foreground
+  if not args.foreground and not os.environ.get("NEMO_FOREGROUND"):
+    _daemonize()
 
   # Log to both stderr and a persistent log file
   log_level = logging.DEBUG if args.verbose else logging.INFO
