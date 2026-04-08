@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import os
+from pathlib import Path
 import shutil
 from asyncio.subprocess import Process
 from typing import Callable
@@ -19,9 +20,14 @@ from .types import JsonObject
 
 log = logging.getLogger(__name__)
 
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+_SIDE_CAR_DIR = _REPO_ROOT / "codex_sidecar"
+_SIDE_CAR_SCRIPT = _SIDE_CAR_DIR / "run_turn.mjs"
+_SIDE_CAR_PACKAGE = _SIDE_CAR_DIR / "package.json"
+
 
 class CodexCodingAgent(CodingAgent):
-  """CodingAgent adapter for the local `codex exec --json` runtime."""
+  """CodingAgent adapter for the local Codex SDK sidecar runtime."""
 
   def __init__(
     self,
@@ -56,7 +62,7 @@ class CodexCodingAgent(CodingAgent):
     self._interrupted = False
 
     args = self._build_command()
-    log.info("codex exec start model=%s resume=%s", self._model, bool(self._session_id))
+    log.info("codex sdk start model=%s resume=%s", self._model, bool(self._session_id))
     proc = await asyncio.create_subprocess_exec(
       *args,
       stdin=asyncio.subprocess.PIPE,
@@ -126,7 +132,7 @@ class CodexCodingAgent(CodingAgent):
 
       rc = await proc.wait()
       if failure is None and rc != 0 and not self._interrupted:
-        failure = f"Codex exited with status {rc}"
+        failure = f"Codex sidecar exited with status {rc}"
         on_event(ErrorEvent(message=failure))
       if failure is not None:
         raise RuntimeError(failure)
@@ -166,13 +172,12 @@ class CodexCodingAgent(CodingAgent):
     if self._permission_mode != "bypassPermissions":
       raise RuntimeError("Codex provider currently supports only bypassPermissions mode")
 
-    args = ["codex", "exec", "--json", "--skip-git-repo-check"]
+    args = ["node", str(_SIDE_CAR_SCRIPT)]
+    args.extend(["--cwd", self._project_dir])
     if self._model:
       args.extend(["--model", self._model])
-    args.extend(["--cd", self._project_dir])
-    args.append("--dangerously-bypass-approvals-and-sandbox")
     if self._session_id:
-      args.extend(["resume", self._session_id])
+      args.extend(["--resume", self._session_id])
     return args
 
   def _build_env(self) -> dict[str, str]:
@@ -195,15 +200,18 @@ class CodexCodingAgent(CodingAgent):
       log.info("[codex-stderr] %s", raw.decode(errors="replace").rstrip())
 
   def _ensure_runtime(self) -> None:
-    if shutil.which("codex"):
-      return
-    raise RuntimeError("codex CLI not found in PATH")
+    if not shutil.which("node"):
+      raise RuntimeError("node not found in PATH")
+    if not shutil.which("codex"):
+      raise RuntimeError("codex CLI not found in PATH")
+    if not _SIDE_CAR_SCRIPT.is_file() or not _SIDE_CAR_PACKAGE.is_file():
+      raise RuntimeError("codex sidecar is not installed")
 
   def _parse_event(self, line: str) -> JsonObject | None:
     try:
       parsed = json.loads(line)
     except json.JSONDecodeError:
-      log.warning("codex json parse failed: %s", line[:200])
+      log.warning("codex sidecar json parse failed: %s", line[:200])
       return None
     if isinstance(parsed, dict):
       return self._coerce_json_object(parsed)
