@@ -17,7 +17,11 @@ from __future__ import annotations
 import logging
 import os
 import uuid
-from typing import Any, Callable
+from typing import Callable
+
+from .channel import Channel
+from .db import Database
+from .types import JsonObject
 
 log = logging.getLogger(__name__)
 
@@ -28,7 +32,7 @@ AUTO_APPROVE_PATTERNS: set[str] = set()
 APPROVE_REACTIONS = {"THUMBSUP", "OK", "YES", "APPROVE", "LIKESMILEY"}
 
 
-def is_auto_approve(tool_name: str, tool_input: dict[str, Any]) -> bool:
+def is_auto_approve(tool_name: str, tool_input: JsonObject) -> bool:
   """Check if a tool call should be auto-approved."""
   if tool_name != "Bash":
     return False
@@ -36,7 +40,7 @@ def is_auto_approve(tool_name: str, tool_input: dict[str, Any]) -> bool:
   return any(pat in cmd for pat in AUTO_APPROVE_PATTERNS)
 
 
-def format_tool(tool_name: str, tool_input: dict[str, Any]) -> str:
+def format_tool(tool_name: str, tool_input: JsonObject) -> str:
   """Format tool for permission card body."""
   if tool_name == "Bash":
     desc = tool_input.get("description", "")
@@ -56,7 +60,7 @@ def _build_permission_card(
   body: str,
   chat_id: str,
   nonce: str,
-) -> dict[str, Any]:
+) -> JsonObject:
   """Build a permission request card with Approve/Approve All/Deny buttons."""
   from .cards import build_card
 
@@ -74,7 +78,7 @@ def _build_permission_card(
   )
 
 
-def _classify_action(action_value: dict[str, Any], nonce: str) -> str | None:
+def _classify_action(action_value: JsonObject, nonce: str) -> str | None:
   """Classify a card action event as a permission decision.
 
   Returns "allow", "always", "deny", or None if not a permission action.
@@ -101,13 +105,12 @@ def _classify_reaction(emoji_type: str) -> str | None:
 def build_permission_handler(
   credentials: dict[str, str],
   chat_id: str,
-  db: Any,
-  events_source: Any,
-) -> Callable[..., Any]:
+  db: Database,
+  events_source: Channel,
+) -> Callable[[str, JsonObject, object], object]:
   """Build an async can_use_tool handler for the SDK.
 
-  events_source: an object with async next_message() that returns the next
-  Lark event from the operator.
+  events_source: a Channel that returns the next operator event via receive().
 
   IMPORTANT: can_use_tool runs on the SDK thread's event loop (not the main
   loop). The events_source queue is bound to the main loop, so we must
@@ -120,24 +123,24 @@ def build_permission_handler(
   # Capture the main loop at build time — this is called from the main loop.
   _main_loop = _asyncio.get_event_loop()
 
-  async def _read_from_main_loop(timeout: float) -> Any:
+  async def _read_from_main_loop(timeout: float) -> object:
     """Read next message from events_source on the main loop."""
-    reader = getattr(events_source, "next_message", None)
-    if callable(reader):
-      return await reader(timeout=timeout)
-    reader = getattr(events_source, "receive", None)
-    if callable(reader):
-      return await reader(timeout=timeout)
-    raise AttributeError("events_source must provide next_message() or receive()")
+    return await events_source.receive(timeout=timeout)
 
   def _set_permission_flag(active: bool) -> None:
     events_source.permission_active = active
 
-  def _push_back_on_main(msg: Any) -> None:
-    if hasattr(events_source, "push_back"):
+  def _push_back_on_main(msg: object) -> None:
+    from .channel import IncomingMessage
+
+    if isinstance(msg, IncomingMessage):
       events_source.push_back(msg)
 
-  async def can_use_tool(tool_name: str, tool_input: dict[str, Any], _context: Any) -> Any:
+  async def can_use_tool(
+    tool_name: str,
+    tool_input: JsonObject,
+    _context: object,
+  ) -> object:
     log.debug("can_use_tool: %s %s", tool_name,
               {k: str(v)[:80] for k, v in tool_input.items()})
 
@@ -170,7 +173,7 @@ def build_permission_handler(
     from .monitor import is_permission_reply
     decision = None
     deadline = _time.time() + 300
-    _pending: list[Any] = []
+    _pending: list[object] = []
 
     # Detect if we're on the main loop (tests) vs SDK thread (production)
     try:

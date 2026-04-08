@@ -132,7 +132,7 @@ from nemo.permissions import build_permission_handler
 def _make_fixtures(reply_event=None, timeout=False, autoapprove=False):
   """Create mock credentials, chat_id, db, events_source, and SDK results.
 
-  reply_event: a MagicMock LarkEvent to return from next_message.
+  reply_event: a MagicMock LarkEvent to return from receive().
     If a str, creates a text reply event with that text.
   """
   # Mock SDK permission result classes
@@ -150,20 +150,21 @@ def _make_fixtures(reply_event=None, timeout=False, autoapprove=False):
 
   events = MagicMock()
   events.permission_active = False
+  events.push_back = MagicMock()
 
   if timeout:
-    events.next_message = AsyncMock(return_value=None)
+    events.receive = AsyncMock(return_value=None)
   elif reply_event is not None:
     if isinstance(reply_event, str):
       reply = MagicMock()
       reply.text = reply_event
       reply.event_type = "im.message.receive_v1"
       reply.chat_id = chat_id
-      events.next_message = AsyncMock(return_value=reply)
+      events.receive = AsyncMock(return_value=reply)
     else:
-      events.next_message = AsyncMock(return_value=reply_event)
+      events.receive = AsyncMock(return_value=reply_event)
   else:
-    events.next_message = AsyncMock(return_value=None)
+    events.receive = AsyncMock(return_value=None)
 
   return credentials, chat_id, db, events, sdk_mod
 
@@ -226,7 +227,7 @@ def test_can_use_tool_deny_text(_get_tok, _send, _update, _build, _pcard):
 @patch("nemo.lark.api.send_card", return_value="msg_001")
 @patch("nemo.lark.auth.get_token", return_value="tok_test")
 def test_can_use_tool_timeout(_get_tok, _send, _update, _build, _pcard):
-  """When next_message returns None (timeout), deny by default."""
+  """When receive() returns None (timeout), deny by default."""
   import time as _time
   real_time = _time.time
   call_count = 0

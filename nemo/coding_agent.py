@@ -10,9 +10,10 @@ depends only on this interface, not on Claude SDK specifics.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Any, Callable
+from typing import Callable
 
 from .turn import TurnEvent
+from .types import JsonObject
 
 
 class CodingAgent(ABC):
@@ -22,9 +23,9 @@ class CodingAgent(ABC):
   async def run_turn(
     self,
     prompt: str,
-    on_event: Callable[[TurnEvent], Any],
+    on_event: Callable[[TurnEvent], None],
     stale_tasks: set[str] | None = None,
-  ) -> tuple[float, dict[str, Any]]:
+  ) -> tuple[float, JsonObject]:
     """Execute one agent turn with the given prompt.
 
     Calls on_event for each TurnEvent (tool use, text output, done, error).

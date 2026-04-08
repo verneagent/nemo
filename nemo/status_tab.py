@@ -11,7 +11,8 @@ not by parsing the tab name.
 from __future__ import annotations
 
 import logging
-from typing import Any
+
+from .types import JsonObject
 
 log = logging.getLogger(__name__)
 
@@ -28,7 +29,7 @@ _STATUS_EMOJI = {
 }
 
 
-def _find_tab_by_marker(tabs: list[dict[str, Any]], marker: str) -> dict[str, Any] | None:
+def _find_tab_by_marker(tabs: list[JsonObject], marker: str) -> JsonObject | None:
   """Find a tab by URL marker."""
   for tab in tabs:
     url = (tab.get("tab_content") or {}).get("url", "")

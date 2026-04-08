@@ -16,14 +16,14 @@ import logging
 import threading
 import time
 import urllib.request
-from typing import Any
 
 from .lark.events import LarkEvent
+from .types import JsonObject
 
 log = logging.getLogger(__name__)
 
 
-def _relay_msg_to_event(msg: dict[str, Any], chat_id: str) -> LarkEvent:
+def _relay_msg_to_event(msg: JsonObject, chat_id: str) -> LarkEvent:
     """Convert a relay message dict to a LarkEvent."""
     msg_type = msg.get("msg_type", "")
 
@@ -96,7 +96,7 @@ class RelayEventStream:
         self._running = False
         self._bg_thread: threading.Thread | None = None
         self._since = ""
-        self._ws: Any = None  # Current WS connection (for force-close)
+        self._ws: object = None  # Current WS connection (for force-close)
         self.permission_active: bool = False
 
     # --- WebSocket approach (preferred) ---
@@ -169,7 +169,7 @@ class RelayEventStream:
 
     # --- Long-poll fallback ---
 
-    def _poll_once(self, timeout: int = 25) -> dict[str, Any]:
+    def _poll_once(self, timeout: int = 25) -> JsonObject:
         url = f"{self._relay_url}/poll/{self._key}?timeout={timeout}"
         if self._since:
             url += f"&since={self._since}"

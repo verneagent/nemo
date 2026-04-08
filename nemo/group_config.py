@@ -22,15 +22,16 @@ from __future__ import annotations
 import json
 import logging
 import threading
-from typing import Any
 
 import yaml
+
+from .types import JsonObject
 
 log = logging.getLogger(__name__)
 
 CONFIG_MARKER = "__nemo_config__"
 
-DEFAULT_CONFIG: dict[str, Any] = {
+DEFAULT_CONFIG: JsonObject = {
   "guests": [],
   "autoapprove": False,
   "rules": {},
@@ -44,12 +45,12 @@ _save_lock = threading.Lock()
 # Text message format: "__nemo_config__\n<yaml>"
 # ---------------------------------------------------------------------------
 
-def _build_config_text(config: dict[str, Any]) -> str:
+def _build_config_text(config: JsonObject) -> str:
   """Encode config as a text message string (YAML)."""
   return f"{CONFIG_MARKER}\n{yaml.dump(config, default_flow_style=False, allow_unicode=True).rstrip()}"
 
 
-def _parse_config_text(msg: dict[str, Any]) -> dict[str, Any] | None:
+def _parse_config_text(msg: JsonObject) -> JsonObject | None:
   """Extract config from a pinned text message (YAML).
 
   Expected msg format from get_message API:
@@ -80,7 +81,7 @@ def _parse_config_text(msg: dict[str, Any]) -> dict[str, Any] | None:
 # Pin management
 # ---------------------------------------------------------------------------
 
-def _find_config_pin(token: str, chat_id: str) -> tuple[str, dict[str, Any]] | None:
+def _find_config_pin(token: str, chat_id: str) -> tuple[str, JsonObject] | None:
   """Find the pinned config message. Returns (message_id, config) or None.
 
   If multiple config pins exist (from past failures), keeps the first and
@@ -94,7 +95,7 @@ def _find_config_pin(token: str, chat_id: str) -> tuple[str, dict[str, Any]] | N
     log.warning("Failed to list pins: %s", e)
     return None
 
-  found: tuple[str, dict[str, Any]] | None = None
+  found: tuple[str, JsonObject] | None = None
   for pin in pins:
     msg_id = pin.get("message_id", "")
     if not msg_id:
@@ -119,7 +120,7 @@ def _find_config_pin(token: str, chat_id: str) -> tuple[str, dict[str, Any]] | N
 
 
 def _create_config_pin(token: str, chat_id: str,
-                       config: dict[str, Any]) -> str:
+                       config: JsonObject) -> str:
   """Create a new config text message and pin it. Returns message_id."""
   from .lark import api as lark_api
 
@@ -131,7 +132,7 @@ def _create_config_pin(token: str, chat_id: str,
 
 def _update_config_pin(token: str, chat_id: str,
                        pin_msg_id: str,
-                       config: dict[str, Any]) -> str:
+                       config: JsonObject) -> str:
   """Update existing config message. Deletes old and creates new."""
   from .lark import api as lark_api
 
@@ -148,7 +149,7 @@ def _update_config_pin(token: str, chat_id: str,
 # Public API
 # ---------------------------------------------------------------------------
 
-def load_config(token: str, chat_id: str) -> dict[str, Any]:
+def load_config(token: str, chat_id: str) -> JsonObject:
   """Load group config from pinned message. Returns default if none found."""
   result = _find_config_pin(token, chat_id)
   if result is not None:
@@ -159,7 +160,7 @@ def load_config(token: str, chat_id: str) -> dict[str, Any]:
   return dict(DEFAULT_CONFIG)
 
 
-def save_config(token: str, chat_id: str, config: dict[str, Any]) -> str:
+def save_config(token: str, chat_id: str, config: JsonObject) -> str:
   """Save config to pinned message. Creates or replaces. Returns message_id."""
   with _save_lock:
     result = _find_config_pin(token, chat_id)

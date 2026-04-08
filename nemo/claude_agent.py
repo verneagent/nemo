@@ -4,13 +4,15 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Any, Callable, cast
+from typing import Callable, cast
 
+from .channel import Channel
 from .coding_agent import CodingAgent
 from .db import Database
 from .permissions import build_permission_handler
 from .sdk_thread import SDKThread
 from .turn import TurnEvent
+from .types import JsonObject
 
 log = logging.getLogger(__name__)
 
@@ -23,7 +25,7 @@ class ClaudeCodingAgent(CodingAgent):
     credentials: dict[str, str],
     chat_id: str,
     db: Database,
-    channel: Any,
+    channel: Channel,
     permission_mode: str = "bypassPermissions",
   ):
     self._credentials = credentials
@@ -33,7 +35,7 @@ class ClaudeCodingAgent(CodingAgent):
     self._permission_mode = permission_mode
     self._sdk = SDKThread()
     self._sdk_started = False
-    self._options: Any = None
+    self._options: object = None
 
   async def start(self, project_dir: str, model: str, resume: str = "") -> None:
     if not self._sdk_started:
@@ -45,9 +47,9 @@ class ClaudeCodingAgent(CodingAgent):
   async def run_turn(
     self,
     prompt: str,
-    on_event: Callable[[TurnEvent], Any],
+    on_event: Callable[[TurnEvent], None],
     stale_tasks: set[str] | None = None,
-  ) -> tuple[float, dict[str, Any]]:
+  ) -> tuple[float, JsonObject]:
     return await self._sdk.run_turn_with_reconnect(
       prompt, on_event, stale_tasks=stale_tasks, options=self._options)
 
@@ -64,7 +66,7 @@ class ClaudeCodingAgent(CodingAgent):
       self._sdk.stop()
       self._sdk_started = False
 
-  def _build_options(self, project_dir: str, model: str, resume: str = "") -> Any:
+  def _build_options(self, project_dir: str, model: str, resume: str = "") -> object:
     from claude_agent_sdk import ClaudeAgentOptions
     from claude_agent_sdk.types import PermissionMode
 
@@ -96,7 +98,7 @@ class ClaudeCodingAgent(CodingAgent):
     def _stderr_handler(line: str) -> None:
       log.info("[sdk-stderr] %s", line.rstrip())
 
-    opts: dict[str, Any] = dict(
+    opts: dict[str, object] = dict(
       allowed_tools=["Agent", "Skill", "Read", "Write", "Edit", "Bash", "Glob", "Grep"],
       setting_sources=["user", "project"],
       permission_mode=cast(PermissionMode, self._permission_mode),

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import os
-from typing import Any
 
 from .channel import Channel, IncomingMessage
 from .config import load_credentials, load_relay_config
@@ -11,6 +10,7 @@ from .lark import api as lark_api
 from .lark import auth as lark_auth
 from .lark.events import LarkEvent, LarkEventStream
 from .relay_events import RelayEventStream
+from .types import JsonObject
 
 
 def _to_incoming(event: LarkEvent) -> IncomingMessage:
@@ -91,10 +91,10 @@ class LarkChannel(Channel):
     )
     self._events.push_back(event)
 
-  async def send_card(self, chat_id: str, card: dict[str, Any]) -> str:
+  async def send_card(self, chat_id: str, card: JsonObject) -> str:
     return lark_api.send_card(self.token, chat_id, card)
 
-  async def update_card(self, message_id: str, card: dict[str, Any]) -> None:
+  async def update_card(self, message_id: str, card: JsonObject) -> None:
     lark_api.update_card(self.token, message_id, card)
 
   async def send_text(self, chat_id: str, text: str) -> str:
@@ -108,8 +108,8 @@ class LarkChannel(Channel):
   ) -> str:
     return lark_api.download_file(self.token, message_id, file_key, file_name)
 
-  async def add_reaction(self, message_id: str, emoji_type: str) -> Any:
-    return lark_api.add_reaction(self.token, message_id, emoji_type)
+  async def add_reaction(self, message_id: str, emoji_type: str) -> None:
+    lark_api.add_reaction(self.token, message_id, emoji_type)
 
   async def remove_reaction(self, message_id: str, reaction_id: str) -> None:
     lark_api.remove_reaction(self.token, message_id, reaction_id)
@@ -118,13 +118,13 @@ class LarkChannel(Channel):
     bot_info = lark_api.get_bot_info(self.token)
     return bot_info.get("open_id", "")
 
-  async def get_chat_members(self, chat_id: str) -> list[dict[str, Any]]:
+  async def get_chat_members(self, chat_id: str) -> list[JsonObject]:
     return lark_api.get_chat_members(self.token, chat_id)
 
   async def lookup_open_id_by_email(self, email: str) -> str:
     return lark_api.lookup_open_id_by_email(self.token, email) or ""
 
-  async def get_chat_info(self, chat_id: str) -> dict[str, Any]:
+  async def get_chat_info(self, chat_id: str) -> JsonObject:
     return lark_api.get_chat_info(self.token, chat_id)
 
   async def refresh_token(self) -> str:

@@ -10,7 +10,8 @@ from __future__ import annotations
 
 import json
 import os
-from typing import Any
+
+from .types import JsonObject
 
 CONFIG_DIR = os.path.expanduser("~/.nemo")
 DB_BASE = os.path.join(CONFIG_DIR, "projects")
@@ -33,7 +34,7 @@ def profile_path(name: str | None = None) -> str:
   return os.path.join(CONFIG_DIR, f"{name or _profile}.json")
 
 
-def load_config() -> dict[str, Any]:
+def load_config() -> JsonObject:
   """Load the active profile's config dict."""
   path = profile_path()
   if os.path.isfile(path):
