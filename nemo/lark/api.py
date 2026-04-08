@@ -304,10 +304,13 @@ def _multipart_upload(url: str, token: str, fields: dict[str, str],
 # Image upload & send
 # ---------------------------------------------------------------------------
 
-def upload_image(token: str, path: str) -> str:
-  """Upload an image to Lark. Returns image_key."""
+def upload_image(token: str, path: str, image_type: str = "message") -> str:
+  """Upload an image to Lark. Returns image_key.
+
+  image_type: "message" for chat images, "avatar" for group avatars.
+  """
   url = f"{BASE_URL}/im/v1/images"
-  data = _multipart_upload(url, token, {"image_type": "message"}, "image", path)
+  data = _multipart_upload(url, token, {"image_type": image_type}, "image", path)
   if data.get("code") == 0:
     return data["data"]["image_key"]
   raise RuntimeError(f"Failed to upload image: {data}")

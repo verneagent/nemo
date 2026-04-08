@@ -188,6 +188,15 @@ def auto_create_chat(token: str, project_dir: str,
     log.error("Failed to create group: %s", e)
     return None
 
+  # Set group avatar
+  try:
+    avatar_path = os.path.join(os.path.dirname(__file__), "assets", "avatar.png")
+    if os.path.isfile(avatar_path):
+      image_key = lark_api.upload_image(token, avatar_path, image_type="avatar")
+      lark_api.update_chat_info(token, chat_id, {"avatar": image_key})
+  except Exception as e:
+    log.warning("Failed to set group avatar: %s", e)
+
   # Add operator by email
   if email:
     try:

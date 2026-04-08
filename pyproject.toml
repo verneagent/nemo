@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "captain-nemo"
-version = "0.3.13"
+version = "0.3.14"
 description = "Lark-connected coding agent daemon powered by Claude Agent SDK"
 requires-python = ">=3.14"
 license = "MIT"
@@ -29,6 +29,9 @@ nemo = "nemo.__main__:main"
 
 [tool.setuptools.packages.find]
 include = ["nemo*"]
+
+[tool.setuptools.package-data]
+nemo = ["assets/*.png"]
 
 [tool.pytest.ini_options]
 markers = ["slow: marks tests as slow (deselect with '-m \"not slow\"')"]
