@@ -156,7 +156,7 @@ def test_text_only_turn_clears_thinking_reaction(tmp_path):
   }), \
        mock.patch("nemo.agent.Database", _FakeDB), \
        mock.patch("nemo.agent.LarkChannel", _FakeChannel), \
-       mock.patch("nemo.agent.ClaudeCodingAgent", _FakeAgent), \
+       mock.patch("nemo.agent.build_coding_agent", return_value=_FakeAgent()), \
        mock.patch.object(_FakeChannel, "add_reaction", return_value="r_thinking") as add_reaction, \
        mock.patch.object(_FakeChannel, "remove_reaction", remove_reaction), \
        mock.patch("nemo.group_config.load_config", return_value={}), \

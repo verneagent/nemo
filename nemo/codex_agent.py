@@ -1,0 +1,248 @@
+"""Concrete CodingAgent implementation backed by the Codex CLI JSON stream."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import os
+import shutil
+from asyncio.subprocess import Process
+from typing import Callable
+
+from .cards import ToolRecord
+from .channel import Channel
+from .coding_agent import CodingAgent
+from .db import Database
+from .turn import DoneEvent, ErrorEvent, TextEvent, ToolProgressEvent, ToolStartEvent, TurnEvent
+from .types import JsonObject
+
+log = logging.getLogger(__name__)
+
+
+class CodexCodingAgent(CodingAgent):
+  """CodingAgent adapter for the local `codex exec --json` runtime."""
+
+  def __init__(
+    self,
+    credentials: dict[str, str],
+    chat_id: str,
+    db: Database,
+    channel: Channel,
+    permission_mode: str = "bypassPermissions",
+  ):
+    del credentials, chat_id, db, channel
+    self._permission_mode = permission_mode
+    self._project_dir = ""
+    self._model = ""
+    self._session_id = ""
+    self._proc: Process | None = None
+    self._interrupted = False
+
+  async def start(self, project_dir: str, model: str, resume: str = "") -> None:
+    self._ensure_runtime()
+    self._project_dir = project_dir
+    self._model = model
+    self._session_id = resume
+
+  async def run_turn(
+    self,
+    prompt: str,
+    on_event: Callable[[TurnEvent], None],
+    stale_tasks: set[str] | None = None,
+  ) -> tuple[float, JsonObject]:
+    del stale_tasks
+    self._ensure_runtime()
+    self._interrupted = False
+
+    args = self._build_command()
+    log.info("codex exec start model=%s resume=%s", self._model, bool(self._session_id))
+    proc = await asyncio.create_subprocess_exec(
+      *args,
+      stdin=asyncio.subprocess.PIPE,
+      stdout=asyncio.subprocess.PIPE,
+      stderr=asyncio.subprocess.PIPE,
+      cwd=self._project_dir or None,
+      env=self._build_env(),
+    )
+    self._proc = proc
+
+    assert proc.stdin is not None
+    assert proc.stdout is not None
+    assert proc.stderr is not None
+
+    stderr_task = asyncio.create_task(self._log_stderr(proc.stderr))
+    proc.stdin.write(prompt.encode())
+    await proc.stdin.drain()
+    proc.stdin.close()
+
+    usage: JsonObject = {}
+    saw_tool = False
+    failure: str | None = None
+
+    try:
+      while True:
+        raw = await proc.stdout.readline()
+        if not raw:
+          break
+        line = raw.decode(errors="replace").strip()
+        if not line:
+          continue
+        event = self._parse_event(line)
+        if event is None:
+          continue
+
+        event_type = str(event.get("type", ""))
+        if event_type == "thread.started":
+          self._session_id = str(event.get("thread_id", "") or "")
+          continue
+        if event_type == "turn.completed":
+          usage = self._coerce_json_object(event.get("usage"))
+          continue
+        if event_type == "turn.failed":
+          error = self._coerce_json_object(event.get("error"))
+          failure = str(error.get("message", "Codex turn failed"))
+          on_event(ErrorEvent(message=failure))
+          break
+        if event_type != "item.completed":
+          continue
+
+        item = self._coerce_json_object(event.get("item"))
+        item_type = str(item.get("type", ""))
+        if item_type == "agent_message":
+          text = str(item.get("text", "") or "")
+          if text:
+            on_event(TextEvent(text=text))
+        else:
+          summary = self._item_summary(item)
+          if not summary:
+            continue
+          record = ToolRecord(name=item_type, summary=summary)
+          if not saw_tool:
+            on_event(ToolStartEvent(tool=record))
+            saw_tool = True
+          else:
+            on_event(ToolProgressEvent(tool=record))
+
+      rc = await proc.wait()
+      if failure is None and rc != 0 and not self._interrupted:
+        failure = f"Codex exited with status {rc}"
+        on_event(ErrorEvent(message=failure))
+      if failure is not None:
+        raise RuntimeError(failure)
+
+      on_event(DoneEvent(cost=0.0, usage=usage, session_id=self._session_id))
+      return 0.0, usage
+    finally:
+      stderr_task.cancel()
+      try:
+        await stderr_task
+      except asyncio.CancelledError:
+        pass
+      self._proc = None
+
+  async def interrupt(self) -> None:
+    proc = self._proc
+    if proc is None or proc.returncode is not None:
+      return
+    self._interrupted = True
+    proc.terminate()
+    try:
+      await asyncio.wait_for(proc.wait(), timeout=5)
+    except asyncio.TimeoutError:
+      proc.kill()
+      await proc.wait()
+
+  async def reset(self, project_dir: str, model: str, resume: str = "") -> None:
+    await self.interrupt()
+    self._project_dir = project_dir
+    self._model = model
+    self._session_id = resume
+
+  async def stop(self) -> None:
+    await self.interrupt()
+
+  def _build_command(self) -> list[str]:
+    if self._permission_mode != "bypassPermissions":
+      raise RuntimeError("Codex provider currently supports only bypassPermissions mode")
+
+    args = ["codex", "exec", "--json", "--skip-git-repo-check"]
+    if self._model:
+      args.extend(["--model", self._model])
+    args.extend(["--cd", self._project_dir])
+    args.append("--dangerously-bypass-approvals-and-sandbox")
+    if self._session_id:
+      args.extend(["resume", self._session_id])
+    return args
+
+  def _build_env(self) -> dict[str, str]:
+    env = {
+      "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+      "HOME": os.environ.get("HOME", ""),
+      "USER": os.environ.get("USER", ""),
+    }
+    for key in ("OPENAI_API_KEY", "CODEX_API_KEY", "http_proxy", "https_proxy", "all_proxy"):
+      val = os.environ.get(key)
+      if val:
+        env[key] = val
+    return env
+
+  async def _log_stderr(self, stream: asyncio.StreamReader) -> None:
+    while True:
+      raw = await stream.readline()
+      if not raw:
+        return
+      log.info("[codex-stderr] %s", raw.decode(errors="replace").rstrip())
+
+  def _ensure_runtime(self) -> None:
+    if shutil.which("codex"):
+      return
+    raise RuntimeError("codex CLI not found in PATH")
+
+  def _parse_event(self, line: str) -> JsonObject | None:
+    try:
+      parsed = json.loads(line)
+    except json.JSONDecodeError:
+      log.warning("codex json parse failed: %s", line[:200])
+      return None
+    if isinstance(parsed, dict):
+      return self._coerce_json_object(parsed)
+    return None
+
+  def _coerce_json_object(self, value: object) -> JsonObject:
+    if isinstance(value, dict):
+      return value
+    return {}
+
+  def _item_summary(self, item: JsonObject) -> str:
+    item_type = str(item.get("type", ""))
+    if item_type == "reasoning":
+      text = str(item.get("text", "") or "")
+      return text[:200] + "..." if len(text) > 200 else text
+    if item_type == "command_execution":
+      command = str(item.get("command", "") or "")
+      return f"$ {command}" if command else "command"
+    if item_type == "file_change":
+      changes = item.get("changes")
+      if isinstance(changes, list):
+        paths = []
+        for change in changes[:3]:
+          if isinstance(change, dict):
+            path = str(change.get("path", "") or "")
+            kind = str(change.get("kind", "") or "")
+            if path:
+              paths.append(f"{kind}:{path}" if kind else path)
+        return ", ".join(paths)
+      return "file change"
+    if item_type == "mcp_tool_call":
+      server = str(item.get("server", "") or "")
+      tool = str(item.get("tool", "") or "")
+      return ": ".join(part for part in (server, tool) if part)
+    if item_type == "web_search":
+      query = str(item.get("query", "") or "")
+      return f"web: {query}" if query else "web search"
+    if item_type == "todo_list":
+      return "todo list updated"
+    if item_type == "error":
+      return str(item.get("message", "") or "error")
+    return ""

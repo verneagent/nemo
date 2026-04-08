@@ -20,8 +20,8 @@ import time
 import uuid
 
 from . import cards, commands, messages, monitor
+from .agent_factory import AgentProvider, build_coding_agent
 from .channel import IncomingMessage
-from .claude_agent import ClaudeCodingAgent
 from .config import load_credentials
 from .db import Database
 from .lark_channel import LarkChannel
@@ -151,6 +151,7 @@ async def main_loop(
   chat_id: str,
   project_dir: str,
   model: str,
+  provider: AgentProvider = "claude",
   permission_mode: str = "bypassPermissions",
 ) -> int:
   """Run the agent main loop."""
@@ -248,7 +249,8 @@ async def main_loop(
 
     _heartbeat_task = asyncio.create_task(_heartbeat_loop())
 
-  agent = ClaudeCodingAgent(
+  agent = build_coding_agent(
+    provider,
     credentials, chat_id, db, channel,
     permission_mode=permission_mode,
   )
