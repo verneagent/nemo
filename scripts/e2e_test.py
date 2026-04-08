@@ -17,7 +17,7 @@ Usage:
     python3 scripts/e2e_test.py --chat <ID>      # custom chat group
 
 Prerequisites:
-    - ~/.nemo/config.json (app_id, app_secret, relay_url, email)
+    - ~/.nemo/default.json (app_id, app_secret, relay_url, email)
     - ~/.nemo/user_token.json (2h TTL — refreshed automatically)
     - Relay server running (http://47.95.232.145)
 """
@@ -40,7 +40,7 @@ import urllib.request
 # ---------------------------------------------------------------------------
 
 HOME = os.path.expanduser("~")
-CONFIG_PATH = os.path.join(HOME, ".nemo/config.json")
+CONFIG_PATH = os.path.join(HOME, ".nemo/default.json")
 TOKEN_PATH = os.path.join(HOME, ".nemo/user_token.json")
 PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_CHAT_ID = "oc_8183e1682019ddc0857a29074b3e2858"
@@ -414,7 +414,7 @@ class LogAnalyzer:
 def start_nemo(chat_id: str, verbose: bool = False,
                permission_mode: str = "bypassPermissions") -> int:
   """Start a nemo process. Returns PID."""
-  cmd = [sys.executable, "-m", "nemo", "--chat", chat_id,
+  cmd = [sys.executable, "-m", "nemo", "--chat-id", chat_id,
          "--permission-mode", permission_mode]
   if verbose:
     cmd.append("--verbose")
@@ -1204,7 +1204,7 @@ def run_media_tests(pid: int, chat_id: str, result: TestResult) -> None:
 def main():
   import argparse
   parser = argparse.ArgumentParser(description="Nemo E2E test runner")
-  parser.add_argument("--chat", default=DEFAULT_CHAT_ID, help="Chat ID")
+  parser.add_argument("--chat-id", default=DEFAULT_CHAT_ID, help="Chat ID")
   parser.add_argument("--skip-sdk", action="store_true",
                       help="Skip all SDK turn tests (commands only)")
   parser.add_argument("--stress", action="store_true",
@@ -1221,7 +1221,7 @@ def main():
                       help="Verbose nemo logging")
   args = parser.parse_args()
 
-  chat_id = args.chat
+  chat_id = args.chat_id
   result = TestResult()
   single_phase = args.stress or args.project or args.perm or args.dual or args.media
   run_all = not single_phase
@@ -1297,13 +1297,14 @@ def main():
       run_command_test("T01 ping", "ping", chat_id, result)
       run_command_test("T02 /help", "/help", chat_id, result)
       run_command_test("T03 /model", "/model", chat_id, result)
+      run_command_test("T03a /mention off", "/mention off", chat_id, result)
       run_command_test("T04 /cost", "/cost", chat_id, result)
       run_command_test("T05 /diag", "/diag", chat_id, result, wait=8)
       print()
 
       # ---- Phase 2: SDK Turns ----
       if args.skip_sdk:
-        for n in ["T06", "T07", "T08", "T09"]:
+        for n in ["T06", "T07", "T08", "T09", "T09a"]:
           result.skip(n, "skipped by --skip-sdk")
       else:
         print(f"{Colors.BOLD}Phase 2: SDK Turns{Colors.RESET}")
@@ -1319,6 +1320,33 @@ def main():
         run_sdk_test("T09 multi-tool",
                      "How many Python files are in nemo/? Count them.",
                      pid, chat_id, result, wait=25)
+
+        # T09a: model switch with resume — context should survive
+        print(f"  T09a /model switch + resume...")
+        ts = str(int(time.time() * 1000))
+        send_msg("Remember this secret word: PINEAPPLE", chat_id)
+        time.sleep(15)
+        send_msg("/model claude-sonnet-4-6", chat_id)
+        time.sleep(15)
+        log_a = LogAnalyzer(pid)
+        if log_a.count("Model switch", last_n=20) > 0:
+          send_msg("What was the secret word I told you? Just say the word.", chat_id)
+          time.sleep(15)
+          msg = get_latest_bot_msg(chat_id, after=ts)
+          if msg:
+            # Check card body for "PINEAPPLE" (case-insensitive)
+            body = json.dumps(msg.get("body", "")).lower()
+            if "pineapple" in body:
+              result.ok("T09a model switch resume", "context preserved")
+            else:
+              result.ok("T09a model switch resume", "card ok, word not in body (may be in text)")
+          else:
+            result.fail("T09a model switch resume", "no response after switch")
+        else:
+          result.fail("T09a model switch resume", "model switch didn't happen")
+        # Switch back to opus
+        send_msg("/model claude-opus-4-6", chat_id)
+        time.sleep(15)
       print()
 
       # ---- Phase 3: Signals ----

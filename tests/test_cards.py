@@ -1,9 +1,10 @@
 """Tests for nemo.cards — card builders and tool summary."""
 
 from nemo.cards import (
-  ToolRecord, build_turn_card, build_card, build_markdown_card,
+  ToolRecord, ThinkingStep, build_turn_card, build_card, build_markdown_card,
   build_form_select, build_form_input,
   tool_use_summary, _elapsed_title, _elapsed_text, _usage_text,
+  _collapsible_thinking,
 )
 
 
@@ -63,6 +64,51 @@ def test_tool_summary_unknown():
 
 
 # ---------------------------------------------------------------------------
+# ThinkingStep & _collapsible_thinking
+# ---------------------------------------------------------------------------
+
+def test_collapsible_thinking_mixed():
+  steps = [
+    ThinkingStep("text", "Let me check..."),
+    ThinkingStep("tool", "Read: main.py"),
+    ThinkingStep("text", "Found the issue"),
+    ThinkingStep("tool", "Edit: main.py"),
+  ]
+  panel = _collapsible_thinking(steps)
+  assert panel["tag"] == "collapsible_panel"
+  assert panel["header"]["title"]["content"] == "Thinking (4)"
+  content = panel["elements"][0]["content"]
+  assert "Let me check..." in content
+  assert "- `Read: main.py`" in content
+  assert "Found the issue" in content
+  assert "- `Edit: main.py`" in content
+
+
+def test_collapsible_thinking_tools_only():
+  steps = [ThinkingStep("tool", "$ ls"), ThinkingStep("tool", "Read: x.py")]
+  panel = _collapsible_thinking(steps)
+  assert panel["header"]["title"]["content"] == "Thinking (2)"
+  content = panel["elements"][0]["content"]
+  assert "- `$ ls`" in content
+  assert "- `Read: x.py`" in content
+
+
+def test_collapsible_thinking_text_truncated():
+  long_text = "x" * 300
+  steps = [ThinkingStep("text", long_text)]
+  panel = _collapsible_thinking(steps)
+  content = panel["elements"][0]["content"]
+  assert len(content) <= 210  # 200 + "..."
+  assert content.endswith("...")
+
+
+def test_collapsible_thinking_empty():
+  """Empty steps list — should not normally be rendered but handle gracefully."""
+  panel = _collapsible_thinking([])
+  assert "Thinking (0)" in panel["header"]["title"]["content"]
+
+
+# ---------------------------------------------------------------------------
 # build_turn_card — working phase
 # ---------------------------------------------------------------------------
 
@@ -77,12 +123,19 @@ def test_working_card_basic():
   assert any(e["tag"] == "column_set" for e in elements)  # stop button
 
 
-def test_working_card_with_tools():
-  tools = [ToolRecord("Read", "Read: a.py"), ToolRecord("Edit", "Edit: b.py")]
-  card = build_turn_card("working", current_tool="Edit: b.py", tools=tools)
+def test_working_card_with_steps():
+  steps = [
+    ThinkingStep("text", "Checking..."),
+    ThinkingStep("tool", "Read: a.py"),
+    ThinkingStep("tool", "Edit: b.py"),
+  ]
+  card = build_turn_card("working", current_tool="Edit: b.py", steps=steps)
   elements = card["body"]["elements"]
-  # Should have collapsible panel for previous tools
-  assert any(e.get("tag") == "collapsible_panel" for e in elements)
+  # Should have: current_tool markdown, thinking collapsible, stop button
+  assert elements[0]["tag"] == "markdown"
+  assert "`Edit: b.py`" in elements[0]["content"]
+  assert elements[1]["tag"] == "collapsible_panel"
+  assert "Thinking (3)" in elements[1]["header"]["title"]["content"]
 
 
 def test_working_card_escalating_title():
@@ -99,26 +152,12 @@ def test_working_card_stop_button_has_chat_id():
   assert btn["value"]["chat_id"] == "oc_123"
 
 
-# ---------------------------------------------------------------------------
-# build_turn_card — working phase with body (intermediate text)
-# ---------------------------------------------------------------------------
-
-def test_working_card_with_body():
-  card = build_turn_card("working", body="Thinking about this...", elapsed=5)
+def test_working_card_with_body_only():
+  """Body param still accepted for backwards compat but not used in working."""
+  card = build_turn_card("working", body="ignored", elapsed=5)
   elements = card["body"]["elements"]
-  # First element should be the body markdown
-  assert elements[0]["tag"] == "markdown"
-  assert elements[0]["content"] == "Thinking about this..."
-
-
-def test_working_card_with_body_and_tool():
-  card = build_turn_card(
-    "working", body="Let me check.", current_tool="Read: foo.py", elapsed=5,
-  )
-  elements = card["body"]["elements"]
-  # body markdown, then tool markdown, then stop button
-  assert elements[0]["content"] == "Let me check."
-  assert "`Read: foo.py`" in elements[1]["content"]
+  # Only stop button when no steps and no current_tool
+  assert elements[0]["tag"] == "column_set"
 
 
 # ---------------------------------------------------------------------------
@@ -130,7 +169,7 @@ def test_done_card_basic():
   assert card["header"]["template"] == "green"
   assert card["header"]["title"]["content"] == "Done ✓"
   elements = card["body"]["elements"]
-  assert any(e["tag"] == "markdown" for e in elements)
+  assert any(e["tag"] == "markdown" and e["content"] == "All done." for e in elements)
   # Footer note is now a markdown element with text_size="notation"
   footer = [e for e in elements if e.get("text_size") == "notation"][0]
   assert "15s" in footer["content"]
@@ -148,11 +187,33 @@ def test_done_card_with_usage():
   assert "300" in text
 
 
-def test_done_card_with_tools():
-  tools = [ToolRecord("Read", "Read: x.py")]
-  card = build_turn_card("done", body="Done.", tools=tools, elapsed=5)
+def test_done_card_with_steps():
+  steps = [ThinkingStep("tool", "Read: x.py"), ThinkingStep("text", "Found it")]
+  card = build_turn_card("done", body="Done.", steps=steps, elapsed=5)
   elements = card["body"]["elements"]
-  assert any(e.get("tag") == "collapsible_panel" for e in elements)
+  # Body inline, then thinking collapsible, then note
+  assert elements[0]["content"] == "Done."
+  assert elements[1]["tag"] == "collapsible_panel"
+  assert "Thinking (2)" in elements[1]["header"]["title"]["content"]
+
+
+# ---------------------------------------------------------------------------
+# build_turn_card — error phase
+# ---------------------------------------------------------------------------
+
+def test_error_card_basic():
+  card = build_turn_card("error", body="**Timeout**", elapsed=30)
+  assert card["header"]["template"] == "red"
+  assert card["header"]["title"]["content"] == "Error"
+  elements = card["body"]["elements"]
+  assert elements[0]["content"] == "**Timeout**"
+
+
+def test_error_card_with_steps():
+  steps = [ThinkingStep("tool", "$ long-running-cmd")]
+  card = build_turn_card("error", body="**Timed out**", steps=steps, elapsed=60)
+  elements = card["body"]["elements"]
+  assert elements[1]["tag"] == "collapsible_panel"
 
 
 # ---------------------------------------------------------------------------

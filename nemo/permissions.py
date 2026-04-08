@@ -22,11 +22,7 @@ from typing import Any, Callable
 log = logging.getLogger(__name__)
 
 # Tools that are always auto-approved (internal operations)
-AUTO_APPROVE_PATTERNS = {
-  "handoff_ops.py", "send_to_group.py", "wait_for_reply.py",
-  "send_and_wait.py", "iterm2_silence.py", "end_and_cleanup.py",
-  "start_and_wait.py", "preflight.py", "enter_handoff.py",
-}
+AUTO_APPROVE_PATTERNS: set[str] = set()
 
 # Reaction emoji types that mean "approve"
 APPROVE_REACTIONS = {"THUMBSUP", "OK", "YES", "APPROVE", "LIKESMILEY"}

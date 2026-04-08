@@ -94,13 +94,14 @@ def try_dispatch(text: str, ctx: AgentContext) -> tuple[bool, str | None]:
       "| `/ping` | Status check |\n"
       "| `/cost` | Session API cost |\n"
       "| `/usage` | Plan usage limits |\n"
+      "| `/mention` | Toggle @mention requirement |\n"
       "| `/norm` | Manage group norms |\n"
       "| `/guest` | Manage guests |\n"
       "| `/diag` | Run diagnostics |\n"
       "| `/exit` | Stop agent, keep group |\n"
       "| `/dissolve` | Stop agent, dissolve group |\n"
       "| `/help` | This help |\n"
-      "| `autoapprove on/off` | Toggle auto-approve |"
+      "| `/autoapprove` | Toggle auto-approve |"
     )
 
   # /norm
@@ -123,12 +124,22 @@ def try_dispatch(text: str, ctx: AgentContext) -> tuple[bool, str | None]:
       "| `/norm list` | List all norms |"
     )
 
+  # /mention
+  if t in ("/mention", "mention"):
+    return True, "__mention_toggle__"
+  if t in ("/mention on", "mention on"):
+    return True, "__mention__:on"
+  if t in ("/mention off", "mention off"):
+    return True, "__mention__:off"
+
   # /diag
   if t in ("/diag", "diag"):
     return True, "__diag__"
 
-  # autoapprove
-  if re.match(r"(auto[\s\-]*approve|autoapprove)\s+(on|off)", t):
+  # /autoapprove
+  if t in ("/autoapprove", "autoapprove"):
+    return True, "__autoapprove_toggle__"
+  if re.match(r"/?(?:auto[\s\-]*approve|autoapprove)\s+(on|off)", t):
     enabled = "on" in t.split()[-1]
     return True, f"__autoapprove__:{'on' if enabled else 'off'}"
 
@@ -164,3 +175,19 @@ def try_dispatch(text: str, ctx: AgentContext) -> tuple[bool, str | None]:
     return True, "__exit__"
 
   return False, None
+
+
+# Commands that require SDK restart — NOT safe during a turn.
+_NEEDS_SDK = ("__clear__", "__esc__", "__model__:", "__cd__:")
+
+
+def is_inline_safe(response: str | None) -> bool:
+  """Check if a command response can be handled during an active turn.
+
+  Returns True for commands that don't interact with the SDK client:
+  /ping, /cost, /help, /mention, /autoapprove, /norm, /guest, /diag, etc.
+  Returns False for /clear, /esc, /model, /cd (need SDK restart).
+  """
+  if not response:
+    return False
+  return not any(response.startswith(p) for p in _NEEDS_SDK)

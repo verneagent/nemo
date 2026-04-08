@@ -1,6 +1,6 @@
 """Tests for nemo.commands — built-in agent commands."""
 
-from nemo.commands import try_dispatch, AgentContext
+from nemo.commands import try_dispatch, is_inline_safe, AgentContext
 
 
 def _ctx():
@@ -81,10 +81,22 @@ def test_autoapprove_on():
   assert resp == "__autoapprove__:on"
 
 
+def test_autoapprove_slash_on():
+  handled, resp = try_dispatch("/autoapprove on", _ctx())
+  assert handled
+  assert resp == "__autoapprove__:on"
+
+
 def test_autoapprove_off():
   handled, resp = try_dispatch("autoapprove off", _ctx())
   assert handled
   assert resp == "__autoapprove__:off"
+
+
+def test_autoapprove_toggle():
+  handled, resp = try_dispatch("/autoapprove", _ctx())
+  assert handled
+  assert resp == "__autoapprove_toggle__"
 
 
 def test_exit():
@@ -187,3 +199,94 @@ def test_diag_bare():
   handled, resp = try_dispatch("diag", _ctx())
   assert handled
   assert resp == "__diag__"
+
+
+# ---------------------------------------------------------------------------
+# /mention command
+# ---------------------------------------------------------------------------
+
+def test_mention_toggle():
+  handled, resp = try_dispatch("/mention", _ctx())
+  assert handled
+  assert resp == "__mention_toggle__"
+
+
+def test_mention_on():
+  handled, resp = try_dispatch("/mention on", _ctx())
+  assert handled
+  assert resp == "__mention__:on"
+
+
+def test_mention_off():
+  handled, resp = try_dispatch("/mention off", _ctx())
+  assert handled
+  assert resp == "__mention__:off"
+
+
+def test_mention_in_help():
+  handled, resp = try_dispatch("/help", _ctx())
+  assert handled
+  assert "mention" in resp.lower()
+
+
+# ---------------------------------------------------------------------------
+# is_inline_safe — classify commands for during-turn execution
+# ---------------------------------------------------------------------------
+
+def test_inline_safe_ping():
+  _, resp = try_dispatch("/ping", _ctx())
+  assert is_inline_safe(resp)
+
+
+def test_inline_safe_cost():
+  _, resp = try_dispatch("/cost", _ctx())
+  assert is_inline_safe(resp)
+
+
+def test_inline_safe_help():
+  _, resp = try_dispatch("/help", _ctx())
+  assert is_inline_safe(resp)
+
+
+def test_inline_safe_mention():
+  _, resp = try_dispatch("/mention on", _ctx())
+  assert is_inline_safe(resp)
+
+
+def test_inline_safe_autoapprove():
+  _, resp = try_dispatch("/autoapprove on", _ctx())
+  assert is_inline_safe(resp)
+
+
+def test_inline_safe_norm():
+  _, resp = try_dispatch("/norm list", _ctx())
+  assert is_inline_safe(resp)
+
+
+def test_inline_safe_diag():
+  _, resp = try_dispatch("/diag", _ctx())
+  assert is_inline_safe(resp)
+
+
+def test_not_inline_safe_clear():
+  _, resp = try_dispatch("/clear", _ctx())
+  assert not is_inline_safe(resp)
+
+
+def test_not_inline_safe_model():
+  _, resp = try_dispatch("/model sonnet", _ctx())
+  assert not is_inline_safe(resp)
+
+
+def test_not_inline_safe_cd(tmp_path):
+  _, resp = try_dispatch(f"/cd {tmp_path}", _ctx())
+  assert not is_inline_safe(resp)
+
+
+def test_not_inline_safe_esc():
+  _, resp = try_dispatch("/esc", _ctx())
+  assert not is_inline_safe(resp)
+
+
+def test_not_inline_safe_none():
+  assert not is_inline_safe(None)

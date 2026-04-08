@@ -50,15 +50,19 @@ def main():
     description="Lark-connected coding agent daemon",
   )
   parser.add_argument("--chat-id", default="", help="Lark chat ID (auto-discovered if omitted)")
+  parser.add_argument("--chat-name", default="", help="Find chat by name substring")
   parser.add_argument("--project-dir", default=".", help="Project directory (default: cwd)")
   parser.add_argument("--model", default="claude-opus-4-6", help="Model to use")
-  parser.add_argument("--sidecar", action="store_true", default=False,
-                      help="Sidecar mode: only respond to @mentions, replies, reactions")
+  parser.add_argument("--profile", default="default", help="Config profile name (default: default)")
   parser.add_argument("--permission-mode", default="bypassPermissions",
                       choices=["default", "acceptEdits", "plan", "bypassPermissions"],
                       help="SDK permission mode (default: bypassPermissions)")
   parser.add_argument("--verbose", "-v", action="store_true", help="Debug logging")
   args = parser.parse_args()
+
+  # Set active profile before any config loading
+  from .config import set_profile, profile_path
+  set_profile(args.profile)
 
   # Log to both stderr and a persistent log file
   log_level = logging.DEBUG if args.verbose else logging.INFO
@@ -100,10 +104,31 @@ def main():
   from .config import load_credentials
   credentials = load_credentials()
   if not credentials:
-    print("Error: No credentials configured (~/.nemo/config.json)", file=sys.stderr)
+    p = profile_path()
+    print(f"Error: No credentials configured ({p})", file=sys.stderr)
     return 1
 
   chat_id = args.chat_id
+
+  # --chat-name: search by name substring
+  if not chat_id and args.chat_name:
+    from .lark.auth import get_token
+    from .lark import api as lark_api
+    token = get_token(credentials["app_id"], credentials["app_secret"])
+    chats = lark_api.list_bot_chats(token)
+    query = args.chat_name.lower()
+    matches = [c for c in chats if query in (c.get("name") or "").lower()]
+    if not matches:
+      print(f"Error: No chat found matching '{args.chat_name}'", file=sys.stderr)
+      return 1
+    if len(matches) > 1:
+      print(f"Multiple chats match '{args.chat_name}':", file=sys.stderr)
+      for c in matches:
+        print(f"  {c['chat_id']}  {c.get('name', '')}", file=sys.stderr)
+      return 1
+    chat_id = matches[0]["chat_id"]
+    logging.getLogger("nemo").info("Found chat: %s (%s)", chat_id, matches[0].get("name", ""))
+
   if not chat_id:
     # Auto-discover idle chat or create a new one
     from .lark.auth import get_token
@@ -126,7 +151,6 @@ def main():
 
   from .agent import main_loop
   return asyncio.run(main_loop(chat_id, project_dir, args.model,
-                               sidecar=args.sidecar,
                                permission_mode=args.permission_mode))
 
 

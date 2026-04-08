@@ -19,7 +19,7 @@ def _relay_request(method: str, path: str, data: dict | None = None) -> dict:
     """Make an authenticated request to the relay server."""
     relay_url, api_key = load_relay_config()
     if not relay_url:
-        raise RuntimeError("Relay not configured (set relay_url in ~/.nemo/config.json)")
+        raise RuntimeError("Relay not configured (set relay_url in ~/.nemo/<profile>.json)")
 
     url = f"{relay_url.rstrip('/')}{path}"
     body = json.dumps(data).encode() if data else None

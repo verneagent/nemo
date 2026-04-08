@@ -1,10 +1,11 @@
 """Unified turn card — one Card V2 per turn, evolving via PATCH.
 
 Lifecycle:
-  1. Working phase  — grey header, current tool in body,
-                      tool history in collapsible panel
-  2. Response phase — response markdown in body, all tools in collapsible
-  3. Done phase     — green header, response in body, tools + stats in collapsible
+  1. Working phase  — grey header, current action inline,
+                      unified thinking timeline in collapsible
+  2. Done phase     — green header, final response inline,
+                      thinking timeline in collapsible
+  3. Error phase    — red header, error inline, thinking in collapsible
 
 All phases update the SAME message via Lark PATCH API.
 """
@@ -27,6 +28,13 @@ class ToolRecord:
   name: str
   summary: str
   ts: float = field(default_factory=time.time)
+
+
+@dataclass
+class ThinkingStep:
+  """One entry in the unified thinking timeline (text or tool)."""
+  kind: str       # "text" | "tool"
+  content: str    # text content or tool summary
 
 
 WORKING_TITLES = [
@@ -105,11 +113,18 @@ def tool_use_summary(tool_name: str, tool_input: dict[str, Any]) -> str:
 # Card V2 builders
 # ---------------------------------------------------------------------------
 
-def _collapsible_tools(tools: list[ToolRecord], label: str = "Tools") -> dict[str, Any]:
-  """Build a collapsible_panel element with tool history."""
+def _collapsible_thinking(steps: list[ThinkingStep]) -> dict[str, Any]:
+  """Build a collapsible_panel with unified thinking timeline."""
   lines = []
-  for t in tools:
-    lines.append(f"- `{t.summary}`")
+  for s in steps:
+    if s.kind == "tool":
+      lines.append(f"- `{s.content}`")
+    else:
+      # Text — render as plain paragraph (truncate long text)
+      text = s.content
+      if len(text) > 200:
+        text = text[:197] + "..."
+      lines.append(text)
   content = "\n".join(lines) if lines else "_none_"
   return {
     "tag": "collapsible_panel",
@@ -117,7 +132,7 @@ def _collapsible_tools(tools: list[ToolRecord], label: str = "Tools") -> dict[st
     "header": {
       "title": {
         "tag": "plain_text",
-        "content": f"{label} ({len(tools)})",
+        "content": f"Thinking ({len(steps)})",
       },
     },
     "vertical_spacing": "8px",
@@ -160,7 +175,7 @@ def build_turn_card(
   phase: str,
   *,
   body: str = "",
-  tools: list[ToolRecord] | None = None,
+  steps: list[ThinkingStep] | None = None,
   current_tool: str = "",
   elapsed: int = 0,
   usage: dict[str, Any] | None = None,
@@ -168,21 +183,20 @@ def build_turn_card(
 ) -> dict[str, Any]:
   """Build a unified turn card for any phase.
 
-  phase: "working" | "response" | "done"
+  phase: "working" | "done" | "error"
+  body:  for done/error — final response or error message
+  steps: unified thinking timeline (text + tool entries in order)
   """
-  tools = tools or []
+  steps = steps or []
   elements: list[dict[str, Any]] = []
 
   if phase == "working":
-    # Body: latest intermediate text (Claude's current thinking)
-    if body:
-      elements.append({"tag": "markdown", "content": body})
-    # Current tool action
+    # Current tool action (inline)
     if current_tool:
       elements.append({"tag": "markdown", "content": f"`{current_tool}`"})
-    # All tools in collapsible
-    if tools:
-      elements.append(_collapsible_tools(tools))
+    # Unified thinking timeline
+    if steps:
+      elements.append(_collapsible_thinking(steps))
     # Stop button
     elements.append(_stop_button(chat_id))
     # Header
@@ -193,32 +207,12 @@ def build_turn_card(
     }
 
   elif phase == "done":
-    # Body: response markdown in collapsible if long
+    # Final response (inline)
     if body:
-      # Split on "---" separators (multi-text turns join with ---)
-      sections = [s.strip() for s in body.split("\n\n---\n\n")]
-      last_section = sections[-1] if sections else body
-      rest = "\n\n---\n\n".join(sections[:-1]) if len(sections) > 1 else ""
-
-      if not rest and len(body) <= 500:
-        # Single short response — show inline
-        elements.append({"tag": "markdown", "content": body})
-      else:
-        # Show last section (summary) inline, rest in collapsible
-        if rest:
-          elements.append({
-            "tag": "collapsible_panel",
-            "expanded": False,
-            "header": {
-              "title": {"tag": "plain_text", "content": "Details"},
-            },
-            "vertical_spacing": "8px",
-            "elements": [{"tag": "markdown", "content": rest}],
-          })
-        elements.append({"tag": "markdown", "content": last_section})
-    # Tools in collapsible
-    if tools:
-      elements.append(_collapsible_tools(tools))
+      elements.append({"tag": "markdown", "content": body})
+    # Thinking timeline
+    if steps:
+      elements.append(_collapsible_thinking(steps))
     # Note: duration + tokens
     note_parts = [_elapsed_text(elapsed)]
     if usage:
@@ -230,6 +224,22 @@ def build_turn_card(
     header = {
       "title": {"tag": "plain_text", "content": "Done ✓"},
       "template": "green",
+    }
+
+  elif phase == "error":
+    # Error message (inline)
+    if body:
+      elements.append({"tag": "markdown", "content": body})
+    # Thinking timeline
+    if steps:
+      elements.append(_collapsible_thinking(steps))
+    # Note: duration
+    note_parts = [_elapsed_text(elapsed)]
+    elements.append(_note_element(" | ".join(note_parts)))
+    # Red header
+    header = {
+      "title": {"tag": "plain_text", "content": "Error"},
+      "template": "red",
     }
 
   else:

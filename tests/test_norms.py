@@ -9,8 +9,7 @@ def _mock_config(rules=None):
   return {
     "guests": [],
     "autoapprove": False,
-    "filter": "concise",
-    "rules": dict(rules or {}),
+"rules": dict(rules or {}),
   }
 
 

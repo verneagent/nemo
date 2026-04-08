@@ -20,7 +20,6 @@ import time
 import uuid
 
 from . import cards, commands, messages, monitor
-from .cards import ToolRecord
 from .config import load_credentials
 from .db import Database
 from .lark import api as lark_api
@@ -58,6 +57,37 @@ def _register_msg(msg_id: str, chat_id: str) -> None:
   if relay_url and msg_id:
     from . import relay as relay_client
     relay_client.register_message(msg_id, chat_id)
+
+
+def _handle_turn_error(
+  message: str,
+  exc: Exception,
+  credentials: dict,
+  chat_id: str,
+  db: Database,
+  session_id: str,
+  card_id: str | None,
+  steps: list,
+  turn_start: float,
+) -> None:
+  """Display a red error card for SDK turn errors (timeout, rate limit, etc.)."""
+  log.error("Turn error: %s", exc)
+  try:
+    token = lark_auth.get_token(credentials["app_id"], credentials["app_secret"])
+    if card_id:
+      elapsed = int(time.time() - turn_start)
+      err_card = cards.build_turn_card(
+        "error", body=f"**{message}**",
+        steps=steps, elapsed=elapsed,
+      )
+      lark_api.update_card(token, card_id, err_card)
+      db.clear_working(session_id)
+    else:
+      err_card = cards.build_card("Error", body=f"**{message}**", color="red")
+      msg_id = lark_api.send_card(token, chat_id, err_card)
+      db.record_sent(msg_id, text=message[:500], chat_id=chat_id)
+  except Exception:
+    pass
 
 
 def _handle_diag(
@@ -121,14 +151,10 @@ async def main_loop(
   chat_id: str,
   project_dir: str,
   model: str,
-  sidecar: bool = False,
   permission_mode: str = "bypassPermissions",
 ) -> int:
   """Run the agent main loop."""
   session_id = str(uuid.uuid4())
-  os.environ["HANDOFF_SESSION_ID"] = session_id
-  os.environ["HANDOFF_PROJECT_DIR"] = project_dir
-  os.environ["HANDOFF_SESSION_TOOL"] = "Claude Agent SDK"
 
   credentials = load_credentials()
   if not credentials:
@@ -161,22 +187,30 @@ async def main_loop(
   except Exception as e:
     log.warning("Stale cleanup error: %s", e)
 
-  # Ensure workspace tag and claim group (skip in sidecar mode)
-  if not sidecar:
-    from .workspace import ensure_workspace_tag, evict_existing, claim_group
-    ensure_workspace_tag(token, chat_id, project_dir)
-    evict_existing(token, chat_id)
-    claim_group(token, chat_id, model=model)
+  # Ensure workspace tag and claim group
+  from .workspace import ensure_workspace_tag, evict_existing, claim_group
+  ensure_workspace_tag(token, chat_id, project_dir)
+  evict_existing(token, chat_id)
+  claim_group(token, chat_id, model=model)
 
-  # Detect need_mention
-  if sidecar:
-    need_mention = True
+  # Detect need_mention: bot-owned groups or 1-on-1 groups default to False,
+  # multi-human groups default to True. Can be overridden via group config.
+  from . import group_config as gcfg
+  gc = gcfg.load_config(token, chat_id)
+  if "need_mention" in gc:
+    need_mention = bool(gc["need_mention"])
   else:
     need_mention = True
     try:
-      members = lark_api.get_chat_members(token, chat_id)
-      human_count = sum(1 for m in members if m.get("member_id") != bot_open_id)
-      need_mention = human_count > 1
+      info = lark_api.get_chat_info(token, chat_id)
+      owner_id = info.get("owner_id", "")
+      if owner_id and owner_id == bot_open_id:
+        need_mention = False
+      else:
+        members = lark_api.get_chat_members(token, chat_id)
+        human_count = sum(1 for m in members if m.get("member_id") != bot_open_id)
+        if human_count <= 1:
+          need_mention = False
     except Exception as e:
       log.warning("Failed to detect need_mention, defaulting to True: %s", e)
 
@@ -220,28 +254,26 @@ async def main_loop(
 
   # Periodic heartbeat (relay-based idle detection)
   _heartbeat_task: asyncio.Task | None = None
-  if not sidecar:
-    from .config import load_relay_config
-    relay_url, _ = load_relay_config()
-    if relay_url:
-      from . import relay as relay_client
-      from .workspace import get_machine_name
+  from .config import load_relay_config
+  relay_url, _ = load_relay_config()
+  if relay_url:
+    from . import relay as relay_client
+    from .workspace import get_machine_name
 
-      async def _heartbeat_loop():
-        while True:
-          await asyncio.sleep(30)
-          relay_client.send_heartbeat(
-            chat_id, pid=os.getpid(), model=model,
-            machine=get_machine_name())
+    async def _heartbeat_loop():
+      while True:
+        await asyncio.sleep(30)
+        relay_client.send_heartbeat(
+          chat_id, pid=os.getpid(), model=model,
+          machine=get_machine_name())
 
-      _heartbeat_task = asyncio.create_task(_heartbeat_loop())
+    _heartbeat_task = asyncio.create_task(_heartbeat_loop())
 
   # Init SDK client — runs in a dedicated thread to isolate anyio from our asyncio
   from .sdk_thread import SDKThread
 
-  session_id_ref = [session_id]
   sdk_options = _build_sdk_options(
-    project_dir, model, credentials, chat_id, session_id_ref, db, events,
+    project_dir, model, credentials, chat_id, db, events,
     permission_mode=permission_mode)
 
   sdk = SDKThread()
@@ -253,6 +285,7 @@ async def main_loop(
   running = True
   _dissolve_on_exit = False
   _stale_tasks: set[str] = set()
+  _sdk_session_id: str = ""  # CLI session UUID for --resume on model switch
 
   def handle_sig(_sig, _frame):
     nonlocal running
@@ -262,11 +295,11 @@ async def main_loop(
   signal.signal(signal.SIGINT, handle_sig)
   signal.signal(signal.SIGTERM, handle_sig)
 
-  async def _restart_client():
+  async def _restart_client(resume: str = ""):
     nonlocal sdk_options
     sdk_options = _build_sdk_options(
-      project_dir, model, credentials, chat_id, session_id_ref, db, events,
-      permission_mode=permission_mode)
+      project_dir, model, credentials, chat_id, db, events,
+      permission_mode=permission_mode, resume=resume)
     await sdk.reconnect(sdk_options)
 
   # ---- Main loop: event-driven ----
@@ -303,8 +336,8 @@ async def main_loop(
         log.debug("Skipping: unauthorized sender %s (operator=%s)", sender, operator_open_id)
         continue
 
-      # Sidecar mode: only respond to bot interactions
-      if sidecar and bot_open_id:
+      # need_mention mode: only respond to @mentions, replies, reactions
+      if need_mention and bot_open_id:
         kept = messages.filter_bot_interactions([reply], bot_open_id)
         if not kept:
           continue
@@ -351,20 +384,40 @@ async def main_loop(
           new_model = response.split(":", 1)[1]
           model = new_model
           ctx.model = model
-          await _restart_client()
+          log.info("Model switch to %s (resume=%s)", model, _sdk_session_id[:8] if _sdk_session_id else "none")
+          await _restart_client(resume=_sdk_session_id)
           _send_response(token, chat_id, f"Model switched to **{model}**.", db)
         elif response and response.startswith("__cd__:"):
           new_dir = response.split(":", 1)[1]
           project_dir = new_dir
           ctx.project_dir = project_dir
-          os.environ["HANDOFF_PROJECT_DIR"] = project_dir
           await _restart_client()
           _send_response(token, chat_id, f"Working directory: **{project_dir}**", db)
+        elif response == "__autoapprove_toggle__":
+          sess = db.get_session(session_id) or {}
+          enabled = not bool(sess.get("autoapprove"))
+          db.set_autoapprove(chat_id, enabled)
+          _send_response(token, chat_id,
+                         f"Auto-approve **{'enabled' if enabled else 'disabled'}**.", db)
         elif response and response.startswith("__autoapprove__:"):
           enabled = response.endswith(":on")
           db.set_autoapprove(chat_id, enabled)
           _send_response(token, chat_id,
                          f"Auto-approve **{'enabled' if enabled else 'disabled'}**.", db)
+        elif response == "__mention_toggle__":
+          need_mention = not need_mention
+          _gc = gcfg.load_config(token, chat_id)
+          _gc["need_mention"] = need_mention
+          gcfg.save_config(token, chat_id, _gc)
+          _send_response(token, chat_id,
+                         f"@mention requirement **{'on' if need_mention else 'off'}**.", db)
+        elif response and response.startswith("__mention__:"):
+          need_mention = response.endswith(":on")
+          _gc = gcfg.load_config(token, chat_id)
+          _gc["need_mention"] = need_mention
+          gcfg.save_config(token, chat_id, _gc)
+          _send_response(token, chat_id,
+                         f"@mention requirement **{'on' if need_mention else 'off'}**.", db)
         elif response == "__norm_list__":
           from .norms import get_norms, format_norms_prompt
           norms = get_norms(token, chat_id)
@@ -412,13 +465,12 @@ async def main_loop(
 
       # Turn state
       _turn_card_id: str | None = None
-      _turn_tools: list[ToolRecord] = []
-      _turn_texts: list[str] = []
+      _turn_steps: list[cards.ThinkingStep] = []
       _turn_start = time.time()
 
       def _on_event(event):
         # Thread safety: this runs on the SDK thread. It mutates _turn_card_id,
-        # _turn_tools, _turn_texts. The main loop only reads these AFTER
+        # _turn_steps. The main loop only reads these AFTER
         # asyncio.wait({sdk_task, ...}) completes, which guarantees all
         # _on_event calls have finished. No lock needed.
         nonlocal _turn_card_id
@@ -443,11 +495,9 @@ async def main_loop(
           if not _turn_card_id:
             return
           elapsed = int(time.time() - _turn_start)
-          latest_text = _turn_texts[-1] if _turn_texts else ""
           card = cards.build_turn_card(
             "working",
-            body=latest_text,
-            tools=_turn_tools,
+            steps=_turn_steps,
             elapsed=elapsed,
             chat_id=chat_id,
             **kwargs,
@@ -458,21 +508,27 @@ async def main_loop(
             pass
 
         if isinstance(event, (ToolStartEvent, ToolProgressEvent)):
-          _turn_tools.append(event.tool)
+          _turn_steps.append(cards.ThinkingStep("tool", event.tool.summary))
           _ensure_card()
           _update_working(current_tool=event.tool.summary)
 
         elif isinstance(event, TextEvent):
-          _turn_texts.append(event.text)
+          _turn_steps.append(cards.ThinkingStep("text", event.text))
           _ensure_card()
           _update_working()
 
         elif isinstance(event, DoneEvent):
+          if event.session_id:
+            _sdk_session_id = event.session_id
           elapsed = int(time.time() - _turn_start)
-          merged = "\n\n---\n\n".join(_turn_texts) if _turn_texts else ""
+          # Final response = last text step (if any)
+          text_steps = [s for s in _turn_steps if s.kind == "text"]
+          final_text = text_steps[-1].content if text_steps else ""
+          # Thinking timeline = all steps except the last text
+          thinking = _turn_steps[:-1] if text_steps and _turn_steps and _turn_steps[-1].kind == "text" else list(_turn_steps)
           if _turn_card_id:
             card = cards.build_turn_card(
-              "done", body=merged, tools=_turn_tools,
+              "done", body=final_text, steps=thinking,
               elapsed=elapsed, usage=event.usage,
             )
             try:
@@ -482,8 +538,8 @@ async def main_loop(
             db.clear_working(session_id)
           else:
             # Pure text response with no tools and no card created
-            if merged:
-              _send_response(token, chat_id, merged, db)
+            if final_text:
+              _send_response(token, chat_id, final_text, db)
           ctx.total_cost += event.cost
 
       # Run SDK turn on dedicated thread (isolates anyio from our asyncio)
@@ -498,6 +554,71 @@ async def main_loop(
       signal_detected = None
 
       _pending_msgs: list = []
+
+      def _dispatch_inline(response: str | None, msg: LarkEvent) -> None:
+        """Handle an inline-safe command during an active turn."""
+        nonlocal need_mention
+        try:
+          _tok = lark_auth.get_token(credentials["app_id"], credentials["app_secret"])
+          # Remove THINKING reaction from the command message
+          if msg.message_id:
+            lark_api.add_reaction(_tok, msg.message_id, "DONE")
+
+          if response == "__autoapprove_toggle__":
+            cur = db.get_session(db._session_id) or {}
+            enabled = not bool(cur.get("autoapprove"))
+            db.set_autoapprove(chat_id, enabled)
+            _send_response(_tok, chat_id,
+                           f"Auto-approve **{'enabled' if enabled else 'disabled'}**.", db)
+          elif response and response.startswith("__autoapprove__:"):
+            enabled = response.endswith(":on")
+            db.set_autoapprove(chat_id, enabled)
+            _send_response(_tok, chat_id,
+                           f"Auto-approve **{'enabled' if enabled else 'disabled'}**.", db)
+          elif response == "__mention_toggle__":
+            need_mention = not need_mention
+            _gc = gcfg.load_config(_tok, chat_id)
+            _gc["need_mention"] = need_mention
+            gcfg.save_config(_tok, chat_id, _gc)
+            _send_response(_tok, chat_id,
+                           f"@mention requirement **{'on' if need_mention else 'off'}**.", db)
+          elif response and response.startswith("__mention__:"):
+            need_mention = response.endswith(":on")
+            _gc = gcfg.load_config(_tok, chat_id)
+            _gc["need_mention"] = need_mention
+            gcfg.save_config(_tok, chat_id, _gc)
+            _send_response(_tok, chat_id,
+                           f"@mention requirement **{'on' if need_mention else 'off'}**.", db)
+          elif response == "__norm_list__":
+            from .norms import get_norms
+            norms = get_norms(_tok, chat_id)
+            if norms:
+              lines = ["**Group Norms**\n"]
+              for name, text in norms.items():
+                lines.append(f"- **{name}**: {text}")
+              _send_response(_tok, chat_id, "\n".join(lines), db)
+            else:
+              _send_response(_tok, chat_id, "No norms configured.", db)
+          elif response and response.startswith("__norm_add__:"):
+            from .norms import add_norm
+            _, rest = response.split(":", 1)
+            name, text = rest.split(":", 1)
+            add_norm(_tok, chat_id, name, text)
+            _send_response(_tok, chat_id, f"Norm **{name}** added.", db)
+          elif response and response.startswith("__norm_remove__:"):
+            from .norms import remove_norm
+            name = response.split(":", 1)[1]
+            if remove_norm(_tok, chat_id, name):
+              _send_response(_tok, chat_id, f"Norm **{name}** removed.", db)
+            else:
+              _send_response(_tok, chat_id, f"Norm **{name}** not found.", db)
+          elif response == "__diag__":
+            _handle_diag(_tok, chat_id, credentials, project_dir, db)
+          elif response:
+            # Text responses: /ping, /cost, /help, /usage, /guest help, /norm help
+            _send_response(_tok, chat_id, response, db)
+        except Exception as e:
+          log.warning("Inline command error: %s", e)
 
       async def _watch_signals():
         nonlocal signal_detected
@@ -537,6 +658,17 @@ async def main_loop(
           if monitor.is_exit(msg_text, mentions):
             signal_detected = "exit"
             return
+          # Inline-safe commands: execute during turn without waiting
+          stripped = messages.strip_mentions(msg_text, [msg])
+          if stripped:
+            handled, response = commands.try_dispatch(stripped, ctx)
+            if handled and commands.is_inline_safe(response):
+              _dispatch_inline(response, msg)
+              continue
+            elif handled:
+              # Needs SDK restart — re-queue for after turn
+              _pending_msgs.append(msg)
+              continue
           # Re-queue non-signal messages so they aren't lost
           _pending_msgs.append(msg)
 
@@ -580,30 +712,25 @@ async def main_loop(
           await watcher
         except asyncio.CancelledError:
           pass
-        # Check for timeout error from run_turn
+        # Check for errors from run_turn (timeout, rate limit, SDK errors)
         try:
           sdk_task.result()
-        except TimeoutError:
-          log.error("SDK turn timed out — interrupted, context preserved")
-          token = lark_auth.get_token(credentials["app_id"], credentials["app_secret"])
-          # Update working card to show timeout
-          if _turn_card_id:
-            elapsed = int(time.time() - _turn_start)
-            err_card = cards.build_turn_card(
-              "done",
-              body="**Timed out** — SDK stopped responding. Interrupted, context preserved.",
-              tools=_turn_tools, elapsed=elapsed,
-            )
-            try:
-              lark_api.update_card(token, _turn_card_id, err_card)
-            except Exception:
-              pass
-            db.clear_working(session_id)
-          else:
-            _send_response(token, chat_id,
-                           "**Timed out** — SDK stopped responding. Context preserved, send another message to continue.", db)
+        except TimeoutError as exc:
+          _handle_turn_error(
+            "Timed out — SDK stopped responding. Context preserved, send another message to continue.",
+            exc, credentials, chat_id, db, session_id,
+            _turn_card_id, _turn_steps, _turn_start,
+          )
           _clear_ack()
-          # Don't restart client — context is preserved in the CLI session
+          for pending in _pending_msgs:
+            events.push_back(pending)
+          continue
+        except Exception as exc:
+          _handle_turn_error(
+            str(exc), exc, credentials, chat_id, db, session_id,
+            _turn_card_id, _turn_steps, _turn_start,
+          )
+          _clear_ack()
           for pending in _pending_msgs:
             events.push_back(pending)
           continue
@@ -618,7 +745,9 @@ async def main_loop(
       log.error("Loop error: %s", e)
       try:
         token = lark_auth.get_token(credentials["app_id"], credentials["app_secret"])
-        _send_response(token, chat_id, f"**Error:**\n```\n{str(e)[:500]}\n```", db)
+        err_card = cards.build_card("Error", body=f"```\n{str(e)[:500]}\n```", color="red")
+        msg_id = lark_api.send_card(token, chat_id, err_card)
+        db.record_sent(msg_id, text=str(e)[:500], chat_id=chat_id)
       except Exception:
         pass
       await asyncio.sleep(5)
@@ -633,10 +762,9 @@ async def main_loop(
   # Close SDK, event stream, and Lark API calls all concurrently
   loop = asyncio.get_event_loop()
   cleanup: list = [sdk.close_client(), events.close()]
-  if not sidecar:
-    from .workspace import release_group
-    cleanup.append(loop.run_in_executor(None, release_group, token, chat_id))
-    cleanup.append(loop.run_in_executor(None, status_tab.update_status, token, chat_id, model, "stopped"))
+  from .workspace import release_group
+  cleanup.append(loop.run_in_executor(None, release_group, token, chat_id))
+  cleanup.append(loop.run_in_executor(None, status_tab.update_status, token, chat_id, model, "stopped"))
   await asyncio.gather(*cleanup, return_exceptions=True)
   sdk.stop()
   db.deactivate(session_id)
@@ -661,10 +789,10 @@ def _build_sdk_options(
   model: str,
   credentials: dict,
   chat_id: str,
-  session_id_ref: list[str],
   db: Database,
   events: LarkEventStream,
   permission_mode: str = "bypassPermissions",
+  resume: str = "",
 ):
   from claude_agent_sdk import ClaudeAgentOptions
 
@@ -681,14 +809,11 @@ def _build_sdk_options(
     "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
     "HOME": os.environ.get("HOME", ""),
     "USER": os.environ.get("USER", ""),
-    "HANDOFF_SESSION_ID": session_id_ref[0],
-    "HANDOFF_PROJECT_DIR": project_dir,
-    "HANDOFF_SESSION_TOOL": "Claude Agent SDK",
     # Enable CLI's built-in stream watchdog — aborts stalled API streams
     "CLAUDE_ENABLE_STREAM_WATCHDOG": "1",
     "CLAUDE_STREAM_IDLE_TIMEOUT_MS": "90000",  # 90s, CLI default
   }
-  for key in ("HANDOFF_TMP_DIR", "http_proxy", "https_proxy", "all_proxy"):
+  for key in ("http_proxy", "https_proxy", "all_proxy"):
     val = os.environ.get(key)
     if val:
       env[key] = val
@@ -722,5 +847,7 @@ def _build_sdk_options(
   )
   if perm_handler is not None:
     opts["can_use_tool"] = perm_handler
+  if resume:
+    opts["resume"] = resume
 
   return ClaudeAgentOptions(**opts)

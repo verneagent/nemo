@@ -1,4 +1,10 @@
-"""Configuration management — loads credentials from ~/.nemo/config.json."""
+"""Configuration management — loads credentials from ~/.nemo/<profile>.json.
+
+Profile files live directly in ~/.nemo/:
+  ~/.nemo/default.json   (used when --profile is omitted)
+  ~/.nemo/alice.json
+  ~/.nemo/bob.json
+"""
 
 from __future__ import annotations
 
@@ -7,26 +13,37 @@ import os
 from typing import Any
 
 CONFIG_DIR = os.path.expanduser("~/.nemo")
-CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
-# Fallback to legacy handoff config for migration
-_LEGACY_CONFIG = os.path.expanduser("~/.handoff/config.json")
 DB_BASE = os.path.join(CONFIG_DIR, "projects")
 TMP_DIR = os.environ.get("NEMO_TMP_DIR", "/tmp/nemo")
 RELAY_URL = os.environ.get("NEMO_RELAY_URL", "")
 RELAY_API_KEY = os.environ.get("NEMO_RELAY_API_KEY", "")
 
+# Active profile — set once at startup via set_profile()
+_profile: str = "default"
+
+
+def set_profile(name: str) -> None:
+  """Set the active profile. Called once from __main__."""
+  global _profile
+  _profile = name
+
+
+def profile_path(name: str | None = None) -> str:
+  """Return the path to a profile config file."""
+  return os.path.join(CONFIG_DIR, f"{name or _profile}.json")
+
 
 def load_config() -> dict[str, Any]:
-  """Load the full config dict. Falls back to legacy ~/.handoff/ path."""
-  for path in (CONFIG_FILE, _LEGACY_CONFIG):
-    if os.path.isfile(path):
-      with open(path) as f:
-        return json.load(f)
+  """Load the active profile's config dict."""
+  path = profile_path()
+  if os.path.isfile(path):
+    with open(path) as f:
+      return json.load(f)
   return {}
 
 
 def load_relay_config() -> tuple[str, str]:
-  """Load relay URL and API key from config or env.
+  """Load relay URL and API key from env or config.
 
   Returns (relay_url, api_key). Either may be empty if not configured.
   """
@@ -37,7 +54,7 @@ def load_relay_config() -> tuple[str, str]:
 
 
 def load_credentials() -> dict[str, str] | None:
-  """Load app_id, app_secret, email from config.
+  """Load app_id, app_secret, email from the active profile.
 
   Returns dict with keys {app_id, app_secret, email} or None if missing.
   """

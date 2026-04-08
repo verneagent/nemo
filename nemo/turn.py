@@ -62,6 +62,7 @@ class DoneEvent:
   """Turn completed."""
   cost: float
   usage: dict[str, Any]
+  session_id: str = ""  # CLI session UUID — needed for --resume on model switch
 
 
 @dataclass
@@ -107,6 +108,7 @@ async def run_turn(
 
   cost = 0.0
   usage: dict[str, Any] = {}
+  sdk_session_id = ""
   pending_tasks: set[str] = set()
   working_started = False
   found_stale = False
@@ -150,6 +152,7 @@ async def run_turn(
       if isinstance(message, ResultMessage):
         cost = getattr(message, "total_cost_usd", 0) or 0.0
         usage = getattr(message, "usage", None) or {}
+        sdk_session_id = getattr(message, "session_id", "") or ""
         break  # Don't wait for StopAsyncIteration in stale path either
       continue
 
@@ -204,6 +207,7 @@ async def run_turn(
     elif isinstance(message, ResultMessage):
       cost = getattr(message, "total_cost_usd", 0) or 0.0
       usage = getattr(message, "usage", None) or {}
+      sdk_session_id = getattr(message, "session_id", "") or ""
       # Mark remaining pending tasks as stale
       for tid in list(pending_tasks):
         stale_tasks.add(tid)
@@ -226,6 +230,6 @@ async def run_turn(
       stale_tasks=stale_tasks, _retry=_retry + 1,
     )
 
-  log.info("turn done (cost=%.4f)", cost)
-  on_event(DoneEvent(cost=cost, usage=usage))
+  log.info("turn done (cost=%.4f, session=%s)", cost, sdk_session_id[:8] if sdk_session_id else "?")
+  on_event(DoneEvent(cost=cost, usage=usage, session_id=sdk_session_id))
   return cost, usage

@@ -62,7 +62,7 @@ def test_parse_config_text_empty():
 
 
 def test_load_config_found():
-  config = {"autoapprove": True, "guests": [], "filter": "verbose", "rules": {}}
+  config = {"autoapprove": True, "guests": [], "rules": {}}
   text = _build_config_text(config)
   msg = _text_msg(text)
   with mock.patch("nemo.lark.api.list_pins", return_value=[
@@ -71,7 +71,6 @@ def test_load_config_found():
     with mock.patch("nemo.lark.api.get_message", return_value=msg):
       result = load_config("tok", "oc_1")
   assert result["autoapprove"] is True
-  assert result["filter"] == "verbose"
 
 
 def test_load_config_not_found():
@@ -91,11 +90,11 @@ def test_load_config_merges_defaults():
       result = load_config("tok", "oc_1")
   assert result["autoapprove"] is True
   assert result["guests"] == []
-  assert result["filter"] == "concise"
+  assert result["rules"] == {}
 
 
 def test_save_config_creates_new():
-  config = {"autoapprove": True, "guests": [], "filter": "concise", "rules": {}}
+  config = {"autoapprove": True, "guests": [], "rules": {}}
   with mock.patch("nemo.lark.api.list_pins", return_value=[]):
     with mock.patch("nemo.lark.api.send_text", return_value="msg_new") as mock_send:
       with mock.patch("nemo.lark.api.create_pin") as mock_pin:
@@ -134,7 +133,7 @@ def test_save_config_concurrent_safety():
   """save_config should not create duplicates under concurrent calls."""
   import threading
 
-  config = {"autoapprove": True, "guests": [], "filter": "concise", "rules": {}}
+  config = {"autoapprove": True, "guests": [], "rules": {}}
   call_count = {"create_pin": 0}
 
   def mock_create_pin(token, msg_id):

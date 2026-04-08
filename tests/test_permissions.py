@@ -5,9 +5,10 @@ from nemo.permissions import (
 )
 
 
-def test_auto_approve_handoff_ops():
-  assert is_auto_approve("Bash", {"command": "python3 handoff_ops.py download"})
-  assert is_auto_approve("Bash", {"command": "python3 send_to_group.py hello"})
+def test_auto_approve_empty_patterns():
+  """No hardcoded auto-approve patterns — handoff remnants removed."""
+  assert not is_auto_approve("Bash", {"command": "python3 handoff_ops.py download"})
+  assert not is_auto_approve("Bash", {"command": "python3 send_to_group.py hello"})
 
 
 def test_auto_approve_non_bash():

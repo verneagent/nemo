@@ -1,58 +1,50 @@
-"""Tests for nemo.config."""
+"""Tests for nemo.config — multi-profile configuration."""
 
 import json
 import os
-import tempfile
 from unittest import mock
 
-from nemo.config import load_config, load_credentials, tmp_dir, CONFIG_FILE, _LEGACY_CONFIG
+from nemo.config import (
+  load_config, load_credentials, tmp_dir, set_profile, profile_path,
+)
+
+
+def test_profile_path_default():
+  set_profile("default")
+  assert profile_path().endswith("/default.json")
+
+
+def test_profile_path_custom():
+  set_profile("alice")
+  assert profile_path().endswith("/alice.json")
+  assert profile_path("bob").endswith("/bob.json")
+  set_profile("default")  # reset
 
 
 def test_load_config_missing_file():
-  with mock.patch("nemo.config.CONFIG_FILE", "/nonexistent/config.json"):
-    with mock.patch("nemo.config._LEGACY_CONFIG", "/nonexistent/legacy.json"):
-      assert load_config() == {}
-
-
-def test_load_config_legacy_fallback(tmp_path):
-  """Falls back to legacy ~/.handoff/config.json."""
-  cfg = {"app_id": "legacy_app", "app_secret": "legacy_secret"}
-  legacy = tmp_path / "legacy.json"
-  legacy.write_text(json.dumps(cfg))
-  with mock.patch("nemo.config.CONFIG_FILE", "/nonexistent/config.json"):
-    with mock.patch("nemo.config._LEGACY_CONFIG", str(legacy)):
-      result = load_config()
-  assert result["app_id"] == "legacy_app"
-
-
-def test_load_config_nemo_takes_priority(tmp_path):
-  """~/.nemo/config.json takes priority over legacy path."""
-  nemo_cfg = {"app_id": "nemo_app", "app_secret": "s"}
-  legacy_cfg = {"app_id": "legacy_app", "app_secret": "s"}
-  nemo = tmp_path / "nemo.json"
-  legacy = tmp_path / "legacy.json"
-  nemo.write_text(json.dumps(nemo_cfg))
-  legacy.write_text(json.dumps(legacy_cfg))
-  with mock.patch("nemo.config.CONFIG_FILE", str(nemo)):
-    with mock.patch("nemo.config._LEGACY_CONFIG", str(legacy)):
-      result = load_config()
-  assert result["app_id"] == "nemo_app"
+  set_profile("nonexistent_test")
+  with mock.patch("nemo.config.CONFIG_DIR", "/nonexistent"):
+    assert load_config() == {}
+  set_profile("default")
 
 
 def test_load_config_reads_json(tmp_path):
   cfg = {"app_id": "cli_test", "app_secret": "secret123", "email": "a@b.com"}
-  path = tmp_path / "config.json"
+  path = tmp_path / "myprofile.json"
   path.write_text(json.dumps(cfg))
-  with mock.patch("nemo.config.CONFIG_FILE", str(path)):
+  set_profile("myprofile")
+  with mock.patch("nemo.config.CONFIG_DIR", str(tmp_path)):
     result = load_config()
   assert result == cfg
+  set_profile("default")
 
 
 def test_load_credentials_success(tmp_path):
   cfg = {"app_id": "cli_test", "app_secret": "secret123", "email": "a@b.com"}
-  path = tmp_path / "config.json"
+  path = tmp_path / "default.json"
   path.write_text(json.dumps(cfg))
-  with mock.patch("nemo.config.CONFIG_FILE", str(path)):
+  set_profile("default")
+  with mock.patch("nemo.config.CONFIG_DIR", str(tmp_path)):
     creds = load_credentials()
   assert creds is not None
   assert creds["app_id"] == "cli_test"
@@ -62,17 +54,19 @@ def test_load_credentials_success(tmp_path):
 
 def test_load_credentials_missing_secret(tmp_path):
   cfg = {"app_id": "cli_test"}
-  path = tmp_path / "config.json"
+  path = tmp_path / "default.json"
   path.write_text(json.dumps(cfg))
-  with mock.patch("nemo.config.CONFIG_FILE", str(path)):
+  set_profile("default")
+  with mock.patch("nemo.config.CONFIG_DIR", str(tmp_path)):
     assert load_credentials() is None
 
 
 def test_load_credentials_no_email(tmp_path):
   cfg = {"app_id": "cli_test", "app_secret": "secret123"}
-  path = tmp_path / "config.json"
+  path = tmp_path / "default.json"
   path.write_text(json.dumps(cfg))
-  with mock.patch("nemo.config.CONFIG_FILE", str(path)):
+  set_profile("default")
+  with mock.patch("nemo.config.CONFIG_DIR", str(tmp_path)):
     creds = load_credentials()
   assert creds is not None
   assert creds["email"] == ""

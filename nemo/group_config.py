@@ -1,6 +1,6 @@
 """Group configuration via pinned text message.
 
-Stores persistent group-level config (guests, autoapprove, filter, rules)
+Stores persistent group-level config (guests, autoapprove, rules)
 as YAML inside a pinned text message. The marker prefix "__nemo_config__"
 identifies it.
 
@@ -14,7 +14,6 @@ Config schema:
       name: Alice
       role: coowner
   autoapprove: false
-  filter: concise
   rules: {}
 """
 
@@ -34,11 +33,10 @@ CONFIG_MARKER = "__nemo_config__"
 DEFAULT_CONFIG: dict[str, Any] = {
   "guests": [],
   "autoapprove": False,
-  "filter": "concise",
   "rules": {},
 }
 
-_VALID_KEYS = {"guests", "autoapprove", "filter", "rules", "active_pid"}
+_VALID_KEYS = {"guests", "autoapprove", "rules", "active_pid", "need_mention"}
 _save_lock = threading.Lock()
 
 
