@@ -776,6 +776,9 @@ async def main_loop(
 
     except KeyboardInterrupt:
       running = False
+    except asyncio.CancelledError:
+      log.warning("Loop cancelled (CancelledError)")
+      running = False
     except Exception as e:
       log.error("Loop error: %s", e)
       try:
