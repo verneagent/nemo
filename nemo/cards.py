@@ -171,6 +171,24 @@ def _stop_button(chat_id: str = "") -> dict[str, Any]:
   }
 
 
+def _working_elements(
+  *,
+  steps: list[ThinkingStep],
+  current_tool: str = "",
+  include_stop_button: bool,
+  chat_id: str = "",
+) -> list[dict[str, Any]]:
+  """Build the shared body for working/stopping/stopped phases."""
+  elements: list[dict[str, Any]] = []
+  if current_tool:
+    elements.append({"tag": "markdown", "content": f"`{current_tool}`"})
+  if steps:
+    elements.append(_collapsible_thinking(steps))
+  if include_stop_button:
+    elements.append(_stop_button(chat_id))
+  return elements
+
+
 def build_turn_card(
   phase: str,
   *,
@@ -183,7 +201,7 @@ def build_turn_card(
 ) -> dict[str, Any]:
   """Build a unified turn card for any phase.
 
-  phase: "working" | "done" | "error"
+  phase: "working" | "stopping" | "stopped" | "done" | "error"
   body:  for done/error — final response or error message
   steps: unified thinking timeline (text + tool entries in order)
   """
@@ -191,18 +209,33 @@ def build_turn_card(
   elements: list[dict[str, Any]] = []
 
   if phase == "working":
-    # Current tool action (inline)
-    if current_tool:
-      elements.append({"tag": "markdown", "content": f"`{current_tool}`"})
-    # Unified thinking timeline
-    if steps:
-      elements.append(_collapsible_thinking(steps))
-    # Stop button
-    elements.append(_stop_button(chat_id))
-    # Header
+    elements = _working_elements(
+      steps=steps, current_tool=current_tool,
+      include_stop_button=True, chat_id=chat_id,
+    )
     title = _elapsed_title(elapsed)
     header: dict[str, Any] | None = {
       "title": {"tag": "plain_text", "content": title},
+      "template": "grey",
+    }
+
+  elif phase == "stopping":
+    elements = _working_elements(
+      steps=steps, current_tool=current_tool,
+      include_stop_button=False,
+    )
+    header = {
+      "title": {"tag": "plain_text", "content": "Stopping..."},
+      "template": "orange",
+    }
+
+  elif phase == "stopped":
+    elements = _working_elements(
+      steps=steps, current_tool=current_tool,
+      include_stop_button=False,
+    )
+    header = {
+      "title": {"tag": "plain_text", "content": "Stopped"},
       "template": "grey",
     }
 

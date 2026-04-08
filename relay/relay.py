@@ -434,23 +434,6 @@ async def _handle_card_action(event: dict) -> tuple[int, dict]:
             })
         return 200, {
             "toast": {"type": "warning", "content": "Stopping..."},
-            "card": {
-                "type": "raw",
-                "data": {
-                    "schema": "2.0",
-                    "config": {"update_multi": True},
-                    "header": {
-                        "title": {"tag": "plain_text", "content": "Stopping..."},
-                        "template": "orange",
-                    },
-                    "body": {
-                        "direction": "vertical",
-                        "elements": [
-                            {"tag": "markdown", "content": "Stop requested. Waiting for current tool to finish..."},
-                        ],
-                    },
-                },
-            },
         }
 
     # Authorization check for regular actions

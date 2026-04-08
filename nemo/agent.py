@@ -443,6 +443,24 @@ async def main_loop(
       _turn_card_id: str | None = None
       _turn_steps: list[cards.ThinkingStep] = []
       _turn_start = time.time()
+      _turn_current_tool = ""
+      _turn_interrupt_phase: str | None = None
+
+      def _update_interrupt_card(phase: str) -> None:
+        nonlocal _turn_card_id, _turn_interrupt_phase
+        if not _turn_card_id:
+          return
+        _turn_interrupt_phase = phase
+        try:
+          card = cards.build_turn_card(
+            phase,
+            steps=_turn_steps,
+            current_tool=_turn_current_tool,
+            elapsed=int(time.time() - _turn_start),
+          )
+          _await_channel(channel.update_card(_turn_card_id, card))
+        except Exception:
+          pass
 
       def _await_channel(coro):
         return asyncio.run_coroutine_threadsafe(coro, main_loop_ref).result()
@@ -452,7 +470,7 @@ async def main_loop(
         # _turn_steps. The main loop only reads these AFTER
         # asyncio.wait({sdk_task, ...}) completes, which guarantees all
         # _on_event calls have finished. No lock needed.
-        nonlocal _turn_card_id, _sdk_session_id
+        nonlocal _turn_card_id, _sdk_session_id, _turn_current_tool
 
         def _ensure_card():
           """Create working card if it doesn't exist yet."""
@@ -470,7 +488,7 @@ async def main_loop(
 
         def _update_working(**kwargs):
           """Update the working card with current state."""
-          if not _turn_card_id:
+          if not _turn_card_id or _turn_interrupt_phase:
             return
           elapsed = int(time.time() - _turn_start)
           card = cards.build_turn_card(
@@ -487,6 +505,7 @@ async def main_loop(
 
         if isinstance(event, (ToolStartEvent, ToolProgressEvent)):
           _turn_steps.append(cards.ThinkingStep("tool", event.tool.summary))
+          _turn_current_tool = event.tool.summary
           _ensure_card()
           _update_working(current_tool=event.tool.summary)
 
@@ -499,6 +518,10 @@ async def main_loop(
         elif isinstance(event, DoneEvent):
           if event.session_id:
             _sdk_session_id = event.session_id
+          if _turn_interrupt_phase:
+            if _turn_card_id:
+              db.clear_working(session_id)
+            return
           elapsed = int(time.time() - _turn_start)
           # Final response = last text step (if any)
           text_steps = [s for s in _turn_steps if s.kind == "text"]
@@ -620,9 +643,14 @@ async def main_loop(
           # Handle Stop button card action (check authorization)
           if msg.event_type == "card.action.trigger":
             action = msg.action_value.get("action", "")
-            if action in ("stop", "__stop__") and monitor.is_authorized(
+            # Relay-originated stop signals are already authenticated by the relay.
+            # Raw "__stop__" actions should still require operator authorization.
+            if action == "stop":
+              signal_detected = "stop"
+              return
+            if action == "__stop__" and monitor.is_authorized(
                 msg.operator_id, operator_open_id):
-              signal_detected = "esc"
+              signal_detected = "stop"
               return
             continue
           msg_text = msg.text
@@ -658,13 +686,15 @@ async def main_loop(
       )
 
       if watcher in done_tasks and signal_detected:
-        if signal_detected == "esc":
+        if signal_detected in ("esc", "stop"):
+          _update_interrupt_card("stopping")
           try:
             await agent.interrupt()
             await asyncio.wait_for(sdk_task, timeout=30)
           except Exception:
             sdk_task.cancel()
           await _send_response(channel, chat_id, "Operation cancelled.", db)
+          _update_interrupt_card("stopped")
 
         elif signal_detected in ("exit", "dissolve"):
           try:

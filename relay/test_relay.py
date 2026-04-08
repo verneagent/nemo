@@ -577,11 +577,7 @@ class RelayTestCase(unittest.TestCase):
     })
     self.assertEqual(result["toast"]["type"], "warning")
     self.assertEqual(result["toast"]["content"], "Stopping...")
-    # Card should be orange "Stopping..."
-    card = result["card"]["data"]
-    self.assertEqual(card["header"]["template"], "orange")
-    self.assertIn("config", card)
-    self.assertTrue(card["config"]["update_multi"])
+    self.assertNotIn("card", result)
 
     # Stop flag consumed via GET
     stop = self._get("/stop/chat:oc_stop_card")
