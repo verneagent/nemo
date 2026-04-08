@@ -43,19 +43,45 @@ def _ensure_sdk():
 
 
 def _daemonize():
-  """Fork into background, detach from terminal."""
+  """Double-fork into background, fully detach from parent process tree.
+
+  Single fork + setsid is not enough: the Claude SDK Bash tool tracks the
+  child PID and kills it when the turn ends. Double-fork ensures the
+  actual daemon (grandchild) is reparented to PID 1 and invisible to any
+  parent process tree cleanup.
+  """
+  # Pipe to communicate daemon PID back to original parent
+  r_fd, w_fd = os.pipe()
+
+  # First fork
   pid = os.fork()
   if pid > 0:
-    print(f"nemo started (PID {pid})", file=sys.stderr)
+    # Original parent — read daemon PID from pipe, then exit
+    os.close(w_fd)
+    daemon_pid = os.read(r_fd, 32).decode().strip() or "?"
+    os.close(r_fd)
+    os.waitpid(pid, 0)
+    print(f"nemo started (PID {daemon_pid})", file=sys.stderr)
     sys.exit(0)
+
+  # Intermediate child — new session, fork again, exit immediately
+  os.close(r_fd)
   os.setsid()
-  # Redirect stdio to /dev/null (logs go to ~/.nemo/logs/)
+
+  pid2 = os.fork()
+  if pid2 > 0:
+    # Write grandchild PID to pipe for original parent
+    os.write(w_fd, str(pid2).encode())
+    os.close(w_fd)
+    os._exit(0)
+
+  # Grandchild — the actual daemon
+  os.close(w_fd)
   devnull = os.open(os.devnull, os.O_RDWR)
   os.dup2(devnull, 0)
   os.dup2(devnull, 1)
   os.dup2(devnull, 2)
   os.close(devnull)
-  # Set env so child knows it's already daemonized
   os.environ["NEMO_FOREGROUND"] = "1"
 
 
