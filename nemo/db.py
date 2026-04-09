@@ -63,6 +63,11 @@ CREATE TABLE IF NOT EXISTS working_state (
 
 def _ensure_tables(conn: sqlite3.Connection) -> None:
   conn.executescript(_SCHEMA)
+  # Migration: add sdk_session_id column if missing
+  cols = {row[1] for row in conn.execute("PRAGMA table_info(sessions)")}
+  if "sdk_session_id" not in cols:
+    conn.execute("ALTER TABLE sessions ADD COLUMN sdk_session_id TEXT DEFAULT ''")
+    conn.commit()
 
 
 class Database:
@@ -94,13 +99,18 @@ class Database:
     need_mention: bool = False,
   ) -> None:
     self._session_id = session_id
+    # Preserve sdk_session_id from previous session for this chat
+    old = self._conn.execute(
+      "SELECT sdk_session_id FROM sessions WHERE chat_id = ?", (chat_id,)
+    ).fetchone()
+    old_sdk_id = (old["sdk_session_id"] or "") if old else ""
     self._conn.execute(
       """INSERT OR REPLACE INTO sessions
          (session_id, chat_id, session_model, activated_at,
-          operator_open_id, bot_open_id, need_mention)
-         VALUES (?, ?, ?, ?, ?, ?, ?)""",
+          operator_open_id, bot_open_id, need_mention, sdk_session_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
       (session_id, chat_id, model, str(int(time.time() * 1000)),
-       operator_open_id, bot_open_id, int(need_mention)),
+       operator_open_id, bot_open_id, int(need_mention), old_sdk_id or ""),
     )
     self._conn.commit()
 
@@ -137,6 +147,19 @@ class Database:
       "SELECT session_id FROM sessions WHERE chat_id = ?", (chat_id,)
     ).fetchone()
     return row["session_id"] if row else None
+
+  def get_sdk_session_id(self, chat_id: str) -> str:
+    row = self._conn.execute(
+      "SELECT sdk_session_id FROM sessions WHERE chat_id = ?", (chat_id,)
+    ).fetchone()
+    return row["sdk_session_id"] if row and row["sdk_session_id"] else ""
+
+  def set_sdk_session_id(self, chat_id: str, sdk_session_id: str) -> None:
+    self._conn.execute(
+      "UPDATE sessions SET sdk_session_id = ? WHERE chat_id = ?",
+      (sdk_session_id, chat_id),
+    )
+    self._conn.commit()
 
   def set_autoapprove(self, chat_id: str, enabled: bool) -> None:
     self._conn.execute(

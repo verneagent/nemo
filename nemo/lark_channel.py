@@ -41,12 +41,17 @@ class LarkChannel(Channel):
   def __init__(self, chat_id: str):
     self.chat_id = chat_id
     self.credentials = load_credentials() or {}
-    self.token = ""
     self._events: LarkEventStream | RelayEventStream | None = None
 
-  async def start(self) -> None:
-    self.token = lark_auth.get_token(
+  @property
+  def token(self) -> str:
+    """Always return a fresh token (cached inside LarkAuth singleton)."""
+    return lark_auth.get_token(
       self.credentials["app_id"], self.credentials["app_secret"])
+
+  async def start(self) -> None:
+    # Warm up the token cache
+    _ = self.token
     relay_url, relay_api_key = load_relay_config()
     if relay_url:
       self._events = RelayEventStream(relay_url, relay_api_key, self.chat_id)
@@ -91,14 +96,24 @@ class LarkChannel(Channel):
     )
     self._events.push_back(event)
 
+  def _retry_on_auth_error(self, fn, *args):
+    """Call fn(token, *args); on auth error invalidate token and retry once."""
+    try:
+      return fn(self.token, *args)
+    except RuntimeError as e:
+      if "99991663" in str(e) or "99991668" in str(e):
+        lark_auth.invalidate()
+        return fn(self.token, *args)
+      raise
+
   async def send_card(self, chat_id: str, card: JsonObject) -> str:
-    return lark_api.send_card(self.token, chat_id, card)
+    return self._retry_on_auth_error(lark_api.send_card, chat_id, card)
 
   async def update_card(self, message_id: str, card: JsonObject) -> None:
-    lark_api.update_card(self.token, message_id, card)
+    self._retry_on_auth_error(lark_api.update_card, message_id, card)
 
   async def send_text(self, chat_id: str, text: str) -> str:
-    return lark_api.send_text(self.token, chat_id, text)
+    return self._retry_on_auth_error(lark_api.send_text, chat_id, text)
 
   async def download_image(self, message_id: str, image_key: str) -> str:
     return lark_api.download_image(self.token, message_id, image_key)
@@ -127,10 +142,6 @@ class LarkChannel(Channel):
   async def get_chat_info(self, chat_id: str) -> JsonObject:
     return lark_api.get_chat_info(self.token, chat_id)
 
-  async def refresh_token(self) -> str:
-    self.token = lark_auth.get_token(
-      self.credentials["app_id"], self.credentials["app_secret"])
-    return self.token
 
   async def delete_message(self, message_id: str) -> None:
     lark_api.delete_message(self.token, message_id)

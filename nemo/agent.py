@@ -99,12 +99,12 @@ async def _handle_diag(
   """Run diagnostics and send results as a card."""
   results: list[str] = []
 
-  # Check token refresh
+  # Check token
   try:
-    await channel.refresh_token()
-    results.append("Token refresh: OK")
+    _ = channel.token  # triggers auto-refresh if expired
+    results.append("Token: OK")
   except Exception as e:
-    results.append(f"Token refresh: FAIL ({e})")
+    results.append(f"Token: FAIL ({e})")
 
   # Check send/receive
   try:
@@ -177,11 +177,14 @@ async def main_loop(
   # Database
   db = Database(project_dir)
 
-  # Clean stale sessions
+  # Clean stale sessions (preserve sdk_session_id for resume)
+  _resume_sdk_id = ""
   try:
     old_owner = db.get_chat_owner(chat_id)
     if old_owner:
-      log.info("Cleaning stale session %s", old_owner)
+      _resume_sdk_id = db.get_sdk_session_id(chat_id)
+      log.info("Cleaning stale session %s (sdk=%s)", old_owner,
+               _resume_sdk_id[:8] if _resume_sdk_id else "none")
       db.deactivate(old_owner)
   except Exception as e:
     log.warning("Stale cleanup error: %s", e)
@@ -259,7 +262,11 @@ async def main_loop(
     credentials, chat_id, db, channel,
     permission_mode=permission_mode,
   )
-  await agent.start(project_dir, model)
+  # Resume previous SDK session if available
+  _sdk_session_id: str = _resume_sdk_id
+  if _sdk_session_id:
+    log.info("Resuming SDK session %s", _sdk_session_id[:8])
+  await agent.start(project_dir, model, resume=_sdk_session_id)
 
   # Context
   ctx = commands.AgentContext(model, project_dir, time.time())
@@ -267,7 +274,6 @@ async def main_loop(
   running = True
   _dissolve_on_exit = False
   _stale_tasks: set[str] = set()
-  _sdk_session_id: str = ""  # CLI session UUID for --resume on model switch
 
   def handle_sig(_sig, _frame):
     nonlocal running
@@ -541,6 +547,7 @@ async def main_loop(
           _await_channel(_clear_ack())
           if event.session_id:
             _sdk_session_id = event.session_id
+            db.set_sdk_session_id(chat_id, _sdk_session_id)
           if _turn_interrupt_phase:
             if _turn_card_id:
               db.clear_working(session_id)
@@ -811,7 +818,6 @@ async def main_loop(
   db.close()
   if _dissolve_on_exit:
     try:
-      await channel.refresh_token()
       await channel.dissolve_chat()
       log.info("Dissolved group %s", chat_id)
     except Exception as e:

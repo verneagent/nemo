@@ -43,6 +43,11 @@ class LarkAuth:
       self._expires_at = time.time() + data.get("expire", 7200)
       return self._token
 
+  def invalidate(self) -> None:
+    """Force token refresh on next get_token() call."""
+    with self._lock:
+      self._expires_at = 0
+
 
 # Module-level singleton
 _auth = LarkAuth()
@@ -50,3 +55,7 @@ _auth = LarkAuth()
 
 def get_token(app_id: str, app_secret: str) -> str:
   return _auth.get_token(app_id, app_secret)
+
+
+def invalidate() -> None:
+  _auth.invalidate()
