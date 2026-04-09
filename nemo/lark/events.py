@@ -88,8 +88,8 @@ def _parse_message_event(payload: JsonObject) -> LarkEvent:
     image_key = content.get("image_key", "")
     file_key = content.get("file_key", "")
     file_name = content.get("file_name", "")
-  except (json.JSONDecodeError, TypeError):
-    pass
+  except (json.JSONDecodeError, TypeError) as e:
+    log.debug("Malformed event content: %s", e)
 
   mentions_raw = msg.get("mentions") or []
   mentions = [{"key": m.get("key", ""), "id": m.get("id", {}).get("open_id", ""),

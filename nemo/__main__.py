@@ -19,7 +19,7 @@ def _ensure_claude_sdk():
     import claude_agent_sdk  # noqa: F401
     return
   except ImportError:
-    pass
+    pass  # SDK not on this Python, try others
   import glob
   import subprocess
   candidates = []
@@ -40,7 +40,8 @@ def _ensure_claude_sdk():
       )
       if rc == 0:
         os.execv(candidate, [candidate, "-m", "nemo"] + sys.argv[1:])
-    except Exception:
+    except Exception as e:
+      print(f"  Skipping {candidate}: {e}", file=sys.stderr)
       continue
   print("Error: claude_agent_sdk not found.", file=sys.stderr)
   sys.exit(1)
@@ -79,7 +80,7 @@ def signal_ready() -> None:
     try:
       os.close(_ready_fd)
     except OSError:
-      pass
+      pass  # fd already closed
     _ready_fd = None
 
 
@@ -90,11 +91,11 @@ def signal_error(msg: str) -> None:
     try:
       os.write(_ready_fd, f"error:{msg}\n".encode())
     except OSError:
-      pass
+      pass  # pipe broken, parent exited
     try:
       os.close(_ready_fd)
     except OSError:
-      pass
+      pass  # fd already closed
     _ready_fd = None
 
 
@@ -241,7 +242,7 @@ def _cmd_list() -> int:
     try:
       pid = int(parts[0])
     except ValueError:
-      continue
+      continue  # skip non-numeric PID
     cmd = parts[1]
     if pid == my_pid:
       continue
@@ -271,7 +272,7 @@ def _cmd_list() -> int:
             proc["chat_id"] = m.group(1)
             break
     except OSError:
-      pass
+      pass  # log file missing or unreadable
 
   # Deduplicate by chat_id (parent + daemon may both appear)
   seen_chats: set[str] = set()

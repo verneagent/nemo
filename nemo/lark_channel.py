@@ -93,8 +93,8 @@ def _extract_message_text(msg: JsonObject) -> str:
       return f"[file: {content.get('file_name', '?')}]"
     if msg_type == "image":
       return "[image]"
-  except (json.JSONDecodeError, TypeError):
-    pass
+  except (json.JSONDecodeError, TypeError) as e:
+    log.debug("Malformed message content (type=%s): %s", msg_type, e)
   return f"[{msg_type}]" if msg_type else ""
 
 
