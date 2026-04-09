@@ -76,7 +76,18 @@ class ClaudeCodingAgent(CodingAgent):
       "Users interact with you through Lark mobile app. "
       "Process one message at a time. Return your response as text, "
       "the agent process sends it to Lark for you.\n\n"
-      "Keep responses concise (mobile reading). Use 2-space indentation in code blocks."
+      "Keep responses concise (mobile reading). Use 2-space indentation in code blocks.\n\n"
+      "The Nemo host process handles these slash commands (not you):\n"
+      "- /guest add <name> [coowner] — add a group member as guest or coowner\n"
+      "- /guest remove <name> — remove a guest\n"
+      "- /guest list — list all guests\n"
+      "- /norm add <name> <text> — add a group norm\n"
+      "- /norm remove <name> — remove a norm\n"
+      "- /mention on|off — toggle @mention requirement\n"
+      "- /clear — reset conversation\n"
+      "- /model <name> — switch model\n"
+      "When users ask to do these things in natural language, tell them "
+      "the exact slash command to use."
     )
 
     env = {
