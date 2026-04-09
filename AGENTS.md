@@ -8,6 +8,7 @@ Lark-connected coding agent daemon. Repo focus:
 ## Working Model
 
 - Keep `nemo/agent.py` as orchestration only. Push provider-specific logic into concrete adapters such as `LarkChannel` and `ClaudeCodingAgent`.
+- `agent.py` is channel-agnostic and agent-agnostic. It only sees `Channel` and `CodingAgent` abstractions. Lark-specific logic (file download, message enrichment, API calls) belongs in `LarkChannel`. SDK-specific logic belongs in `ClaudeCodingAgent`.
 - Prefer relay-backed event delivery. Direct Lark 长连接 is only a fallback when relay is not configured.
 - Preserve the one-card-per-turn model: turn cards evolve through PATCH instead of emitting a new card for each phase.
 - Keep turn execution event-driven. `run_turn()` should emit typed events and the main loop should react to them.

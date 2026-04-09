@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import json
+import logging
 import os
+
+log = logging.getLogger(__name__)
 
 from .channel import Channel, IncomingMessage
 from .config import load_credentials, load_relay_config
@@ -13,15 +17,56 @@ from .relay_events import RelayEventStream
 from .types import JsonObject
 
 
-def _to_incoming(event: LarkEvent) -> IncomingMessage:
+def _to_incoming(event: LarkEvent, token: str = "") -> IncomingMessage:
+  text = event.text
+  msg_type = event.msg_type
+
+  # Enrich: download files and embed path in text
+  if msg_type == "file" and event.file_key and event.message_id and token:
+    try:
+      path = lark_api.download_file(
+        token, event.message_id, event.file_key, event.file_name)
+      label = event.file_name or event.file_key
+      text = f"[file: {path}] {label}" if not text else f"{text}\n[file: {path}]"
+      log.info("Downloaded file: %s -> %s", label, path)
+    except Exception as e:
+      log.warning("File download failed: %s", e)
+      text = f"[file download failed: {event.file_name or event.file_key}]"
+
+  # Enrich: download images and embed path in text
+  if msg_type == "image" and event.image_key and event.message_id and token:
+    try:
+      path = lark_api.download_image(token, event.message_id, event.image_key)
+      text = f"[image: {path}]" if not text else f"{text}\n[image: {path}]"
+      log.info("Downloaded image: %s -> %s", event.image_key, path)
+    except Exception as e:
+      log.warning("Image download failed: %s", e)
+
+  # Enrich: fetch reply parent context
+  if event.parent_id and token:
+    try:
+      parent = lark_api.get_message(token, event.parent_id)
+      parent_text = _extract_message_text(parent)
+      if parent_text:
+        text = f"[replying to: {parent_text}]\n{text}"
+    except Exception as e:
+      log.warning("Failed to fetch parent message: %s", e)
+
+  # Enrich: expand merge_forward (folder) messages
+  if msg_type == "merge_forward" and event.message_id and token:
+    try:
+      text = _expand_merge_forward(token, event.message_id) or text
+    except Exception as e:
+      log.warning("Failed to expand merge_forward: %s", e)
+
   return IncomingMessage(
     event_type=event.event_type,
     chat_id=event.chat_id,
     chat_type=event.chat_type,
     sender_id=event.sender_id,
     message_id=event.message_id,
-    msg_type=event.msg_type,
-    text=event.text,
+    msg_type=msg_type,
+    text=text,
     mentions=list(event.mentions),
     image_key=event.image_key,
     file_key=event.file_key,
@@ -33,6 +78,52 @@ def _to_incoming(event: LarkEvent) -> IncomingMessage:
     operator_id=event.operator_id,
     raw=dict(event.raw),
   )
+
+
+def _extract_message_text(msg: JsonObject) -> str:
+  """Extract readable text from a get_message API response item."""
+  msg_type = msg.get("msg_type", "")
+  body = msg.get("body", {})
+  content_str = body.get("content", "{}") if isinstance(body, dict) else "{}"
+  try:
+    content = json.loads(content_str) if isinstance(content_str, str) else {}
+    if msg_type == "text":
+      return str(content.get("text", ""))
+    if msg_type == "file":
+      return f"[file: {content.get('file_name', '?')}]"
+    if msg_type == "image":
+      return "[image]"
+  except (json.JSONDecodeError, TypeError):
+    pass
+  return f"[{msg_type}]" if msg_type else ""
+
+
+def _expand_merge_forward(token: str, message_id: str) -> str:
+  """Expand a merge_forward (folder) message into readable text."""
+  msg = lark_api.get_message(token, message_id)
+  body = msg.get("body", {})
+  content_str = body.get("content", "{}") if isinstance(body, dict) else "{}"
+  try:
+    content = json.loads(content_str) if isinstance(content_str, str) else {}
+  except (json.JSONDecodeError, TypeError):
+    return "[folder message: could not parse]"
+
+  # merge_forward content has sub messages inline or as IDs
+  # Try to extract text from the content directly
+  if isinstance(content, dict):
+    # Some formats have "title" and "messages" or "message_id_list"
+    title = content.get("title", "")
+    parts: list[str] = []
+    if title:
+      parts.append(f"[folder: {title}]")
+
+    # If content has inline text
+    for key in ("text", "content"):
+      if key in content and isinstance(content[key], str):
+        parts.append(content[key])
+        return "\n".join(parts)
+
+  return f"[folder message]"
 
 
 class LarkChannel(Channel):
@@ -70,7 +161,7 @@ class LarkChannel(Channel):
     event = await self._events.next_message(timeout=timeout)
     if event is None:
       return None
-    return _to_incoming(event)
+    return _to_incoming(event, token=self.token)
 
   def push_back(self, message: IncomingMessage) -> None:
     if self._events is None:
