@@ -65,6 +65,18 @@ def _ensure_provider_runtime(provider: str) -> None:
   sys.exit(1)
 
 
+_ready_fd: int | None = None  # write-end of readiness pipe (grandchild only)
+
+
+def signal_ready() -> None:
+  """Signal the waiting parent that the daemon is ready."""
+  global _ready_fd
+  if _ready_fd is not None:
+    os.write(_ready_fd, f"ready:{os.getpid()}\n".encode())
+    os.close(_ready_fd)
+    _ready_fd = None
+
+
 def _daemonize():
   """Double-fork into background, fully detach from parent process tree.
 
@@ -72,20 +84,38 @@ def _daemonize():
   child PID and kills it when the turn ends. Double-fork ensures the
   actual daemon (grandchild) is reparented to PID 1 and invisible to any
   parent process tree cleanup.
+
+  The parent blocks until the daemon signals readiness (after the start
+  card is sent) or the pipe closes on error.
   """
-  # Pipe to communicate daemon PID back to original parent
+  # Pipe to communicate readiness back to original parent
   r_fd, w_fd = os.pipe()
 
   # First fork
   pid = os.fork()
   if pid > 0:
-    # Original parent — read daemon PID from pipe, then exit
+    # Original parent — wait for readiness signal from daemon
     os.close(w_fd)
-    daemon_pid = os.read(r_fd, 32).decode().strip() or "?"
+    data = b""
+    while True:
+      chunk = os.read(r_fd, 256)
+      if not chunk:
+        break
+      data += chunk
+      if b"\n" in data:
+        break
     os.close(r_fd)
     os.waitpid(pid, 0)
-    print(f"nemo started (PID {daemon_pid})", file=sys.stderr)
-    sys.exit(0)
+    msg = data.decode().strip()
+    if msg.startswith("ready:"):
+      daemon_pid = msg.split(":", 1)[1]
+      print(f"nemo started (PID {daemon_pid})", file=sys.stderr)
+      sys.exit(0)
+    else:
+      print("nemo failed to start", file=sys.stderr)
+      if msg:
+        print(msg, file=sys.stderr)
+      sys.exit(1)
 
   # Intermediate child — new session, fork again, exit immediately
   os.close(r_fd)
@@ -93,13 +123,12 @@ def _daemonize():
 
   pid2 = os.fork()
   if pid2 > 0:
-    # Write grandchild PID to pipe for original parent
-    os.write(w_fd, str(pid2).encode())
     os.close(w_fd)
     os._exit(0)
 
-  # Grandchild — the actual daemon
-  os.close(w_fd)
+  # Grandchild — the actual daemon; keep w_fd for readiness signal
+  global _ready_fd
+  _ready_fd = w_fd
   devnull = os.open(os.devnull, os.O_RDWR)
   os.dup2(devnull, 0)
   os.dup2(devnull, 1)

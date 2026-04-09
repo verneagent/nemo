@@ -223,8 +223,9 @@ async def main_loop(
 
   # Send start card
   log.info("Sending start card to %s", chat_id)
+  from nemo import __version__
   start_card = cards.build_card(
-    f"Nemo ({model})",
+    f"Nemo v{__version__} ({model})",
     body="Agent ready. Send a message to begin.",
     color="blue",
   )
@@ -233,6 +234,10 @@ async def main_loop(
     log.info("Start card sent: %s", msg_id)
   except Exception as e:
     log.warning("Start card failed: %s", e)
+
+  # Signal parent process that the daemon is ready
+  from .__main__ import signal_ready
+  signal_ready()
 
   # Status tab — green idle
   await channel.update_status(model, "idle")
