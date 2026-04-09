@@ -81,8 +81,8 @@ class Channel(ABC):
     ...
 
   @abstractmethod
-  async def add_reaction(self, message_id: str, emoji_type: str) -> None:
-    """Add an emoji reaction to a message."""
+  async def add_reaction(self, message_id: str, emoji_type: str) -> str:
+    """Add an emoji reaction to a message. Returns reaction_id."""
     ...
 
   @abstractmethod

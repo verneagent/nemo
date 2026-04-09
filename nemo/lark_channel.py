@@ -108,8 +108,8 @@ class LarkChannel(Channel):
   ) -> str:
     return lark_api.download_file(self.token, message_id, file_key, file_name)
 
-  async def add_reaction(self, message_id: str, emoji_type: str) -> None:
-    lark_api.add_reaction(self.token, message_id, emoji_type)
+  async def add_reaction(self, message_id: str, emoji_type: str) -> str:
+    return lark_api.add_reaction(self.token, message_id, emoji_type)
 
   async def remove_reaction(self, message_id: str, reaction_id: str) -> None:
     lark_api.remove_reaction(self.token, message_id, reaction_id)
