@@ -411,6 +411,7 @@ async def main_loop(
           project_dir = new_dir
           ctx.project_dir = project_dir
           await _restart_client()
+          await channel.update_workspace_tag(project_dir)
           await _send_response(channel, chat_id, f"Working directory: **{project_dir}**", db)
         elif response == "__autoapprove_toggle__":
           sess = db.get_session(session_id) or {}

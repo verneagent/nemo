@@ -252,6 +252,10 @@ class LarkChannel(Channel):
     claim_group(self.token, self.chat_id, model=model)
     write_pid_file(self.chat_id)
 
+  async def update_workspace_tag(self, project_dir: str) -> None:
+    from .workspace import ensure_workspace_tag
+    ensure_workspace_tag(self.token, self.chat_id, project_dir)
+
   async def release_workspace(self) -> None:
     from .workspace import release_group, remove_pid_file
     release_group(self.token, self.chat_id)

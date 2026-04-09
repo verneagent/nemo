@@ -431,23 +431,28 @@ def release_group(token: str, chat_id: str) -> None:
 
 
 def ensure_workspace_tag(token: str, chat_id: str, project_dir: str) -> None:
-  """Ensure the chat description contains the workspace tag.
+  """Ensure the chat description contains exactly one workspace tag.
 
-  If the new-format tag is present, do nothing. If only legacy tag exists,
-  replace it. Otherwise append new-format tag.
+  Removes all existing workspace: tags and writes the current one.
+  Skips update if the description already has exactly the right tag.
   """
+  import re
   from .lark import api as lark_api
 
   workspace_tag = f"workspace:{get_workspace_id(project_dir)}"
-  legacy_tag = f"workspace:{_get_legacy_workspace_id(project_dir)}"
 
   try:
     info = lark_api.get_chat_info(token, chat_id)
-    desc = info.get("description") or ""
-    if _workspace_tag_matches(desc, workspace_tag):
-      return  # Already tagged with new format
-    # Append tag to existing description
-    new_desc = f"{desc}\n{workspace_tag}".strip() if desc.strip() else workspace_tag
+    desc = str(info.get("description", "") or "")
+
+    # Strip all existing workspace tags
+    cleaned = re.sub(r"workspace:\S+", "", desc).strip()
+    # Build new description
+    new_desc = f"{cleaned}\n{workspace_tag}".strip() if cleaned else workspace_tag
+
+    if desc.strip() == new_desc.strip():
+      return  # Already correct
+
     lark_api.update_chat_info(token, chat_id, {"description": new_desc})
     log.info("Tagged chat %s with %s", chat_id, workspace_tag)
   except Exception as e:

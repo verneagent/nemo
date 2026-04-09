@@ -116,3 +116,7 @@ class Channel(ABC):
   def permission_active(self, active: bool) -> None:
     """Set whether the permission bridge is currently consuming channel events."""
     ...
+
+  async def update_workspace_tag(self, project_dir: str) -> None:
+    """Update the workspace tag for the current chat. No-op by default."""
+    pass
