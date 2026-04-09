@@ -303,15 +303,68 @@ def discover_or_create_chat(token: str, project_dir: str,
                           existing_names=existing_names)
 
 
+def _pid_file_path(chat_id: str) -> str:
+  """Path to the PID file for a given chat."""
+  from .config import CONFIG_DIR
+  pid_dir = os.path.join(CONFIG_DIR, "pids")
+  os.makedirs(pid_dir, exist_ok=True)
+  return os.path.join(pid_dir, f"{chat_id}.pid")
+
+
+def write_pid_file(chat_id: str) -> None:
+  """Write current PID to the chat's PID file."""
+  path = _pid_file_path(chat_id)
+  with open(path, "w") as f:
+    f.write(str(os.getpid()))
+  log.info("Wrote PID file: %s (pid=%d)", path, os.getpid())
+
+
+def remove_pid_file(chat_id: str) -> None:
+  """Remove the chat's PID file."""
+  path = _pid_file_path(chat_id)
+  try:
+    os.remove(path)
+  except FileNotFoundError:
+    pass
+
+
+def _read_pid_file(chat_id: str) -> int:
+  """Read PID from file. Returns 0 if missing or invalid."""
+  path = _pid_file_path(chat_id)
+  try:
+    with open(path) as f:
+      return int(f.read().strip())
+  except (FileNotFoundError, ValueError):
+    return 0
+
+
 def evict_existing(token: str, chat_id: str) -> None:
   """If another nemo process occupies this group, stop it before we start.
 
-  Checks local process table and relay heartbeat. For local processes,
-  sends SIGTERM. For remote (relay-only), sends a stop signal via relay.
+  Checks PID file, local process table, and relay heartbeat.
   """
   from .config import load_relay_config
 
-  # 1. Check local process table for nemo targeting this chat
+  # 1. Check PID file (reliable even after daemonize)
+  old_pid = _read_pid_file(chat_id)
+  if old_pid and old_pid != os.getpid() and _is_pid_alive(old_pid):
+    log.info("Stopping existing nemo process from PID file (pid=%d)", old_pid)
+    import signal as _signal
+    try:
+      os.kill(old_pid, _signal.SIGTERM)
+      import time
+      for _ in range(30):
+        if not _is_pid_alive(old_pid):
+          log.info("Previous process (pid=%d) stopped", old_pid)
+          break
+        time.sleep(0.5)
+      else:
+        log.warning("Previous process (pid=%d) did not exit, killing", old_pid)
+        os.kill(old_pid, _signal.SIGKILL)
+    except OSError:
+      pass
+
+  # 2. Check local process table (fallback for processes without PID file)
   local_pids = _find_local_nemo_pids(chat_id)
   for old_pid in local_pids:
     if _is_pid_alive(old_pid):

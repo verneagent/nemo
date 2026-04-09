@@ -245,14 +245,17 @@ class LarkChannel(Channel):
     return operator_open_id, bot_info.get("open_id", "")
 
   async def ensure_workspace_claimed(self, project_dir: str, model: str) -> None:
-    from .workspace import ensure_workspace_tag, evict_existing, claim_group
+    from .workspace import (ensure_workspace_tag, evict_existing,
+                            claim_group, write_pid_file)
     ensure_workspace_tag(self.token, self.chat_id, project_dir)
     evict_existing(self.token, self.chat_id)
     claim_group(self.token, self.chat_id, model=model)
+    write_pid_file(self.chat_id)
 
   async def release_workspace(self) -> None:
-    from .workspace import release_group
+    from .workspace import release_group, remove_pid_file
     release_group(self.token, self.chat_id)
+    remove_pid_file(self.chat_id)
 
   async def update_status(self, model: str, state: str) -> None:
     from . import status_tab
