@@ -90,16 +90,36 @@ class SDKThread:
     await self.run_on_sdk_loop(_create())
 
   async def close_client(self) -> None:
-    """Close the SDK client."""
+    """Close the SDK client and ensure its CLI subprocess is dead."""
     if self._client is None:
       return
 
     async def _close():
+      client = self._client
+      self._client = None
+
+      # Get the CLI subprocess PID before closing
+      cli_pid = None
+      transport = getattr(client, '_transport', None)
+      proc = getattr(transport, '_process', None) if transport else None
+      if proc:
+        cli_pid = getattr(proc, 'pid', None)
+
       try:
-        await self._client.__aexit__(None, None, None)
+        await asyncio.wait_for(client.__aexit__(None, None, None), timeout=5)
       except Exception:
         pass
-      self._client = None
+
+      # Ensure CLI subprocess is dead
+      if cli_pid:
+        import os
+        import signal as _signal
+        try:
+          os.kill(cli_pid, 0)  # Check if alive
+          log.warning("CLI subprocess %d still alive after close, killing", cli_pid)
+          os.kill(cli_pid, _signal.SIGKILL)
+        except OSError:
+          pass  # Already dead — good
 
     await self.run_on_sdk_loop(_close())
 
