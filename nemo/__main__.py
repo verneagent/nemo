@@ -8,11 +8,12 @@ import faulthandler
 import logging
 import os
 import signal
+import shutil
 import sys
 import threading
 
 
-def _ensure_sdk():
+def _ensure_claude_sdk():
   """Ensure we're running on a Python with claude_agent_sdk."""
   try:
     import claude_agent_sdk  # noqa: F401
@@ -42,6 +43,25 @@ def _ensure_sdk():
     except Exception:
       continue
   print("Error: claude_agent_sdk not found.", file=sys.stderr)
+  sys.exit(1)
+
+
+def _ensure_codex_cli() -> None:
+  """Ensure the local codex CLI is available."""
+  if shutil.which("codex"):
+    return
+  print("Error: codex CLI not found in PATH.", file=sys.stderr)
+  sys.exit(1)
+
+
+def _ensure_provider_runtime(provider: str) -> None:
+  if provider == "claude":
+    _ensure_claude_sdk()
+    return
+  if provider == "codex":
+    _ensure_codex_cli()
+    return
+  print(f"Error: unsupported provider '{provider}'", file=sys.stderr)
   sys.exit(1)
 
 
@@ -141,8 +161,6 @@ def _setup_crash_diagnostics(log_path: str) -> None:
 
 
 def main():
-  _ensure_sdk()
-
   parser = argparse.ArgumentParser(
     prog="nemo",
     description="Lark-connected coding agent daemon",
@@ -150,7 +168,9 @@ def main():
   parser.add_argument("--chat-id", default="", help="Lark chat ID (auto-discovered if omitted)")
   parser.add_argument("--chat-name", default="", help="Find chat by name substring")
   parser.add_argument("--project-dir", default=".", help="Project directory (default: cwd)")
-  parser.add_argument("--model", default="claude-opus-4-6", help="Model to use")
+  parser.add_argument("--provider", default="claude", choices=["claude", "codex"],
+                      help="Coding agent provider (default: claude)")
+  parser.add_argument("--model", default="", help="Model to use (provider default if omitted)")
   parser.add_argument("--profile", default="default", help="Config profile name (default: default)")
   parser.add_argument("--permission-mode", default="bypassPermissions",
                       choices=["default", "acceptEdits", "plan", "bypassPermissions"],
@@ -159,6 +179,8 @@ def main():
                       help="Run in foreground (default: daemonize)")
   parser.add_argument("--verbose", "-v", action="store_true", help="Debug logging")
   args = parser.parse_args()
+
+  _ensure_provider_runtime(args.provider)
 
   # Set active profile before any config loading
   from .config import set_profile, profile_path
@@ -201,6 +223,8 @@ def main():
   logging.getLogger().addHandler(rfh)
 
   project_dir = os.path.abspath(args.project_dir)
+  from .agent_factory import default_model_for_provider
+  model = args.model or default_model_for_provider(args.provider)
   if not os.path.isdir(project_dir):
     print(f"Error: {project_dir} is not a directory", file=sys.stderr)
     return 1
@@ -258,7 +282,8 @@ def main():
 
   from .agent import main_loop
   try:
-    return asyncio.run(main_loop(chat_id, project_dir, args.model,
+    return asyncio.run(main_loop(chat_id, project_dir, model,
+                                 provider=args.provider,
                                  permission_mode=args.permission_mode))
   except KeyboardInterrupt:
     return 0

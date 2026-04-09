@@ -11,7 +11,8 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Any
+
+from .types import JsonObject
 
 
 @dataclass
@@ -31,10 +32,10 @@ class IncomingMessage:
   parent_id: str = ""
   create_time: str = ""
   # Card action fields
-  action_value: dict[str, Any] = field(default_factory=dict)
+  action_value: JsonObject = field(default_factory=dict)
   action_tag: str = ""
   operator_id: str = ""
-  raw: dict[str, Any] = field(default_factory=dict)
+  raw: JsonObject = field(default_factory=dict)
 
 
 class Channel(ABC):
@@ -46,12 +47,17 @@ class Channel(ABC):
     ...
 
   @abstractmethod
-  async def send_card(self, chat_id: str, card: dict[str, Any]) -> str:
+  def push_back(self, message: IncomingMessage) -> None:
+    """Re-queue a message so it can be consumed again."""
+    ...
+
+  @abstractmethod
+  async def send_card(self, chat_id: str, card: JsonObject) -> str:
     """Send an interactive card. Returns message_id."""
     ...
 
   @abstractmethod
-  async def update_card(self, message_id: str, card: dict[str, Any]) -> None:
+  async def update_card(self, message_id: str, card: JsonObject) -> None:
     """Update (PATCH) an existing card message."""
     ...
 
@@ -95,6 +101,18 @@ class Channel(ABC):
     ...
 
   @abstractmethod
-  async def get_chat_members(self, chat_id: str) -> list[dict[str, Any]]:
+  async def get_chat_members(self, chat_id: str) -> list[JsonObject]:
     """Get members of a chat."""
+    ...
+
+  @property
+  @abstractmethod
+  def permission_active(self) -> bool:
+    """Whether the permission bridge is currently consuming channel events."""
+    ...
+
+  @permission_active.setter
+  @abstractmethod
+  def permission_active(self, active: bool) -> None:
+    """Set whether the permission bridge is currently consuming channel events."""
     ...

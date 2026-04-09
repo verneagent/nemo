@@ -7,13 +7,14 @@ import os
 import time
 import urllib.error
 import urllib.request
-from typing import Any
+
+from ..types import JsonObject
 
 BASE_URL = "https://open.larksuite.com/open-apis"
 
 
-def _request(url: str, token: str, payload: dict[str, Any] | None = None,
-             method: str = "GET", timeout: int = 30) -> dict[str, Any]:
+def _request(url: str, token: str, payload: JsonObject | None = None,
+             method: str = "GET", timeout: int = 30) -> JsonObject:
   """Make an authenticated request to Lark API."""
   headers = {"Authorization": f"Bearer {token}"}
   data = None
@@ -37,7 +38,7 @@ def _request(url: str, token: str, payload: dict[str, Any] | None = None,
 # Message operations
 # ---------------------------------------------------------------------------
 
-def send_card(token: str, chat_id: str, card: dict[str, Any]) -> str:
+def send_card(token: str, chat_id: str, card: JsonObject) -> str:
   """Send an interactive card message. Returns message_id."""
   url = f"{BASE_URL}/im/v1/messages?receive_id_type=chat_id"
   payload = {
@@ -45,7 +46,7 @@ def send_card(token: str, chat_id: str, card: dict[str, Any]) -> str:
     "msg_type": "interactive",
     "content": json.dumps(card),
   }
-  data: dict[str, Any] = {}
+  data: JsonObject = {}
   for attempt in range(3):
     data = _request(url, token, payload)
     if data.get("code") == 0:
@@ -55,7 +56,7 @@ def send_card(token: str, chat_id: str, card: dict[str, Any]) -> str:
   raise RuntimeError(f"Failed to send card: {data}")
 
 
-def update_card(token: str, message_id: str, card: dict[str, Any]) -> None:
+def update_card(token: str, message_id: str, card: JsonObject) -> None:
   """PATCH an existing card message."""
   url = f"{BASE_URL}/im/v1/messages/{message_id}"
   payload = {"msg_type": "interactive", "content": json.dumps(card)}
@@ -82,7 +83,7 @@ def send_text(token: str, chat_id: str, text: str) -> str:
 # User & chat info
 # ---------------------------------------------------------------------------
 
-def get_bot_info(token: str) -> dict[str, Any]:
+def get_bot_info(token: str) -> JsonObject:
   """Get bot's own info (open_id, etc.)."""
   url = f"{BASE_URL}/bot/v3/info"
   data = _request(url, token)
@@ -103,7 +104,7 @@ def lookup_open_id_by_email(token: str, email: str) -> str | None:
   return None
 
 
-def get_chat_info(token: str, chat_id: str) -> dict[str, Any]:
+def get_chat_info(token: str, chat_id: str) -> JsonObject:
   """Get chat group info."""
   url = f"{BASE_URL}/im/v1/chats/{chat_id}"
   data = _request(url, token)
@@ -112,7 +113,7 @@ def get_chat_info(token: str, chat_id: str) -> dict[str, Any]:
   return data.get("data", {})
 
 
-def get_message(token: str, message_id: str) -> dict[str, Any]:
+def get_message(token: str, message_id: str) -> JsonObject:
   """Fetch a message by ID. Returns the message item dict."""
   url = f"{BASE_URL}/im/v1/messages/{message_id}"
   data = _request(url, token)
@@ -142,10 +143,10 @@ def delete_pin(token: str, message_id: str) -> None:
   _request(url, token, method="DELETE")
 
 
-def list_pins(token: str, chat_id: str) -> list[dict[str, Any]]:
+def list_pins(token: str, chat_id: str) -> list[JsonObject]:
   """List all pinned messages in a chat."""
   url = f"{BASE_URL}/im/v1/pins?chat_id={chat_id}"
-  pins: list[dict[str, Any]] = []
+  pins: list[JsonObject] = []
   page_token = ""
   for _ in range(10):
     req_url = url + (f"&page_token={page_token}" if page_token else "")
@@ -169,10 +170,10 @@ def update_chat_info(token: str, chat_id: str,
     raise RuntimeError(f"Failed to update chat: {data}")
 
 
-def list_bot_chats(token: str) -> list[dict[str, Any]]:
+def list_bot_chats(token: str) -> list[JsonObject]:
   """List all chat groups the bot belongs to."""
   url = f"{BASE_URL}/im/v1/chats?user_id_type=open_id"
-  chats: list[dict[str, Any]] = []
+  chats: list[JsonObject] = []
   page_token = ""
   for _ in range(50):  # safety limit
     req_url = url + (f"&page_token={page_token}" if page_token else "")
@@ -187,10 +188,10 @@ def list_bot_chats(token: str) -> list[dict[str, Any]]:
   return chats
 
 
-def get_chat_members(token: str, chat_id: str) -> list[dict[str, Any]]:
+def get_chat_members(token: str, chat_id: str) -> list[JsonObject]:
   """Get all members of a chat group."""
   url = f"{BASE_URL}/im/v1/chats/{chat_id}/members?member_id_type=open_id"
-  members: list[dict[str, Any]] = []
+  members: list[JsonObject] = []
   page_token = ""
   while True:
     req_url = url + (f"&page_token={page_token}" if page_token else "")
@@ -264,7 +265,7 @@ def remove_reaction(token: str, message_id: str, reaction_id: str) -> None:
 
 def _multipart_upload(url: str, token: str, fields: dict[str, str],
                       file_field: str, file_path: str,
-                      timeout: int = 60) -> dict[str, Any]:
+                      timeout: int = 60) -> JsonObject:
   """Upload a file using multipart/form-data via urllib."""
   import mimetypes
   import uuid
@@ -377,7 +378,7 @@ def reply_message(token: str, message_id: str, text: str) -> str:
   raise RuntimeError(f"Failed to reply message: {data}")
 
 
-def reply_card(token: str, message_id: str, card: dict[str, Any]) -> str:
+def reply_card(token: str, message_id: str, card: JsonObject) -> str:
   """Reply to a message with a card. Returns message_id."""
   url = f"{BASE_URL}/im/v1/messages/{message_id}/reply"
   payload = {
@@ -437,7 +438,7 @@ def update_chat_tab(token: str, chat_id: str, tab_id: str,
     raise RuntimeError(f"Failed to update chat tab: {data}")
 
 
-def list_chat_tabs(token: str, chat_id: str) -> list[dict[str, Any]]:
+def list_chat_tabs(token: str, chat_id: str) -> list[JsonObject]:
   """List all tabs in chat."""
   api_url = f"{BASE_URL}/im/v1/chats/{chat_id}/chat_tabs/list_tabs"
   data = _request(api_url, token)
@@ -465,7 +466,7 @@ def create_chat(token: str, name: str, description: str = "") -> str:
   Add users separately via add_chat_members.
   """
   url = f"{BASE_URL}/im/v1/chats"
-  payload: dict[str, Any] = {
+  payload: JsonObject = {
     "name": name,
     "chat_mode": "group",
   }

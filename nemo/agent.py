@@ -20,12 +20,11 @@ import time
 import uuid
 
 from . import cards, commands, messages, monitor
+from .agent_factory import AgentProvider, build_coding_agent, is_model_compatible
+from .channel import IncomingMessage
 from .config import load_credentials
 from .db import Database
-from .lark import api as lark_api
-from .lark import auth as lark_auth
-from .lark.events import LarkEvent, LarkEventStream
-from .permissions import build_permission_handler
+from .lark_channel import LarkChannel
 from .turn import (
   DoneEvent, TextEvent, ToolProgressEvent, ToolStartEvent,
 )
@@ -37,11 +36,13 @@ log = logging.getLogger(__name__)
 # Response helpers
 # ---------------------------------------------------------------------------
 
-def _send_response(token: str, chat_id: str, text: str, db: Database) -> str | None:
+async def _send_response(
+  channel: LarkChannel, chat_id: str, text: str, db: Database,
+) -> str | None:
   """Send a markdown response card. Returns message_id."""
   card = cards.build_markdown_card(text)
   try:
-    msg_id = lark_api.send_card(token, chat_id, card)
+    msg_id = await channel.send_card(chat_id, card)
     db.record_sent(msg_id, text=text[:500], chat_id=chat_id)
     _register_msg(msg_id, chat_id)
     return msg_id
@@ -59,10 +60,10 @@ def _register_msg(msg_id: str, chat_id: str) -> None:
     relay_client.register_message(msg_id, chat_id)
 
 
-def _handle_turn_error(
+async def _handle_turn_error(
   message: str,
   exc: Exception,
-  credentials: dict,
+  channel: LarkChannel,
   chat_id: str,
   db: Database,
   session_id: str,
@@ -73,26 +74,26 @@ def _handle_turn_error(
   """Display a red error card for SDK turn errors (timeout, rate limit, etc.)."""
   log.error("Turn error: %s", exc)
   try:
-    token = lark_auth.get_token(credentials["app_id"], credentials["app_secret"])
     if card_id:
       elapsed = int(time.time() - turn_start)
       err_card = cards.build_turn_card(
         "error", body=f"**{message}**",
         steps=steps, elapsed=elapsed,
       )
-      lark_api.update_card(token, card_id, err_card)
+      await channel.update_card(card_id, err_card)
       db.clear_working(session_id)
     else:
       err_card = cards.build_card("Error", body=f"**{message}**", color="red")
-      msg_id = lark_api.send_card(token, chat_id, err_card)
+      msg_id = await channel.send_card(chat_id, err_card)
       db.record_sent(msg_id, text=message[:500], chat_id=chat_id)
   except Exception:
     pass
 
 
-def _handle_diag(
-  token: str, chat_id: str,
-  credentials: dict, project_dir: str,
+async def _handle_diag(
+  channel: LarkChannel,
+  chat_id: str,
+  project_dir: str,
   db: Database,
 ) -> None:
   """Run diagnostics and send results as a card."""
@@ -100,20 +101,19 @@ def _handle_diag(
 
   # Check token refresh
   try:
-    new_token = lark_auth.get_token(credentials["app_id"], credentials["app_secret"])
+    await channel.refresh_token()
     results.append("Token refresh: OK")
   except Exception as e:
     results.append(f"Token refresh: FAIL ({e})")
-    new_token = token
 
   # Check send/receive
   try:
     test_card = cards.build_card("Diag", body="test", color="grey")
-    msg_id = lark_api.send_card(new_token, chat_id, test_card)
+    msg_id = await channel.send_card(chat_id, test_card)
     if msg_id:
       results.append("Send card: OK")
       try:
-        lark_api.delete_message(new_token, msg_id)
+        await channel.delete_message(msg_id)
       except Exception:
         pass
     else:
@@ -125,7 +125,7 @@ def _handle_diag(
   try:
     from .workspace import get_workspace_id
     ws_id = get_workspace_id(project_dir)
-    info = lark_api.get_chat_info(new_token, chat_id)
+    info = await channel.get_chat_info(chat_id)
     desc = info.get("description", "")
     tag = f"workspace:{ws_id}"
     if tag in desc:
@@ -138,7 +138,7 @@ def _handle_diag(
   body = "\n".join(f"- {r}" for r in results)
   diag_card = cards.build_card("Diagnostics", body=body, color="blue")
   try:
-    lark_api.send_card(new_token, chat_id, diag_card)
+    await channel.send_card(chat_id, diag_card)
   except Exception as e:
     log.error("Failed to send diag card: %s", e)
 
@@ -151,6 +151,7 @@ async def main_loop(
   chat_id: str,
   project_dir: str,
   model: str,
+  provider: AgentProvider = "claude",
   permission_mode: str = "bypassPermissions",
 ) -> int:
   """Run the agent main loop."""
@@ -161,17 +162,15 @@ async def main_loop(
     log.error("No credentials configured")
     return 1
 
-  token = lark_auth.get_token(credentials["app_id"], credentials["app_secret"])
+  channel = LarkChannel(chat_id)
+  await channel.start()
 
   # Resolve operator & bot
   operator_open_id = ""
   bot_open_id = ""
   try:
     email = credentials.get("email", "")
-    if email:
-      operator_open_id = lark_api.lookup_open_id_by_email(token, email) or ""
-    bot_info = lark_api.get_bot_info(token)
-    bot_open_id = bot_info.get("open_id", "")
+    operator_open_id, bot_open_id = await channel.resolve_operator_and_bot(email)
   except Exception as e:
     log.warning("Operator/bot lookup failed: %s", e)
 
@@ -188,26 +187,23 @@ async def main_loop(
     log.warning("Stale cleanup error: %s", e)
 
   # Ensure workspace tag and claim group
-  from .workspace import ensure_workspace_tag, evict_existing, claim_group
-  ensure_workspace_tag(token, chat_id, project_dir)
-  evict_existing(token, chat_id)
-  claim_group(token, chat_id, model=model)
+  await channel.ensure_workspace_claimed(project_dir, model)
 
   # Detect need_mention: bot-owned groups or 1-on-1 groups default to False,
   # multi-human groups default to True. Can be overridden via group config.
   from . import group_config as gcfg
-  gc = gcfg.load_config(token, chat_id)
+  gc = gcfg.load_config(channel.token, chat_id)
   if "need_mention" in gc:
     need_mention = bool(gc["need_mention"])
   else:
     need_mention = True
     try:
-      info = lark_api.get_chat_info(token, chat_id)
+      info = await channel.get_chat_info(chat_id)
       owner_id = info.get("owner_id", "")
       if owner_id and owner_id == bot_open_id:
         need_mention = False
       else:
-        members = lark_api.get_chat_members(token, chat_id)
+        members = await channel.get_chat_members(chat_id)
         human_count = sum(1 for m in members if m.get("member_id") != bot_open_id)
         if human_count <= 1:
           need_mention = False
@@ -225,16 +221,6 @@ async def main_loop(
            session_id, chat_id, bot_open_id[:16] if bot_open_id else "?",
            operator_open_id[:16] if operator_open_id else "?", need_mention)
 
-  # Connect to event stream (relay if configured, otherwise lark-oapi WS)
-  from .config import load_relay_config
-  relay_url, relay_api_key = load_relay_config()
-  if relay_url:
-    from .relay_events import RelayEventStream
-    events = RelayEventStream(relay_url, relay_api_key, chat_id)
-  else:
-    events = LarkEventStream(credentials["app_id"], credentials["app_secret"])
-  await events.connect()
-
   # Send start card
   log.info("Sending start card to %s", chat_id)
   start_card = cards.build_card(
@@ -243,45 +229,36 @@ async def main_loop(
     color="blue",
   )
   try:
-    msg_id = lark_api.send_card(token, chat_id, start_card)
+    msg_id = await channel.send_card(chat_id, start_card)
     log.info("Start card sent: %s", msg_id)
   except Exception as e:
     log.warning("Start card failed: %s", e)
 
   # Status tab — green idle
-  from . import status_tab
-  status_tab.update_status(token, chat_id, model, "idle")
+  await channel.update_status(model, "idle")
 
   # Periodic heartbeat (relay-based idle detection)
   _heartbeat_task: asyncio.Task | None = None
   from .config import load_relay_config
   relay_url, _ = load_relay_config()
   if relay_url:
-    from . import relay as relay_client
-    from .workspace import get_machine_name
-
     async def _heartbeat_loop():
       while True:
         await asyncio.sleep(30)
-        relay_client.send_heartbeat(
-          chat_id, pid=os.getpid(), model=model,
-          machine=get_machine_name())
+        await channel.send_heartbeat(model)
 
     _heartbeat_task = asyncio.create_task(_heartbeat_loop())
 
-  # Init SDK client — runs in a dedicated thread to isolate anyio from our asyncio
-  from .sdk_thread import SDKThread
-
-  sdk_options = _build_sdk_options(
-    project_dir, model, credentials, chat_id, db, events,
-    permission_mode=permission_mode)
-
-  sdk = SDKThread()
-  sdk.start()
-  await sdk.create_client(sdk_options)
+  agent = build_coding_agent(
+    provider,
+    credentials, chat_id, db, channel,
+    permission_mode=permission_mode,
+  )
+  await agent.start(project_dir, model)
 
   # Context
   ctx = commands.AgentContext(model, project_dir, time.time())
+  main_loop_ref = asyncio.get_running_loop()
   running = True
   _dissolve_on_exit = False
   _stale_tasks: set[str] = set()
@@ -290,23 +267,18 @@ async def main_loop(
   def handle_sig(_sig, _frame):
     nonlocal running
     running = False
-    events.push_back(LarkEvent())
+    channel.push_back(IncomingMessage())
 
   signal.signal(signal.SIGINT, handle_sig)
   signal.signal(signal.SIGTERM, handle_sig)
 
   async def _restart_client(resume: str = ""):
-    nonlocal sdk_options
-    sdk_options = _build_sdk_options(
-      project_dir, model, credentials, chat_id, db, events,
-      permission_mode=permission_mode, resume=resume)
-    await sdk.reconnect(sdk_options)
+    await agent.reset(project_dir, model, resume=resume)
 
   # ---- Main loop: event-driven ----
   while running:
     try:
-      # Wait for next message from Lark event stream
-      reply = await events.next_message(timeout=300)
+      reply = await channel.receive(timeout=300)
       if reply is None:
         continue  # Timeout, keep waiting
 
@@ -355,108 +327,123 @@ async def main_loop(
 
       # Acknowledge receipt with THINKING reaction
       ack_msg_id = reply.message_id
-      ack_reaction_id = lark_api.add_reaction(token, ack_msg_id, "THINKING")
+      ack_reaction_id = await channel.add_reaction(ack_msg_id, "THINKING")
       db.record_received(
         chat_id=chat_id, text=text,
         source_message_id=reply.message_id,
         message_time=reply.create_time,
       )
 
-      def _clear_ack():
+      async def _clear_ack():
         nonlocal ack_reaction_id
         if ack_reaction_id and ack_msg_id:
-          lark_api.remove_reaction(token, ack_msg_id, ack_reaction_id)
+          await channel.remove_reaction(ack_msg_id, ack_reaction_id)
           ack_reaction_id = ""
 
       # Command dispatch
       handled, response = commands.try_dispatch(user_message, ctx)
       if handled:
-        token = lark_auth.get_token(credentials["app_id"], credentials["app_secret"])
         if response == "__clear__":
-          await _restart_client()
           t = datetime.datetime.now().strftime("%H:%M")
           card = cards.build_card("🔄 Session Cleared",
                                   body=f"Context reset at {t}.", color="orange")
-          lark_api.send_card(token, chat_id, card)
+          msg_id = await channel.send_card(chat_id, card)
+          db.record_sent(msg_id, text="Session Cleared", chat_id=chat_id)
+          _register_msg(msg_id, chat_id)
+          log.info("Session cleared card sent: %s", msg_id)
+          await _restart_client()
         elif response == "__esc__":
-          _send_response(token, chat_id, "Operation cancelled.", db)
+          await _send_response(channel, chat_id, "Operation cancelled.", db)
         elif response and response.startswith("__model__:"):
           new_model = response.split(":", 1)[1]
+          if not is_model_compatible(provider, new_model):
+            await _send_response(
+              channel,
+              chat_id,
+              f"Model **{new_model}** is not supported by provider **{provider}**.",
+              db,
+            )
+            await _clear_ack()
+            continue
           model = new_model
           ctx.model = model
           log.info("Model switch to %s (resume=%s)", model, _sdk_session_id[:8] if _sdk_session_id else "none")
           await _restart_client(resume=_sdk_session_id)
-          _send_response(token, chat_id, f"Model switched to **{model}**.", db)
+          await _send_response(channel, chat_id, f"Model switched to **{model}**.", db)
         elif response and response.startswith("__cd__:"):
           new_dir = response.split(":", 1)[1]
           project_dir = new_dir
           ctx.project_dir = project_dir
           await _restart_client()
-          _send_response(token, chat_id, f"Working directory: **{project_dir}**", db)
+          await _send_response(channel, chat_id, f"Working directory: **{project_dir}**", db)
         elif response == "__autoapprove_toggle__":
           sess = db.get_session(session_id) or {}
           enabled = not bool(sess.get("autoapprove"))
           db.set_autoapprove(chat_id, enabled)
-          _send_response(token, chat_id,
-                         f"Auto-approve **{'enabled' if enabled else 'disabled'}**.", db)
+          await _send_response(
+            channel, chat_id,
+            f"Auto-approve **{'enabled' if enabled else 'disabled'}**.", db)
         elif response and response.startswith("__autoapprove__:"):
           enabled = response.endswith(":on")
           db.set_autoapprove(chat_id, enabled)
-          _send_response(token, chat_id,
-                         f"Auto-approve **{'enabled' if enabled else 'disabled'}**.", db)
+          await _send_response(
+            channel, chat_id,
+            f"Auto-approve **{'enabled' if enabled else 'disabled'}**.", db)
         elif response == "__mention_toggle__":
           need_mention = not need_mention
-          _gc = gcfg.load_config(token, chat_id)
+          _gc = gcfg.load_config(channel.token, chat_id)
           _gc["need_mention"] = need_mention
-          gcfg.save_config(token, chat_id, _gc)
-          _send_response(token, chat_id,
-                         f"@mention requirement **{'on' if need_mention else 'off'}**.", db)
+          gcfg.save_config(channel.token, chat_id, _gc)
+          await _send_response(
+            channel, chat_id,
+            f"@mention requirement **{'on' if need_mention else 'off'}**.", db)
         elif response and response.startswith("__mention__:"):
           need_mention = response.endswith(":on")
-          _gc = gcfg.load_config(token, chat_id)
+          _gc = gcfg.load_config(channel.token, chat_id)
           _gc["need_mention"] = need_mention
-          gcfg.save_config(token, chat_id, _gc)
-          _send_response(token, chat_id,
-                         f"@mention requirement **{'on' if need_mention else 'off'}**.", db)
+          gcfg.save_config(channel.token, chat_id, _gc)
+          await _send_response(
+            channel, chat_id,
+            f"@mention requirement **{'on' if need_mention else 'off'}**.", db)
         elif response == "__norm_list__":
           from .norms import get_norms, format_norms_prompt
-          norms = get_norms(token, chat_id)
+          norms = get_norms(channel.token, chat_id)
           if norms:
             lines = [f"**Group Norms**\n"]
             for name, text in norms.items():
               lines.append(f"- **{name}**: {text}")
-            _send_response(token, chat_id, "\n".join(lines), db)
+            await _send_response(channel, chat_id, "\n".join(lines), db)
           else:
-            _send_response(token, chat_id, "No norms configured.", db)
+            await _send_response(channel, chat_id, "No norms configured.", db)
         elif response and response.startswith("__norm_add__:"):
           from .norms import add_norm
           _, rest = response.split(":", 1)
           name, text = rest.split(":", 1)
-          add_norm(token, chat_id, name, text)
-          _send_response(token, chat_id, f"Norm **{name}** added.", db)
+          add_norm(channel.token, chat_id, name, text)
+          await _send_response(channel, chat_id, f"Norm **{name}** added.", db)
         elif response and response.startswith("__norm_remove__:"):
           from .norms import remove_norm
           name = response.split(":", 1)[1]
-          if remove_norm(token, chat_id, name):
-            _send_response(token, chat_id, f"Norm **{name}** removed.", db)
+          if remove_norm(channel.token, chat_id, name):
+            await _send_response(channel, chat_id, f"Norm **{name}** removed.", db)
           else:
-            _send_response(token, chat_id, f"Norm **{name}** not found.", db)
+            await _send_response(channel, chat_id, f"Norm **{name}** not found.", db)
         elif response == "__diag__":
-          _handle_diag(token, chat_id, credentials, project_dir, db)
+          await _handle_diag(channel, chat_id, project_dir, db)
         elif response == "__exit__":
           end_card = cards.build_card("Nemo — Stopped", body="Agent stopped.", color="blue")
-          lark_api.send_card(token, chat_id, end_card)
+          await channel.send_card(chat_id, end_card)
           running = False
           break
         elif response == "__dissolve__":
           end_card = cards.build_card("Nemo — Dissolved", body="Agent stopped. Group will be dissolved.", color="red")
-          lark_api.send_card(token, chat_id, end_card)
+          await channel.send_card(chat_id, end_card)
           _dissolve_on_exit = True
           running = False
           break
         elif response:
-          _send_response(token, chat_id, response, db)
-        _clear_ack()
+          await _send_response(channel, chat_id, response, db)
+        await _clear_ack()
         continue
 
       # --- Run SDK turn ---
@@ -476,34 +463,35 @@ async def main_loop(
           return
         _turn_interrupt_phase = phase
         try:
-          tok = lark_auth.get_token(credentials["app_id"], credentials["app_secret"])
           card = cards.build_turn_card(
             phase,
             steps=_turn_steps,
             current_tool=_turn_current_tool,
             elapsed=int(time.time() - _turn_start),
           )
-          lark_api.update_card(tok, _turn_card_id, card)
+          _await_channel(channel.update_card(_turn_card_id, card))
         except Exception:
           pass
+
+      def _await_channel(coro):
+        return asyncio.run_coroutine_threadsafe(coro, main_loop_ref).result()
 
       def _on_event(event):
         # Thread safety: this runs on the SDK thread. It mutates _turn_card_id,
         # _turn_steps. The main loop only reads these AFTER
         # asyncio.wait({sdk_task, ...}) completes, which guarantees all
         # _on_event calls have finished. No lock needed.
-        nonlocal _turn_card_id, _turn_current_tool
-        token = lark_auth.get_token(credentials["app_id"], credentials["app_secret"])
+        nonlocal _turn_card_id, _sdk_session_id, _turn_current_tool
 
         def _ensure_card():
           """Create working card if it doesn't exist yet."""
           nonlocal _turn_card_id
           if _turn_card_id:
             return
-          _clear_ack()
+          _await_channel(_clear_ack())
           card = cards.build_turn_card("working", chat_id=chat_id)
           try:
-            _turn_card_id = lark_api.send_card(token, chat_id, card)
+            _turn_card_id = _await_channel(channel.send_card(chat_id, card))
             db.set_working(session_id, _turn_card_id)
             _register_msg(_turn_card_id, chat_id)
           except Exception as e:
@@ -522,7 +510,7 @@ async def main_loop(
             **kwargs,
           )
           try:
-            lark_api.update_card(token, _turn_card_id, card)
+            _await_channel(channel.update_card(_turn_card_id, card))
           except Exception:
             pass
 
@@ -539,7 +527,7 @@ async def main_loop(
           _update_working()
 
         elif isinstance(event, DoneEvent):
-          _clear_ack()
+          _await_channel(_clear_ack())
           if event.session_id:
             _sdk_session_id = event.session_id
           if _turn_interrupt_phase:
@@ -558,22 +546,18 @@ async def main_loop(
               elapsed=elapsed, usage=event.usage,
             )
             try:
-              lark_api.update_card(token, _turn_card_id, card)
+              _await_channel(channel.update_card(_turn_card_id, card))
             except Exception:
               pass
             db.clear_working(session_id)
           else:
             # Pure text response with no tools and no card created
             if final_text:
-              _send_response(token, chat_id, final_text, db)
+              _await_channel(_send_response(channel, chat_id, final_text, db))
           ctx.total_cost += event.cost
 
-      # Run SDK turn on dedicated thread (isolates anyio from our asyncio)
       sdk_task = asyncio.create_task(
-        sdk.run_turn_with_reconnect(
-          user_message, _on_event,
-          stale_tasks=_stale_tasks, options=sdk_options,
-        )
+        agent.run_turn(user_message, _on_event, stale_tasks=_stale_tasks)
       )
 
       # Concurrent signal watcher: read events during SDK execution
@@ -581,68 +565,71 @@ async def main_loop(
 
       _pending_msgs: list = []
 
-      def _dispatch_inline(response: str | None, msg: LarkEvent) -> None:
+      async def _dispatch_inline(response: str | None, msg: IncomingMessage) -> None:
         """Handle an inline-safe command during an active turn."""
         nonlocal need_mention
         try:
-          _tok = lark_auth.get_token(credentials["app_id"], credentials["app_secret"])
           # Remove THINKING reaction from the command message
           if msg.message_id:
-            lark_api.add_reaction(_tok, msg.message_id, "DONE")
+            await channel.add_reaction(msg.message_id, "DONE")
 
           if response == "__autoapprove_toggle__":
             cur = db.get_session(db._session_id) or {}
             enabled = not bool(cur.get("autoapprove"))
             db.set_autoapprove(chat_id, enabled)
-            _send_response(_tok, chat_id,
-                           f"Auto-approve **{'enabled' if enabled else 'disabled'}**.", db)
+            await _send_response(
+              channel, chat_id,
+              f"Auto-approve **{'enabled' if enabled else 'disabled'}**.", db)
           elif response and response.startswith("__autoapprove__:"):
             enabled = response.endswith(":on")
             db.set_autoapprove(chat_id, enabled)
-            _send_response(_tok, chat_id,
-                           f"Auto-approve **{'enabled' if enabled else 'disabled'}**.", db)
+            await _send_response(
+              channel, chat_id,
+              f"Auto-approve **{'enabled' if enabled else 'disabled'}**.", db)
           elif response == "__mention_toggle__":
             need_mention = not need_mention
-            _gc = gcfg.load_config(_tok, chat_id)
+            _gc = gcfg.load_config(channel.token, chat_id)
             _gc["need_mention"] = need_mention
-            gcfg.save_config(_tok, chat_id, _gc)
-            _send_response(_tok, chat_id,
-                           f"@mention requirement **{'on' if need_mention else 'off'}**.", db)
+            gcfg.save_config(channel.token, chat_id, _gc)
+            await _send_response(
+              channel, chat_id,
+              f"@mention requirement **{'on' if need_mention else 'off'}**.", db)
           elif response and response.startswith("__mention__:"):
             need_mention = response.endswith(":on")
-            _gc = gcfg.load_config(_tok, chat_id)
+            _gc = gcfg.load_config(channel.token, chat_id)
             _gc["need_mention"] = need_mention
-            gcfg.save_config(_tok, chat_id, _gc)
-            _send_response(_tok, chat_id,
-                           f"@mention requirement **{'on' if need_mention else 'off'}**.", db)
+            gcfg.save_config(channel.token, chat_id, _gc)
+            await _send_response(
+              channel, chat_id,
+              f"@mention requirement **{'on' if need_mention else 'off'}**.", db)
           elif response == "__norm_list__":
             from .norms import get_norms
-            norms = get_norms(_tok, chat_id)
+            norms = get_norms(channel.token, chat_id)
             if norms:
               lines = ["**Group Norms**\n"]
               for name, text in norms.items():
                 lines.append(f"- **{name}**: {text}")
-              _send_response(_tok, chat_id, "\n".join(lines), db)
+              await _send_response(channel, chat_id, "\n".join(lines), db)
             else:
-              _send_response(_tok, chat_id, "No norms configured.", db)
+              await _send_response(channel, chat_id, "No norms configured.", db)
           elif response and response.startswith("__norm_add__:"):
             from .norms import add_norm
             _, rest = response.split(":", 1)
             name, text = rest.split(":", 1)
-            add_norm(_tok, chat_id, name, text)
-            _send_response(_tok, chat_id, f"Norm **{name}** added.", db)
+            add_norm(channel.token, chat_id, name, text)
+            await _send_response(channel, chat_id, f"Norm **{name}** added.", db)
           elif response and response.startswith("__norm_remove__:"):
             from .norms import remove_norm
             name = response.split(":", 1)[1]
-            if remove_norm(_tok, chat_id, name):
-              _send_response(_tok, chat_id, f"Norm **{name}** removed.", db)
+            if remove_norm(channel.token, chat_id, name):
+              await _send_response(channel, chat_id, f"Norm **{name}** removed.", db)
             else:
-              _send_response(_tok, chat_id, f"Norm **{name}** not found.", db)
+              await _send_response(channel, chat_id, f"Norm **{name}** not found.", db)
           elif response == "__diag__":
-            _handle_diag(_tok, chat_id, credentials, project_dir, db)
+            await _handle_diag(channel, chat_id, project_dir, db)
           elif response:
             # Text responses: /ping, /cost, /help, /usage, /guest help, /norm help
-            _send_response(_tok, chat_id, response, db)
+            await _send_response(channel, chat_id, response, db)
         except Exception as e:
           log.warning("Inline command error: %s", e)
 
@@ -650,16 +637,16 @@ async def main_loop(
         nonlocal signal_detected
         while not sdk_task.done():
           # If permission handler is reading the queue, yield to it
-          if events.permission_active:
+          if channel.permission_active:
             await asyncio.sleep(0.2)
             continue
-          msg = await events.next_message(timeout=5)
+          msg = await channel.receive(timeout=5)
           if msg is None:
             continue
           # Double-check: if permission became active while we waited,
           # push back the message so permission handler can read it
-          if events.permission_active:
-            events.push_back(msg)
+          if channel.permission_active:
+            channel.push_back(msg)
             await asyncio.sleep(0.1)
             continue
           # Scope to this session's chat
@@ -694,7 +681,7 @@ async def main_loop(
           if stripped:
             handled, response = commands.try_dispatch(stripped, ctx)
             if handled and commands.is_inline_safe(response):
-              _dispatch_inline(response, msg)
+              await _dispatch_inline(response, msg)
               continue
             elif handled:
               # Needs SDK restart — re-queue for after turn
@@ -712,32 +699,30 @@ async def main_loop(
 
       if watcher in done_tasks and signal_detected:
         if signal_detected in ("esc", "stop"):
-          _clear_ack()
+          await _clear_ack()
           _update_interrupt_card("stopping")
           try:
-            await sdk.interrupt()
+            await agent.interrupt()
             await asyncio.wait_for(sdk_task, timeout=30)
           except Exception:
             sdk_task.cancel()
+          await _send_response(channel, chat_id, "Operation cancelled.", db)
           _update_interrupt_card("stopped")
-          token = lark_auth.get_token(credentials["app_id"], credentials["app_secret"])
-          _send_response(token, chat_id, "Operation cancelled.", db)
 
         elif signal_detected in ("exit", "dissolve"):
-          _clear_ack()
+          await _clear_ack()
           try:
-            await sdk.interrupt()
+            await agent.interrupt()
             await asyncio.wait_for(sdk_task, timeout=10)
           except Exception:
             sdk_task.cancel()
-          token = lark_auth.get_token(credentials["app_id"], credentials["app_secret"])
           if signal_detected == "dissolve":
             end_card = cards.build_card("Nemo — Dissolved",
                                         body="Agent stopped. Group will be dissolved.", color="red")
             _dissolve_on_exit = True
           else:
             end_card = cards.build_card("Nemo — Stopped", body="Agent stopped.", color="blue")
-          lark_api.send_card(token, chat_id, end_card)
+          await channel.send_card(chat_id, end_card)
           running = False
           break
       else:
@@ -751,28 +736,28 @@ async def main_loop(
         try:
           sdk_task.result()
         except TimeoutError as exc:
-          _handle_turn_error(
+          await _handle_turn_error(
             "Timed out — SDK stopped responding. Context preserved, send another message to continue.",
-            exc, credentials, chat_id, db, session_id,
+            exc, channel, chat_id, db, session_id,
             _turn_card_id, _turn_steps, _turn_start,
           )
-          _clear_ack()
+          await _clear_ack()
           for pending in _pending_msgs:
-            events.push_back(pending)
+            channel.push_back(pending)
           continue
         except Exception as exc:
-          _handle_turn_error(
-            str(exc), exc, credentials, chat_id, db, session_id,
+          await _handle_turn_error(
+            str(exc), exc, channel, chat_id, db, session_id,
             _turn_card_id, _turn_steps, _turn_start,
           )
-          _clear_ack()
+          await _clear_ack()
           for pending in _pending_msgs:
-            events.push_back(pending)
+            channel.push_back(pending)
           continue
 
       # Re-queue any messages consumed during the turn
       for pending in _pending_msgs:
-        events.push_back(pending)
+        channel.push_back(pending)
 
     except KeyboardInterrupt:
       running = False
@@ -782,9 +767,8 @@ async def main_loop(
     except Exception as e:
       log.error("Loop error: %s", e)
       try:
-        token = lark_auth.get_token(credentials["app_id"], credentials["app_secret"])
         err_card = cards.build_card("Error", body=f"```\n{str(e)[:500]}\n```", color="red")
-        msg_id = lark_api.send_card(token, chat_id, err_card)
+        msg_id = await channel.send_card(chat_id, err_card)
         db.record_sent(msg_id, text=str(e)[:500], chat_id=chat_id)
       except Exception:
         pass
@@ -799,93 +783,18 @@ async def main_loop(
       pass
   # Close SDK, event stream, and Lark API calls all concurrently
   loop = asyncio.get_event_loop()
-  cleanup: list = [sdk.close_client(), events.close()]
-  from .workspace import release_group
-  cleanup.append(loop.run_in_executor(None, release_group, token, chat_id))
-  cleanup.append(loop.run_in_executor(None, status_tab.update_status, token, chat_id, model, "stopped"))
+  cleanup: list = [agent.stop(), channel.stop()]
+  cleanup.append(channel.release_workspace())
+  cleanup.append(channel.update_status(model, "stopped"))
   await asyncio.gather(*cleanup, return_exceptions=True)
-  sdk.stop()
   db.deactivate(session_id)
   db.close()
   if _dissolve_on_exit:
     try:
-      token = lark_auth.get_token(credentials["app_id"], credentials["app_secret"])
-      lark_api.dissolve_chat(token, chat_id)
+      await channel.refresh_token()
+      await channel.dissolve_chat()
       log.info("Dissolved group %s", chat_id)
     except Exception as e:
       log.warning("Failed to dissolve group: %s", e)
   log.info("Agent stopped.")
   return 0
-
-
-# ---------------------------------------------------------------------------
-# SDK options builder
-# ---------------------------------------------------------------------------
-
-def _build_sdk_options(
-  project_dir: str,
-  model: str,
-  credentials: dict,
-  chat_id: str,
-  db: Database,
-  events: LarkEventStream,
-  permission_mode: str = "bypassPermissions",
-  resume: str = "",
-):
-  from claude_agent_sdk import ClaudeAgentOptions
-
-  # System prompt: tell the SDK client it's running inside Nemo
-  agent_prompt = (
-    "You are running inside Nemo, a Lark-connected coding agent daemon. "
-    "Users interact with you through Lark mobile app. "
-    "Process one message at a time. Return your response as text — "
-    "the agent process sends it to Lark for you.\n\n"
-    "Keep responses concise (mobile reading). Use 2-space indentation in code blocks."
-  )
-
-  env = {
-    "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
-    "HOME": os.environ.get("HOME", ""),
-    "USER": os.environ.get("USER", ""),
-    # Enable CLI's built-in stream watchdog — aborts stalled API streams
-    "CLAUDE_ENABLE_STREAM_WATCHDOG": "1",
-    "CLAUDE_STREAM_IDLE_TIMEOUT_MS": "90000",  # 90s, CLI default
-  }
-  for key in ("http_proxy", "https_proxy", "all_proxy"):
-    val = os.environ.get(key)
-    if val:
-      env[key] = val
-
-  perm_handler = None
-  if permission_mode != "bypassPermissions":
-    perm_handler = build_permission_handler(credentials, chat_id, db, events)
-
-  def _stderr_handler(line: str) -> None:
-    log.info("[sdk-stderr] %s", line.rstrip())
-
-  # Cast str to the SDK's Literal type
-  from typing import cast
-  from claude_agent_sdk.types import PermissionMode
-  perm_mode = cast(PermissionMode, permission_mode)
-
-  opts: dict = dict(
-    allowed_tools=["Agent", "Skill", "Read", "Write", "Edit", "Bash", "Glob", "Grep"],
-    setting_sources=["user", "project"],
-    permission_mode=perm_mode,
-    system_prompt={
-      "type": "preset",
-      "preset": "claude_code",
-      "append": agent_prompt,
-    },
-    cwd=project_dir,
-    model=model,
-    env=env,
-    stderr=_stderr_handler,
-    hooks={},
-  )
-  if perm_handler is not None:
-    opts["can_use_tool"] = perm_handler
-  if resume:
-    opts["resume"] = resume
-
-  return ClaudeAgentOptions(**opts)

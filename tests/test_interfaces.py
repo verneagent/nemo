@@ -44,6 +44,7 @@ class FakeChannel(Channel):
     self.sent_cards = []
     self.updated_cards = []
     self.sent_texts = []
+    self._permission_active = False
 
   async def receive(self, timeout=300):
     if self.messages:
@@ -53,6 +54,9 @@ class FakeChannel(Channel):
   async def send_card(self, chat_id, card):
     self.sent_cards.append((chat_id, card))
     return f"om_{len(self.sent_cards)}"
+
+  def push_back(self, message):
+    self.messages.insert(0, message)
 
   async def update_card(self, message_id, card):
     self.updated_cards.append((message_id, card))
@@ -81,6 +85,14 @@ class FakeChannel(Channel):
 
   async def get_chat_members(self, chat_id):
     return [{"member_id": "ou_1"}, {"member_id": "ou_bot"}]
+
+  @property
+  def permission_active(self):
+    return self._permission_active
+
+  @permission_active.setter
+  def permission_active(self, active):
+    self._permission_active = active
 
 
 def test_fake_channel_implements_interface():
@@ -156,19 +168,20 @@ class FakeAgent(CodingAgent):
     self.turns = []
     self._interrupted = False
 
-  async def run_turn(self, prompt, on_event):
+  async def run_turn(self, prompt, on_event, stale_tasks=None):
     self.turns.append(prompt)
     on_event(ToolStartEvent(tool=None))
     on_event(TextEvent(text="response"))
     on_event(DoneEvent(cost=0.01, usage={"input_tokens": 100}))
+    return 0.01, {"input_tokens": 100}
 
   async def interrupt(self):
     self._interrupted = True
 
-  async def reset(self):
+  async def reset(self, project_dir, model, resume=""):
     self.turns.clear()
 
-  async def start(self, project_dir, model):
+  async def start(self, project_dir, model, resume=""):
     pass
 
   async def stop(self):
@@ -207,6 +220,6 @@ def test_agent_reset():
   async def _run():
     agent = FakeAgent()
     agent.turns.append("old")
-    await agent.reset()
+    await agent.reset("/tmp", "claude")
     assert agent.turns == []
   asyncio.run(_run())

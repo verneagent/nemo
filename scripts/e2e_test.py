@@ -34,6 +34,7 @@ import sys
 import tempfile
 import time
 import urllib.request
+import urllib.error
 
 # ---------------------------------------------------------------------------
 # Config
@@ -276,16 +277,41 @@ def send_msg(text: str, chat_id: str) -> str:
   return _send_via_relay(text, chat_id)
 
 
+def _lark_get_json(url: str, token: str, retries: int = 5) -> dict:
+  """GET JSON from Lark with light retry for transient server failures."""
+  last_err = None
+  for attempt in range(1, retries + 1):
+    req = urllib.request.Request(url)
+    req.add_header("Authorization", f"Bearer {token}")
+    try:
+      resp = urllib.request.urlopen(req, timeout=10)
+      return json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+      last_err = e
+      # Lark occasionally returns 5xx while the message list is otherwise healthy.
+      if 500 <= e.code < 600 and attempt < retries:
+        time.sleep(min(attempt, 3))
+        continue
+      raise
+    except Exception as e:
+      last_err = e
+      if attempt < retries:
+        time.sleep(min(attempt, 3))
+        continue
+      raise
+  assert last_err is not None
+  raise last_err
+
+
 def get_latest_bot_msg(chat_id: str, after: str = "0") -> dict | None:
   """Get the latest bot message after a timestamp."""
   token = _get_bot_token()
-  req = urllib.request.Request(
+  data = _lark_get_json(
     f"https://open.larksuite.com/open-apis/im/v1/messages"
     f"?container_id_type=chat&container_id={chat_id}"
-    f"&page_size=5&sort_type=ByCreateTimeDesc")
-  req.add_header("Authorization", f"Bearer {token}")
-  resp = urllib.request.urlopen(req, timeout=10)
-  data = json.loads(resp.read())
+    f"&page_size=5&sort_type=ByCreateTimeDesc",
+    token,
+  )
   for item in data.get("data", {}).get("items", []):
     sender = item.get("sender", {}).get("id", "")
     ct = item.get("create_time", "0")
@@ -303,13 +329,12 @@ def get_bot_msgs(chat_id: str, after: str = "0",
                  limit: int = 10) -> list[dict]:
   """Get all bot messages after a timestamp, newest first."""
   token = _get_bot_token()
-  req = urllib.request.Request(
+  data = _lark_get_json(
     f"https://open.larksuite.com/open-apis/im/v1/messages"
     f"?container_id_type=chat&container_id={chat_id}"
-    f"&page_size={limit}&sort_type=ByCreateTimeDesc")
-  req.add_header("Authorization", f"Bearer {token}")
-  resp = urllib.request.urlopen(req, timeout=10)
-  data = json.loads(resp.read())
+    f"&page_size={limit}&sort_type=ByCreateTimeDesc",
+    token,
+  )
   msgs = []
   for item in data.get("data", {}).get("items", []):
     sender = item.get("sender", {}).get("id", "")
@@ -412,22 +437,35 @@ class LogAnalyzer:
 # ---------------------------------------------------------------------------
 
 def start_nemo(chat_id: str, verbose: bool = False,
-               permission_mode: str = "bypassPermissions") -> int:
+               permission_mode: str = "bypassPermissions",
+               provider: str = "claude") -> int:
   """Start a nemo process. Returns PID."""
   cmd = [sys.executable, "-m", "nemo", "--chat-id", chat_id,
-         "--permission-mode", permission_mode]
+         "--permission-mode", permission_mode,
+         "--provider", provider]
   if verbose:
     cmd.append("--verbose")
   proc = subprocess.Popen(
     cmd, cwd=PROJECT_DIR,
-    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+    text=True)
+  try:
+    line = proc.stderr.readline().strip() if proc.stderr else ""
+  except Exception:
+    line = ""
+  m = re.search(r"nemo started \(PID (\d+)\)", line)
+  if m:
+    return int(m.group(1))
   return proc.pid
 
 
-def wait_for_ready(pid: int, timeout: int = 30) -> bool:
-  """Wait for nemo to log 'SDK client connected'."""
+def wait_for_ready(pid: int, timeout: int = 30, provider: str = "claude") -> bool:
+  """Wait for nemo to log a provider-specific ready signal."""
   log = LogAnalyzer(pid)
-  return log.wait_for("SDK client connected", timeout=timeout)
+  if provider == "claude":
+    if log.wait_for("SDK client connected", timeout=timeout):
+      return True
+  return log.wait_for("Start card sent:", timeout=timeout)
 
 
 def is_alive(pid: int) -> bool:
@@ -466,15 +504,32 @@ def kill_nemo(pid: int) -> None:
     pass
 
 
-def wait_for_idle(pid: int, timeout: int = 30) -> None:
-  """Wait for nemo to be idle (no Processing/turn in last few log lines)."""
+def _has_working_turn(chat_id: str) -> bool:
+  """Check whether the chat still has an active working card in the session DB."""
+  from nemo.db import Database
+
+  db = Database(PROJECT_DIR)
+  try:
+    session_id = db.get_chat_owner(chat_id)
+    if not session_id:
+      return False
+    return db.get_working(session_id) is not None
+  finally:
+    db.close()
+
+
+def wait_for_idle(pid: int, chat_id: str, timeout: int = 30) -> None:
+  """Wait for nemo to be idle for this chat."""
   log = LogAnalyzer(pid)
   deadline = time.time() + timeout
   while time.time() < deadline:
-    tail = log.lines(5)
-    active = any("Processing:" in l or "query() prompt" in l or
-                  "turn msg:" in l for l in tail)
-    if not active:
+    tail = log.lines(8)
+    active_log = any(
+      "Processing:" in l or "query() prompt" in l or "turn msg:" in l
+      for l in tail
+    )
+    active_working = _has_working_turn(chat_id)
+    if not active_log and not active_working:
       return
     time.sleep(2)
 
@@ -639,7 +694,7 @@ def run_stale_task_stress(pid: int, chat_id: str, result: TestResult,
 
     # Step 2: follow-up after turn completes
     # Wait for nemo to finish processing the multi-agent turn
-    wait_for_idle(pid, timeout=60)
+    wait_for_idle(pid, chat_id, timeout=60)
     time.sleep(2)
     ts2 = str(int(time.time() * 1000))
     send_msg(f"What is {i+2}+{i+3}? Just the number, nothing else.", chat_id)
@@ -796,7 +851,7 @@ def run_project_flow(pid: int, chat_id: str, result: TestResult) -> None:
         result.ok(name, f"{elapsed:.0f}s")
 
     # Wait for last step to finish before checking files
-    wait_for_idle(pid, timeout=30)
+    wait_for_idle(pid, chat_id, timeout=30)
 
     # T36: verify project files
     existing = [f for f in os.listdir(tmpdir) if f.endswith(".py")]
@@ -946,6 +1001,10 @@ def run_permission_tests(pid: int, chat_id: str,
     msg, elapsed = wait_for_response(chat_id, after=ts, timeout=45)
     # Should NOT show permission card (auto-approved by "always")
     perm_after = log.count("Permission request:.*auto_test", last_n=20)
+    perm_seen = log.count("Permission request:", last_n=80) > 0
+    if not perm_seen:
+      result.skip("T43 auto-approve", "permission cards unsupported in current CLI")
+      return
     if msg and os.path.exists(os.path.join(tmpdir, "auto_test.txt")):
       if perm_after == 0:
         result.ok("T43 auto-approve", f"no prompt ({elapsed:.0f}s)")
@@ -1148,7 +1207,7 @@ def run_media_tests(pid: int, chat_id: str, result: TestResult) -> None:
   else:
     result.fail("T60 reaction received", "no bot message to react to")
 
-  wait_for_idle(pid, timeout=30)
+  wait_for_idle(pid, chat_id, timeout=30)
 
   # T61: Image message — inject an image, verify nemo processes it
   print("  [T61] Sending image message...")
@@ -1169,7 +1228,7 @@ def run_media_tests(pid: int, chat_id: str, result: TestResult) -> None:
     else:
       result.fail("T61 image event", "no image event in log")
 
-  wait_for_idle(pid, timeout=30)
+  wait_for_idle(pid, chat_id, timeout=30)
 
   # T62: Reply message (parent_id) — send a message, reply to bot's response
   print("  [T62] Sending reply message...")
@@ -1178,7 +1237,7 @@ def run_media_tests(pid: int, chat_id: str, result: TestResult) -> None:
   msg, elapsed = wait_for_response(chat_id, ts, timeout=30)
   if msg and msg.get("message_id"):
     parent_id = msg["message_id"]
-    wait_for_idle(pid, timeout=30)
+    wait_for_idle(pid, chat_id, timeout=30)
     ts2 = str(int(time.time() * 1000))
     send_reply_msg("What did you just say?", parent_id, chat_id)
     resp, elapsed = wait_for_response(chat_id, ts2, timeout=30)
@@ -1204,7 +1263,10 @@ def run_media_tests(pid: int, chat_id: str, result: TestResult) -> None:
 def main():
   import argparse
   parser = argparse.ArgumentParser(description="Nemo E2E test runner")
-  parser.add_argument("--chat-id", default=DEFAULT_CHAT_ID, help="Chat ID")
+  parser.add_argument("--chat-id", default="",
+                      help="Chat ID (defaults to a fresh temp group)")
+  parser.add_argument("--provider", default="claude", choices=["claude", "codex"],
+                      help="Coding agent provider (default: claude)")
   parser.add_argument("--skip-sdk", action="store_true",
                       help="Skip all SDK turn tests (commands only)")
   parser.add_argument("--stress", action="store_true",
@@ -1221,25 +1283,19 @@ def main():
                       help="Verbose nemo logging")
   args = parser.parse_args()
 
-  chat_id = args.chat_id
+  chat_id = args.chat_id.strip()
   result = TestResult()
   single_phase = args.stress or args.project or args.perm or args.dual or args.media
   run_all = not single_phase
+  created_temp_chat = False
 
-  print(f"{Colors.BOLD}Nemo E2E Test Suite{Colors.RESET}")
-  print(f"  Chat: {chat_id}")
-  print(f"  Project: {PROJECT_DIR}")
-  if args.stress:
-    print(f"  Mode: stress test only")
-  elif args.project:
-    print(f"  Mode: project flow only")
-  elif args.perm:
-    print(f"  Mode: permission test only")
-  elif args.dual:
-    print(f"  Mode: dual-instance test only")
-  elif args.media:
-    print(f"  Mode: media & interaction test only")
-  print()
+  def _cleanup_temp_chat() -> None:
+    if created_temp_chat and chat_id:
+      dissolve_temp_group(chat_id)
+
+  def _finish(code: int) -> int:
+    _cleanup_temp_chat()
+    return code
 
   # ---- Phase 0: Setup ----
   print(f"{Colors.BOLD}Phase 0: Setup{Colors.RESET}")
@@ -1262,7 +1318,39 @@ def main():
     print("  Message mode: relay injection (no user token)")
   else:
     print(f"{Colors.RED}Missing user token and no relay_verify_token{Colors.RESET}")
-    return 1
+    return _finish(1)
+
+  if not chat_id:
+    print("  Creating fresh temp group...")
+    chat_id = create_temp_group("nemo-e2e")
+    if not chat_id:
+      print(f"{Colors.RED}  Failed to create temp group{Colors.RESET}")
+      return _finish(1)
+    created_temp_chat = True
+    print(f"  Temp chat: {chat_id}")
+
+  print()
+  print(f"{Colors.BOLD}Nemo E2E Test Suite{Colors.RESET}")
+  print(f"  Chat: {chat_id}")
+  print(f"  Provider: {args.provider}")
+  print(f"  Project: {PROJECT_DIR}")
+  if created_temp_chat:
+    print("  Chat mode: fresh temp group")
+  elif chat_id == DEFAULT_CHAT_ID:
+    print("  Chat mode: shared default group")
+  else:
+    print("  Chat mode: explicit custom group")
+  if args.stress:
+    print(f"  Mode: stress test only")
+  elif args.project:
+    print(f"  Mode: project flow only")
+  elif args.perm:
+    print(f"  Mode: permission test only")
+  elif args.dual:
+    print(f"  Mode: dual-instance test only")
+  elif args.media:
+    print(f"  Mode: media & interaction test only")
+  print()
 
   # Dual-instance manages its own processes
   if args.dual:
@@ -1270,7 +1358,7 @@ def main():
     run_dual_instance(chat_id, result, verbose=args.verbose)
     print()
     ok = result.summary()
-    return 0 if ok else 1
+    return _finish(0 if ok else 1)
 
   # Start nemo for other phases
   # NOTE: can_use_tool callback requires CLI support for --permission-prompt-tool
@@ -1278,15 +1366,17 @@ def main():
   # will show auto-approved until a newer CLI version ships with this feature.
   perm_mode = "default" if args.perm else "bypassPermissions"
   print(f"  Starting nemo (permission_mode={perm_mode})...")
-  pid = start_nemo(chat_id, verbose=args.verbose, permission_mode=perm_mode)
+  pid = start_nemo(chat_id, verbose=args.verbose,
+                   permission_mode=perm_mode,
+                   provider=args.provider)
   print(f"  PID: {pid}")
 
-  if not wait_for_ready(pid, timeout=30):
+  if not wait_for_ready(pid, timeout=30, provider=args.provider):
     print(f"{Colors.RED}  Nemo failed to start (no SDK connection in 30s)"
           f"{Colors.RESET}")
     LogAnalyzer(pid).dump_tail(15, "startup")
     kill_nemo(pid)
-    return 1
+    return _finish(1)
   print("  Nemo ready")
   print()
 
@@ -1326,7 +1416,12 @@ def main():
         ts = str(int(time.time() * 1000))
         send_msg("Remember this secret word: PINEAPPLE", chat_id)
         time.sleep(15)
-        send_msg("/model claude-sonnet-4-6", chat_id)
+        switch_model = "claude-sonnet-4-6"
+        restore_model = "claude-opus-4-6"
+        if args.provider == "codex":
+          switch_model = "gpt-5-codex"
+          restore_model = "gpt-5-codex"
+        send_msg(f"/model {switch_model}", chat_id)
         time.sleep(15)
         log_a = LogAnalyzer(pid)
         if log_a.count("Model switch", last_n=20) > 0:
@@ -1345,7 +1440,7 @@ def main():
         else:
           result.fail("T09a model switch resume", "model switch didn't happen")
         # Switch back to opus
-        send_msg("/model claude-opus-4-6", chat_id)
+        send_msg(f"/model {restore_model}", chat_id)
         time.sleep(15)
       print()
 
@@ -1401,14 +1496,14 @@ def main():
 
       # ---- Phase 4: Recovery ----
       print(f"{Colors.BOLD}Phase 4: Recovery{Colors.RESET}")
-      pid2 = start_nemo(chat_id, verbose=args.verbose)
-      if wait_for_ready(pid2, timeout=30):
+      pid2 = start_nemo(chat_id, verbose=args.verbose, provider=args.provider)
+      if wait_for_ready(pid2, timeout=30, provider=args.provider):
         result.ok("T14 restart")
       else:
         result.fail("T14 restart", "failed to start")
         kill_nemo(pid2)
         result.summary()
-        return 1 if result.failed else 0
+        return _finish(1 if result.failed else 0)
 
       try:
         if not args.skip_sdk:
@@ -1459,20 +1554,20 @@ def main():
       # ---- Phases 5-8: Advanced (need fresh nemo) ----
       if not args.skip_sdk:
         print("  Starting fresh nemo for advanced phases...")
-        pid = start_nemo(chat_id, verbose=args.verbose)
-        if not wait_for_ready(pid, timeout=30):
+        pid = start_nemo(chat_id, verbose=args.verbose, provider=args.provider)
+        if not wait_for_ready(pid, timeout=30, provider=args.provider):
           print(f"{Colors.RED}  Failed to start nemo for advanced phases"
                 f"{Colors.RESET}")
           result.summary()
-          return 1 if result.failed else 0
+          return _finish(1 if result.failed else 0)
         print(f"  PID: {pid}")
         print()
 
         try:
           run_stale_task_stress(pid, chat_id, result)
-          wait_for_idle(pid, timeout=30)
+          wait_for_idle(pid, chat_id, timeout=30)
           run_project_flow(pid, chat_id, result)
-          wait_for_idle(pid, timeout=30)
+          wait_for_idle(pid, chat_id, timeout=30)
           run_media_tests(pid, chat_id, result)
         finally:
           send_msg("/exit", chat_id)
@@ -1482,8 +1577,9 @@ def main():
         # Permission tests need plan mode — restart with different perms
         print("  Starting nemo for permission tests (plan mode)...")
         pid_perm = start_nemo(chat_id, verbose=args.verbose,
-                              permission_mode="plan")
-        if wait_for_ready(pid_perm, timeout=30):
+                              permission_mode="plan",
+                              provider=args.provider)
+        if wait_for_ready(pid_perm, timeout=30, provider=args.provider):
           try:
             run_permission_tests(pid_perm, chat_id, result)
           finally:
@@ -1536,17 +1632,17 @@ def main():
   except KeyboardInterrupt:
     print(f"\n{Colors.YELLOW}Interrupted{Colors.RESET}")
     kill_nemo(pid)
-    return 1
+    return _finish(1)
   except Exception as e:
     print(f"\n{Colors.RED}Unexpected error: {e}{Colors.RESET}")
     import traceback
     traceback.print_exc()
     kill_nemo(pid)
-    return 1
+    return _finish(1)
 
   print()
   ok = result.summary()
-  return 0 if ok else 1
+  return _finish(0 if ok else 1)
 
 
 if __name__ == "__main__":

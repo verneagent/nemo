@@ -5,7 +5,6 @@ from __future__ import annotations
 import os
 import sqlite3
 import time
-from typing import Any
 
 from .config import DB_BASE
 
@@ -117,7 +116,7 @@ class Database:
     self._conn.commit()
     return chat_id
 
-  def get_session(self, session_id: str) -> dict[str, Any] | None:
+  def get_session(self, session_id: str) -> dict[str, object] | None:
     row = self._conn.execute(
       "SELECT * FROM sessions WHERE session_id = ?", (session_id,)
     ).fetchone()
@@ -128,7 +127,7 @@ class Database:
     d["autoapprove"] = bool(d.get("autoapprove"))
     return d
 
-  def get_current_session(self) -> dict[str, Any] | None:
+  def get_current_session(self) -> dict[str, object] | None:
     if not self._session_id:
       return None
     return self.get_session(self._session_id)
@@ -170,7 +169,7 @@ class Database:
     )
     self._conn.commit()
 
-  def lookup_parent_message(self, message_id: str) -> dict[str, Any] | None:
+  def lookup_parent_message(self, message_id: str) -> dict[str, object] | None:
     row = self._conn.execute(
       "SELECT * FROM messages WHERE message_id = ? LIMIT 1", (message_id,)
     ).fetchone()

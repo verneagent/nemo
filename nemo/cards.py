@@ -15,7 +15,8 @@ from __future__ import annotations
 import os
 import time
 from dataclasses import dataclass, field
-from typing import Any
+
+from .types import JsonObject
 
 
 # ---------------------------------------------------------------------------
@@ -61,7 +62,7 @@ def _elapsed_text(elapsed: int) -> str:
   return f"{elapsed // 60}m {elapsed % 60}s"
 
 
-def _usage_text(usage: dict[str, Any]) -> str:
+def _usage_text(usage: JsonObject) -> str:
   parts = []
   inp = usage.get("input_tokens")
   out = usage.get("output_tokens")
@@ -76,7 +77,7 @@ def _usage_text(usage: dict[str, Any]) -> str:
 # Tool summary extraction
 # ---------------------------------------------------------------------------
 
-def tool_use_summary(tool_name: str, tool_input: dict[str, Any]) -> str:
+def tool_use_summary(tool_name: str, tool_input: JsonObject) -> str:
   """Build a one-line summary from a ToolUseBlock."""
   if tool_name == "Bash":
     desc = tool_input.get("description", "")
@@ -113,7 +114,7 @@ def tool_use_summary(tool_name: str, tool_input: dict[str, Any]) -> str:
 # Card V2 builders
 # ---------------------------------------------------------------------------
 
-def _collapsible_thinking(steps: list[ThinkingStep]) -> dict[str, Any]:
+def _collapsible_thinking(steps: list[ThinkingStep]) -> JsonObject:
   """Build a collapsible_panel with unified thinking timeline."""
   lines = []
   for s in steps:
@@ -142,7 +143,7 @@ def _collapsible_thinking(steps: list[ThinkingStep]) -> dict[str, Any]:
   }
 
 
-def _note_element(text: str) -> dict[str, Any]:
+def _note_element(text: str) -> JsonObject:
   """Small footer text. Uses markdown instead of deprecated 'note' tag (V2)."""
   return {
     "tag": "markdown",
@@ -151,7 +152,7 @@ def _note_element(text: str) -> dict[str, Any]:
   }
 
 
-def _stop_button(chat_id: str = "") -> dict[str, Any]:
+def _stop_button(chat_id: str = "") -> JsonObject:
   """Build a Stop button inside a column_set (Card V2 compatible)."""
   return {
     "tag": "column_set",
@@ -177,9 +178,9 @@ def _working_elements(
   current_tool: str = "",
   include_stop_button: bool,
   chat_id: str = "",
-) -> list[dict[str, Any]]:
+) -> list[JsonObject]:
   """Build the shared body for working/stopping/stopped phases."""
-  elements: list[dict[str, Any]] = []
+  elements: list[JsonObject] = []
   if current_tool:
     elements.append({"tag": "markdown", "content": f"`{current_tool}`"})
   if steps:
@@ -196,9 +197,9 @@ def build_turn_card(
   steps: list[ThinkingStep] | None = None,
   current_tool: str = "",
   elapsed: int = 0,
-  usage: dict[str, Any] | None = None,
+  usage: JsonObject | None = None,
   chat_id: str = "",
-) -> dict[str, Any]:
+) -> JsonObject:
   """Build a unified turn card for any phase.
 
   phase: "working" | "stopping" | "stopped" | "done" | "error"
@@ -206,7 +207,7 @@ def build_turn_card(
   steps: unified thinking timeline (text + tool entries in order)
   """
   steps = steps or []
-  elements: list[dict[str, Any]] = []
+  elements: list[JsonObject] = []
 
   if phase == "working":
     elements = _working_elements(
@@ -214,7 +215,7 @@ def build_turn_card(
       include_stop_button=True, chat_id=chat_id,
     )
     title = _elapsed_title(elapsed)
-    header: dict[str, Any] | None = {
+    header: JsonObject | None = {
       "title": {"tag": "plain_text", "content": title},
       "template": "grey",
     }
@@ -278,7 +279,7 @@ def build_turn_card(
   else:
     raise ValueError(f"Unknown phase: {phase}")
 
-  card: dict[str, Any] = {
+  card: JsonObject = {
     "schema": "2.0",
     "config": {"update_multi": True},
     "body": {"direction": "vertical", "elements": elements},
@@ -295,9 +296,9 @@ def build_turn_card(
 def _buttons_row(
   buttons: list[tuple[str, str, str]],
   chat_id: str = "",
-) -> dict[str, Any]:
+) -> JsonObject:
   """Build a column_set row of buttons (Card V2 compatible)."""
-  columns: list[dict[str, Any]] = []
+  columns: list[JsonObject] = []
   for label, action_value, button_type in buttons:
     columns.append({
       "tag": "column",
@@ -325,16 +326,16 @@ def build_card(
   buttons: list[tuple[str, str, str]] | None = None,
   chat_id: str = "",
   note: str = "",
-) -> dict[str, Any]:
+) -> JsonObject:
   """Build a simple Card V2 for non-turn messages."""
-  elements: list[dict[str, Any]] = []
+  elements: list[JsonObject] = []
   if body and body.strip():
     elements.append({"tag": "markdown", "content": body})
   if buttons:
     elements.append(_buttons_row(buttons, chat_id))
   if note:
     elements.append(_note_element(note))
-  card: dict[str, Any] = {
+  card: JsonObject = {
     "schema": "2.0",
     "config": {"update_multi": True},
     "header": {
@@ -347,7 +348,7 @@ def build_card(
 
 
 def build_form_select(title: str, options: list[dict[str, str]],
-                      chat_id: str = "") -> dict[str, Any]:
+                      chat_id: str = "") -> JsonObject:
   """Build a card with select dropdown.
 
   Each option should have 'text' and 'value' keys.
@@ -357,7 +358,7 @@ def build_form_select(title: str, options: list[dict[str, str]],
      "value": opt["value"]}
     for opt in options
   ]
-  elements: list[dict[str, Any]] = [
+  elements: list[JsonObject] = [
     {
       "tag": "select_static",
       "placeholder": {"tag": "plain_text", "content": "Select..."},
@@ -377,9 +378,9 @@ def build_form_select(title: str, options: list[dict[str, str]],
 
 
 def build_form_input(title: str, placeholder: str = "",
-                     chat_id: str = "") -> dict[str, Any]:
+                     chat_id: str = "") -> JsonObject:
   """Build a card with text input."""
-  elements: list[dict[str, Any]] = [
+  elements: list[JsonObject] = [
     {
       "tag": "input",
       "name": "user_input",
@@ -398,9 +399,9 @@ def build_form_input(title: str, placeholder: str = "",
   }
 
 
-def build_markdown_card(content: str, title: str = "", color: str = "") -> dict[str, Any]:
+def build_markdown_card(content: str, title: str = "", color: str = "") -> JsonObject:
   """Build a Card V2 with markdown content."""
-  card: dict[str, Any] = {
+  card: JsonObject = {
     "schema": "2.0",
     "config": {"update_multi": True},
     "body": {
@@ -409,7 +410,7 @@ def build_markdown_card(content: str, title: str = "", color: str = "") -> dict[
     },
   }
   if title:
-    header: dict[str, Any] = {"title": {"tag": "plain_text", "content": title}}
+    header: JsonObject = {"title": {"tag": "plain_text", "content": title}}
     if color:
       header["template"] = color
     card["header"] = header

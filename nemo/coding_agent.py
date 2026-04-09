@@ -10,9 +10,10 @@ depends only on this interface, not on Claude SDK specifics.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Any, Callable
+from typing import Callable
 
 from .turn import TurnEvent
+from .types import JsonObject
 
 
 class CodingAgent(ABC):
@@ -22,8 +23,9 @@ class CodingAgent(ABC):
   async def run_turn(
     self,
     prompt: str,
-    on_event: Callable[[TurnEvent], Any],
-  ) -> None:
+    on_event: Callable[[TurnEvent], None],
+    stale_tasks: set[str] | None = None,
+  ) -> tuple[float, JsonObject]:
     """Execute one agent turn with the given prompt.
 
     Calls on_event for each TurnEvent (tool use, text output, done, error).
@@ -37,13 +39,13 @@ class CodingAgent(ABC):
     ...
 
   @abstractmethod
-  async def reset(self) -> None:
-    """Reset conversation state (new conversation)."""
+  async def start(self, project_dir: str, model: str, resume: str = "") -> None:
+    """Initialize the agent (connect to SDK, etc.)."""
     ...
 
   @abstractmethod
-  async def start(self, project_dir: str, model: str) -> None:
-    """Initialize the agent (connect to SDK, etc.)."""
+  async def reset(self, project_dir: str, model: str, resume: str = "") -> None:
+    """Reset or reconnect the agent with updated runtime settings."""
     ...
 
   @abstractmethod

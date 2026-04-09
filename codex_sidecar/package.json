@@ -1,0 +1,9 @@
+{
+  "name": "nemo-codex-sidecar",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@openai/codex": "^0.118.0",
+    "@openai/codex-sdk": "^0.118.0"
+  }
+}

@@ -7,17 +7,18 @@ from __future__ import annotations
 
 import json
 import re
-from typing import Any
+
+from .types import JsonObject
 
 
-def _get(obj: Any, key: str, default: Any = "") -> Any:
+def _get(obj: object, key: str, default: object = "") -> object:
   """Get attribute or dict key — works with LarkEvent or dict."""
   if isinstance(obj, dict):
     return obj.get(key, default)
   return getattr(obj, key, default)
 
 
-def build_prompt(replies: list[Any]) -> str:
+def build_prompt(replies: list[object]) -> str:
   """Build a prompt string from messages.
 
   If any reply has media (image/file) or parent_id, return JSON.
@@ -30,7 +31,7 @@ def build_prompt(replies: list[Any]) -> str:
   )
   if has_media or any(_get(r, "parent_id") for r in replies):
     # Convert to dicts for JSON serialization
-    dicts: list[dict[str, Any]] = []
+    dicts: list[JsonObject] = []
     for r in replies:
       if isinstance(r, dict):
         dicts.append(r)
@@ -44,7 +45,7 @@ def build_prompt(replies: list[Any]) -> str:
   if texts:
     return "\n".join(texts)
   # Fallback to JSON
-  dicts: list[dict[str, Any]] = []
+  dicts: list[JsonObject] = []
   for r in replies:
     if isinstance(r, dict):
       dicts.append(r)
@@ -55,7 +56,7 @@ def build_prompt(replies: list[Any]) -> str:
   return json.dumps(dicts, ensure_ascii=False)
 
 
-def strip_mentions(text: str, replies: list[Any]) -> str:
+def strip_mentions(text: str, replies: list[object]) -> str:
   """Remove @-mention markers from text."""
   for r in replies:
     for m in (_get(r, "mentions") or []):
@@ -65,14 +66,14 @@ def strip_mentions(text: str, replies: list[Any]) -> str:
   return re.sub(r"\s+", " ", text).strip()
 
 
-def filter_self_bot(replies: list[Any], bot_open_id: str) -> list[Any]:
+def filter_self_bot(replies: list[object], bot_open_id: str) -> list[object]:
   """Remove messages sent by the bot itself."""
   if not bot_open_id:
     return replies
   return [r for r in replies if _get(r, "sender_id") != bot_open_id]
 
 
-def filter_by_operator(replies: list[Any], operator_open_id: str) -> list[Any]:
+def filter_by_operator(replies: list[object], operator_open_id: str) -> list[object]:
   """Keep only messages from the operator."""
   if not operator_open_id:
     return replies
@@ -80,10 +81,10 @@ def filter_by_operator(replies: list[Any], operator_open_id: str) -> list[Any]:
 
 
 def filter_by_allowed_senders(
-  replies: list[Any],
+  replies: list[object],
   operator_open_id: str,
   member_roles: dict[str, str],
-) -> list[Any]:
+) -> list[object]:
   """Keep messages from operator, coowners, and guests."""
   if not operator_open_id:
     return replies
@@ -97,7 +98,7 @@ def filter_by_allowed_senders(
   return result
 
 
-def filter_bot_interactions(replies: list[Any], bot_open_id: str) -> list[Any]:
+def filter_bot_interactions(replies: list[object], bot_open_id: str) -> list[object]:
   """In need_mention mode, keep only bot-directed messages."""
   if not bot_open_id:
     return replies

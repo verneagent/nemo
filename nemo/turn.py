@@ -9,9 +9,10 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Callable
 
 from .cards import ToolRecord, tool_use_summary
+from .types import JsonObject, TurnClient
 
 log = logging.getLogger(__name__)
 
@@ -61,7 +62,7 @@ class TaskDoneEvent:
 class DoneEvent:
   """Turn completed."""
   cost: float
-  usage: dict[str, Any]
+  usage: JsonObject
   session_id: str = ""  # CLI session UUID — needed for --resume on model switch
 
 
@@ -82,12 +83,12 @@ TurnEvent = (
 # ---------------------------------------------------------------------------
 
 async def run_turn(
-  client: Any,
+  client: TurnClient,
   prompt: str,
   on_event: Callable[[TurnEvent], None],
   stale_tasks: set[str] | None = None,
   _retry: int = 0,
-) -> tuple[float, dict[str, Any]]:
+) -> tuple[float, JsonObject]:
   """Send prompt to SDK client, stream responses, emit events.
 
   Returns (cost, usage_dict).
@@ -107,7 +108,7 @@ async def run_turn(
   log.info("query() sent to CLI")
 
   cost = 0.0
-  usage: dict[str, Any] = {}
+  usage: JsonObject = {}
   sdk_session_id = ""
   pending_tasks: set[str] = set()
   working_started = False

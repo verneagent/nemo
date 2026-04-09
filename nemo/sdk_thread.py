@@ -13,9 +13,12 @@ from __future__ import annotations
 import asyncio
 import logging
 import threading
-from typing import Any, Callable
+from collections.abc import Coroutine
+from concurrent.futures import Future
+from typing import Callable
 
 from .turn import TurnEvent, run_turn
+from .types import ClaudeSDKClientLike, JsonObject
 
 log = logging.getLogger(__name__)
 
@@ -28,7 +31,7 @@ class SDKThread:
   def __init__(self):
     self._loop: asyncio.AbstractEventLoop | None = None
     self._thread: threading.Thread | None = None
-    self._client: Any = None
+    self._client: ClaudeSDKClientLike | None = None
     self._ready = threading.Event()
 
   def start(self) -> None:
@@ -46,18 +49,18 @@ class SDKThread:
     self._ready.set()
     self._loop.run_forever()
 
-  def _schedule(self, coro) -> asyncio.Future:
+  def _schedule(self, coro: Coroutine[object, object, object]) -> Future[object]:
     """Schedule a coroutine on the SDK thread, return concurrent.futures.Future."""
     if self._loop is None:
       raise RuntimeError("SDK thread not started")
     return asyncio.run_coroutine_threadsafe(coro, self._loop)
 
-  async def run_on_sdk_loop(self, coro):
+  async def run_on_sdk_loop(self, coro: Coroutine[object, object, object]) -> object:
     """Schedule a coroutine on the SDK thread, awaitable from the main loop."""
     future = self._schedule(coro)
     return await asyncio.wrap_future(future)
 
-  async def create_client(self, options: Any) -> None:
+  async def create_client(self, options: object) -> None:
     """Create and connect SDK client on the SDK thread."""
     from claude_agent_sdk import ClaudeSDKClient
 
@@ -99,7 +102,7 @@ class SDKThread:
 
     await self.run_on_sdk_loop(_close())
 
-  async def reconnect(self, options: Any) -> None:
+  async def reconnect(self, options: object) -> None:
     """Close and recreate the client."""
     await self.close_client()
     await self.create_client(options)
@@ -109,7 +112,7 @@ class SDKThread:
     prompt: str,
     on_event: Callable[[TurnEvent], None],
     stale_tasks: set[str] | None = None,
-  ) -> tuple[float, dict[str, Any]]:
+  ) -> tuple[float, JsonObject]:
     """Run a single SDK turn on the SDK thread.
 
     on_event is called from the SDK thread — it must be thread-safe.
@@ -128,9 +131,9 @@ class SDKThread:
     prompt: str,
     on_event: Callable[[TurnEvent], None],
     stale_tasks: set[str] | None = None,
-    options: Any = None,
+    options: object = None,
     max_attempts: int = 3,
-  ) -> tuple[float, dict[str, Any]]:
+  ) -> tuple[float, JsonObject]:
     """Run turn with automatic reconnect on timeout.
 
     On timeout, reconnects and retries. On the last attempt, raises

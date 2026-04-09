@@ -15,17 +15,18 @@ import json
 import logging
 import threading
 from dataclasses import dataclass, field
-from typing import Any
 
 import lark_oapi as lark
 from lark_oapi.event.callback.model.p2_card_action_trigger import (
   P2CardActionTrigger, P2CardActionTriggerResponse,
 )
 
+from ..types import JsonObject, JsonValue
+
 log = logging.getLogger(__name__)
 
 
-def _model_to_dict(obj: Any) -> dict[str, Any] | list[Any] | str | int | float | bool | None:
+def _model_to_dict(obj: object) -> JsonValue:
   """Recursively convert a lark-oapi SDK model object to a plain dict.
 
   SDK objects like EventMessage, EventSender etc. have __dict__ with
@@ -64,13 +65,13 @@ class LarkEvent:
   parent_id: str = ""
   create_time: str = ""
   # Card action fields
-  action_value: dict[str, Any] = field(default_factory=dict)
+  action_value: JsonObject = field(default_factory=dict)
   action_tag: str = ""
   operator_id: str = ""
-  raw: dict[str, Any] = field(default_factory=dict)
+  raw: JsonObject = field(default_factory=dict)
 
 
-def _parse_message_event(payload: dict[str, Any]) -> LarkEvent:
+def _parse_message_event(payload: JsonObject) -> LarkEvent:
   """Parse an im.message.receive_v1 event."""
   event = payload.get("event", {})
   msg = event.get("message", {})
@@ -112,7 +113,7 @@ def _parse_message_event(payload: dict[str, Any]) -> LarkEvent:
   )
 
 
-def _parse_card_action(payload: dict[str, Any]) -> LarkEvent:
+def _parse_card_action(payload: JsonObject) -> LarkEvent:
   """Parse a card.action.trigger callback."""
   event = payload.get("event", {})
   operator = event.get("operator", {})
@@ -131,7 +132,7 @@ def _parse_card_action(payload: dict[str, Any]) -> LarkEvent:
   )
 
 
-def _parse_reaction_event(payload: dict[str, Any]) -> LarkEvent:
+def _parse_reaction_event(payload: JsonObject) -> LarkEvent:
   """Parse an im.message.reaction.created_v1 event."""
   event = payload.get("event", {})
   return LarkEvent(
@@ -142,7 +143,7 @@ def _parse_reaction_event(payload: dict[str, Any]) -> LarkEvent:
   )
 
 
-def parse_event(payload: dict[str, Any]) -> LarkEvent:
+def parse_event(payload: JsonObject) -> LarkEvent:
   """Parse a raw event payload into a LarkEvent."""
   header = payload.get("header", {})
   event_type = header.get("event_type", "")
@@ -176,7 +177,7 @@ class LarkEventStream:
     self._app_secret = app_secret
     self._queue: asyncio.Queue[LarkEvent] = asyncio.Queue()
     self._running = False
-    self._ws_client: Any = None
+    self._ws_client: object = None
     self._ws_thread: threading.Thread | None = None
     self.permission_active: bool = False  # Set by permission handler to pause watcher
 
@@ -185,9 +186,9 @@ class LarkEventStream:
     loop = asyncio.get_event_loop()
     self._running = True
 
-    def _on_message(data: Any) -> None:
+    def _on_message(data: object) -> None:
       # Convert entire SDK model tree to plain dicts
-      event_payload: dict[str, Any] = {
+      event_payload: JsonObject = {
         "header": {"event_type": "im.message.receive_v1"},
         "event": _model_to_dict(data.event) if hasattr(data, 'event') else {},
       }
@@ -198,7 +199,7 @@ class LarkEventStream:
 
     def _on_card_action(data: P2CardActionTrigger) -> P2CardActionTriggerResponse:
       # Convert entire SDK model tree to plain dicts
-      event_payload: dict[str, Any] = {
+      event_payload: JsonObject = {
         "header": {"event_type": "card.action.trigger"},
         "event": _model_to_dict(data.event) if hasattr(data, 'event') else {},
       }
@@ -206,7 +207,7 @@ class LarkEventStream:
       loop.call_soon_threadsafe(self._queue.put_nowait, parsed)
       return P2CardActionTriggerResponse()
 
-    handler: Any = lark.EventDispatcherHandler.builder("", "") \
+    handler: object = lark.EventDispatcherHandler.builder("", "") \
       .register_p2_im_message_receive_v1(_on_message) \
       .register_p2_card_action_trigger(_on_card_action) \
       .build()
