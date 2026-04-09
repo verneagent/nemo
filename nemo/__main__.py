@@ -72,8 +72,14 @@ def signal_ready() -> None:
   """Signal the waiting parent that the daemon is ready."""
   global _ready_fd
   if _ready_fd is not None:
-    os.write(_ready_fd, f"ready:{os.getpid()}\n".encode())
-    os.close(_ready_fd)
+    try:
+      os.write(_ready_fd, f"ready:{os.getpid()}\n".encode())
+    except OSError:
+      pass  # Parent already exited — pipe broken, harmless
+    try:
+      os.close(_ready_fd)
+    except OSError:
+      pass
     _ready_fd = None
 
 
@@ -81,8 +87,14 @@ def signal_error(msg: str) -> None:
   """Signal the waiting parent that startup failed."""
   global _ready_fd
   if _ready_fd is not None:
-    os.write(_ready_fd, f"error:{msg}\n".encode())
-    os.close(_ready_fd)
+    try:
+      os.write(_ready_fd, f"error:{msg}\n".encode())
+    except OSError:
+      pass
+    try:
+      os.close(_ready_fd)
+    except OSError:
+      pass
     _ready_fd = None
 
 
@@ -198,7 +210,130 @@ def _setup_crash_diagnostics(log_path: str) -> None:
   wd.start()
 
 
+def _cmd_list() -> int:
+  """List all running nemo processes with their chat and project info."""
+  import re
+  import subprocess
+
+  from .config import CONFIG_DIR, load_credentials
+  from .lark.auth import get_token
+  from .lark import api as lark_api
+
+  # 1. Find all nemo daemon processes
+  my_pid = os.getpid()
+  try:
+    result = subprocess.run(
+      ["ps", "ax", "-o", "pid=,command="],
+      capture_output=True, text=True, timeout=5,
+    )
+  except Exception as e:
+    print(f"Error listing processes: {e}", file=sys.stderr)
+    return 1
+
+  nemo_procs: list[dict[str, str]] = []
+  for line in result.stdout.splitlines():
+    line = line.strip()
+    if not line:
+      continue
+    parts = line.split(None, 1)
+    if len(parts) < 2:
+      continue
+    try:
+      pid = int(parts[0])
+    except ValueError:
+      continue
+    cmd = parts[1]
+    if pid == my_pid:
+      continue
+    # Match: command line contains /bin/nemo or /nemo as an argument
+    if "/nemo" not in cmd:
+      continue
+    # Exclude grep, vim, etc. that happen to have 'nemo' in args
+    if not any("/nemo" in part for part in cmd.split()[:3]):
+      continue
+    chat_match = re.search(r"--chat-id\s+(\S+)", cmd)
+    nemo_procs.append({
+      "pid": str(pid),
+      "chat_id": chat_match.group(1) if chat_match else "",
+    })
+
+  # 2. For processes without --chat-id, scan their log files
+  log_dir = os.path.join(CONFIG_DIR, "logs")
+  for proc in nemo_procs:
+    if proc["chat_id"]:
+      continue
+    log_path = os.path.join(log_dir, f"nemo-{proc['pid']}.log")
+    try:
+      with open(log_path) as f:
+        for line in f:
+          m = re.search(r"chat[=:](oc_[a-f0-9]{32})", line)
+          if m:
+            proc["chat_id"] = m.group(1)
+            break
+    except OSError:
+      pass
+
+  # Deduplicate by chat_id (parent + daemon may both appear)
+  seen_chats: set[str] = set()
+  unique_procs: list[dict[str, str]] = []
+  for proc in nemo_procs:
+    chat = proc["chat_id"]
+    if chat and chat in seen_chats:
+      continue
+    if chat:
+      seen_chats.add(chat)
+    unique_procs.append(proc)
+
+  if not unique_procs:
+    print("No running nemo processes found.")
+    return 0
+
+  # 3. Resolve chat names and workspace tags via Lark API
+  credentials = load_credentials()
+  chat_info: dict[str, dict[str, str]] = {}
+  if credentials:
+    try:
+      token = get_token(credentials["app_id"], credentials["app_secret"])
+      for proc in unique_procs:
+        chat = proc["chat_id"]
+        if not chat or chat in chat_info:
+          continue
+        try:
+          info = lark_api.get_chat_info(token, chat)
+          name = str(info.get("name", "") or "")
+          desc = str(info.get("description", "") or "")
+          # Extract project path from workspace tag
+          # Format: workspace:{machine}-{path-with-dashes}
+          wm = re.search(r"workspace:\S+?-((?:Users|home)-.+)", desc)
+          project = ""
+          if wm:
+            project = "/" + wm.group(1).replace("-", "/")
+          chat_info[chat] = {"name": name, "project": project}
+        except Exception:
+          chat_info[chat] = {"name": "?", "project": "?"}
+    except Exception as e:
+      print(f"(Lark API unavailable: {e})", file=sys.stderr)
+
+  # 4. Print table
+  print(f"{'PID':<8} {'Chat':<25} {'Project'}")
+  print("-" * 70)
+  for proc in unique_procs:
+    pid = proc["pid"]
+    chat = proc["chat_id"] or "?"
+    info = chat_info.get(chat, {})
+    name = info.get("name", "")
+    project = info.get("project", "")
+    label = name or chat[:25]
+    print(f"{pid:<8} {label:<25} {project}")
+
+  return 0
+
+
 def main():
+  # Intercept subcommands before argparse
+  if len(sys.argv) >= 2 and sys.argv[1] == "list":
+    sys.exit(_cmd_list())
+
   parser = argparse.ArgumentParser(
     prog="nemo",
     description="Lark-connected coding agent daemon",
@@ -227,6 +362,9 @@ def main():
   # Daemonize unless --foreground
   if not args.foreground and not os.environ.get("NEMO_FOREGROUND"):
     _daemonize()
+
+  # Ignore SIGPIPE — broken pipe from parent exit is harmless
+  signal.signal(signal.SIGPIPE, signal.SIG_IGN)
 
   # Log to both stderr and a persistent log file
   log_level = logging.DEBUG if args.verbose else logging.INFO
