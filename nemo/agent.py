@@ -227,13 +227,16 @@ async def main_loop(
   # Send start card
   log.info("Sending start card to %s", chat_id)
   from nemo import __version__
-  start_body = "Agent ready. Send a message to begin."
+  folder = os.path.basename(project_dir) or project_dir
+  start_lines = [f"📂 `{folder}`  ·  pid `{os.getpid()}`"]
   if _resume_sdk_id:
-    start_body += f"\nSession: `{_resume_sdk_id[:8]}` (resumed)"
+    start_lines.append(f"Session `{_resume_sdk_id[:8]}` resumed")
+  start_note = project_dir
   start_card = cards.build_card(
     f"Nemo v{__version__} ({model})",
-    body=start_body,
+    body="\n".join(start_lines),
     color="blue",
+    note=start_note,
   )
   try:
     msg_id = await channel.send_card(chat_id, start_card)
