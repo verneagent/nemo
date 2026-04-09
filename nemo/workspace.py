@@ -36,17 +36,22 @@ def get_machine_name() -> str:
 
 
 def get_workspace_id(project_dir: str) -> str:
-  """Compute workspace ID: {machine}-{folder}."""
+  """Compute workspace ID: {machine}|{abspath}."""
+  machine = get_machine_name()
+  return f"{machine}|{os.path.abspath(project_dir)}"
+
+
+def _get_legacy_workspace_id(project_dir: str) -> str:
+  """Old format for backward compat: {machine}-{folder-with-dashes}."""
   machine = get_machine_name()
   folder = os.path.abspath(project_dir).replace("/", "-").strip("-")
   return f"{machine}-{folder}"
 
 
 def _workspace_tag_matches(desc: str, tag: str) -> bool:
-  """Check if description contains the exact workspace tag (not a prefix).
+  """Check if description contains the exact workspace tag.
 
   The tag must be followed by whitespace, newline, or end of string.
-  This prevents 'workspace:A-B' from matching 'workspace:A-B-C'.
   """
   start = 0
   while True:
@@ -123,12 +128,14 @@ def _find_local_nemo_pids(chat_id: str) -> list[int]:
 def _find_workspace_groups(token: str, project_dir: str) -> list[dict[str, str]]:
   """Find all Lark groups tagged with this project's workspace ID.
 
+  Matches both new format (workspace:{machine}|{path}) and legacy
+  format (workspace:{machine}-{folder-dashes}) for backward compat.
   Returns list of {"chat_id": ..., "name": ...}.
   """
   from .lark import api as lark_api
 
-  workspace_id = get_workspace_id(project_dir)
-  workspace_tag = f"workspace:{workspace_id}"
+  workspace_tag = f"workspace:{get_workspace_id(project_dir)}"
+  legacy_tag = f"workspace:{_get_legacy_workspace_id(project_dir)}"
   log.info("Looking for workspace tag: %s", workspace_tag)
 
   try:
@@ -145,7 +152,8 @@ def _find_workspace_groups(token: str, project_dir: str) -> list[dict[str, str]]
     try:
       info = lark_api.get_chat_info(token, chat_id)
       desc = info.get("description") or ""
-      if _workspace_tag_matches(desc, workspace_tag):
+      if _workspace_tag_matches(desc, workspace_tag) or \
+         _workspace_tag_matches(desc, legacy_tag):
         matches.append({"chat_id": chat_id, "name": info.get("name", "")})
     except Exception as e:
       log.debug("Failed to inspect chat %s: %s", chat_id, e)
@@ -372,18 +380,19 @@ def release_group(token: str, chat_id: str) -> None:
 def ensure_workspace_tag(token: str, chat_id: str, project_dir: str) -> None:
   """Ensure the chat description contains the workspace tag.
 
-  If the tag is already present, do nothing. Otherwise append it.
+  If the new-format tag is present, do nothing. If only legacy tag exists,
+  replace it. Otherwise append new-format tag.
   """
   from .lark import api as lark_api
 
-  workspace_id = get_workspace_id(project_dir)
-  workspace_tag = f"workspace:{workspace_id}"
+  workspace_tag = f"workspace:{get_workspace_id(project_dir)}"
+  legacy_tag = f"workspace:{_get_legacy_workspace_id(project_dir)}"
 
   try:
     info = lark_api.get_chat_info(token, chat_id)
     desc = info.get("description") or ""
     if _workspace_tag_matches(desc, workspace_tag):
-      return  # Already tagged
+      return  # Already tagged with new format
     # Append tag to existing description
     new_desc = f"{desc}\n{workspace_tag}".strip() if desc.strip() else workspace_tag
     lark_api.update_chat_info(token, chat_id, {"description": new_desc})

@@ -14,7 +14,7 @@ from nemo.workspace import (
 def test_get_workspace_id():
   with mock.patch("nemo.workspace.get_machine_name", return_value="MyMac"):
     ws_id = get_workspace_id("/Users/alice/projects/myapp")
-  assert ws_id == "MyMac-Users-alice-projects-myapp"
+  assert ws_id == "MyMac|/Users/alice/projects/myapp"
 
 
 def test_workspace_tag_matches_exact():
@@ -83,10 +83,10 @@ def test_discover_chat_id_api_error():
 
 
 def test_ensure_workspace_tag_already_present():
-  """Should not update if tag already exists."""
+  """Should not update if new-format tag already exists."""
   with mock.patch("nemo.workspace.get_machine_name", return_value="Mac"):
     with mock.patch("nemo.lark.api.get_chat_info",
-                    return_value={"description": "workspace:Mac-tmp-proj"}):
+                    return_value={"description": "workspace:Mac|/tmp/proj"}):
       with mock.patch("nemo.lark.api.update_chat_info") as mock_update:
         ensure_workspace_tag("tok", "oc_1", "/tmp/proj")
         mock_update.assert_not_called()
@@ -101,7 +101,7 @@ def test_ensure_workspace_tag_appends():
         ensure_workspace_tag("tok", "oc_1", "/tmp/proj")
         mock_update.assert_called_once()
         new_desc = mock_update.call_args[0][2]["description"]
-        assert "workspace:Mac-tmp-proj" in new_desc
+        assert "workspace:Mac|/tmp/proj" in new_desc
         assert "My project group" in new_desc
 
 
@@ -113,7 +113,7 @@ def test_ensure_workspace_tag_empty_description():
       with mock.patch("nemo.lark.api.update_chat_info") as mock_update:
         ensure_workspace_tag("tok", "oc_1", "/tmp/proj")
         new_desc = mock_update.call_args[0][2]["description"]
-        assert new_desc == "workspace:Mac-tmp-proj"
+        assert new_desc == "workspace:Mac|/tmp/proj"
 
 
 # ---------------------------------------------------------------------------
@@ -130,7 +130,7 @@ def test_auto_create_chat_success():
             result = auto_create_chat("tok", "/tmp/proj", email="a@b.com")
   assert result == "oc_new"
   mock_create.assert_called_once()
-  assert "workspace:Mac-tmp-proj" in mock_create.call_args[1]["description"]
+  assert "workspace:Mac|/tmp/proj" in mock_create.call_args[1]["description"]
   mock_add.assert_called_once_with("tok", "oc_new", ["ou_123"])
   mock_save.assert_called_once()
 

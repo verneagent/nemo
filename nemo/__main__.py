@@ -303,11 +303,16 @@ def _cmd_list() -> int:
           name = str(info.get("name", "") or "")
           desc = str(info.get("description", "") or "")
           # Extract project path from workspace tag
-          # Format: workspace:{machine}-{path-with-dashes}
-          wm = re.search(r"workspace:\S+?-((?:Users|home)-.+)", desc)
+          # New format: workspace:{machine}|{path}
+          # Legacy format: workspace:{machine}-{path-with-dashes}
           project = ""
+          wm = re.search(r"workspace:[^|\s]+\|(.+?)(?:\s|$)", desc)
           if wm:
-            project = "/" + wm.group(1).replace("-", "/")
+            project = wm.group(1)
+          else:
+            wm = re.search(r"workspace:\S+?-((?:Users|home)-.+?)(?:\s|$)", desc)
+            if wm:
+              project = "/" + wm.group(1).replace("-", "/")
           chat_info[chat] = {"name": name, "project": project}
         except Exception:
           chat_info[chat] = {"name": "?", "project": "?"}
