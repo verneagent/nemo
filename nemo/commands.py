@@ -145,7 +145,7 @@ def try_dispatch(text: str, ctx: AgentContext) -> tuple[bool, str | None]:
 
   # /guest
   if t.startswith("/guest"):
-    parts = text.strip().split(None, 2)
+    parts = text.strip().split()
     if len(parts) < 2:
       return True, (
         "**Guest Commands**\n\n"
