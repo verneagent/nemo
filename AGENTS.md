@@ -44,6 +44,10 @@ Lark-connected coding agent daemon. Repo focus:
   - `collapsible_panel` headers must use `plain_text`
 - `get_message` loses original card body content. Persistent config/state must not depend on reading interactive card bodies back.
 
+## Error Handling
+
+- Never `except Exception: pass` — always log the exception. Silent swallowing hides bugs (e.g. the zombie CLI subprocess bug was invisible because `__aexit__` failures were silently passed).
+
 ## Typing Rule
 
 - Do not introduce `Any` in repo Python code.
