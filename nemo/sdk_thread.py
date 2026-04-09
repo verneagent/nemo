@@ -33,6 +33,7 @@ class SDKThread:
     self._thread: threading.Thread | None = None
     self._client: ClaudeSDKClientLike | None = None
     self._ready = threading.Event()
+    self._cancelled = threading.Event()
 
   def start(self) -> None:
     """Start the SDK thread. Blocks until the event loop is ready."""
@@ -126,6 +127,10 @@ class SDKThread:
 
     return await self.run_on_sdk_loop(_turn())
 
+  def cancel(self) -> None:
+    """Signal the SDK thread to abort reconnect loops."""
+    self._cancelled.set()
+
   async def run_turn_with_reconnect(
     self,
     prompt: str,
@@ -138,8 +143,12 @@ class SDKThread:
 
     On timeout or client disconnection, reconnects and retries. On the
     last attempt, raises immediately without wasting a reconnect.
+    Checks _cancelled flag between attempts so interrupt can abort.
     """
+    self._cancelled.clear()
     for attempt in range(max_attempts):
+      if self._cancelled.is_set():
+        raise asyncio.CancelledError("SDK turn cancelled")
       try:
         return await self.run_turn(prompt, on_event, stale_tasks=stale_tasks)
       except (TimeoutError, RuntimeError) as exc:
@@ -149,6 +158,8 @@ class SDKThread:
           log.warning("SDK turn %s (attempt %d/%d)", label, attempt + 1, max_attempts)
           if attempt == max_attempts - 1 or options is None:
             raise
+          if self._cancelled.is_set():
+            raise asyncio.CancelledError("SDK turn cancelled")
           log.info("Reconnecting...")
           await self.reconnect(options)
         else:

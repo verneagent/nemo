@@ -310,6 +310,30 @@ class TestRunTurnWithReconnect:
             options=mock.MagicMock(), max_attempts=3,
           ))
 
+  def test_cancel_aborts_reconnect_loop(self, sdk_thread: SDKThread):
+    """cancel() should abort the reconnect loop between attempts."""
+    call_count = 0
+
+    async def fake_turn(prompt, on_event, stale_tasks=None):
+      nonlocal call_count
+      call_count += 1
+      raise TimeoutError("hung")
+
+    async def fake_reconnect(options):
+      # Simulate cancel being called during reconnect
+      sdk_thread.cancel()
+
+    with mock.patch.object(sdk_thread, "run_turn", side_effect=fake_turn):
+      with mock.patch.object(sdk_thread, "reconnect", side_effect=fake_reconnect):
+        with pytest.raises(asyncio.CancelledError):
+          _run(sdk_thread.run_turn_with_reconnect(
+            "hello", on_event=lambda e: None,
+            options=mock.MagicMock(), max_attempts=3,
+          ))
+
+    # Should have only attempted once before cancel took effect
+    assert call_count == 1
+
   def test_other_runtime_error_not_retried(self, sdk_thread: SDKThread):
     """RuntimeError without 'not connected' should not be retried."""
     call_count = 0

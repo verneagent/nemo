@@ -54,6 +54,7 @@ class ClaudeCodingAgent(CodingAgent):
       prompt, on_event, stale_tasks=stale_tasks, options=self._options)
 
   async def interrupt(self) -> None:
+    self._sdk.cancel()
     await self._sdk.interrupt()
 
   async def reset(self, project_dir: str, model: str, resume: str = "") -> None:

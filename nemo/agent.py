@@ -741,14 +741,15 @@ async def main_loop(
           _update_interrupt_card("stopping")
           try:
             await agent.interrupt()
-            await asyncio.wait_for(sdk_task, timeout=30)
+            await asyncio.wait_for(sdk_task, timeout=10)
             log.info("SDK turn interrupted cleanly")
           except Exception as exc:
             log.warning("SDK interrupt failed (%s), cancelling task", exc)
             sdk_task.cancel()
-          # Reset SDK client to ensure clean state for next turn
+          # Reset SDK client — timeout so stop is never stuck
           try:
-            await _restart_client(resume=_sdk_session_id)
+            await asyncio.wait_for(
+              _restart_client(resume=_sdk_session_id), timeout=15)
             log.info("SDK client reset after stop")
           except Exception as exc:
             log.warning("SDK reset after stop failed: %s", exc)
