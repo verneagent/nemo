@@ -127,11 +127,11 @@ def _collapsible_thinking(steps: list[ThinkingStep]) -> JsonObject:
         text = text[:197] + "..."
       lines.append(f"- *{text}*")
     else:
-      # Text — render as plain paragraph (truncate long text)
+      # Text — render as list item (truncate long text)
       text = s.content
       if len(text) > 200:
         text = text[:197] + "..."
-      lines.append(text)
+      lines.append(f"- {text}")
   content = "\n".join(lines) if lines else "_none_"
   return {
     "tag": "collapsible_panel",
