@@ -56,12 +56,21 @@ def build_prompt(replies: list[object]) -> str:
   return json.dumps(dicts, ensure_ascii=False)
 
 
-def strip_mentions(text: str, replies: list[object]) -> str:
-  """Remove @-mention markers from text."""
+def strip_mentions(text: str, replies: list[object],
+                   bot_open_id: str = "") -> str:
+  """Strip bot @-mentions; replace other @-mentions with the person's name."""
   for r in replies:
     for m in (_get(r, "mentions") or []):
       key = m.get("key", "") if isinstance(m, dict) else getattr(m, "key", "")
-      if key:
+      if not key:
+        continue
+      mid = m.get("id", "") if isinstance(m, dict) else getattr(m, "id", "")
+      name = m.get("name", "") if isinstance(m, dict) else getattr(m, "name", "")
+      if bot_open_id and mid == bot_open_id:
+        text = text.replace(key, "")
+      elif name:
+        text = text.replace(key, name)
+      else:
         text = text.replace(key, "")
   return re.sub(r"\s+", " ", text).strip()
 

@@ -92,7 +92,8 @@ def _parse_message_event(payload: JsonObject) -> LarkEvent:
     pass
 
   mentions_raw = msg.get("mentions") or []
-  mentions = [{"key": m.get("key", ""), "id": m.get("id", {}).get("open_id", "")}
+  mentions = [{"key": m.get("key", ""), "id": m.get("id", {}).get("open_id", ""),
+               "name": m.get("name", "")}
               for m in mentions_raw]
 
   return LarkEvent(

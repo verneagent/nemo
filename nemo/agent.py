@@ -354,7 +354,7 @@ async def main_loop(
         continue
 
       # Strip @-mention markers
-      user_message = messages.strip_mentions(text, [reply])
+      user_message = messages.strip_mentions(text, [reply], bot_open_id=bot_open_id)
       if not user_message:
         log.debug("Skipping: empty after stripping mentions")
         continue
@@ -717,7 +717,7 @@ async def main_loop(
             signal_detected = "exit"
             return
           # Inline-safe commands: execute during turn without waiting
-          stripped = messages.strip_mentions(msg_text, [msg])
+          stripped = messages.strip_mentions(msg_text, [msg], bot_open_id=bot_open_id)
           if stripped:
             handled, response = commands.try_dispatch(stripped, ctx)
             if handled and commands.is_inline_safe(response):
