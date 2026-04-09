@@ -26,7 +26,7 @@ from .config import load_credentials
 from .db import Database
 from .lark_channel import LarkChannel
 from .turn import (
-  DoneEvent, TextEvent, ToolProgressEvent, ToolStartEvent,
+  DoneEvent, TextEvent, ThinkingEvent, ToolProgressEvent, ToolStartEvent,
 )
 
 log = logging.getLogger(__name__)
@@ -524,6 +524,10 @@ async def main_loop(
           _turn_current_tool = event.tool.summary
           _ensure_card()
           _update_working(current_tool=event.tool.summary)
+
+        elif isinstance(event, ThinkingEvent):
+          _turn_steps.append(cards.ThinkingStep("thinking", event.text))
+          _update_working()
 
         elif isinstance(event, TextEvent):
           _turn_steps.append(cards.ThinkingStep("text", event.text))

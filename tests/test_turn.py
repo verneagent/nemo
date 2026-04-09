@@ -25,6 +25,13 @@ class FakeTextBlock:
 
 
 @dataclass
+class FakeThinkingBlock:
+  thinking: str
+  signature: str = ""
+  type: str = "thinking"
+
+
+@dataclass
 class FakeToolUseBlock:
   name: str
   input: dict
@@ -90,6 +97,7 @@ def _sdk_modules():
     "claude_agent_sdk": mock.MagicMock(
       AssistantMessage=FakeAssistantMessage,
       TextBlock=FakeTextBlock,
+      ThinkingBlock=FakeThinkingBlock,
       ToolUseBlock=FakeToolUseBlock,
       ResultMessage=FakeResultMessage,
       TaskStartedMessage=FakeTaskStartedMessage,

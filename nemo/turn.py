@@ -40,6 +40,12 @@ class ToolProgressEvent:
 
 
 @dataclass
+class ThinkingEvent:
+  """Agent produced thinking/reasoning output."""
+  text: str
+
+
+@dataclass
 class TextEvent:
   """Agent produced text output."""
   text: str
@@ -73,7 +79,7 @@ class ErrorEvent:
 
 
 TurnEvent = (
-  ToolStartEvent | ToolProgressEvent | TextEvent |
+  ToolStartEvent | ToolProgressEvent | ThinkingEvent | TextEvent |
   TaskStartedEvent | TaskDoneEvent | DoneEvent | ErrorEvent
 )
 
@@ -94,7 +100,7 @@ async def run_turn(
   Returns (cost, usage_dict).
   """
   from claude_agent_sdk import (
-    AssistantMessage, TextBlock, ToolUseBlock, ResultMessage,
+    AssistantMessage, TextBlock, ThinkingBlock, ToolUseBlock, ResultMessage,
     TaskStartedMessage, TaskNotificationMessage, TaskProgressMessage,
   )
 
@@ -160,12 +166,18 @@ async def run_turn(
     # --- Normal message handling ---
     if isinstance(message, AssistantMessage):
       text_parts = []
+      thinking_parts = []
       tool_summary = ""
       for block in message.content:
-        if isinstance(block, TextBlock) and block.text:
+        if isinstance(block, ThinkingBlock) and block.thinking:
+          thinking_parts.append(block.thinking)
+        elif isinstance(block, TextBlock) and block.text:
           text_parts.append(block.text)
         elif isinstance(block, ToolUseBlock):
           tool_summary = tool_use_summary(block.name, block.input)
+
+      if thinking_parts:
+        on_event(ThinkingEvent(text="\n".join(thinking_parts)))
 
       text = "\n".join(text_parts)
       if not text and message.content:

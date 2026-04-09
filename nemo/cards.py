@@ -120,6 +120,12 @@ def _collapsible_thinking(steps: list[ThinkingStep]) -> JsonObject:
   for s in steps:
     if s.kind == "tool":
       lines.append(f"- `{s.content}`")
+    elif s.kind == "thinking":
+      # Thinking — render as italic, truncated
+      text = s.content.replace("\n", " ")
+      if len(text) > 200:
+        text = text[:197] + "..."
+      lines.append(f"- *{text}*")
     else:
       # Text — render as plain paragraph (truncate long text)
       text = s.content
