@@ -205,6 +205,7 @@ def build_turn_card(
   elapsed: int = 0,
   usage: JsonObject | None = None,
   chat_id: str = "",
+  session_id: str = "",
 ) -> JsonObject:
   """Build a unified turn card for any phase.
 
@@ -253,12 +254,14 @@ def build_turn_card(
     # Thinking timeline
     if steps:
       elements.append(_collapsible_thinking(steps))
-    # Note: duration + tokens
+    # Note: duration + tokens + session
     note_parts = [_elapsed_text(elapsed)]
     if usage:
       ut = _usage_text(usage)
       if ut:
         note_parts.append(ut)
+    if session_id:
+      note_parts.append(f"session: {session_id[:8]}")
     elements.append(_note_element(" | ".join(note_parts)))
     # Green header
     header = {

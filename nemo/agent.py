@@ -227,9 +227,12 @@ async def main_loop(
   # Send start card
   log.info("Sending start card to %s", chat_id)
   from nemo import __version__
+  start_body = "Agent ready. Send a message to begin."
+  if _resume_sdk_id:
+    start_body += f"\nSession: `{_resume_sdk_id[:8]}` (resumed)"
   start_card = cards.build_card(
     f"Nemo v{__version__} ({model})",
-    body="Agent ready. Send a message to begin.",
+    body=start_body,
     color="blue",
   )
   try:
@@ -562,6 +565,7 @@ async def main_loop(
             card = cards.build_turn_card(
               "done", body=final_text, steps=thinking,
               elapsed=elapsed, usage=event.usage,
+              session_id=_sdk_session_id,
             )
             try:
               _await_channel(channel.update_card(_turn_card_id, card))
