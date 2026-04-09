@@ -61,7 +61,7 @@ def test_guest_list():
 def test_guest_add():
   handled, resp = try_dispatch("/guest add Alice", _ctx())
   assert handled
-  assert resp == "__guest_add__:Alice"
+  assert resp == "__guest_add__:guest:Alice"
 
 
 def test_guest_remove():

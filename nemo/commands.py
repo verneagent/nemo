@@ -152,7 +152,7 @@ def try_dispatch(text: str, ctx: AgentContext) -> tuple[bool, str | None]:
         "| Command | Description |\n"
         "|---|---|\n"
         "| `/guest list` | List all guests |\n"
-        "| `/guest add <name>` | Add a guest |\n"
+        "| `/guest add <name> [coowner]` | Add a guest (optionally as coowner) |\n"
         "| `/guest remove <name>` | Remove a guest |"
       )
     sub = parts[1].strip().lower()
@@ -160,7 +160,10 @@ def try_dispatch(text: str, ctx: AgentContext) -> tuple[bool, str | None]:
       return True, "__guest_list__"
     if sub == "add" and len(parts) >= 3:
       name = parts[2].strip()
-      return True, f"__guest_add__:{name}"
+      role = "guest"
+      if len(parts) >= 4 and parts[3].strip().lower() == "coowner":
+        role = "coowner"
+      return True, f"__guest_add__:{role}:{name}"
     if sub == "remove" and len(parts) >= 3:
       name = parts[2].strip()
       return True, f"__guest_remove__:{name}"

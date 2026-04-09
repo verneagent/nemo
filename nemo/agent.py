@@ -192,8 +192,9 @@ async def main_loop(
   # Ensure workspace tag and claim group
   await channel.ensure_workspace_claimed(project_dir, model)
 
-  # Detect need_mention: bot-owned groups or 1-on-1 groups default to False,
-  # multi-human groups default to True. Can be overridden via group config.
+  # Detect need_mention: nemo-managed groups (with workspace tag) or
+  # 1-on-1 groups default to False. Other multi-human groups default to True.
+  # Can be overridden via group config.
   from . import group_config as gcfg
   gc = gcfg.load_config(channel.token, chat_id)
   if "need_mention" in gc:
@@ -202,8 +203,9 @@ async def main_loop(
     need_mention = True
     try:
       info = await channel.get_chat_info(chat_id)
-      owner_id = info.get("owner_id", "")
-      if owner_id and owner_id == bot_open_id:
+      desc = str(info.get("description", "") or "")
+      if "workspace:" in desc:
+        # Nemo-managed group (created by auto_create_chat)
         need_mention = False
       else:
         members = await channel.get_chat_members(chat_id)
@@ -462,6 +464,50 @@ async def main_loop(
             await _send_response(channel, chat_id, f"Norm **{name}** removed.", db)
           else:
             await _send_response(channel, chat_id, f"Norm **{name}** not found.", db)
+        elif response == "__guest_list__":
+          from .guests import list_guests
+          guests = list_guests(channel.token, chat_id)
+          if guests:
+            lines = ["**Guests**\n"]
+            for g in guests:
+              role = g.get("role", "guest")
+              name = g.get("name", g.get("open_id", "?")[:16])
+              lines.append(f"- **{name}** ({role})")
+            await _send_response(channel, chat_id, "\n".join(lines), db)
+          else:
+            await _send_response(channel, chat_id, "No guests configured.", db)
+        elif response and response.startswith("__guest_add__:"):
+          from .guests import add_guest
+          _, rest = response.split(":", 1)
+          role, name = rest.split(":", 1)
+          # Resolve name to open_id by searching chat members
+          open_id = ""
+          try:
+            members = await channel.get_chat_members(chat_id)
+            for m in members:
+              mname = str(m.get("name", ""))
+              if mname.lower() == name.lower():
+                open_id = str(m.get("member_id", ""))
+                name = mname  # Use canonical name
+                break
+          except Exception:
+            pass
+          if open_id:
+            add_guest(channel.token, chat_id, open_id, name=name, role=role)
+            await _send_response(channel, chat_id, f"Added **{name}** as **{role}**.", db)
+          else:
+            await _send_response(channel, chat_id, f"Could not find **{name}** in this group.", db)
+        elif response and response.startswith("__guest_remove__:"):
+          from .guests import remove_guest, list_guests as _lg
+          name = response.split(":", 1)[1]
+          # Find open_id by name
+          guests = _lg(channel.token, chat_id)
+          target = next((g for g in guests if g.get("name", "").lower() == name.lower()), None)
+          if target:
+            remove_guest(channel.token, chat_id, target["open_id"])
+            await _send_response(channel, chat_id, f"Removed **{name}**.", db)
+          else:
+            await _send_response(channel, chat_id, f"Guest **{name}** not found.", db)
         elif response == "__diag__":
           await _handle_diag(channel, chat_id, project_dir, db)
         elif response == "__exit__":
