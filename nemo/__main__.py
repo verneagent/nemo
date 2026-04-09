@@ -77,6 +77,15 @@ def signal_ready() -> None:
     _ready_fd = None
 
 
+def signal_error(msg: str) -> None:
+  """Signal the waiting parent that startup failed."""
+  global _ready_fd
+  if _ready_fd is not None:
+    os.write(_ready_fd, f"error:{msg}\n".encode())
+    os.close(_ready_fd)
+    _ready_fd = None
+
+
 def _daemonize():
   """Double-fork into background, fully detach from parent process tree.
 
