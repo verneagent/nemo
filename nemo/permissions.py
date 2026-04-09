@@ -270,8 +270,8 @@ def build_permission_handler(
       else:
         update_card(token, msg_id, build_card(
           "Denied ✗", body=body, color="red"))
-    except Exception:
-      pass
+    except Exception as e:
+      log.warning("Failed to update permission card: %s", e)
 
     if decision in ("allow", "always"):
       return PermissionResultAllow()

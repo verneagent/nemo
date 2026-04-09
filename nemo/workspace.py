@@ -30,8 +30,8 @@ def get_machine_name() -> str:
       name = data.get("System", {}).get("System", {}).get("ComputerName")
       if name:
         return name
-    except Exception:
-      pass
+    except Exception as e:
+      log.debug("Failed to read machine name from plist: %s", e)
   return socket.gethostname().split(".")[0]
 
 
@@ -120,8 +120,8 @@ def _find_local_nemo_pids(chat_id: str) -> list[int]:
       cmd = parts[1]
       if "--chat-id" in cmd and chat_id in cmd:
         pids.append(pid)
-  except Exception:
-    pass
+  except Exception as e:
+    log.debug("Failed to scan for local nemo pids: %s", e)
   return pids
 
 

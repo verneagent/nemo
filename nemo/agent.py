@@ -86,8 +86,8 @@ async def _handle_turn_error(
       err_card = cards.build_card("Error", body=f"**{message}**", color="red")
       msg_id = await channel.send_card(chat_id, err_card)
       db.record_sent(msg_id, text=message[:500], chat_id=chat_id)
-  except Exception:
-    pass
+  except Exception as e:
+    log.warning("Failed to send error card: %s", e)
 
 
 async def _handle_diag(
@@ -114,8 +114,8 @@ async def _handle_diag(
       results.append("Send card: OK")
       try:
         await channel.delete_message(msg_id)
-      except Exception:
-        pass
+      except Exception as e:
+        log.debug("Failed to delete diag test message: %s", e)
     else:
       results.append("Send card: FAIL (no msg_id)")
   except Exception as e:
@@ -286,8 +286,8 @@ async def main_loop(
     err_card = cards.build_card("Error", body=f"```\n{e}\n```", color="red")
     try:
       await channel.send_card(chat_id, err_card)
-    except Exception:
-      pass
+    except Exception as e:
+      log.warning("Failed to send SDK startup error card: %s", e)
     # Continue into the main loop — run_turn_with_reconnect will
     # attempt to reconnect when the user sends a message.
 
@@ -491,8 +491,8 @@ async def main_loop(
                 open_id = str(m.get("member_id", ""))
                 name = mname  # Use canonical name
                 break
-          except Exception:
-            pass
+          except Exception as e:
+            log.warning("Failed to get chat members for guest add: %s", e)
           if open_id:
             add_guest(channel.token, chat_id, open_id, name=name, role=role)
             await _send_response(channel, chat_id, f"Added **{name}** as **{role}**.", db)
@@ -551,8 +551,8 @@ async def main_loop(
             elapsed=int(time.time() - _turn_start),
           )
           await channel.update_card(_turn_card_id, card)
-        except Exception:
-          pass
+        except Exception as e:
+          log.warning("Failed to update interrupt card: %s", e)
 
       def _await_channel(coro):
         return asyncio.run_coroutine_threadsafe(coro, main_loop_ref).result()
@@ -592,8 +592,8 @@ async def main_loop(
           )
           try:
             _await_channel(channel.update_card(_turn_card_id, card))
-          except Exception:
-            pass
+          except Exception as e:
+            log.debug("Failed to update working card: %s", e)
 
         if isinstance(event, (ToolStartEvent, ToolProgressEvent)):
           _turn_steps.append(cards.ThinkingStep("tool", event.tool.summary))
@@ -634,8 +634,8 @@ async def main_loop(
             )
             try:
               _await_channel(channel.update_card(_turn_card_id, card))
-            except Exception:
-              pass
+            except Exception as e:
+              log.warning("Failed to update done card: %s", e)
             db.clear_working(session_id)
           else:
             # Pure text response with no tools and no card created
@@ -860,8 +860,8 @@ async def main_loop(
         err_card = cards.build_card("Error", body=f"```\n{str(e)[:500]}\n```", color="red")
         msg_id = await channel.send_card(chat_id, err_card)
         db.record_sent(msg_id, text=str(e)[:500], chat_id=chat_id)
-      except Exception:
-        pass
+      except Exception as e2:
+        log.warning("Failed to send loop error card: %s", e2)
       await asyncio.sleep(5)
 
   # Cleanup — all threads are daemon, so fire-and-forget is safe.

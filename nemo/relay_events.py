@@ -256,8 +256,8 @@ class RelayEventStream:
         if ws:
             try:
                 ws.close()
-            except Exception:
-                pass
+            except Exception as e:
+                log.debug("ws.close() during shutdown: %s", e)
         await self._queue.put(LarkEvent(event_type="_stop"))
         if self._bg_thread:
             self._bg_thread.join(timeout=1)

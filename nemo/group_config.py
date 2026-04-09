@@ -112,8 +112,8 @@ def _find_config_pin(token: str, chat_id: str) -> tuple[str, JsonObject] | None:
           try:
             lark_api.delete_pin(token, msg_id)
             lark_api.delete_message(token, msg_id)
-          except Exception:
-            pass
+          except Exception as e:
+            log.warning("Failed to delete duplicate config pin %s: %s", msg_id, e)
     except Exception:
       continue
   return found
@@ -140,8 +140,8 @@ def _update_config_pin(token: str, chat_id: str,
   try:
     lark_api.delete_pin(token, pin_msg_id)
     lark_api.delete_message(token, pin_msg_id)
-  except Exception:
-    pass
+  except Exception as e:
+    log.warning("Failed to delete old config pin %s: %s", pin_msg_id, e)
   return _create_config_pin(token, chat_id, config)
 
 

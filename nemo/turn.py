@@ -226,8 +226,8 @@ async def run_turn(
         stale_tasks.add(tid)
         try:
           await client.stop_task(tid)
-        except Exception:
-          pass
+        except Exception as e:
+          log.warning("Failed to stop stale task %s: %s", tid, e)
       pending_tasks.clear()
       break  # ResultMessage is the final message — don't wait for StopAsyncIteration
 

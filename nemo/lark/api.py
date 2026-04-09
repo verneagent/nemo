@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import time
 import urllib.error
 import urllib.request
+
+log = logging.getLogger(__name__)
 
 from ..types import JsonObject
 
@@ -255,8 +258,8 @@ def remove_reaction(token: str, message_id: str, reaction_id: str) -> None:
   url = f"{BASE_URL}/im/v1/messages/{message_id}/reactions/{reaction_id}"
   try:
     _request(url, token, method="DELETE")
-  except Exception:
-    pass
+  except Exception as e:
+    log.debug("Failed to remove reaction %s from %s: %s", reaction_id, message_id, e)
 
 
 # ---------------------------------------------------------------------------
