@@ -746,13 +746,6 @@ async def main_loop(
           except Exception as exc:
             log.warning("SDK interrupt failed (%s), cancelling task", exc)
             sdk_task.cancel()
-          # Reset SDK client — timeout so stop is never stuck
-          try:
-            await asyncio.wait_for(
-              _restart_client(resume=_sdk_session_id), timeout=15)
-            log.info("SDK client reset after stop")
-          except Exception as exc:
-            log.warning("SDK reset after stop failed: %s", exc)
           await _send_response(channel, chat_id, "Operation cancelled.", db)
           _update_interrupt_card("stopped")
 
