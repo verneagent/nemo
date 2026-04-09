@@ -491,7 +491,7 @@ async def main_loop(
       _turn_current_tool = ""
       _turn_interrupt_phase: str | None = None
 
-      def _update_interrupt_card(phase: str) -> None:
+      async def _update_interrupt_card(phase: str) -> None:
         nonlocal _turn_card_id, _turn_interrupt_phase
         if not _turn_card_id:
           return
@@ -503,7 +503,7 @@ async def main_loop(
             current_tool=_turn_current_tool,
             elapsed=int(time.time() - _turn_start),
           )
-          _await_channel(channel.update_card(_turn_card_id, card))
+          await channel.update_card(_turn_card_id, card)
         except Exception:
           pass
 
@@ -741,7 +741,7 @@ async def main_loop(
         if signal_detected in ("esc", "stop"):
           log.info("Stop signal received — interrupting SDK")
           await _clear_ack()
-          _update_interrupt_card("stopping")
+          await _update_interrupt_card("stopping")
           try:
             await agent.interrupt()
             await asyncio.wait_for(sdk_task, timeout=10)
@@ -750,7 +750,7 @@ async def main_loop(
             log.warning("SDK interrupt failed (%s), cancelling task", exc)
             sdk_task.cancel()
           await _send_response(channel, chat_id, "Operation cancelled.", db)
-          _update_interrupt_card("stopped")
+          await _update_interrupt_card("stopped")
 
         elif signal_detected in ("exit", "dissolve"):
           await _clear_ack()
