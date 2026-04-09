@@ -287,12 +287,14 @@ async def main_loop(
       if reply is None:
         continue  # Timeout, keep waiting
 
-      log.debug("Event: type=%s chat=%s sender=%s msg_type=%s text=%r",
-                reply.event_type, reply.chat_id, reply.sender_id,
-                reply.msg_type, reply.text[:80] if reply.text else "")
+      log.info("Event: type=%s chat=%s sender=%s text=%r",
+               reply.event_type, reply.chat_id[:16] if reply.chat_id else "?",
+               reply.sender_id[:16] if reply.sender_id else "?",
+               reply.text[:60] if reply.text else "")
 
       # Skip card action events at top level (handled during turns)
       if reply.event_type == "card.action.trigger":
+        log.info("Ignoring card action outside turn: %s", reply.action_value)
         continue
 
       # Scope to this session's chat (WebSocket receives all chats)
@@ -708,13 +710,22 @@ async def main_loop(
 
       if watcher in done_tasks and signal_detected:
         if signal_detected in ("esc", "stop"):
+          log.info("Stop signal received — interrupting SDK")
           await _clear_ack()
           _update_interrupt_card("stopping")
           try:
             await agent.interrupt()
             await asyncio.wait_for(sdk_task, timeout=30)
-          except Exception:
+            log.info("SDK turn interrupted cleanly")
+          except Exception as exc:
+            log.warning("SDK interrupt failed (%s), cancelling task", exc)
             sdk_task.cancel()
+          # Reset SDK client to ensure clean state for next turn
+          try:
+            await _restart_client(resume=_sdk_session_id)
+            log.info("SDK client reset after stop")
+          except Exception as exc:
+            log.warning("SDK reset after stop failed: %s", exc)
           await _send_response(channel, chat_id, "Operation cancelled.", db)
           _update_interrupt_card("stopped")
 
