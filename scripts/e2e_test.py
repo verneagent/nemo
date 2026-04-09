@@ -1263,7 +1263,8 @@ def run_media_tests(pid: int, chat_id: str, result: TestResult) -> None:
 def main():
   import argparse
   parser = argparse.ArgumentParser(description="Nemo E2E test runner")
-  parser.add_argument("--chat-id", default=DEFAULT_CHAT_ID, help="Chat ID")
+  parser.add_argument("--chat-id", default="",
+                      help="Chat ID (defaults to a fresh temp group)")
   parser.add_argument("--provider", default="claude", choices=["claude", "codex"],
                       help="Coding agent provider (default: claude)")
   parser.add_argument("--skip-sdk", action="store_true",
@@ -1282,26 +1283,19 @@ def main():
                       help="Verbose nemo logging")
   args = parser.parse_args()
 
-  chat_id = args.chat_id
+  chat_id = args.chat_id.strip()
   result = TestResult()
   single_phase = args.stress or args.project or args.perm or args.dual or args.media
   run_all = not single_phase
+  created_temp_chat = False
 
-  print(f"{Colors.BOLD}Nemo E2E Test Suite{Colors.RESET}")
-  print(f"  Chat: {chat_id}")
-  print(f"  Provider: {args.provider}")
-  print(f"  Project: {PROJECT_DIR}")
-  if args.stress:
-    print(f"  Mode: stress test only")
-  elif args.project:
-    print(f"  Mode: project flow only")
-  elif args.perm:
-    print(f"  Mode: permission test only")
-  elif args.dual:
-    print(f"  Mode: dual-instance test only")
-  elif args.media:
-    print(f"  Mode: media & interaction test only")
-  print()
+  def _cleanup_temp_chat() -> None:
+    if created_temp_chat and chat_id:
+      dissolve_temp_group(chat_id)
+
+  def _finish(code: int) -> int:
+    _cleanup_temp_chat()
+    return code
 
   # ---- Phase 0: Setup ----
   print(f"{Colors.BOLD}Phase 0: Setup{Colors.RESET}")
@@ -1324,7 +1318,39 @@ def main():
     print("  Message mode: relay injection (no user token)")
   else:
     print(f"{Colors.RED}Missing user token and no relay_verify_token{Colors.RESET}")
-    return 1
+    return _finish(1)
+
+  if not chat_id:
+    print("  Creating fresh temp group...")
+    chat_id = create_temp_group("nemo-e2e")
+    if not chat_id:
+      print(f"{Colors.RED}  Failed to create temp group{Colors.RESET}")
+      return _finish(1)
+    created_temp_chat = True
+    print(f"  Temp chat: {chat_id}")
+
+  print()
+  print(f"{Colors.BOLD}Nemo E2E Test Suite{Colors.RESET}")
+  print(f"  Chat: {chat_id}")
+  print(f"  Provider: {args.provider}")
+  print(f"  Project: {PROJECT_DIR}")
+  if created_temp_chat:
+    print("  Chat mode: fresh temp group")
+  elif chat_id == DEFAULT_CHAT_ID:
+    print("  Chat mode: shared default group")
+  else:
+    print("  Chat mode: explicit custom group")
+  if args.stress:
+    print(f"  Mode: stress test only")
+  elif args.project:
+    print(f"  Mode: project flow only")
+  elif args.perm:
+    print(f"  Mode: permission test only")
+  elif args.dual:
+    print(f"  Mode: dual-instance test only")
+  elif args.media:
+    print(f"  Mode: media & interaction test only")
+  print()
 
   # Dual-instance manages its own processes
   if args.dual:
@@ -1332,7 +1358,7 @@ def main():
     run_dual_instance(chat_id, result, verbose=args.verbose)
     print()
     ok = result.summary()
-    return 0 if ok else 1
+    return _finish(0 if ok else 1)
 
   # Start nemo for other phases
   # NOTE: can_use_tool callback requires CLI support for --permission-prompt-tool
@@ -1350,7 +1376,7 @@ def main():
           f"{Colors.RESET}")
     LogAnalyzer(pid).dump_tail(15, "startup")
     kill_nemo(pid)
-    return 1
+    return _finish(1)
   print("  Nemo ready")
   print()
 
@@ -1477,7 +1503,7 @@ def main():
         result.fail("T14 restart", "failed to start")
         kill_nemo(pid2)
         result.summary()
-        return 1 if result.failed else 0
+        return _finish(1 if result.failed else 0)
 
       try:
         if not args.skip_sdk:
@@ -1533,7 +1559,7 @@ def main():
           print(f"{Colors.RED}  Failed to start nemo for advanced phases"
                 f"{Colors.RESET}")
           result.summary()
-          return 1 if result.failed else 0
+          return _finish(1 if result.failed else 0)
         print(f"  PID: {pid}")
         print()
 
@@ -1606,17 +1632,17 @@ def main():
   except KeyboardInterrupt:
     print(f"\n{Colors.YELLOW}Interrupted{Colors.RESET}")
     kill_nemo(pid)
-    return 1
+    return _finish(1)
   except Exception as e:
     print(f"\n{Colors.RED}Unexpected error: {e}{Colors.RESET}")
     import traceback
     traceback.print_exc()
     kill_nemo(pid)
-    return 1
+    return _finish(1)
 
   print()
   ok = result.summary()
-  return 0 if ok else 1
+  return _finish(0 if ok else 1)
 
 
 if __name__ == "__main__":
