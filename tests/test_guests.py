@@ -211,3 +211,79 @@ def test_guest_add_missing_name():
   handled, resp = try_dispatch("/guest add", _ctx())
   assert handled
   assert "Usage" in resp
+
+
+# ---------------------------------------------------------------------------
+# /guest add with coowner role
+# ---------------------------------------------------------------------------
+
+def test_guest_add_coowner():
+  """/guest add Alice coowner produces __guest_add__:coowner:Alice."""
+  handled, resp = try_dispatch("/guest add Alice coowner", _ctx())
+  assert handled
+  assert resp == "__guest_add__:coowner:Alice"
+
+
+def test_guest_add_coowner_case_insensitive():
+  """/guest add Alice Coowner (mixed case) still resolves to coowner."""
+  handled, resp = try_dispatch("/guest add Alice Coowner", _ctx())
+  assert handled
+  assert resp == "__guest_add__:coowner:Alice"
+
+
+def test_guest_add_default_role():
+  """/guest add Alice (no role) defaults to guest."""
+  handled, resp = try_dispatch("/guest add Alice", _ctx())
+  assert handled
+  assert resp == "__guest_add__:guest:Alice"
+
+
+def test_guest_add_unknown_role_ignored():
+  """/guest add Alice admin — unknown role word is ignored, defaults to guest."""
+  handled, resp = try_dispatch("/guest add Alice admin", _ctx())
+  assert handled
+  assert resp == "__guest_add__:guest:Alice"
+
+
+# ---------------------------------------------------------------------------
+# Token round-trip: parsing tokens back into role + name
+# ---------------------------------------------------------------------------
+
+def test_guest_add_token_roundtrip_guest():
+  """Token from /guest add Alice can be split back into role='guest', name='Alice'."""
+  _, token = try_dispatch("/guest add Alice", _ctx())
+  assert token.startswith("__guest_add__:")
+  _, rest = token.split(":", 1)
+  role, name = rest.split(":", 1)
+  assert role == "guest"
+  assert name == "Alice"
+
+
+def test_guest_add_token_roundtrip_coowner():
+  """Token from /guest add Alice coowner can be split back into role='coowner', name='Alice'."""
+  _, token = try_dispatch("/guest add Alice coowner", _ctx())
+  assert token.startswith("__guest_add__:")
+  _, rest = token.split(":", 1)
+  role, name = rest.split(":", 1)
+  assert role == "coowner"
+  assert name == "Alice"
+
+
+def test_guest_remove_token_roundtrip():
+  """Token from /guest remove Bob can be split back into name='Bob'."""
+  _, token = try_dispatch("/guest remove Bob", _ctx())
+  assert token.startswith("__guest_remove__:")
+  name = token.split(":", 1)[1]
+  assert name == "Bob"
+
+
+def test_guest_add_name_with_no_extra_colons():
+  """Ensure the token format has exactly the expected structure (no stray colons)."""
+  _, token = try_dispatch("/guest add Charlie coowner", _ctx())
+  # Format: __guest_add__:coowner:Charlie — split on first ':' gives prefix + rest
+  prefix, rest = token.split(":", 1)
+  assert prefix == "__guest_add__"
+  parts = rest.split(":", 1)
+  assert len(parts) == 2
+  assert parts[0] == "coowner"
+  assert parts[1] == "Charlie"
