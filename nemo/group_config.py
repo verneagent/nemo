@@ -37,7 +37,7 @@ DEFAULT_CONFIG: JsonObject = {
   "rules": {},
 }
 
-_VALID_KEYS = {"guests", "autoapprove", "rules", "active_pid", "need_mention"}
+_VALID_KEYS = {"guests", "autoapprove", "rules", "need_mention"}
 _save_lock = threading.Lock()
 
 

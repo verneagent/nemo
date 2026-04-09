@@ -274,7 +274,17 @@ async def main_loop(
   _sdk_session_id: str = _resume_sdk_id
   if _sdk_session_id:
     log.info("Resuming SDK session %s", _sdk_session_id[:8])
-  await agent.start(project_dir, model, resume=_sdk_session_id)
+  try:
+    await agent.start(project_dir, model, resume=_sdk_session_id)
+  except Exception as e:
+    log.error("SDK startup failed: %s", e)
+    err_card = cards.build_card("Error", body=f"```\n{e}\n```", color="red")
+    try:
+      await channel.send_card(chat_id, err_card)
+    except Exception:
+      pass
+    # Continue into the main loop — run_turn_with_reconnect will
+    # attempt to reconnect when the user sends a message.
 
   # Context
   ctx = commands.AgentContext(model, project_dir, time.time())

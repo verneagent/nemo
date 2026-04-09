@@ -51,6 +51,7 @@ Lark-connected coding agent daemon. Repo focus:
 
 ## Validation
 
+- Bug fixes must include a test case that covers the fix.
 - Minimum regression pass after core changes:
   ```bash
   pytest tests/test_main.py tests/test_interfaces.py tests/test_permissions.py tests/test_turn.py -q

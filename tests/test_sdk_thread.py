@@ -273,6 +273,65 @@ class TestRunTurnWithReconnect:
     assert result == expected
     assert turn_calls == 3
 
+  def test_retries_on_not_connected(self, sdk_thread: SDKThread):
+    """Should reconnect when client is not connected (RuntimeError)."""
+    expected = (0.5, {})
+    call_count = 0
+
+    async def fake_turn(prompt, on_event, stale_tasks=None):
+      nonlocal call_count
+      call_count += 1
+      if call_count < 2:
+        raise RuntimeError("SDK client not connected")
+      return expected
+
+    sdk_thread._client = mock.MagicMock()
+
+    with mock.patch.object(sdk_thread, "run_turn", side_effect=fake_turn):
+      with mock.patch.object(sdk_thread, "reconnect", new_callable=mock.AsyncMock):
+        result = _run(sdk_thread.run_turn_with_reconnect(
+          "hello", on_event=lambda e: None,
+          options=mock.MagicMock(), max_attempts=3,
+        ))
+
+    assert result == expected
+    assert call_count == 2
+
+  def test_not_connected_raises_after_max_attempts(self, sdk_thread: SDKThread):
+    """Should raise after exhausting all reconnect attempts for not-connected."""
+    async def fake_turn(prompt, on_event, stale_tasks=None):
+      raise RuntimeError("SDK client not connected")
+
+    with mock.patch.object(sdk_thread, "run_turn", side_effect=fake_turn):
+      with mock.patch.object(sdk_thread, "reconnect", new_callable=mock.AsyncMock):
+        with pytest.raises(RuntimeError, match="not connected"):
+          _run(sdk_thread.run_turn_with_reconnect(
+            "hello", on_event=lambda e: None,
+            options=mock.MagicMock(), max_attempts=3,
+          ))
+
+  def test_other_runtime_error_not_retried(self, sdk_thread: SDKThread):
+    """RuntimeError without 'not connected' should not be retried."""
+    call_count = 0
+
+    async def fake_turn(prompt, on_event, stale_tasks=None):
+      nonlocal call_count
+      call_count += 1
+      raise RuntimeError("some other error")
+
+    sdk_thread._client = mock.MagicMock()
+
+    with mock.patch.object(sdk_thread, "run_turn", side_effect=fake_turn):
+      with mock.patch.object(sdk_thread, "reconnect", new_callable=mock.AsyncMock) as mock_reconn:
+        with pytest.raises(RuntimeError, match="some other error"):
+          _run(sdk_thread.run_turn_with_reconnect(
+            "hello", on_event=lambda e: None,
+            options=mock.MagicMock(), max_attempts=3,
+          ))
+
+    assert call_count == 1
+    mock_reconn.assert_not_awaited()
+
 
 # ---------------------------------------------------------------------------
 # 7. interrupt dispatches to SDK thread

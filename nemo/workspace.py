@@ -4,9 +4,9 @@ The workspace ID is `{machine}-{folder}` and is stored in the Lark
 group description as `workspace:{id}`. This lets nemo auto-discover
 which chat to connect to based on the current project directory.
 
-Groups are tracked as idle/occupied via `active_pid` in the config card.
-On startup nemo picks an idle group (or creates one). On shutdown it
-clears the PID to mark the group idle again.
+Groups are tracked as idle/occupied via relay heartbeat (cross-device)
+or local process-table scan (fallback). On startup nemo picks an idle
+group (or creates one).
 """
 
 from __future__ import annotations
@@ -82,6 +82,44 @@ def _is_pid_alive(pid: int) -> bool:
     return True  # Can't verify — assume alive to be safe
 
 
+def _find_local_nemo_pids(chat_id: str) -> list[int]:
+  """Find local nemo processes targeting the given chat_id.
+
+  Scans the process table for nemo commands containing --chat-id <chat_id>.
+  Returns PIDs excluding the current process.
+  """
+  import subprocess
+
+  my_pid = os.getpid()
+  pids: list[int] = []
+  try:
+    result = subprocess.run(
+      ["ps", "ax", "-o", "pid=,command="],
+      capture_output=True, text=True, timeout=5,
+    )
+    for line in result.stdout.splitlines():
+      line = line.strip()
+      if not line:
+        continue
+      if "nemo" not in line or chat_id not in line:
+        continue
+      parts = line.split(None, 1)
+      if len(parts) < 2:
+        continue
+      try:
+        pid = int(parts[0])
+      except ValueError:
+        continue
+      if pid == my_pid:
+        continue
+      cmd = parts[1]
+      if "--chat-id" in cmd and chat_id in cmd:
+        pids.append(pid)
+  except Exception:
+    pass
+  return pids
+
+
 def _find_workspace_groups(token: str, project_dir: str) -> list[dict[str, str]]:
   """Find all Lark groups tagged with this project's workspace ID.
 
@@ -120,7 +158,7 @@ def _is_group_idle(token: str, chat_id: str) -> bool:
 
   Strategy:
   1. If relay is configured, use heartbeat (works cross-device).
-  2. Fall back to PID-based check (local machine only).
+  2. Fall back to local process-table scan.
   """
   from .config import load_relay_config
 
@@ -131,18 +169,9 @@ def _is_group_idle(token: str, chat_id: str) -> bool:
     log.debug("Relay heartbeat for %s: alive=%s", chat_id, alive)
     return not alive
 
-  # Fallback: PID-based (local machine only)
-  from .group_config import load_config
-
-  try:
-    config = load_config(token, chat_id)
-  except Exception:
-    return True  # Can't read config → treat as idle
-
-  pid = config.get("active_pid", 0)
-  if not pid:
-    return True
-  return not _is_pid_alive(int(pid))
+  # Fallback: scan local process table for nemo targeting this chat
+  pids = _find_local_nemo_pids(chat_id)
+  return len(pids) == 0
 
 
 def discover_chat_id(token: str, project_dir: str) -> str | None:
@@ -269,24 +298,19 @@ def discover_or_create_chat(token: str, project_dir: str,
 def evict_existing(token: str, chat_id: str) -> None:
   """If another nemo process occupies this group, stop it before we start.
 
-  Checks both local PID and relay heartbeat. For local processes, sends
-  SIGTERM. For remote (relay-only), sends a stop signal via relay.
+  Checks local process table and relay heartbeat. For local processes,
+  sends SIGTERM. For remote (relay-only), sends a stop signal via relay.
   """
   from .config import load_relay_config
-  from .group_config import load_config
 
-  my_pid = os.getpid()
-
-  # 1. Check local PID in config card
-  try:
-    config = load_config(token, chat_id)
-    old_pid = int(config.get("active_pid", 0))
-    if old_pid and old_pid != my_pid and _is_pid_alive(old_pid):
+  # 1. Check local process table for nemo targeting this chat
+  local_pids = _find_local_nemo_pids(chat_id)
+  for old_pid in local_pids:
+    if _is_pid_alive(old_pid):
       log.info("Stopping existing nemo process (pid=%d)", old_pid)
       import signal as _signal
       try:
         os.kill(old_pid, _signal.SIGTERM)
-        # Wait up to 15s for it to exit
         import time
         for _ in range(30):
           if not _is_pid_alive(old_pid):
@@ -298,9 +322,6 @@ def evict_existing(token: str, chat_id: str) -> None:
           os.kill(old_pid, _signal.SIGKILL)
       except OSError:
         pass  # Already exited
-      return
-  except Exception as e:
-    log.debug("PID check failed: %s", e)
 
   # 2. Check relay heartbeat (covers remote processes)
   relay_url, _ = load_relay_config()
@@ -310,7 +331,6 @@ def evict_existing(token: str, chat_id: str) -> None:
       log.info("Relay shows chat occupied — sending stop signal")
       try:
         relay_client.send_stop(chat_id)
-        # Wait for heartbeat to expire
         import time
         for _ in range(10):
           time.sleep(1)
@@ -325,14 +345,9 @@ def evict_existing(token: str, chat_id: str) -> None:
 
 def claim_group(token: str, chat_id: str,
                 model: str = "", machine: str = "") -> None:
-  """Mark this group as occupied.
-
-  Sends relay heartbeat (cross-device) and writes PID to config card (local fallback).
-  """
+  """Mark this group as occupied via relay heartbeat."""
   from .config import load_relay_config
-  from .group_config import load_config, save_config
 
-  # Relay heartbeat
   relay_url, _ = load_relay_config()
   if relay_url:
     from . import relay as relay_client
@@ -340,39 +355,18 @@ def claim_group(token: str, chat_id: str,
       machine = get_machine_name()
     relay_client.send_heartbeat(chat_id, pid=os.getpid(),
                                 model=model, machine=machine)
-
-  # Config card PID (local fallback)
-  try:
-    config = load_config(token, chat_id)
-    config["active_pid"] = os.getpid()
-    save_config(token, chat_id, config)
-    log.info("Claimed group %s (pid=%d)", chat_id, os.getpid())
-  except Exception as e:
-    log.warning("Failed to claim group: %s", e)
+  log.info("Claimed group %s (pid=%d)", chat_id, os.getpid())
 
 
 def release_group(token: str, chat_id: str) -> None:
-  """Mark this group as idle.
-
-  Releases relay heartbeat and clears PID in config card.
-  """
+  """Mark this group as idle by releasing relay heartbeat."""
   from .config import load_relay_config
-  from .group_config import load_config, save_config
 
-  # Release relay heartbeat
   relay_url, _ = load_relay_config()
   if relay_url:
     from . import relay as relay_client
     relay_client.release_heartbeat(chat_id)
-
-  # Clear config card PID
-  try:
-    config = load_config(token, chat_id)
-    config["active_pid"] = 0
-    save_config(token, chat_id, config)
-    log.info("Released group %s", chat_id)
-  except Exception as e:
-    log.warning("Failed to release group: %s", e)
+  log.info("Released group %s", chat_id)
 
 
 def ensure_workspace_tag(token: str, chat_id: str, project_dir: str) -> None:
