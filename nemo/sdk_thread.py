@@ -81,8 +81,8 @@ class SDKThread:
           log.warning("SDK connect attempt %d/%d failed: %s", attempt, MAX_CONNECT_ATTEMPTS, e)
           try:
             await c.__aexit__(None, None, None)
-          except Exception:
-            pass
+          except Exception as close_err:
+            log.warning("Failed to close client after connect failure: %s", close_err)
           if attempt == MAX_CONNECT_ATTEMPTS:
             raise RuntimeError(f"SDK connect failed after {MAX_CONNECT_ATTEMPTS} attempts") from e
           await asyncio.sleep(2)
@@ -107,8 +107,8 @@ class SDKThread:
 
       try:
         await asyncio.wait_for(client.__aexit__(None, None, None), timeout=5)
-      except Exception:
-        pass
+      except Exception as e:
+        log.warning("SDK client __aexit__ failed: %s", e)
 
       # Ensure CLI subprocess is dead
       if cli_pid:
