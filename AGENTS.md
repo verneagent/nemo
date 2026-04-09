@@ -11,6 +11,7 @@ Lark-connected coding agent daemon. Repo focus:
 - Prefer relay-backed event delivery. Direct Lark 长连接 is only a fallback when relay is not configured.
 - Preserve the one-card-per-turn model: turn cards evolve through PATCH instead of emitting a new card for each phase.
 - Keep turn execution event-driven. `run_turn()` should emit typed events and the main loop should react to them.
+- Stop/esc only interrupts the current turn — do not reset or restart the SDK client. Session and conversation context must be preserved (match CLI Escape behavior).
 
 ## Runtime Notes
 
