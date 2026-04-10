@@ -79,10 +79,10 @@ def test_collapsible_thinking_mixed():
   assert panel["header"]["title"]["content"] == "Thinking (4)"
   content = panel["elements"][0]["content"]
   assert "Let me check..." in content
-  assert "**Read**" in content
+  assert "Read:" in content
   assert "main.py" in content
   assert "Found the issue" in content
-  assert "**Edit**" in content
+  assert "Edit:" in content
 
 
 def test_collapsible_thinking_groups_consecutive_tools():
@@ -91,7 +91,7 @@ def test_collapsible_thinking_groups_consecutive_tools():
   panel = _collapsible_thinking(steps)
   content = panel["elements"][0]["content"]
   # Should be one grouped line, not 7 bullet points
-  assert content.count("**Grep**") == 1
+  assert content.count("Grep:") == 1
   assert "pattern0" in content
   assert "pattern6" in content
 
@@ -106,8 +106,8 @@ def test_collapsible_thinking_separates_different_tool_types():
   ]
   panel = _collapsible_thinking(steps)
   content = panel["elements"][0]["content"]
-  assert content.count("**Read**") == 2  # two separate Read groups
-  assert content.count("**Grep**") == 1
+  assert content.count("Read:") == 2  # two separate Read groups
+  assert content.count("Grep:") == 1
 
 
 def test_collapsible_thinking_escapes_angle_brackets():
@@ -115,7 +115,7 @@ def test_collapsible_thinking_escapes_angle_brackets():
   steps = [ThinkingStep("tool", "Grep: <<<<<<<")]
   panel = _collapsible_thinking(steps)
   content = panel["elements"][0]["content"]
-  assert "<" not in content
+  assert "<<" not in content  # raw pattern stripped
   assert "&lt;" not in content
   assert "‹‹‹‹‹‹‹" in content
 

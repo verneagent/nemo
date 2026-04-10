@@ -179,9 +179,11 @@ def _collapsible_thinking(steps: list[ThinkingStep]) -> JsonObject:
       joined = ", ".join(details)
       if len(joined) > 200:
         joined = joined[:197] + "..."
-      lines.append(f"**{pending_type}** · {_escape_md(joined)}")
+      lines.append(
+        f"<font color='grey'>{pending_type}:</font> {_escape_md(joined)}")
     else:
-      lines.append(f"**{pending_type}** × {len(pending_details)}")
+      lines.append(
+        f"<font color='grey'>{pending_type}</font> × {len(pending_details)}")
 
   for s in steps:
     if s.kind == "tool":
