@@ -114,25 +114,28 @@ def tool_use_summary(tool_name: str, tool_input: JsonObject) -> str:
 # Card V2 builders
 # ---------------------------------------------------------------------------
 
-def _sanitize_markdown(text: str) -> str:
-  """Flatten markdown so Lark card renderer doesn't create nested blocks.
+def _sanitize_markdown_keep_newlines(text: str) -> str:
+  """Flatten markdown tables into bullet-like lines, preserving newlines.
 
-  Removes table pipes/separators and collapses newlines. Lark has a hard
-  limit on tables per card (~10) and long tool output with tables blows it.
+  Lark cards have a hard limit (~3) on tables per card. Convert table
+  rows to `col1 · col2 · col3` text so they still read naturally.
   """
-  # Strip table rows (lines starting with | or containing --- separators)
   lines = []
   for line in text.split("\n"):
     stripped = line.lstrip()
     if stripped.startswith("|") or set(stripped.replace(" ", "").replace("|", "")) <= {"-", ":"}:
-      # Replace table row with inline text, keeping cell content
       cells = [c.strip() for c in stripped.strip("|").split("|")]
       cells = [c for c in cells if c and not set(c) <= {"-", ":"}]
       if cells:
         lines.append(" · ".join(cells))
     else:
       lines.append(line)
-  return " ".join(lines)
+  return "\n".join(lines)
+
+
+def _sanitize_markdown(text: str) -> str:
+  """Same as above but collapses newlines (for inline truncated rendering)."""
+  return " ".join(_sanitize_markdown_keep_newlines(text).split("\n"))
 
 
 def _collapsible_thinking(steps: list[ThinkingStep]) -> JsonObject:
@@ -269,9 +272,9 @@ def build_turn_card(
     }
 
   elif phase == "done":
-    # Final response (inline)
+    # Final response (inline) — sanitize tables (Lark limits ~3 per card)
     if body:
-      elements.append({"tag": "markdown", "content": body})
+      elements.append({"tag": "markdown", "content": _sanitize_markdown_keep_newlines(body)})
     # Thinking timeline
     if steps:
       elements.append(_collapsible_thinking(steps))
