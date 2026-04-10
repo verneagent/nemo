@@ -309,6 +309,14 @@ async def main_loop(
   async def _restart_client(resume: str = ""):
     await agent.reset(project_dir, model, resume=resume)
 
+  # Load guest/coowner roles for authorization
+  from .guests import get_member_roles
+  _member_roles: dict[str, str] = {}
+  try:
+    _member_roles = get_member_roles(channel.token, chat_id)
+  except Exception as e:
+    log.warning("Failed to load member roles: %s", e)
+
   # ---- Main loop: event-driven ----
   while running:
     try:
@@ -340,7 +348,7 @@ async def main_loop(
       if bot_open_id and sender == bot_open_id:
         log.debug("Skipping: own message from bot %s", sender)
         continue  # Skip own messages
-      if not monitor.is_authorized(sender, operator_open_id):
+      if not monitor.is_authorized(sender, operator_open_id, _member_roles):
         log.debug("Skipping: unauthorized sender %s (operator=%s)", sender, operator_open_id)
         continue
 
@@ -495,6 +503,7 @@ async def main_loop(
             log.warning("Failed to get chat members for guest add: %s", e)
           if open_id:
             add_guest(channel.token, chat_id, open_id, name=name, role=role)
+            _member_roles = get_member_roles(channel.token, chat_id)
             await _send_response(channel, chat_id, f"Added **{name}** as **{role}**.", db)
           else:
             await _send_response(channel, chat_id, f"Could not find **{name}** in this group.", db)
@@ -506,6 +515,7 @@ async def main_loop(
           target = next((g for g in guests if g.get("name", "").lower() == name.lower()), None)
           if target:
             remove_guest(channel.token, chat_id, target["open_id"])
+            _member_roles = get_member_roles(channel.token, chat_id)
             await _send_response(channel, chat_id, f"Removed **{name}**.", db)
           else:
             await _send_response(channel, chat_id, f"Guest **{name}** not found.", db)
@@ -750,7 +760,7 @@ async def main_loop(
               signal_detected = "stop"
               return
             if action == "__stop__" and monitor.is_authorized(
-                msg.operator_id, operator_open_id):
+                msg.operator_id, operator_open_id, _member_roles):
               signal_detected = "stop"
               return
             continue
