@@ -642,10 +642,39 @@ async def main_loop(
               elapsed=elapsed, usage=event.usage,
               session_id=_sdk_session_id,
             )
+            _card_update_failed = False
             try:
               _await_channel(channel.update_card(_turn_card_id, card))
             except Exception as e:
               log.warning("Failed to update done card: %s", e)
+              _card_update_failed = True
+            # Fallback: if card update failed (typically table limit), send
+            # the full response as a markdown file and retry with preview.
+            if _card_update_failed and final_text:
+              try:
+                import tempfile
+                file_dir = os.path.join("/tmp/nemo", "nemo-files")
+                os.makedirs(file_dir, exist_ok=True)
+                fd, overflow_path = tempfile.mkstemp(
+                  suffix=".md", prefix="nemo-response-", dir=file_dir)
+                with os.fdopen(fd, "w") as f:
+                  f.write(final_text)
+                # Send as file
+                from .lark import api as lark_api
+                file_key = lark_api.upload_file(channel.token, overflow_path)
+                lark_api.send_file(channel.token, chat_id, file_key)
+                log.info("Sent overflow response as file: %s", overflow_path)
+                # Retry card with a short preview
+                preview = final_text[:500].rsplit("\n", 1)[0]
+                preview += f"\n\n_…full response ({len(final_text)} chars) sent as file_"
+                fallback_card = cards.build_turn_card(
+                  "done", body=preview, steps=thinking,
+                  elapsed=elapsed, usage=event.usage,
+                  session_id=_sdk_session_id,
+                )
+                _await_channel(channel.update_card(_turn_card_id, fallback_card))
+              except Exception as e:
+                log.warning("Failed to send overflow fallback: %s", e)
             db.clear_working(session_id)
             if final_text:
               db.record_sent(_turn_card_id, text=final_text[:500], chat_id=chat_id)

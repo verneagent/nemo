@@ -272,9 +272,9 @@ def build_turn_card(
     }
 
   elif phase == "done":
-    # Final response (inline) — sanitize tables (Lark limits ~3 per card)
+    # Final response (inline)
     if body:
-      elements.append({"tag": "markdown", "content": _sanitize_markdown_keep_newlines(body)})
+      elements.append({"tag": "markdown", "content": body})
     # Thinking timeline
     if steps:
       elements.append(_collapsible_thinking(steps))
