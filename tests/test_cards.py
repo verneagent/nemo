@@ -110,6 +110,34 @@ def test_collapsible_thinking_separates_different_tool_types():
   assert content.count("Grep:") == 1
 
 
+def test_collapsible_thinking_text_separates_groups_with_divider():
+  """Each narrative text starts a new group with a --- divider."""
+  steps = [
+    ThinkingStep("text", "Let me check"),
+    ThinkingStep("tool", "Read: a.py"),
+    ThinkingStep("text", "Now fixing"),
+    ThinkingStep("tool", "Edit: a.py"),
+  ]
+  panel = _collapsible_thinking(steps)
+  content = panel["elements"][0]["content"]
+  assert "---" in content
+  # Divider appears between groups, not at the start
+  assert not content.startswith("---")
+  # Exactly one divider (between the two text blocks)
+  assert content.count("---") == 1
+
+
+def test_collapsible_thinking_no_divider_for_single_group():
+  """A single group (no second text) should have no divider."""
+  steps = [
+    ThinkingStep("text", "Let me check"),
+    ThinkingStep("tool", "Read: a.py"),
+  ]
+  panel = _collapsible_thinking(steps)
+  content = panel["elements"][0]["content"]
+  assert "---" not in content
+
+
 def test_collapsible_thinking_escapes_angle_brackets():
   """Grep patterns with <<<< should not render as &lt;&lt;&lt;."""
   steps = [ThinkingStep("tool", "Grep: <<<<<<<")]

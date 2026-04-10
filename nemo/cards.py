@@ -163,15 +163,18 @@ def _tool_type_and_detail(summary: str) -> tuple[str, str]:
 def _collapsible_thinking(steps: list[ThinkingStep]) -> JsonObject:
   """Build a collapsible_panel with narrative text + grouped tool lines.
 
-  Consecutive tool calls of the same type are merged into one line,
-  e.g. 7 Grep calls become `Grep: pat1, pat2, pat3, ...`.
+  Consecutive tool calls of the same type are merged into one line.
+  Each narrative text starts a new "group"; groups are separated by
+  a horizontal divider.
   """
   lines: list[str] = []
-  # Accumulator for consecutive same-type tool calls
   pending_type: str = ""
   pending_details: list[str] = []
+  # Track whether the current group has any content yet (for divider logic)
+  group_has_content = False
 
   def _flush_tools() -> None:
+    nonlocal group_has_content
     if not pending_type:
       return
     details = [d for d in pending_details if d]
@@ -184,6 +187,7 @@ def _collapsible_thinking(steps: list[ThinkingStep]) -> JsonObject:
     else:
       lines.append(
         f"<font color='grey'>{pending_type}</font> × {len(pending_details)}")
+    group_has_content = True
 
   for s in steps:
     if s.kind == "tool":
@@ -194,19 +198,26 @@ def _collapsible_thinking(steps: list[ThinkingStep]) -> JsonObject:
         _flush_tools()
         pending_type = ttype
         pending_details = [detail]
-    else:
-      # Narrative text or thinking — flush pending tools first
+    elif s.kind == "thinking":
       _flush_tools()
       pending_type = ""
       pending_details = []
       text = _sanitize_markdown(s.content)
-      max_len = 200 if s.kind == "thinking" else 300
-      if len(text) > max_len:
-        text = text[:max_len - 3] + "..."
-      if s.kind == "thinking":
-        lines.append(f"_{_escape_md(text)}_")
-      else:
-        lines.append(_escape_md(text))
+      if len(text) > 200:
+        text = text[:197] + "..."
+      lines.append(f"_{_escape_md(text)}_")
+      group_has_content = True
+    else:  # text — start of a new group
+      _flush_tools()
+      pending_type = ""
+      pending_details = []
+      if group_has_content:
+        lines.append("---")  # horizontal divider
+      text = _sanitize_markdown(s.content)
+      if len(text) > 300:
+        text = text[:297] + "..."
+      lines.append(_escape_md(text))
+      group_has_content = True
   _flush_tools()
 
   content = "\n\n".join(lines) if lines else "_none_"
