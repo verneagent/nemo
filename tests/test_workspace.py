@@ -135,6 +135,87 @@ def test_ensure_workspace_tag_empty_description():
         assert new_desc == "workspace:Mac|/tmp/proj"
 
 
+def test_ensure_workspace_tag_only_garbage():
+  """Description with only fragment junk (no tag) → cleaned + tag added."""
+  with mock.patch("nemo.workspace.get_machine_name", return_value="Mac"):
+    # Only fragments, no current workspace tag at all
+    old_desc = "Mac|/old/path\nOther|/another\n"
+    with mock.patch("nemo.lark.api.get_chat_info",
+                    return_value={"description": old_desc}):
+      with mock.patch("nemo.lark.api.update_chat_info") as mock_update:
+        ensure_workspace_tag("tok", "oc_1", "/tmp/proj")
+        mock_update.assert_called_once()
+        new_desc = mock_update.call_args[0][2]["description"]
+        assert new_desc == "workspace:Mac|/tmp/proj"
+        assert "/old/path" not in new_desc
+        assert "/another" not in new_desc
+
+
+def test_ensure_workspace_tag_strips_new_format_fragment():
+  """A line containing `|/` should be stripped as a new-format fragment."""
+  with mock.patch("nemo.workspace.get_machine_name", return_value="Mac"):
+    old_desc = "Real description line\nStudio|/leftover/path"
+    with mock.patch("nemo.lark.api.get_chat_info",
+                    return_value={"description": old_desc}):
+      with mock.patch("nemo.lark.api.update_chat_info") as mock_update:
+        ensure_workspace_tag("tok", "oc_1", "/tmp/proj")
+        mock_update.assert_called_once()
+        new_desc = mock_update.call_args[0][2]["description"]
+        assert "|/leftover/path" not in new_desc
+        assert "Real description line" in new_desc
+        assert "workspace:Mac|/tmp/proj" in new_desc
+
+
+def test_ensure_workspace_tag_strips_legacy_fragment():
+  """A legacy-format fragment like `Mac-Users-foo-bar` should be stripped."""
+  with mock.patch("nemo.workspace.get_machine_name", return_value="Mac"):
+    old_desc = "Project notes\nMac-Users-foo-bar\nmore notes"
+    with mock.patch("nemo.lark.api.get_chat_info",
+                    return_value={"description": old_desc}):
+      with mock.patch("nemo.lark.api.update_chat_info") as mock_update:
+        ensure_workspace_tag("tok", "oc_1", "/tmp/proj")
+        mock_update.assert_called_once()
+        new_desc = mock_update.call_args[0][2]["description"]
+        assert "Mac-Users-foo-bar" not in new_desc
+        assert "Project notes" in new_desc
+        assert "more notes" in new_desc
+        assert "workspace:Mac|/tmp/proj" in new_desc
+
+
+def test_ensure_workspace_tag_preserves_user_content():
+  """Legitimate user content should be preserved alongside tag update."""
+  with mock.patch("nemo.workspace.get_machine_name", return_value="Mac"):
+    old_desc = (
+      "This is our project group.\n"
+      "Contact: alice@example.com\n"
+      "workspace:Mac|/old/path"
+    )
+    with mock.patch("nemo.lark.api.get_chat_info",
+                    return_value={"description": old_desc}):
+      with mock.patch("nemo.lark.api.update_chat_info") as mock_update:
+        ensure_workspace_tag("tok", "oc_1", "/tmp/proj")
+        mock_update.assert_called_once()
+        new_desc = mock_update.call_args[0][2]["description"]
+        assert "This is our project group." in new_desc
+        assert "Contact: alice@example.com" in new_desc
+        assert "workspace:Mac|/tmp/proj" in new_desc
+        assert "workspace:Mac|/old/path" not in new_desc
+        # Exactly one workspace tag
+        assert new_desc.count("workspace:") == 1
+
+
+def test_ensure_workspace_tag_no_change_skips_update():
+  """When description already matches expected form, no update call made."""
+  with mock.patch("nemo.workspace.get_machine_name", return_value="Mac"):
+    # Description exactly equals cleaned + tag joined by newline
+    old_desc = "Team group\nworkspace:Mac|/tmp/proj"
+    with mock.patch("nemo.lark.api.get_chat_info",
+                    return_value={"description": old_desc}):
+      with mock.patch("nemo.lark.api.update_chat_info") as mock_update:
+        ensure_workspace_tag("tok", "oc_1", "/tmp/proj")
+        mock_update.assert_not_called()
+
+
 # ---------------------------------------------------------------------------
 # auto_create_chat tests
 # ---------------------------------------------------------------------------
