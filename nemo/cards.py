@@ -78,14 +78,17 @@ def _usage_text(usage: JsonObject) -> str:
 # ---------------------------------------------------------------------------
 
 def tool_use_summary(tool_name: str, tool_input: JsonObject) -> str:
-  """Build a one-line summary from a ToolUseBlock."""
+  """Build a short label for a tool call. Format: `{Type}: {detail}`.
+
+  Type prefix lets _collapsible_thinking group consecutive same-type calls.
+  """
   if tool_name == "Bash":
     desc = tool_input.get("description", "")
     cmd = tool_input.get("command", "")
     label = desc or cmd
     if len(label) > 60:
       label = label[:57] + "..."
-    return f"$ {label}"
+    return f"Bash: {label}"
 
   if tool_name in ("Edit", "Write"):
     fp = tool_input.get("file_path", "")
@@ -103,9 +106,13 @@ def tool_use_summary(tool_name: str, tool_input: JsonObject) -> str:
       pattern = pattern[:37] + "..."
     return f"{tool_name}: {pattern}"
 
-  if tool_name == "Agent":
+  if tool_name in ("Agent", "Task"):
     desc = tool_input.get("description", "")
     return f"Agent: {desc}" if desc else "Agent"
+
+  if tool_name == "Skill":
+    name = tool_input.get("skill", "")
+    return f"Skill: {name}" if name else "Skill"
 
   return tool_name
 
@@ -138,25 +145,69 @@ def _sanitize_markdown(text: str) -> str:
   return " ".join(_sanitize_markdown_keep_newlines(text).split("\n"))
 
 
+def _escape_md(text: str) -> str:
+  """Escape markdown special chars that would break rendering."""
+  # Lark markdown escapes < and > to &lt;/&gt; inside code blocks which looks
+  # ugly. Replace with visually similar chars for patterns like `<<<<<<<`.
+  return text.replace("<", "‹").replace(">", "›").replace("*", "\\*")
+
+
+def _tool_type_and_detail(summary: str) -> tuple[str, str]:
+  """Split a tool summary 'Type: detail' into (type, detail)."""
+  if ":" in summary:
+    t, d = summary.split(":", 1)
+    return t.strip(), d.strip()
+  return summary.strip(), ""
+
+
 def _collapsible_thinking(steps: list[ThinkingStep]) -> JsonObject:
-  """Build a collapsible_panel with unified thinking timeline."""
-  lines = []
+  """Build a collapsible_panel with narrative text + grouped tool lines.
+
+  Consecutive tool calls of the same type are merged into one line,
+  e.g. 7 Grep calls become `Grep: pat1, pat2, pat3, ...`.
+  """
+  lines: list[str] = []
+  # Accumulator for consecutive same-type tool calls
+  pending_type: str = ""
+  pending_details: list[str] = []
+
+  def _flush_tools() -> None:
+    if not pending_type:
+      return
+    details = [d for d in pending_details if d]
+    if details:
+      joined = ", ".join(details)
+      if len(joined) > 200:
+        joined = joined[:197] + "..."
+      lines.append(f"**{pending_type}** · {_escape_md(joined)}")
+    else:
+      lines.append(f"**{pending_type}** × {len(pending_details)}")
+
   for s in steps:
     if s.kind == "tool":
-      lines.append(f"- `{s.content}`")
-    elif s.kind == "thinking":
-      # Thinking — render as italic, truncated
-      text = _sanitize_markdown(s.content)
-      if len(text) > 200:
-        text = text[:197] + "..."
-      lines.append(f"- *{text}*")
+      ttype, detail = _tool_type_and_detail(s.content)
+      if ttype == pending_type:
+        pending_details.append(detail)
+      else:
+        _flush_tools()
+        pending_type = ttype
+        pending_details = [detail]
     else:
-      # Text — render as list item (truncate long text)
+      # Narrative text or thinking — flush pending tools first
+      _flush_tools()
+      pending_type = ""
+      pending_details = []
       text = _sanitize_markdown(s.content)
-      if len(text) > 200:
-        text = text[:197] + "..."
-      lines.append(f"- {text}")
-  content = "\n".join(lines) if lines else "_none_"
+      max_len = 200 if s.kind == "thinking" else 300
+      if len(text) > max_len:
+        text = text[:max_len - 3] + "..."
+      if s.kind == "thinking":
+        lines.append(f"_{_escape_md(text)}_")
+      else:
+        lines.append(_escape_md(text))
+  _flush_tools()
+
+  content = "\n\n".join(lines) if lines else "_none_"
   return {
     "tag": "collapsible_panel",
     "expanded": False,

@@ -36,8 +36,8 @@ def test_usage_text():
 # ---------------------------------------------------------------------------
 
 def test_tool_summary_bash():
-  assert tool_use_summary("Bash", {"command": "ls -la"}) == "$ ls -la"
-  assert tool_use_summary("Bash", {"description": "List files"}) == "$ List files"
+  assert tool_use_summary("Bash", {"command": "ls -la"}) == "Bash: ls -la"
+  assert tool_use_summary("Bash", {"description": "List files"}) == "Bash: List files"
 
 
 def test_tool_summary_edit():
@@ -79,26 +79,53 @@ def test_collapsible_thinking_mixed():
   assert panel["header"]["title"]["content"] == "Thinking (4)"
   content = panel["elements"][0]["content"]
   assert "Let me check..." in content
-  assert "- `Read: main.py`" in content
+  assert "**Read**" in content
+  assert "main.py" in content
   assert "Found the issue" in content
-  assert "- `Edit: main.py`" in content
+  assert "**Edit**" in content
 
 
-def test_collapsible_thinking_tools_only():
-  steps = [ThinkingStep("tool", "$ ls"), ThinkingStep("tool", "Read: x.py")]
+def test_collapsible_thinking_groups_consecutive_tools():
+  """7 consecutive Grep calls should merge into one line."""
+  steps = [ThinkingStep("tool", f"Grep: pattern{i}") for i in range(7)]
   panel = _collapsible_thinking(steps)
-  assert panel["header"]["title"]["content"] == "Thinking (2)"
   content = panel["elements"][0]["content"]
-  assert "- `$ ls`" in content
-  assert "- `Read: x.py`" in content
+  # Should be one grouped line, not 7 bullet points
+  assert content.count("**Grep**") == 1
+  assert "pattern0" in content
+  assert "pattern6" in content
+
+
+def test_collapsible_thinking_separates_different_tool_types():
+  """Different tool types should not be grouped together."""
+  steps = [
+    ThinkingStep("tool", "Read: a.py"),
+    ThinkingStep("tool", "Read: b.py"),
+    ThinkingStep("tool", "Grep: foo"),
+    ThinkingStep("tool", "Read: c.py"),
+  ]
+  panel = _collapsible_thinking(steps)
+  content = panel["elements"][0]["content"]
+  assert content.count("**Read**") == 2  # two separate Read groups
+  assert content.count("**Grep**") == 1
+
+
+def test_collapsible_thinking_escapes_angle_brackets():
+  """Grep patterns with <<<< should not render as &lt;&lt;&lt;."""
+  steps = [ThinkingStep("tool", "Grep: <<<<<<<")]
+  panel = _collapsible_thinking(steps)
+  content = panel["elements"][0]["content"]
+  assert "<" not in content
+  assert "&lt;" not in content
+  assert "‹‹‹‹‹‹‹" in content
 
 
 def test_collapsible_thinking_text_truncated():
-  long_text = "x" * 300
+  long_text = "x" * 500
   steps = [ThinkingStep("text", long_text)]
   panel = _collapsible_thinking(steps)
   content = panel["elements"][0]["content"]
-  assert len(content) <= 210  # 200 + "..."
+  assert len(content) <= 310  # 300 + "..."
   assert content.endswith("...")
 
 
