@@ -114,6 +114,27 @@ def tool_use_summary(tool_name: str, tool_input: JsonObject) -> str:
 # Card V2 builders
 # ---------------------------------------------------------------------------
 
+def _sanitize_markdown(text: str) -> str:
+  """Flatten markdown so Lark card renderer doesn't create nested blocks.
+
+  Removes table pipes/separators and collapses newlines. Lark has a hard
+  limit on tables per card (~10) and long tool output with tables blows it.
+  """
+  # Strip table rows (lines starting with | or containing --- separators)
+  lines = []
+  for line in text.split("\n"):
+    stripped = line.lstrip()
+    if stripped.startswith("|") or set(stripped.replace(" ", "").replace("|", "")) <= {"-", ":"}:
+      # Replace table row with inline text, keeping cell content
+      cells = [c.strip() for c in stripped.strip("|").split("|")]
+      cells = [c for c in cells if c and not set(c) <= {"-", ":"}]
+      if cells:
+        lines.append(" · ".join(cells))
+    else:
+      lines.append(line)
+  return " ".join(lines)
+
+
 def _collapsible_thinking(steps: list[ThinkingStep]) -> JsonObject:
   """Build a collapsible_panel with unified thinking timeline."""
   lines = []
@@ -122,13 +143,13 @@ def _collapsible_thinking(steps: list[ThinkingStep]) -> JsonObject:
       lines.append(f"- `{s.content}`")
     elif s.kind == "thinking":
       # Thinking — render as italic, truncated
-      text = s.content.replace("\n", " ")
+      text = _sanitize_markdown(s.content)
       if len(text) > 200:
         text = text[:197] + "..."
       lines.append(f"- *{text}*")
     else:
       # Text — render as list item (truncate long text)
-      text = s.content
+      text = _sanitize_markdown(s.content)
       if len(text) > 200:
         text = text[:197] + "..."
       lines.append(f"- {text}")
