@@ -436,7 +436,6 @@ def ensure_workspace_tag(token: str, chat_id: str, project_dir: str) -> None:
   Removes all existing workspace: tags and writes the current one.
   Skips update if the description already has exactly the right tag.
   """
-  import re
   from .lark import api as lark_api
 
   workspace_tag = f"workspace:{get_workspace_id(project_dir)}"
@@ -445,8 +444,24 @@ def ensure_workspace_tag(token: str, chat_id: str, project_dir: str) -> None:
     info = lark_api.get_chat_info(token, chat_id)
     desc = str(info.get("description", "") or "")
 
-    # Strip all existing workspace tags
-    cleaned = re.sub(r"workspace:\S+", "", desc).strip()
+    # Strip workspace tag lines and any fragment lines left from past
+    # buggy runs. A fragment is a line that contains `|/` (machine-path
+    # separator from the new format) or matches the legacy dash format.
+    import re
+    def _is_fragment(line: str) -> bool:
+      s = line.strip()
+      if "workspace:" in s:
+        return True
+      if "|/" in s:  # new format fragment
+        return True
+      if re.match(r"^[\w ]+-(Users|home)-", s):  # legacy format fragment
+        return True
+      return False
+
+    cleaned_lines = [
+      line for line in desc.split("\n") if not _is_fragment(line)
+    ]
+    cleaned = "\n".join(cleaned_lines).strip()
     # Build new description
     new_desc = f"{cleaned}\n{workspace_tag}".strip() if cleaned else workspace_tag
 

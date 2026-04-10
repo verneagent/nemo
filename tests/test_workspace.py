@@ -105,6 +105,25 @@ def test_ensure_workspace_tag_appends():
         assert "My project group" in new_desc
 
 
+def test_ensure_workspace_tag_machine_name_with_spaces():
+  """Machine name with spaces should not cause tag accumulation."""
+  with mock.patch("nemo.workspace.get_machine_name", return_value="Mac Studio"):
+    # Simulate accumulated description from past buggy runs
+    old_desc = (
+      "Studio|/path\n Studio|/path\n"
+      "workspace:Mac Studio|/path"
+    )
+    with mock.patch("nemo.lark.api.get_chat_info",
+                    return_value={"description": old_desc}):
+      with mock.patch("nemo.lark.api.update_chat_info") as mock_update:
+        ensure_workspace_tag("tok", "oc_1", "/path")
+        mock_update.assert_called_once()
+        new_desc = mock_update.call_args[0][2]["description"]
+        # Should have exactly one workspace tag, no residual lines
+        assert new_desc.count("workspace:") == 1
+        assert "Studio|/path" not in new_desc.replace("workspace:Mac Studio|/path", "")
+
+
 def test_ensure_workspace_tag_empty_description():
   """Should set tag as description when empty."""
   with mock.patch("nemo.workspace.get_machine_name", return_value="Mac"):
