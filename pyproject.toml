@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "captain-nemo"
-version = "0.3.32"
+version = "0.3.33"
 description = "Lark-connected coding agent daemon powered by Claude Agent SDK"
 requires-python = ">=3.14"
 license = "MIT"
@@ -26,6 +26,7 @@ Repository = "https://github.com/verneagent/nemo"
 
 [project.scripts]
 nemo = "nemo.__main__:main"
+nemo-send = "nemo.send:main"
 
 [tool.setuptools.packages.find]
 include = ["nemo*"]

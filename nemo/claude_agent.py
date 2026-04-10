@@ -88,7 +88,10 @@ class ClaudeCodingAgent(CodingAgent):
       "When users ask to do these things in natural language, tell them "
       "the exact slash command to use. Do NOT try to execute them yourself.\n\n"
       "Chat history is stored in a SQLite DB. To find past messages:\n"
-      "  sqlite3 \"$NEMO_DB\" \"SELECT direction, text, datetime(sent_at, 'unixepoch', 'localtime') FROM messages ORDER BY id DESC LIMIT 20;\""
+      "  sqlite3 \"$NEMO_DB\" \"SELECT direction, text, datetime(sent_at, 'unixepoch', 'localtime') FROM messages ORDER BY id DESC LIMIT 20;\"\n\n"
+      "To send an image or file to the user:\n"
+      "  nemo-send image /path/to/screenshot.png\n"
+      "  nemo-send file /path/to/document.pdf"
     )
 
     from .db import _db_path
@@ -98,6 +101,7 @@ class ClaudeCodingAgent(CodingAgent):
       "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
       "HOME": os.environ.get("HOME", ""),
       "USER": os.environ.get("USER", ""),
+      "NEMO_CHAT_ID": self._chat_id,
       "NEMO_DB": db_path,
       "CLAUDE_ENABLE_STREAM_WATCHDOG": "1",
       "CLAUDE_STREAM_IDLE_TIMEOUT_MS": "90000",
