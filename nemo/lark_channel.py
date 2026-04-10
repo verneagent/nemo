@@ -33,14 +33,23 @@ def _to_incoming(event: LarkEvent, token: str = "") -> IncomingMessage:
       log.warning("File download failed: %s", e)
       text = f"[file download failed: {event.file_name or event.file_key}]"
 
-  # Enrich: download images and embed path in text
-  if msg_type == "image" and event.image_key and event.message_id and token:
-    try:
-      path = lark_api.download_image(token, event.message_id, event.image_key)
-      text = f"[image: {path}]" if not text else f"{text}\n[image: {path}]"
-      log.info("Downloaded image: %s -> %s", event.image_key, path)
-    except Exception as e:
-      log.warning("Image download failed: %s", e)
+  # Enrich: download images (pure image or inline in post)
+  # Relay may send multiple keys comma-separated for post messages
+  if event.image_key and event.message_id and token:
+    for img_key in event.image_key.split(","):
+      img_key = img_key.strip()
+      if not img_key:
+        continue
+      try:
+        path = lark_api.download_image(token, event.message_id, img_key)
+        # Replace [image] placeholder with actual path, or append
+        if "[image]" in text:
+          text = text.replace("[image]", f"[image: {path}]", 1)
+        else:
+          text = f"{text}\n[image: {path}]" if text else f"[image: {path}]"
+        log.info("Downloaded image: %s -> %s", img_key, path)
+      except Exception as e:
+        log.warning("Image download failed (%s): %s", img_key, e)
 
   # Enrich: fetch reply parent context
   if event.parent_id and token:

@@ -82,6 +82,35 @@ def test_image_download_failure_graceful(mock_dl):
   assert msg.text  # not empty
 
 
+@mock.patch("nemo.lark_channel.lark_api.download_image", return_value="/tmp/img.png")
+def test_post_with_image_placeholder_replaced(mock_dl):
+  """Post messages with [image] placeholder should replace it with path."""
+  ev = _make_event(msg_type="post", image_key="ik_1", text="[image]\nlook at this")
+  msg = _to_incoming(ev, token=TOKEN)
+  assert "[image: /tmp/img.png]" in msg.text
+  assert "[image]\n" not in msg.text  # placeholder replaced
+
+
+@mock.patch("nemo.lark_channel.lark_api.download_image", return_value="/tmp/img.png")
+def test_post_with_image_no_msg_type_check(mock_dl):
+  """Image key triggers download regardless of msg_type."""
+  ev = _make_event(msg_type="post", image_key="ik_1", text="see this")
+  msg = _to_incoming(ev, token=TOKEN)
+  assert "/tmp/img.png" in msg.text
+
+
+@mock.patch("nemo.lark_channel.lark_api.download_image",
+            side_effect=["/tmp/a.png", "/tmp/b.png"])
+def test_multiple_image_keys(mock_dl):
+  """Comma-separated image keys should all be downloaded."""
+  ev = _make_event(msg_type="post", image_key="ik_1,ik_2",
+                   text="[image] and [image]")
+  msg = _to_incoming(ev, token=TOKEN)
+  assert "/tmp/a.png" in msg.text
+  assert "/tmp/b.png" in msg.text
+  assert mock_dl.call_count == 2
+
+
 # ---------------------------------------------------------------------------
 # Reply (parent_id) enrichment
 # ---------------------------------------------------------------------------
