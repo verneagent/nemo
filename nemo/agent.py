@@ -821,7 +821,7 @@ async def main_loop(
         try:
           await watcher
         except asyncio.CancelledError:
-          pass
+          pass  # expected on watcher cancel
         # Check for errors from run_turn (timeout, rate limit, SDK errors)
         try:
           sdk_task.result()
@@ -870,7 +870,7 @@ async def main_loop(
     try:
       await _heartbeat_task
     except asyncio.CancelledError:
-      pass
+      pass  # expected on shutdown cancel
   # Close SDK, event stream, and Lark API calls all concurrently
   loop = asyncio.get_event_loop()
   cleanup: list = [agent.stop(), channel.stop()]

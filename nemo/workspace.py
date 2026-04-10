@@ -114,7 +114,7 @@ def _find_local_nemo_pids(chat_id: str) -> list[int]:
       try:
         pid = int(parts[0])
       except ValueError:
-        continue
+        continue  # skip non-numeric PID
       if pid == my_pid:
         continue
       cmd = parts[1]
@@ -275,7 +275,7 @@ def _compute_group_name(folder_name: str, machine: str,
         n = int(mid)
         max_n = max(max_n, n)
       except ValueError:
-        pass
+        pass  # non-numeric suffix, skip
   return f"{folder_name}{max_n + 1}@{machine}"
 
 
@@ -325,7 +325,7 @@ def remove_pid_file(chat_id: str) -> None:
   try:
     os.remove(path)
   except FileNotFoundError:
-    pass
+    pass  # already removed or never created
 
 
 def _read_pid_file(chat_id: str) -> int:
@@ -362,7 +362,7 @@ def evict_existing(token: str, chat_id: str) -> None:
         log.warning("Previous process (pid=%d) did not exit, killing", old_pid)
         os.kill(old_pid, _signal.SIGKILL)
     except OSError:
-      pass
+      pass  # process already exited
 
   # 2. Check local process table (fallback for processes without PID file)
   local_pids = _find_local_nemo_pids(chat_id)

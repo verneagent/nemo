@@ -147,7 +147,7 @@ class CodexCodingAgent(CodingAgent):
       try:
         await stderr_task
       except asyncio.CancelledError:
-        pass
+        pass  # cleanup on task cancel
       self._proc = None
 
   async def interrupt(self) -> None:
