@@ -637,6 +637,8 @@ async def main_loop(
             except Exception as e:
               log.warning("Failed to update done card: %s", e)
             db.clear_working(session_id)
+            if final_text:
+              db.record_sent(_turn_card_id, text=final_text[:500], chat_id=chat_id)
           else:
             # Pure text response with no tools and no card created
             if final_text:
