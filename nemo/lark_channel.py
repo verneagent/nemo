@@ -98,6 +98,8 @@ def _extract_message_text(msg: JsonObject) -> str:
     content = json.loads(content_str) if isinstance(content_str, str) else {}
     if msg_type == "text":
       return str(content.get("text", ""))
+    if msg_type == "post":
+      return _extract_post_text(content)
     if msg_type == "file":
       return f"[file: {content.get('file_name', '?')}]"
     if msg_type == "image":
@@ -105,6 +107,36 @@ def _extract_message_text(msg: JsonObject) -> str:
   except (json.JSONDecodeError, TypeError) as e:
     log.debug("Malformed message content (type=%s): %s", msg_type, e)
   return f"[{msg_type}]" if msg_type else ""
+
+
+def _extract_post_text(content: JsonObject) -> str:
+  """Extract text from a post (rich text) message content."""
+  post = content
+  # Post content may be locale-keyed: {"zh_cn": {"title": ..., "content": [...]}}
+  if not isinstance(content.get("content"), list):
+    locale = next(iter(content), None)
+    post = content.get(locale, {}) if locale else {}
+    if not isinstance(post, dict):
+      return "[post]"
+  paragraphs = post.get("content", [])
+  if not isinstance(paragraphs, list):
+    return "[post]"
+  parts: list[str] = []
+  for para in paragraphs:
+    if not isinstance(para, list):
+      continue
+    for elem in para:
+      if not isinstance(elem, dict):
+        continue
+      if elem.get("text"):
+        parts.append(str(elem["text"]))
+      elif elem.get("tag") == "img":
+        parts.append("[image]")
+  title = post.get("title", "")
+  text = "\n".join(parts)
+  if title:
+    text = f"{title}\n{text}"
+  return text or "[post]"
 
 
 def _expand_merge_forward(token: str, message_id: str) -> str:

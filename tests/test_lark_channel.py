@@ -187,6 +187,27 @@ def test_extract_image_message():
   assert _extract_message_text(msg) == "[image]"
 
 
+def test_extract_post_message():
+  content = {"zh_cn": {"title": "Hello", "content": [
+    [{"text": "line one"}, {"tag": "img", "image_key": "ik_1"}],
+    [{"text": "line two"}],
+  ]}}
+  msg = {"msg_type": "post", "body": {"content": json.dumps(content)}}
+  result = _extract_message_text(msg)
+  assert "line one" in result
+  assert "[image]" in result
+  assert "line two" in result
+  assert "Hello" in result
+
+
+def test_extract_post_direct_content():
+  """Post with content directly (not locale-keyed)."""
+  content = {"content": [[{"text": "direct text"}]]}
+  msg = {"msg_type": "post", "body": {"content": json.dumps(content)}}
+  result = _extract_message_text(msg)
+  assert "direct text" in result
+
+
 def test_extract_unknown_type():
   msg = {"msg_type": "sticker", "body": {"content": "{}"}}
   assert _extract_message_text(msg) == "[sticker]"
