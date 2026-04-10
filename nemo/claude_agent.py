@@ -86,13 +86,19 @@ class ClaudeCodingAgent(CodingAgent):
       "- /mention on|off — toggle @mention requirement\n"
       "- /model <name> — switch model\n"
       "When users ask to do these things in natural language, tell them "
-      "the exact slash command to use. Do NOT try to execute them yourself."
+      "the exact slash command to use. Do NOT try to execute them yourself.\n\n"
+      "Chat history is stored in a SQLite DB. To find past messages:\n"
+      "  sqlite3 \"$NEMO_DB\" \"SELECT direction, text, datetime(sent_at, 'unixepoch', 'localtime') FROM messages ORDER BY id DESC LIMIT 20;\""
     )
+
+    from .db import _db_path
+    db_path = _db_path(project_dir)
 
     env = {
       "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
       "HOME": os.environ.get("HOME", ""),
       "USER": os.environ.get("USER", ""),
+      "NEMO_DB": db_path,
       "CLAUDE_ENABLE_STREAM_WATCHDOG": "1",
       "CLAUDE_STREAM_IDLE_TIMEOUT_MS": "90000",
     }
