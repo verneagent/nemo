@@ -110,6 +110,7 @@ def _to_incoming(
     file_key=event.file_key,
     file_name=event.file_name,
     parent_id=event.parent_id,
+    thread_id=event.thread_id,
     create_time=event.create_time,
     action_value=dict(event.action_value),
     action_tag=event.action_tag,
@@ -246,6 +247,14 @@ class LarkChannel(Channel):
     # Optional: agent-supplied lookup to recover text of a quoted message
     # (e.g. from nemo's own DB) when the Lark API can't return it.
     self.parent_lookup: ParentLookup | None = None
+    # Chat mode from Lark API: "group" | "topic" | "p2p" | "". In topic
+    # chats the bot must scope every reply to the current topic, so we
+    # route sends through the /reply endpoint anchored at the latest
+    # inbound message.
+    self._chat_mode: str = ""
+    # Latest inbound message_id seen on self.chat_id. Used as the reply
+    # anchor for thread-scoped sends in topic chats.
+    self._reply_anchor: str = ""
 
   @property
   def token(self) -> str:
@@ -256,6 +265,15 @@ class LarkChannel(Channel):
   async def start(self) -> None:
     # Warm up the token cache
     _ = self.token
+    # Detect chat mode so we know whether to scope sends to a topic.
+    # Missing/unknown modes fall through to the non-topic code paths.
+    try:
+      info = lark_api.get_chat_info(self.token, self.chat_id)
+      self._chat_mode = str(info.get("chat_mode", "") or "")
+      if self._chat_mode:
+        log.info("Chat %s mode=%s", self.chat_id[:16], self._chat_mode)
+    except Exception as e:
+      log.warning("chat_mode detection failed: %s", e)
     relay_url, relay_api_key = load_relay_config()
     if relay_url:
       self._events = RelayEventStream(relay_url, relay_api_key, self.chat_id)
@@ -274,8 +292,19 @@ class LarkChannel(Channel):
     event = await self._events.next_message(timeout=timeout)
     if event is None:
       return None
-    return _to_incoming(
+    incoming = _to_incoming(
       event, token=self.token, parent_lookup=self.parent_lookup)
+    # Remember the latest inbound message on our chat so topic-mode
+    # sends can thread back to it. Only update for events that carry a
+    # real message id on our chat (skip _stop sentinels and events
+    # targeting other chats that leaked through the relay).
+    if (
+      self._chat_mode == "topic"
+      and incoming.message_id
+      and incoming.chat_id == self.chat_id
+    ):
+      self._reply_anchor = incoming.message_id
+    return incoming
 
   def push_back(self, message: IncomingMessage) -> None:
     if self._events is None:
@@ -293,6 +322,7 @@ class LarkChannel(Channel):
       file_key=message.file_key,
       file_name=message.file_name,
       parent_id=message.parent_id,
+      thread_id=message.thread_id,
       create_time=message.create_time,
       action_value=dict(message.action_value),
       action_tag=message.action_tag,
@@ -311,13 +341,32 @@ class LarkChannel(Channel):
         return fn(self.token, *args)
       raise
 
+  def _should_thread(self, chat_id: str) -> bool:
+    return (
+      self._chat_mode == "topic"
+      and bool(self._reply_anchor)
+      and chat_id == self.chat_id
+    )
+
   async def send_card(self, chat_id: str, card: JsonObject) -> str:
+    # In topic chats, route through /messages/{anchor}/reply so the
+    # card lands in the same topic as the user's triggering message.
+    # Fall back to plain send when no anchor has been captured yet
+    # (e.g. the startup card, before any user message arrived).
+    if self._should_thread(chat_id):
+      return self._retry_on_auth_error(
+        lark_api.reply_card, self._reply_anchor, card, True)
     return self._retry_on_auth_error(lark_api.send_card, chat_id, card)
 
   async def update_card(self, message_id: str, card: JsonObject) -> None:
+    # PATCH /im/v1/messages/{id} works identically for threaded replies
+    # since they are still plain messages, so no topic-specific routing.
     self._retry_on_auth_error(lark_api.update_card, message_id, card)
 
   async def send_text(self, chat_id: str, text: str) -> str:
+    if self._should_thread(chat_id):
+      return self._retry_on_auth_error(
+        lark_api.reply_message, self._reply_anchor, text, True)
     return self._retry_on_auth_error(lark_api.send_text, chat_id, text)
 
   async def download_image(self, message_id: str, image_key: str) -> str:

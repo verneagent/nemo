@@ -368,26 +368,44 @@ def send_file(token: str, chat_id: str, file_key: str) -> str:
 # Reply message (thread)
 # ---------------------------------------------------------------------------
 
-def reply_message(token: str, message_id: str, text: str) -> str:
-  """Reply to a specific message (creates thread). Returns message_id."""
+def reply_message(
+  token: str, message_id: str, text: str,
+  reply_in_thread: bool = False,
+) -> str:
+  """Reply to a specific message. Returns message_id.
+
+  When ``reply_in_thread`` is True, the reply joins (or starts) a
+  message thread rooted at ``message_id``. In topic chats every message
+  is already threaded, so the flag is a no-op there but still safe.
+  """
   url = f"{BASE_URL}/im/v1/messages/{message_id}/reply"
-  payload = {
+  payload: JsonObject = {
     "msg_type": "text",
     "content": json.dumps({"text": text}),
   }
+  if reply_in_thread:
+    payload["reply_in_thread"] = True
   data = _request(url, token, payload)
   if data.get("code") == 0:
     return data["data"]["message_id"]
   raise RuntimeError(f"Failed to reply message: {data}")
 
 
-def reply_card(token: str, message_id: str, card: JsonObject) -> str:
-  """Reply to a message with a card. Returns message_id."""
+def reply_card(
+  token: str, message_id: str, card: JsonObject,
+  reply_in_thread: bool = False,
+) -> str:
+  """Reply to a message with a card. Returns message_id.
+
+  See ``reply_message`` for ``reply_in_thread`` semantics.
+  """
   url = f"{BASE_URL}/im/v1/messages/{message_id}/reply"
-  payload = {
+  payload: JsonObject = {
     "msg_type": "interactive",
     "content": json.dumps(card),
   }
+  if reply_in_thread:
+    payload["reply_in_thread"] = True
   data = _request(url, token, payload)
   if data.get("code") == 0:
     return data["data"]["message_id"]

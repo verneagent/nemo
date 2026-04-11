@@ -1,10 +1,11 @@
 """Tests for _to_incoming enrichment and helpers in nemo.lark_channel."""
 
+import asyncio
 import json
 from unittest import mock
 
 from nemo.lark.events import LarkEvent
-from nemo.lark_channel import _to_incoming, _extract_message_text
+from nemo.lark_channel import LarkChannel, _to_incoming, _extract_message_text
 
 
 TOKEN = "t-test_token"
@@ -296,3 +297,82 @@ def test_extract_missing_body():
   result = _extract_message_text(msg)
   # Should not crash; body defaults to {}
   assert isinstance(result, str)
+
+
+# ---------------------------------------------------------------------------
+# Topic-chat routing (chat_mode="topic")
+# ---------------------------------------------------------------------------
+
+def _build_topic_channel() -> LarkChannel:
+  """Construct a LarkChannel without running start() so unit tests
+  can exercise topic routing without touching real credentials."""
+  ch = LarkChannel.__new__(LarkChannel)
+  ch.chat_id = "oc_topic"
+  ch.credentials = {"app_id": "cli_x", "app_secret": "s"}
+  ch._events = None
+  ch.parent_lookup = None
+  ch._chat_mode = "topic"
+  ch._reply_anchor = ""
+  return ch
+
+
+def test_send_card_routes_to_reply_in_topic():
+  """In topic mode with an anchor, send_card must use reply_card with
+  reply_in_thread=True so the card lands in the current topic."""
+  ch = _build_topic_channel()
+  ch._reply_anchor = "om_user_msg"
+  card = {"title": "hi"}
+  with mock.patch("nemo.lark_channel.lark_auth.get_token", return_value="t"), \
+       mock.patch("nemo.lark_channel.lark_api.reply_card",
+                  return_value="om_bot_msg") as mock_reply, \
+       mock.patch("nemo.lark_channel.lark_api.send_card") as mock_send:
+    result = asyncio.run(ch.send_card("oc_topic", card))
+  assert result == "om_bot_msg"
+  mock_reply.assert_called_once_with("t", "om_user_msg", card, True)
+  mock_send.assert_not_called()
+
+
+def test_send_text_routes_to_reply_in_topic():
+  ch = _build_topic_channel()
+  ch._reply_anchor = "om_user_msg"
+  with mock.patch("nemo.lark_channel.lark_auth.get_token", return_value="t"), \
+       mock.patch("nemo.lark_channel.lark_api.reply_message",
+                  return_value="om_bot_msg") as mock_reply, \
+       mock.patch("nemo.lark_channel.lark_api.send_text") as mock_send:
+    result = asyncio.run(ch.send_text("oc_topic", "hello"))
+  assert result == "om_bot_msg"
+  mock_reply.assert_called_once_with("t", "om_user_msg", "hello", True)
+  mock_send.assert_not_called()
+
+
+def test_send_card_plain_in_topic_without_anchor():
+  """Before any user message arrives (e.g. startup card), send_card
+  must not try to reply — it falls back to the plain send endpoint so
+  the card creates a fresh topic instead of crashing."""
+  ch = _build_topic_channel()
+  card = {"title": "nemo up"}
+  with mock.patch("nemo.lark_channel.lark_auth.get_token", return_value="t"), \
+       mock.patch("nemo.lark_channel.lark_api.send_card",
+                  return_value="om_start") as mock_send, \
+       mock.patch("nemo.lark_channel.lark_api.reply_card") as mock_reply:
+    result = asyncio.run(ch.send_card("oc_topic", card))
+  assert result == "om_start"
+  mock_send.assert_called_once_with("t", "oc_topic", card)
+  mock_reply.assert_not_called()
+
+
+def test_send_card_plain_in_non_topic_chat():
+  """Non-topic chats keep the existing behavior even when an anchor
+  happens to be set — other code paths rely on plain sends."""
+  ch = _build_topic_channel()
+  ch._chat_mode = "group"
+  ch._reply_anchor = "om_whatever"
+  card = {"title": "x"}
+  with mock.patch("nemo.lark_channel.lark_auth.get_token", return_value="t"), \
+       mock.patch("nemo.lark_channel.lark_api.send_card",
+                  return_value="om_sent") as mock_send, \
+       mock.patch("nemo.lark_channel.lark_api.reply_card") as mock_reply:
+    result = asyncio.run(ch.send_card("oc_topic", card))
+  assert result == "om_sent"
+  mock_send.assert_called_once()
+  mock_reply.assert_not_called()

@@ -63,6 +63,11 @@ class LarkEvent:
   file_key: str = ""
   file_name: str = ""
   parent_id: str = ""
+  # Thread identifier for topic chats (chat_mode="topic"). Every message
+  # in a topic group carries a thread_id (format: "omt_<hex>"). Replies
+  # made via the /reply endpoint are automatically threaded when the
+  # target message is already in a thread.
+  thread_id: str = ""
   create_time: str = ""
   # Card action fields
   action_value: JsonObject = field(default_factory=dict)
@@ -109,6 +114,7 @@ def _parse_message_event(payload: JsonObject) -> LarkEvent:
     file_key=file_key,
     file_name=file_name,
     parent_id=msg.get("parent_id", "") or msg.get("root_id", ""),
+    thread_id=msg.get("thread_id", ""),
     create_time=msg.get("create_time", ""),
     raw=payload,
   )

@@ -45,6 +45,28 @@ def test_parse_message_event():
   assert ev.create_time == "1234567890"
 
 
+def test_parse_message_event_thread_id():
+  """Topic-chat messages carry a thread_id (format: omt_<hex>) that
+  must be surfaced so nemo can scope replies to the same topic."""
+  payload = {
+    "header": {"event_type": "im.message.receive_v1"},
+    "event": {
+      "message": {
+        "chat_id": "oc_topic",
+        "chat_type": "group",
+        "content": json.dumps({"text": "hi"}),
+        "message_id": "om_t1",
+        "message_type": "text",
+        "thread_id": "omt_d4be107c616a",
+      },
+      "sender": {"sender_id": {"open_id": "ou_user1"}},
+    },
+  }
+  ev = parse_event(payload)
+  assert ev.thread_id == "omt_d4be107c616a"
+  assert ev.chat_id == "oc_topic"
+
+
 def test_parse_message_image():
   payload = {
     "header": {"event_type": "im.message.receive_v1"},

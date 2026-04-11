@@ -30,6 +30,9 @@ class IncomingMessage:
   file_key: str = ""
   file_name: str = ""
   parent_id: str = ""
+  # Thread identifier in threaded chats (e.g. Lark topic groups). Empty
+  # outside of topic/thread contexts.
+  thread_id: str = ""
   create_time: str = ""
   # Card action fields
   action_value: JsonObject = field(default_factory=dict)
