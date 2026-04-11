@@ -57,6 +57,30 @@ def build_prompt(replies: list[object]) -> str:
   return json.dumps(dicts, ensure_ascii=False)
 
 
+# Marker appended by LarkChannel._to_incoming when a message has a
+# parent_id / thread root. The tail is useful as SDK context but breaks
+# slash-command dispatch (which relies on exact or prefix matches on the
+# whole string). strip_parent_quote() peels it off for command dispatch
+# while leaving the full enriched text intact for the SDK prompt.
+_PARENT_QUOTE_MARKER = "\n\n(The user is replying to this earlier message"
+
+
+def strip_parent_quote(text: str) -> str:
+  """Remove the LarkChannel parent-quote tail from a user message.
+
+  In Lark topic groups every message carries a root_id pointing at the
+  topic root, so the parent-quote enrichment fires on every message —
+  including plain slash commands. Without stripping, `"/mention"` looks
+  like `"/mention\\n\\n(The user is replying to this earlier message…)"`
+  to ``commands.try_dispatch`` and never matches the command table.
+  Return only the portion before the marker; leave plain text alone.
+  """
+  idx = text.find(_PARENT_QUOTE_MARKER)
+  if idx >= 0:
+    return text[:idx].rstrip()
+  return text
+
+
 def strip_mentions(text: str, replies: list[object],
                    bot_open_id: str = "") -> str:
   """Strip bot @-mentions; replace other @-mentions with the person's name."""

@@ -408,8 +408,12 @@ async def main_loop(
           await channel.remove_reaction(ack_msg_id, ack_reaction_id)
           ack_reaction_id = ""
 
-      # Command dispatch
-      handled, response = commands.try_dispatch(user_message, ctx)
+      # Command dispatch — strip the parent-quote tail first, otherwise
+      # slash commands in topic chats (where every message carries a
+      # root_id) never match because the enriched text looks like
+      # "/mention\n\n(The user is replying…)".
+      handled, response = commands.try_dispatch(
+        messages.strip_parent_quote(user_message), ctx)
       if handled:
         if response == "__clear__":
           t = datetime.datetime.now().strftime("%H:%M")
@@ -879,7 +883,8 @@ async def main_loop(
           # Inline-safe commands: execute during turn without waiting
           stripped = messages.strip_mentions(msg_text, [msg], bot_open_id=bot_open_id)
           if stripped:
-            handled, response = commands.try_dispatch(stripped, ctx)
+            handled, response = commands.try_dispatch(
+              messages.strip_parent_quote(stripped), ctx)
             if handled and commands.is_inline_safe(response):
               await _dispatch_inline(response, msg)
               continue
