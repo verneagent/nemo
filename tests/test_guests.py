@@ -259,6 +259,27 @@ def test_guest_add_token_roundtrip_guest():
   assert name == "Alice"
 
 
+def test_guest_add_all_as_guest():
+  """/guest add all produces __guest_add_all__:guest."""
+  handled, resp = try_dispatch("/guest add all", _ctx())
+  assert handled
+  assert resp == "__guest_add_all__:guest"
+
+
+def test_guest_add_all_as_coowner():
+  """/guest add all coowner produces __guest_add_all__:coowner."""
+  handled, resp = try_dispatch("/guest add all coowner", _ctx())
+  assert handled
+  assert resp == "__guest_add_all__:coowner"
+
+
+def test_guest_add_all_case_insensitive():
+  """/guest add ALL should work."""
+  handled, resp = try_dispatch("/guest add ALL", _ctx())
+  assert handled
+  assert resp == "__guest_add_all__:guest"
+
+
 def test_guest_add_token_roundtrip_coowner():
   """Token from /guest add Alice coowner can be split back into role='coowner', name='Alice'."""
   _, token = try_dispatch("/guest add Alice coowner", _ctx())

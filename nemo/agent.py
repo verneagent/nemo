@@ -485,6 +485,33 @@ async def main_loop(
             await _send_response(channel, chat_id, "\n".join(lines), db)
           else:
             await _send_response(channel, chat_id, "No guests configured.", db)
+        elif response and response.startswith("__guest_add_all__:"):
+          from .guests import add_guest
+          role = response.split(":", 1)[1]
+          added: list[str] = []
+          try:
+            members = await channel.get_chat_members(chat_id)
+            for m in members:
+              mid = str(m.get("member_id", ""))
+              mname = str(m.get("name", "")) or mid[:16]
+              if not mid:
+                continue
+              if mid == operator_open_id:
+                continue  # skip the owner/operator
+              if mid == bot_open_id:
+                continue  # skip the bot
+              add_guest(channel.token, chat_id, mid, name=mname, role=role)
+              added.append(mname)
+            _member_roles = get_member_roles(channel.token, chat_id)
+          except Exception as e:
+            log.warning("Failed to batch-add guests: %s", e)
+            await _send_response(channel, chat_id, f"Batch add failed: {e}", db)
+          if added:
+            lines = [f"Added **{len(added)}** members as **{role}**:"]
+            lines.extend(f"- {n}" for n in added)
+            await _send_response(channel, chat_id, "\n".join(lines), db)
+          else:
+            await _send_response(channel, chat_id, "No members to add.", db)
         elif response and response.startswith("__guest_add__:"):
           from .guests import add_guest
           _, rest = response.split(":", 1)
