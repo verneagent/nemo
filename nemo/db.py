@@ -193,8 +193,13 @@ class Database:
     self._conn.commit()
 
   def lookup_parent_message(self, message_id: str) -> dict[str, object] | None:
+    """Look up a past message by ID — matches both sent (message_id) and
+    received (source_message_id) messages."""
     row = self._conn.execute(
-      "SELECT * FROM messages WHERE message_id = ? LIMIT 1", (message_id,)
+      """SELECT * FROM messages
+         WHERE message_id = ? OR source_message_id = ?
+         ORDER BY id DESC LIMIT 1""",
+      (message_id, message_id),
     ).fetchone()
     return dict(row) if row else None
 

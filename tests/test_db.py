@@ -74,6 +74,11 @@ def test_record_and_lookup_messages(tmp_path):
     parent = db.lookup_parent_message("om_2")
     assert parent is not None
     assert parent["text"] == "hi back"
+    # Lookup also finds received messages by source_message_id —
+    # needed so quoted user messages can be recovered from our own DB.
+    received = db.lookup_parent_message("om_1")
+    assert received is not None
+    assert received["text"] == "hello"
     assert db.lookup_parent_message("om_999") is None
     db.close()
 

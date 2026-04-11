@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+from typing import Callable
 
 log = logging.getLogger(__name__)
 
@@ -16,8 +17,14 @@ from .lark.events import LarkEvent, LarkEventStream
 from .relay_events import RelayEventStream
 from .types import JsonObject
 
+ParentLookup = Callable[[str], str | None]
 
-def _to_incoming(event: LarkEvent, token: str = "") -> IncomingMessage:
+
+def _to_incoming(
+  event: LarkEvent,
+  token: str = "",
+  parent_lookup: ParentLookup | None = None,
+) -> IncomingMessage:
   text = event.text
   msg_type = event.msg_type
 
@@ -51,15 +58,25 @@ def _to_incoming(event: LarkEvent, token: str = "") -> IncomingMessage:
       except Exception as e:
         log.warning("Image download failed (%s): %s", img_key, e)
 
-  # Enrich: fetch reply parent context
-  if event.parent_id and token:
-    try:
-      parent = lark_api.get_message(token, event.parent_id)
-      parent_text = _extract_message_text(parent)
-      if parent_text:
-        text = f"[replying to: {parent_text}]\n{text}"
-    except Exception as e:
-      log.warning("Failed to fetch parent message: %s", e)
+  # Enrich: fetch reply parent context.
+  # Prefer the parent_lookup callback (nemo's own DB) first — Lark's
+  # get_message API loses interactive card body content, so quoting a bot
+  # card would otherwise yield just "[interactive]".
+  if event.parent_id:
+    parent_text = ""
+    if parent_lookup is not None:
+      try:
+        parent_text = parent_lookup(event.parent_id) or ""
+      except Exception as e:
+        log.warning("parent_lookup failed: %s", e)
+    if not parent_text and token:
+      try:
+        parent = lark_api.get_message(token, event.parent_id)
+        parent_text = _extract_message_text(parent)
+      except Exception as e:
+        log.warning("Failed to fetch parent message: %s", e)
+    if parent_text:
+      text = f"[replying to: {parent_text}]\n{text}"
 
   # Enrich: expand merge_forward (folder) messages
   if msg_type == "merge_forward" and event.message_id and token:
@@ -104,9 +121,49 @@ def _extract_message_text(msg: JsonObject) -> str:
       return f"[file: {content.get('file_name', '?')}]"
     if msg_type == "image":
       return "[image]"
+    if msg_type == "interactive":
+      return _extract_interactive_text(content)
   except (json.JSONDecodeError, TypeError) as e:
     log.debug("Malformed message content (type=%s): %s", msg_type, e)
   return f"[{msg_type}]" if msg_type else ""
+
+
+def _extract_interactive_text(content: JsonObject) -> str:
+  """Extract readable text from an interactive card's body.content.
+
+  Format (as returned by im/v1/messages/{id} for non-template cards):
+    {"title": "...", "elements": [[{tag, ...}, ...], ...]}
+
+  Template-based cards (built via template_id / card_v2) don't expose
+  their rendered text here — those fall back to '[interactive]'.
+  """
+  title = content.get("title") or ""
+  elements = content.get("elements", [])
+  if not isinstance(elements, list):
+    return str(title) if title else "[interactive]"
+  lines: list[str] = []
+  for row in elements:
+    if not isinstance(row, list):
+      continue
+    parts: list[str] = []
+    for elem in row:
+      if not isinstance(elem, dict):
+        continue
+      tag = elem.get("tag", "")
+      if tag in ("text", "a", "md", "plain_text", "lark_md"):
+        t = elem.get("text") or elem.get("content") or ""
+        if t:
+          parts.append(str(t))
+      elif tag == "img":
+        parts.append("[image]")
+      elif tag == "hr":
+        continue
+    if parts:
+      lines.append("".join(parts))
+  body_text = "\n".join(line for line in lines if line.strip())
+  if title and body_text:
+    return f"{title}\n{body_text}"
+  return str(title) or body_text or "[interactive]"
 
 
 def _extract_post_text(content: JsonObject) -> str:
@@ -174,6 +231,9 @@ class LarkChannel(Channel):
     self.chat_id = chat_id
     self.credentials = load_credentials() or {}
     self._events: LarkEventStream | RelayEventStream | None = None
+    # Optional: agent-supplied lookup to recover text of a quoted message
+    # (e.g. from nemo's own DB) when the Lark API can't return it.
+    self.parent_lookup: ParentLookup | None = None
 
   @property
   def token(self) -> str:
@@ -202,7 +262,8 @@ class LarkChannel(Channel):
     event = await self._events.next_message(timeout=timeout)
     if event is None:
       return None
-    return _to_incoming(event, token=self.token)
+    return _to_incoming(
+      event, token=self.token, parent_lookup=self.parent_lookup)
 
   def push_back(self, message: IncomingMessage) -> None:
     if self._events is None:

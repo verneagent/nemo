@@ -135,6 +135,72 @@ def test_reply_parent_fetch_failure_graceful(mock_get):
   assert "hello" in msg.text
 
 
+@mock.patch("nemo.lark_channel.lark_api.get_message")
+def test_reply_parent_lookup_preferred_over_api(mock_get):
+  """parent_lookup (DB) wins over get_message — needed because Lark's
+  get_message returns no body for interactive cards, so quoting a bot
+  card previously yielded just '[interactive]'."""
+  ev = _make_event(parent_id="om_card1")
+  msg = _to_incoming(
+    ev, token=TOKEN,
+    parent_lookup=lambda mid: "Here is the delete account flow…",
+  )
+  mock_get.assert_not_called()
+  assert "delete account flow" in msg.text
+  assert msg.text.index("replying to") < msg.text.index("hello")
+
+
+@mock.patch("nemo.lark_channel.lark_api.get_message", return_value={
+  "msg_type": "text",
+  "body": {"content": json.dumps({"text": "from api"})},
+})
+def test_reply_parent_lookup_falls_through_to_api(mock_get):
+  """When parent_lookup returns None, fall back to get_message API."""
+  ev = _make_event(parent_id="om_parent2")
+  msg = _to_incoming(
+    ev, token=TOKEN,
+    parent_lookup=lambda mid: None,
+  )
+  mock_get.assert_called_once_with(TOKEN, "om_parent2")
+  assert "from api" in msg.text
+
+
+# Jenkins bot CI card — real-world payload shape from list_messages
+_JENKINS_CARD = {
+  "msg_type": "interactive",
+  "body": {"content": json.dumps({
+    "title": "FiveD iOS Build (preview)",
+    "elements": [
+      [{"tag": "text", "text": "✅ Checkout\n⏳ EAS Build (local)"}],
+      [{"tag": "hr"}],
+      [{"tag": "a", "href": "https://x", "text": "79f8b32"},
+       {"tag": "text", "text": " Merge main into HEAD — CI"}],
+    ],
+  })},
+}
+
+
+def test_extract_interactive_card_text():
+  """Interactive cards (e.g. from other bots) should yield readable text
+  instead of the opaque '[interactive]' placeholder."""
+  text = _extract_message_text(_JENKINS_CARD)
+  assert "FiveD iOS Build" in text
+  assert "✅ Checkout" in text
+  assert "79f8b32" in text
+  assert "Merge main into HEAD" in text
+  assert "[interactive]" not in text
+
+
+@mock.patch("nemo.lark_channel.lark_api.get_message", return_value=_JENKINS_CARD)
+def test_reply_to_other_bot_card_includes_card_text(mock_get):
+  """User replies to a Jenkins/other bot card — nemo should see the
+  card's actual text in the prompt, not just '[interactive]'."""
+  ev = _make_event(parent_id="om_jenkins1")
+  msg = _to_incoming(ev, token=TOKEN)
+  assert "FiveD iOS Build" in msg.text
+  assert "[interactive]" not in msg.text
+
+
 # ---------------------------------------------------------------------------
 # Plain text — no enrichment
 # ---------------------------------------------------------------------------

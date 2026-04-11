@@ -177,6 +177,17 @@ async def main_loop(
   # Database
   db = Database(project_dir)
 
+  # Let LarkChannel recover quoted-message text from our own DB when the
+  # Lark API can't (e.g. interactive cards lose body content on get_message).
+  def _db_parent_lookup(mid: str) -> str | None:
+    row = db.lookup_parent_message(mid)
+    if not row:
+      return None
+    text = row.get("text")
+    return str(text) if text else None
+
+  channel.parent_lookup = _db_parent_lookup
+
   # Clean stale sessions (preserve sdk_session_id for resume)
   _resume_sdk_id = ""
   try:
