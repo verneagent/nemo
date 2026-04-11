@@ -573,7 +573,7 @@ def dissolve_temp_group(chat_id: str) -> None:
 # Test runner
 # ---------------------------------------------------------------------------
 
-class TestResult:
+class E2EResult:
   def __init__(self):
     self.passed: list[str] = []
     self.failed: list[str] = []
@@ -608,7 +608,7 @@ class TestResult:
 
 
 def run_command_test(name: str, text: str, chat_id: str,
-                     result: TestResult, wait: int = 5) -> None:
+                     result: E2EResult, wait: int = 5) -> None:
   """Send a command and verify a bot response card appears."""
   ts = str(int(time.time() * 1000))
   send_msg(text, chat_id)
@@ -621,7 +621,7 @@ def run_command_test(name: str, text: str, chat_id: str,
 
 
 def run_sdk_test(name: str, text: str, pid: int, chat_id: str,
-                 result: TestResult, wait: int = 20,
+                 result: E2EResult, wait: int = 20,
                  expect_log: str | None = None) -> None:
   """Send a message that triggers an SDK turn, verify response."""
   ts = str(int(time.time() * 1000))
@@ -668,7 +668,7 @@ AGENT_PROMPTS = [
 ]
 
 
-def run_stale_task_stress(pid: int, chat_id: str, result: TestResult,
+def run_stale_task_stress(pid: int, chat_id: str, result: E2EResult,
                           rounds: int = 3) -> None:
   """Phase 5: trigger multi-agent turns and verify stale task handling."""
   print(f"{Colors.BOLD}Phase 5: Stale Task Stress Test{Colors.RESET}")
@@ -784,7 +784,7 @@ PROJECT_STEPS = [
 ]
 
 
-def run_project_flow(pid: int, chat_id: str, result: TestResult) -> None:
+def run_project_flow(pid: int, chat_id: str, result: E2EResult) -> None:
   """Phase 6: multi-turn project creation in a temp directory."""
   print(f"{Colors.BOLD}Phase 6: Multi-Turn Project Flow{Colors.RESET}")
 
@@ -907,7 +907,7 @@ def run_project_flow(pid: int, chat_id: str, result: TestResult) -> None:
 # ---------------------------------------------------------------------------
 
 def run_permission_tests(pid: int, chat_id: str,
-                         result: TestResult) -> None:
+                         result: E2EResult) -> None:
   """Phase 7: test approve / deny / always permission flow."""
   print(f"{Colors.BOLD}Phase 7: Permission Flow{Colors.RESET}")
   log = LogAnalyzer(pid)
@@ -1029,7 +1029,7 @@ def run_permission_tests(pid: int, chat_id: str,
 # Phase 8: Dual-Instance (same dir, two groups)
 # ---------------------------------------------------------------------------
 
-def run_dual_instance(chat_id_a: str, result: TestResult,
+def run_dual_instance(chat_id_a: str, result: E2EResult,
                       verbose: bool = False) -> None:
   """Phase 8: two nemo instances on same project dir, different groups."""
   print(f"{Colors.BOLD}Phase 8: Dual-Instance Test{Colors.RESET}")
@@ -1179,7 +1179,7 @@ def run_dual_instance(chat_id_a: str, result: TestResult,
 # Main
 # ---------------------------------------------------------------------------
 
-def run_media_tests(pid: int, chat_id: str, result: TestResult) -> None:
+def run_media_tests(pid: int, chat_id: str, result: E2EResult) -> None:
   """Phase 9: Media & interaction tests — reaction, image, reply."""
   print(f"{Colors.BOLD}Phase 9: Media & Interaction{Colors.RESET}")
   log = LogAnalyzer(pid)
@@ -1284,7 +1284,7 @@ def main():
   args = parser.parse_args()
 
   chat_id = args.chat_id.strip()
-  result = TestResult()
+  result = E2EResult()
   single_phase = args.stress or args.project or args.perm or args.dual or args.media
   run_all = not single_phase
   created_temp_chat = False
