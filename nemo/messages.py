@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import re
+from typing import Callable
 
 from .types import JsonObject
 
@@ -107,8 +108,25 @@ def filter_by_allowed_senders(
   return result
 
 
-def filter_bot_interactions(replies: list[object], bot_open_id: str) -> list[object]:
-  """In need_mention mode, keep only bot-directed messages."""
+def filter_bot_interactions(
+  replies: list[object],
+  bot_open_id: str,
+  is_own_parent: Callable[[str], bool] | None = None,
+) -> list[object]:
+  """In need_mention mode, keep only bot-directed messages.
+
+  A message is considered bot-directed when:
+    - it @-mentions the bot, OR
+    - it's a reaction/sticker (always allowed), OR
+    - it's a reply to one of the bot's own earlier messages (implicit
+      thread continuation — checked via is_own_parent).
+
+  Replying to *other* messages (e.g. quoting a teammate's text while
+  @-mentioning a different teammate) is NOT considered bot-directed.
+  If is_own_parent is not supplied, any parent_id is treated as implicit
+  mention — that's the old permissive behavior kept for test fixtures
+  that don't model message ownership.
+  """
   if not bot_open_id:
     return replies
   result = []
@@ -116,14 +134,22 @@ def filter_bot_interactions(replies: list[object], bot_open_id: str) -> list[obj
     mentions = _get(r, "mentions") or []
     if any(
       (m.get("id") if isinstance(m, dict) else getattr(m, "id", "")) == bot_open_id
-      for m in mentions
+      for m in mentions  # type: ignore[union-attr]
     ):
-      result.append(r)
-      continue
-    if _get(r, "parent_id"):
       result.append(r)
       continue
     if _get(r, "msg_type") in ("reaction", "sticker"):
       result.append(r)
       continue
+    parent_id = _get(r, "parent_id")
+    if parent_id:
+      if is_own_parent is None:
+        result.append(r)
+        continue
+      try:
+        if is_own_parent(str(parent_id)):
+          result.append(r)
+          continue
+      except Exception:
+        pass
   return result

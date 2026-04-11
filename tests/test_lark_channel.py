@@ -119,12 +119,18 @@ def test_multiple_image_keys(mock_dl):
   "msg_type": "text",
   "body": {"content": json.dumps({"text": "original question"})},
 })
-def test_reply_prepends_parent_context(mock_get):
+def test_reply_includes_parent_as_secondary_context(mock_get):
+  """User's own text must come first; the quoted parent is secondary
+  context. Otherwise the model anchors on the quote and ignores the
+  user's actual instruction."""
   ev = _make_event(parent_id="om_parent1")
   msg = _to_incoming(ev, token=TOKEN)
   mock_get.assert_called_once_with(TOKEN, "om_parent1")
   assert "original question" in msg.text
-  assert msg.text.index("replying to") < msg.text.index("hello")
+  # User text "hello" leads; the quoted context appears afterward.
+  assert msg.text.index("hello") < msg.text.index("original question")
+  # Framing makes it clear the quote is reference, not an instruction.
+  assert "reference context" in msg.text or "earlier message" in msg.text
 
 
 @mock.patch("nemo.lark_channel.lark_api.get_message", side_effect=RuntimeError("not found"))
@@ -147,7 +153,8 @@ def test_reply_parent_lookup_preferred_over_api(mock_get):
   )
   mock_get.assert_not_called()
   assert "delete account flow" in msg.text
-  assert msg.text.index("replying to") < msg.text.index("hello")
+  # User text leads; quote is appended as secondary context.
+  assert msg.text.index("hello") < msg.text.index("delete account flow")
 
 
 @mock.patch("nemo.lark_channel.lark_api.get_message", return_value={

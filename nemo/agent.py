@@ -357,11 +357,26 @@ async def main_loop(
         log.debug("Skipping: unauthorized sender %s (operator=%s)", sender, operator_open_id)
         continue
 
-      # need_mention mode: only respond to @mentions, replies, reactions
+      # need_mention mode: only respond to @mentions, replies to nemo's
+      # own messages, and reactions. Slash commands always pass through
+      # — otherwise users can't send /mention to toggle the requirement
+      # off (catch-22). Replying to *other* people's messages (e.g.
+      # quoting a teammate's card while @-ing another teammate) is not
+      # considered bot-directed.
       if need_mention and bot_open_id:
-        kept = messages.filter_bot_interactions([reply], bot_open_id)
-        if not kept:
-          continue
+        stripped = reply.text.strip() if reply.text else ""
+        if not stripped.startswith("/"):
+          def _is_own_parent(mid: str) -> bool:
+            row = db.lookup_parent_message(mid)
+            return bool(row and row.get("direction") == "sent")
+          kept = messages.filter_bot_interactions(
+            [reply], bot_open_id, is_own_parent=_is_own_parent)
+          if not kept:
+            log.info("Skipping: need_mention on, not bot-directed "
+                     "(parent=%s mentions=%s)",
+                     reply.parent_id[:16] if reply.parent_id else "",
+                     [m.get("id","")[:10] for m in reply.mentions])
+            continue
 
       text = reply.text.strip()
       if not text:

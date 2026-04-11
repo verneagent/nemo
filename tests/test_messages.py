@@ -145,6 +145,32 @@ def test_filter_bot_interactions_reply():
   assert len(filtered) == 1
 
 
+def test_filter_bot_interactions_reply_to_own_only():
+  """With is_own_parent supplied, a reply only counts as implicit mention
+  if the parent was sent by the bot. Replies to other bots/users don't."""
+  own = {"parent_id": "om_bot_1", "msg_type": "text", "mentions": [],
+         "text": "thanks!"}
+  other = {"parent_id": "om_jenkins", "msg_type": "text",
+           "mentions": [{"id": "ou_rikki"}],
+           "text": "@RikiRiki 其他 quest 相关的也该 fix 了"}
+  filtered = filter_bot_interactions(
+    [own, other], "ou_bot",
+    is_own_parent=lambda mid: mid == "om_bot_1",
+  )
+  assert len(filtered) == 1
+  assert filtered[0] is own
+
+
+def test_filter_bot_interactions_mention_wins_over_parent():
+  """@-mention to bot passes even if parent is someone else's message."""
+  r = {"parent_id": "om_other", "msg_type": "text",
+       "mentions": [{"id": "ou_bot"}]}
+  filtered = filter_bot_interactions(
+    [r], "ou_bot", is_own_parent=lambda mid: False,
+  )
+  assert len(filtered) == 1
+
+
 def test_filter_bot_interactions_reaction():
   replies = [{"msg_type": "reaction", "mentions": []}]
   filtered = filter_bot_interactions(replies, "ou_bot")
