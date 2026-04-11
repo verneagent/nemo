@@ -89,6 +89,46 @@ def test_verbose_flag(tmp_path):
               assert mock_logging.call_args[1]["level"] == 10  # DEBUG
 
 
+def test_system_prompt_file_is_read_and_passed(tmp_path):
+  project = str(tmp_path)
+  sp_file = tmp_path / "sp.txt"
+  sp_file.write_text("Respect the code style.\n")
+  captured = {}
+
+  def _capture_asyncio_run(coro):
+    captured["frame"] = coro.cr_frame
+    coro.close()
+    return 0
+
+  with mock.patch("sys.argv", ["nemo", "--chat-id", "oc_1",
+                                "--project-dir", project,
+                                "--system-prompt-file", str(sp_file)]):
+    with mock.patch("nemo.__main__._ensure_provider_runtime"):
+      with mock.patch("nemo.config.load_credentials",
+                      return_value={"app_id": "a", "app_secret": "s", "email": ""}):
+        with mock.patch("nemo.preflight.run_preflight", return_value=[]):
+          with mock.patch("nemo.__main__.asyncio") as mock_asyncio:
+            mock_asyncio.run.side_effect = _capture_asyncio_run
+            result = main()
+            assert result == 0
+            frame = captured["frame"]
+            assert frame is not None
+            assert frame.f_locals["system_prompt"] == "Respect the code style."
+
+
+def test_system_prompt_file_missing_returns_error(tmp_path):
+  project = str(tmp_path)
+  missing = str(tmp_path / "nope.txt")
+  with mock.patch("sys.argv", ["nemo", "--chat-id", "oc_1",
+                                "--project-dir", project,
+                                "--system-prompt-file", missing]):
+    with mock.patch("nemo.__main__._ensure_provider_runtime"):
+      with mock.patch("nemo.config.load_credentials",
+                      return_value={"app_id": "a", "app_secret": "s", "email": ""}):
+        result = main()
+        assert result == 1
+
+
 def test_codex_provider_uses_provider_default_model(tmp_path):
   project = str(tmp_path)
   captured = {}

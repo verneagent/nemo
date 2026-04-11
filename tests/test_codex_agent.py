@@ -146,6 +146,50 @@ def test_claude_prefix_prompt_effort_keywords():
   assert agent._prefix_prompt("fix bug") == "fix bug"
 
 
+def test_codex_prepare_prompt_injects_system_prompt_on_first_turn():
+  agent = CodexCodingAgent(
+    {}, "oc_1", _DummyDB(), _DummyChannel(),
+    system_prompt="Be extra polite.",
+  )
+  # No session_id yet → first turn gets the instructions prepended.
+  out = agent._prepare_prompt("hello")
+  assert "<system_instructions>" in out
+  assert "Be extra polite." in out
+  assert out.endswith("hello")
+  # After a session is established, subsequent turns do NOT re-inject.
+  agent._session_id = "sess-1"
+  assert agent._prepare_prompt("next") == "next"
+
+
+def test_codex_prepare_prompt_noop_without_system_prompt():
+  agent = CodexCodingAgent({}, "oc_1", _DummyDB(), _DummyChannel())
+  assert agent._prepare_prompt("hello") == "hello"
+
+
+def test_claude_system_prompt_appended_to_agent_prompt():
+  agent = ClaudeCodingAgent(
+    {}, "oc_1", _DummyDB(), _DummyChannel(),
+    system_prompt="Follow the house style guide.",
+  )
+  built = agent._build_agent_prompt()
+  assert "Follow the house style guide." in built
+  # Default agent_prompt preamble is still present.
+  assert "Nemo" in built
+
+
+def test_claude_build_agent_prompt_without_user_prompt():
+  agent = ClaudeCodingAgent({}, "oc_1", _DummyDB(), _DummyChannel())
+  built = agent._build_agent_prompt()
+  assert "Nemo" in built
+  # No trailing double newline from empty append.
+  assert not built.endswith("\n\n")
+
+
+def test_claude_system_prompt_empty_by_default():
+  agent = ClaudeCodingAgent({}, "oc_1", _DummyDB(), _DummyChannel())
+  assert agent._system_prompt == ""
+
+
 def test_codex_build_command_rejects_permission_mode():
   agent = CodexCodingAgent({}, "oc_1", _DummyDB(), _DummyChannel(), permission_mode="default")
   agent._project_dir = "/tmp/project"

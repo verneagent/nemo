@@ -43,15 +43,18 @@ def build_coding_agent(
   channel: Channel,
   *,
   permission_mode: str = "bypassPermissions",
+  system_prompt: str = "",
 ) -> CodingAgent:
   if provider == "claude":
     return ClaudeCodingAgent(
       credentials, chat_id, db, channel,
       permission_mode=permission_mode,
+      system_prompt=system_prompt,
     )
   if provider == "codex":
     return CodexCodingAgent(
       credentials, chat_id, db, channel,
       permission_mode=permission_mode,
+      system_prompt=system_prompt,
     )
   raise ValueError(f"Unsupported provider: {provider}")

@@ -39,9 +39,11 @@ class CodexCodingAgent(CodingAgent):
     db: Database,
     channel: Channel,
     permission_mode: str = "bypassPermissions",
+    system_prompt: str = "",
   ):
     del credentials, chat_id, db, channel
     self._permission_mode = permission_mode
+    self._system_prompt = system_prompt
     self._project_dir = ""
     self._model = ""
     self._session_id = ""
@@ -85,7 +87,7 @@ class CodexCodingAgent(CodingAgent):
     assert proc.stderr is not None
 
     stderr_task = asyncio.create_task(self._log_stderr(proc.stderr))
-    proc.stdin.write(prompt.encode())
+    proc.stdin.write(self._prepare_prompt(prompt).encode())
     await proc.stdin.drain()
     proc.stdin.close()
 
@@ -177,6 +179,19 @@ class CodexCodingAgent(CodingAgent):
 
   async def stop(self) -> None:
     await self.interrupt()
+
+  def _prepare_prompt(self, prompt: str) -> str:
+    # Codex SDK has no system-prompt field, so inject custom instructions
+    # by prepending to the first turn of a thread. Subsequent turns inherit
+    # them via the persisted thread context.
+    if self._system_prompt and not self._session_id:
+      return (
+        "<system_instructions>\n"
+        f"{self._system_prompt}\n"
+        "</system_instructions>\n\n"
+        f"{prompt}"
+      )
+    return prompt
 
   def _build_command(self) -> list[str]:
     if self._permission_mode != "bypassPermissions":

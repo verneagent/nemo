@@ -154,6 +154,7 @@ async def main_loop(
   provider: AgentProvider = "claude",
   permission_mode: str = "bypassPermissions",
   effort: str = "",
+  system_prompt: str = "",
 ) -> int:
   """Run the agent main loop."""
   session_id = str(uuid.uuid4())
@@ -280,6 +281,7 @@ async def main_loop(
     provider,
     credentials, chat_id, db, channel,
     permission_mode=permission_mode,
+    system_prompt=system_prompt,
   )
   if effort:
     agent.set_effort(effort)

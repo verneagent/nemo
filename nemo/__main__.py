@@ -285,8 +285,27 @@ def main():
   parser.add_argument("--permission-mode", default="bypassPermissions",
                       choices=["default", "acceptEdits", "plan", "bypassPermissions"],
                       help="SDK permission mode (default: bypassPermissions)")
+  parser.add_argument("--system-prompt-file", default="",
+                      help="Path to a file whose contents are appended to the "
+                           "agent's system prompt")
   parser.add_argument("--verbose", "-v", action="store_true", help="Debug logging")
   args = parser.parse_args()
+
+  system_prompt = ""
+  if args.system_prompt_file:
+    sp_path = os.path.expanduser(args.system_prompt_file)
+    if not os.path.isfile(sp_path):
+      print(f"Error: --system-prompt-file not found: {sp_path}", file=sys.stderr)
+      return 1
+    try:
+      with open(sp_path, encoding="utf-8") as f:
+        system_prompt = f.read().strip()
+    except OSError as e:
+      print(f"Error: cannot read --system-prompt-file: {e}", file=sys.stderr)
+      return 1
+    if not system_prompt:
+      print(f"Error: --system-prompt-file is empty: {sp_path}", file=sys.stderr)
+      return 1
 
   _ensure_provider_runtime(args.provider)
 
@@ -392,7 +411,8 @@ def main():
     return asyncio.run(main_loop(chat_id, project_dir, model,
                                  provider=args.provider,
                                  permission_mode=args.permission_mode,
-                                 effort=args.effort))
+                                 effort=args.effort,
+                                 system_prompt=system_prompt))
   except KeyboardInterrupt:
     return 0
   except BaseException as e:

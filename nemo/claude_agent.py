@@ -37,12 +37,14 @@ class ClaudeCodingAgent(CodingAgent):
     db: Database,
     channel: Channel,
     permission_mode: str = "bypassPermissions",
+    system_prompt: str = "",
   ):
     self._credentials = credentials
     self._chat_id = chat_id
     self._db = db
     self._channel = channel
     self._permission_mode = permission_mode
+    self._system_prompt = system_prompt
     self._sdk = SDKThread()
     self._sdk_started = False
     self._options: object = None
@@ -88,10 +90,7 @@ class ClaudeCodingAgent(CodingAgent):
       self._sdk.stop()
       self._sdk_started = False
 
-  def _build_options(self, project_dir: str, model: str, resume: str = "") -> object:
-    from claude_agent_sdk import ClaudeAgentOptions
-    from claude_agent_sdk.types import PermissionMode
-
+  def _build_agent_prompt(self) -> str:
     agent_prompt = (
       "You are running inside Nemo, a Lark-connected coding agent daemon. "
       "Users interact with you through Lark mobile app. "
@@ -115,6 +114,15 @@ class ClaudeCodingAgent(CodingAgent):
       "  nemo-send image /path/to/screenshot.png\n"
       "  nemo-send file /path/to/document.pdf"
     )
+    if self._system_prompt:
+      agent_prompt = f"{agent_prompt}\n\n{self._system_prompt}"
+    return agent_prompt
+
+  def _build_options(self, project_dir: str, model: str, resume: str = "") -> object:
+    from claude_agent_sdk import ClaudeAgentOptions
+    from claude_agent_sdk.types import PermissionMode
+
+    agent_prompt = self._build_agent_prompt()
 
     from .db import _db_path
     db_path = _db_path(project_dir)
