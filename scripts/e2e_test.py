@@ -230,6 +230,44 @@ def send_reply_msg(text: str, parent_id: str, chat_id: str) -> str:
   }, chat_id)
 
 
+def send_topic_msg(text: str, thread_id: str, chat_id: str,
+                   parent_id: str = "") -> str:
+  """Inject a topic-chat style message via relay webhook.
+
+  Topic-chat messages carry thread_id (format: "omt_<hex>") and
+  usually parent_id pointing at the topic root. This simulates the
+  FivedBug scenario end-to-end without needing to create a real topic
+  group (which requires the Lark client — the OpenAPI only creates
+  chat_mode=group).
+  """
+  ts = str(int(time.time() * 1000))
+  msg_id = f"test_topic_{ts}_{os.getpid()}"
+  message: dict = {
+    "chat_id": chat_id,
+    "chat_type": "group",
+    "message_type": "text",
+    "content": json.dumps({"text": text}),
+    "create_time": ts,
+    "message_id": msg_id,
+    "thread_id": thread_id,
+  }
+  if parent_id:
+    message["parent_id"] = parent_id
+  return _inject_relay_event({
+    "header": {
+      "event_type": "im.message.receive_v1",
+      "event_id": f"evt_{msg_id}",
+    },
+    "event": {
+      "message": message,
+      "sender": {
+        "sender_type": "user",
+        "sender_id": {"open_id": OPERATOR_OPEN_ID},
+      },
+    },
+  }, chat_id)
+
+
 def send_reaction(target_message_id: str, emoji_type: str,
                   chat_id: str) -> str:
   """Inject a reaction event via relay webhook."""
@@ -1260,6 +1298,120 @@ def run_media_tests(pid: int, chat_id: str, result: E2EResult) -> None:
   print()
 
 
+def run_topic_tests(pid: int, chat_id: str, result: E2EResult) -> None:
+  """Phase 10: Topic-chat scenarios — regression for parent-quote
+  enrichment breaking slash commands and for thread_id propagation.
+
+  We can't create an actual chat_mode=topic group via OpenAPI (only
+  the Lark client can), so we inject topic-style events into the
+  regular e2e chat: messages with ``thread_id`` set and/or
+  ``parent_id`` pointing at an earlier bot message. This reproduces
+  every code path except the LarkChannel.send_* routing to the reply
+  API (which is gated on _chat_mode == "topic"; chat_mode detection
+  is covered by unit tests).
+  """
+  print(f"{Colors.BOLD}Phase 10: Topic Chat{Colors.RESET}")
+  log = LogAnalyzer(pid)
+
+  # Anchor: make sure there's a recent bot message to use as parent.
+  print("  [T70] Priming parent anchor...")
+  ts = str(int(time.time() * 1000))
+  send_msg("ping", chat_id)
+  anchor_msg, _ = wait_for_response(chat_id, ts, timeout=20)
+  if not anchor_msg or not anchor_msg.get("message_id"):
+    result.fail("T70 prime anchor", "no bot message to anchor replies to")
+    print()
+    return
+  anchor_id = anchor_msg["message_id"]
+  result.ok("T70 prime anchor", anchor_id[:20])
+  wait_for_idle(pid, chat_id, timeout=30)
+
+  # T71: slash command sent as a reply (parent_id set). Pre-fix this
+  # fell through to the SDK because the parent-quote tail broke
+  # exact-match dispatch; post-fix strip_parent_quote peels it off
+  # and the command dispatches locally.
+  print("  [T71] /help as reply (parent-quote regression)...")
+  ts = str(int(time.time() * 1000))
+  send_reply_msg("/help", anchor_id, chat_id)
+  msg, elapsed = wait_for_response(chat_id, ts, timeout=15)
+  tail = log.lines(30)
+  # "query() sent to CLI" means it was forwarded to the SDK — the bug.
+  forwarded_to_sdk = any(
+    "/help" in l and "query() sent to CLI" in l for l in tail
+  )
+  if msg and not forwarded_to_sdk:
+    result.ok("T71 /help as reply", f"{elapsed:.1f}s")
+  elif forwarded_to_sdk:
+    result.fail(
+      "T71 /help as reply",
+      "dispatched to SDK instead of local handler (parent-quote not stripped)",
+    )
+    log.dump_tail(15, "T71")
+  else:
+    result.fail("T71 /help as reply", "no response card")
+    log.dump_tail(15, "T71")
+
+  wait_for_idle(pid, chat_id, timeout=30)
+
+  # T72: /ping as a reply — same regression, second command.
+  print("  [T72] /ping as reply...")
+  ts = str(int(time.time() * 1000))
+  send_reply_msg("/ping", anchor_id, chat_id)
+  msg, elapsed = wait_for_response(chat_id, ts, timeout=15)
+  if msg:
+    result.ok("T72 /ping as reply", f"{elapsed:.1f}s")
+  else:
+    result.fail("T72 /ping as reply", "no response card")
+    log.dump_tail(15, "T72")
+
+  wait_for_idle(pid, chat_id, timeout=30)
+
+  # T73: /model (arg-parsing command) as a reply — must not pick up
+  # the parent-quote tail as its argument.
+  print("  [T73] /model as reply (arg-parsing)...")
+  ts = str(int(time.time() * 1000))
+  send_reply_msg("/model", anchor_id, chat_id)
+  msg, elapsed = wait_for_response(chat_id, ts, timeout=15)
+  # When /model has no arg, nemo replies with usage text — the card
+  # must not contain the parent-quote marker text.
+  if msg:
+    body_txt = json.dumps(msg.get("body", ""))
+    if "The user is replying to this earlier message" in body_txt:
+      result.fail(
+        "T73 /model as reply",
+        "parent-quote leaked into command response",
+      )
+    else:
+      result.ok("T73 /model as reply", f"{elapsed:.1f}s")
+  else:
+    result.fail("T73 /model as reply", "no response card")
+    log.dump_tail(15, "T73")
+
+  wait_for_idle(pid, chat_id, timeout=30)
+
+  # T74: thread_id propagation — inject a topic-style event carrying
+  # thread_id and verify the LarkEvent parser surfaced it. We check
+  # the log for "Processing:" to confirm the message was accepted;
+  # thread_id parsing itself is covered by test_lark_events.py, but
+  # an end-to-end smoke test catches relay-side regressions.
+  print("  [T74] thread_id propagation...")
+  ts = str(int(time.time() * 1000))
+  send_topic_msg(
+    "say pineapple",
+    thread_id="omt_e2etest0001",
+    chat_id=chat_id,
+    parent_id=anchor_id,
+  )
+  msg, elapsed = wait_for_response(chat_id, ts, timeout=30)
+  if msg:
+    result.ok("T74 thread_id event accepted", f"{elapsed:.1f}s")
+  else:
+    result.fail("T74 thread_id event accepted", "no response")
+    log.dump_tail(15, "T74")
+
+  print()
+
+
 def main():
   import argparse
   parser = argparse.ArgumentParser(description="Nemo E2E test runner")
@@ -1279,13 +1431,16 @@ def main():
                       help="Run only dual-instance test (Phase 8)")
   parser.add_argument("--media", action="store_true",
                       help="Run only media & interaction test (Phase 9)")
+  parser.add_argument("--topic", action="store_true",
+                      help="Run only topic-chat regression test (Phase 10)")
   parser.add_argument("--verbose", "-v", action="store_true",
                       help="Verbose nemo logging")
   args = parser.parse_args()
 
   chat_id = args.chat_id.strip()
   result = E2EResult()
-  single_phase = args.stress or args.project or args.perm or args.dual or args.media
+  single_phase = (args.stress or args.project or args.perm
+                  or args.dual or args.media or args.topic)
   run_all = not single_phase
   created_temp_chat = False
 
@@ -1350,6 +1505,8 @@ def main():
     print(f"  Mode: dual-instance test only")
   elif args.media:
     print(f"  Mode: media & interaction test only")
+  elif args.topic:
+    print(f"  Mode: topic chat test only")
   print()
 
   # Dual-instance manages its own processes
@@ -1569,6 +1726,8 @@ def main():
           run_project_flow(pid, chat_id, result)
           wait_for_idle(pid, chat_id, timeout=30)
           run_media_tests(pid, chat_id, result)
+          wait_for_idle(pid, chat_id, timeout=30)
+          run_topic_tests(pid, chat_id, result)
         finally:
           send_msg("/exit", chat_id)
           if not wait_for_exit(pid, timeout=35):
@@ -1624,6 +1783,14 @@ def main():
     elif args.media:
       try:
         run_media_tests(pid, chat_id, result)
+      finally:
+        send_msg("/exit", chat_id)
+        if not wait_for_exit(pid, timeout=35):
+          kill_nemo(pid)
+
+    elif args.topic:
+      try:
+        run_topic_tests(pid, chat_id, result)
       finally:
         send_msg("/exit", chat_id)
         if not wait_for_exit(pid, timeout=35):

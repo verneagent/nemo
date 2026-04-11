@@ -59,10 +59,16 @@ def build_prompt(replies: list[object]) -> str:
 
 # Marker appended by LarkChannel._to_incoming when a message has a
 # parent_id / thread root. The tail is useful as SDK context but breaks
-# slash-command dispatch (which relies on exact or prefix matches on the
-# whole string). strip_parent_quote() peels it off for command dispatch
-# while leaving the full enriched text intact for the SDK prompt.
-_PARENT_QUOTE_MARKER = "\n\n(The user is replying to this earlier message"
+# slash-command dispatch (which relies on exact or prefix matches on
+# the whole string). strip_parent_quote() peels it off for command
+# dispatch while leaving the full enriched text intact for the SDK
+# prompt.
+#
+# Note: no leading whitespace in the marker — strip_mentions() collapses
+# runs of whitespace (including the original "\n\n") to single spaces
+# before this runs, so matching on the parenthesized phrase alone works
+# for both the raw and the whitespace-collapsed form.
+_PARENT_QUOTE_MARKER = "(The user is replying to this earlier message"
 
 
 def strip_parent_quote(text: str) -> str:
@@ -70,10 +76,11 @@ def strip_parent_quote(text: str) -> str:
 
   In Lark topic groups every message carries a root_id pointing at the
   topic root, so the parent-quote enrichment fires on every message —
-  including plain slash commands. Without stripping, `"/mention"` looks
-  like `"/mention\\n\\n(The user is replying to this earlier message…)"`
-  to ``commands.try_dispatch`` and never matches the command table.
-  Return only the portion before the marker; leave plain text alone.
+  including plain slash commands. Without stripping, ``"/mention"``
+  looks like ``"/mention (The user is replying to this earlier
+  message…)"`` to ``commands.try_dispatch`` and never matches the
+  command table. Return only the portion before the marker; leave
+  plain text alone.
   """
   idx = text.find(_PARENT_QUOTE_MARKER)
   if idx >= 0:
