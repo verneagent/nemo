@@ -146,8 +146,9 @@ def test_filter_bot_interactions_reply():
 
 
 def test_filter_bot_interactions_reply_to_own_only():
-  """With is_own_parent supplied, a reply only counts as implicit mention
-  if the parent was sent by the bot. Replies to other bots/users don't."""
+  """With is_own_message supplied, a reply only counts as implicit
+  mention if the parent was sent by the bot. Replies to other bots/
+  users don't."""
   own = {"parent_id": "om_bot_1", "msg_type": "text", "mentions": [],
          "text": "thanks!"}
   other = {"parent_id": "om_jenkins", "msg_type": "text",
@@ -155,7 +156,7 @@ def test_filter_bot_interactions_reply_to_own_only():
            "text": "@RikiRiki 其他 quest 相关的也该 fix 了"}
   filtered = filter_bot_interactions(
     [own, other], "ou_bot",
-    is_own_parent=lambda mid: mid == "om_bot_1",
+    is_own_message=lambda mid: mid == "om_bot_1",
   )
   assert len(filtered) == 1
   assert filtered[0] is own
@@ -166,15 +167,31 @@ def test_filter_bot_interactions_mention_wins_over_parent():
   r = {"parent_id": "om_other", "msg_type": "text",
        "mentions": [{"id": "ou_bot"}]}
   filtered = filter_bot_interactions(
-    [r], "ou_bot", is_own_parent=lambda mid: False,
+    [r], "ou_bot", is_own_message=lambda mid: False,
   )
   assert len(filtered) == 1
 
 
-def test_filter_bot_interactions_reaction():
-  replies = [{"msg_type": "reaction", "mentions": []}]
-  filtered = filter_bot_interactions(replies, "ou_bot")
+def test_filter_bot_interactions_reaction_to_own():
+  """A reaction to one of the bot's own messages counts as bot-directed
+  (reactions are a form of reply; the target id lives in message_id,
+  not parent_id, because reaction events don't carry a parent)."""
+  reaction_to_own = {
+    "event_type": "im.message.reaction.created_v1",
+    "message_id": "om_bot_reply",
+    "mentions": [],
+  }
+  reaction_to_other = {
+    "event_type": "im.message.reaction.created_v1",
+    "message_id": "om_jenkins_card",
+    "mentions": [],
+  }
+  filtered = filter_bot_interactions(
+    [reaction_to_own, reaction_to_other], "ou_bot",
+    is_own_message=lambda mid: mid == "om_bot_reply",
+  )
   assert len(filtered) == 1
+  assert filtered[0] is reaction_to_own
 
 
 def test_filter_bot_interactions_object():

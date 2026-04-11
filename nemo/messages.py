@@ -111,21 +111,27 @@ def filter_by_allowed_senders(
 def filter_bot_interactions(
   replies: list[object],
   bot_open_id: str,
-  is_own_parent: Callable[[str], bool] | None = None,
+  is_own_message: Callable[[str], bool] | None = None,
 ) -> list[object]:
   """In need_mention mode, keep only bot-directed messages.
 
   A message is considered bot-directed when:
     - it @-mentions the bot, OR
-    - it's a reaction/sticker (always allowed), OR
-    - it's a reply to one of the bot's own earlier messages (implicit
-      thread continuation — checked via is_own_parent).
+    - it's a reply whose parent was sent by the bot (text/card reply),
+      OR
+    - it's a reaction whose target message was sent by the bot.
 
-  Replying to *other* messages (e.g. quoting a teammate's text while
-  @-mentioning a different teammate) is NOT considered bot-directed.
-  If is_own_parent is not supplied, any parent_id is treated as implicit
-  mention — that's the old permissive behavior kept for test fixtures
-  that don't model message ownership.
+  Reactions are a form of reply — reacting to one of the bot's own
+  messages counts as addressing the bot. Reacting to someone else's
+  message does not.
+
+  Replying to *other* messages (e.g. quoting a teammate's card while
+  @-mentioning another teammate) is NOT considered bot-directed.
+
+  `is_own_message(message_id)` should return True iff the given id
+  corresponds to a message the bot itself sent. If not supplied, any
+  parent_id/reaction is treated as implicit mention — the permissive
+  legacy behavior kept for test fixtures that don't model ownership.
   """
   if not bot_open_id:
     return replies
@@ -138,16 +144,30 @@ def filter_bot_interactions(
     ):
       result.append(r)
       continue
-    if _get(r, "msg_type") in ("reaction", "sticker"):
-      result.append(r)
-      continue
-    parent_id = _get(r, "parent_id")
-    if parent_id:
-      if is_own_parent is None:
+
+    # Reactions: target is in message_id (no parent_id).
+    if _get(r, "event_type") == "im.message.reaction.created_v1":
+      target = str(_get(r, "message_id") or "")
+      if not target:
+        continue
+      if is_own_message is None:
         result.append(r)
         continue
       try:
-        if is_own_parent(str(parent_id)):
+        if is_own_message(target):
+          result.append(r)
+      except Exception:
+        pass
+      continue
+
+    # Regular replies: parent_id points at the quoted message.
+    parent_id = _get(r, "parent_id")
+    if parent_id:
+      if is_own_message is None:
+        result.append(r)
+        continue
+      try:
+        if is_own_message(str(parent_id)):
           result.append(r)
           continue
       except Exception:

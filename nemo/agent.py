@@ -357,20 +357,21 @@ async def main_loop(
         log.debug("Skipping: unauthorized sender %s (operator=%s)", sender, operator_open_id)
         continue
 
-      # need_mention mode: only respond to @mentions, replies to nemo's
-      # own messages, and reactions. Slash commands (including /mention)
-      # must also be @-directed when need_mention is on. Replying to
-      # *other* people's messages (e.g. quoting a teammate's card while
-      # @-ing another teammate) is not considered bot-directed.
+      # need_mention mode: only respond to @mentions and interactions
+      # directed at nemo's own messages (text reply or emoji reaction).
+      # Slash commands must also be @-directed. Replying to *other*
+      # people's messages (quoting a teammate's card while @-ing
+      # another teammate) is not considered bot-directed.
       if need_mention and bot_open_id:
-        def _is_own_parent(mid: str) -> bool:
+        def _is_own_message(mid: str) -> bool:
           row = db.lookup_parent_message(mid)
           return bool(row and row.get("direction") == "sent")
         kept = messages.filter_bot_interactions(
-          [reply], bot_open_id, is_own_parent=_is_own_parent)
+          [reply], bot_open_id, is_own_message=_is_own_message)
         if not kept:
           log.info("Skipping: need_mention on, not bot-directed "
-                   "(parent=%s mentions=%s)",
+                   "(event=%s parent=%s mentions=%s)",
+                   reply.event_type,
                    reply.parent_id[:16] if reply.parent_id else "",
                    [m.get("id","")[:10] for m in reply.mentions])
           continue
