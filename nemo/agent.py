@@ -247,13 +247,7 @@ async def main_loop(
     log.error("Start card failed: %s", e)
     err_msg = str(e)
     if "230002" in err_msg or "NOT be out of the chat" in err_msg:
-      from .__main__ import signal_error
-      signal_error(f"Bot is not in chat {chat_id}")
       return 1
-
-  # Signal parent process that the daemon is ready
-  from .__main__ import signal_ready
-  signal_ready()
 
   # Status tab — green idle
   await channel.update_status(model, "idle")

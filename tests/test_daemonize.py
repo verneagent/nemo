@@ -1,117 +1,77 @@
-"""Tests for _daemonize() double-fork."""
+"""Regression tests for removed daemonization.
+
+Nemo used to double-fork and set NEMO_FOREGROUND=1 in its own environ
+to mark 'already daemonized'. That env var leaked into every
+subprocess — including bash invocations inside the Claude SDK — so a
+nested `nemo` launched from a parent nemo's bash tool would see the
+marker, skip daemonization, run as a foreground child of bash, and die
+silently when that bash invocation wrapped up.
+
+We removed daemonization entirely. These tests make sure nothing
+accidentally re-introduces the env pollution or the helper symbols.
+"""
 
 import os
-import re
 import subprocess
 import sys
-import time
 
-import pytest
+import nemo.__main__ as nemo_main
 
 
-@pytest.mark.slow
-def test_double_fork_reparents_to_pid1():
-  """Daemon (grandchild) should be reparented to PID 1 after double-fork."""
+REPO_ROOT = os.path.dirname(os.path.dirname(__file__))
+
+
+def test_daemonize_helpers_are_gone():
+  """The daemonize helpers must not reappear — they are the thing that
+  set and relied on the poisoned NEMO_FOREGROUND marker."""
+  for name in ("_daemonize", "signal_ready", "signal_error", "_ready_fd"):
+    assert not hasattr(nemo_main, name), (
+      f"nemo.__main__.{name} should be gone after daemonize removal"
+    )
+
+
+def test_main_source_does_not_touch_nemo_foreground_env():
+  """Regression: grep the module source for the leaked env var."""
+  src_path = nemo_main.__file__
+  with open(src_path) as f:
+    src = f.read()
+  assert "NEMO_FOREGROUND" not in src, (
+    "NEMO_FOREGROUND env var reintroduced — it leaks into subprocess "
+    "env and breaks nested nemo launches."
+  )
+
+
+def test_foreground_flag_is_gone():
+  """--foreground / -f has no meaning and should be rejected by argparse."""
   result = subprocess.run(
-    [sys.executable, "-c", """
-import os, sys, time
-sys.path.insert(0, ".")
-from nemo.__main__ import _daemonize, signal_ready
-_daemonize()
-signal_ready()
-# We are the daemon — sleep so the test can inspect us
-time.sleep(5)
-"""],
+    [sys.executable, "-m", "nemo", "--foreground"],
     capture_output=True, text=True, timeout=10,
-    cwd=os.path.dirname(os.path.dirname(__file__)),
+    cwd=REPO_ROOT,
   )
-  assert result.returncode == 0
-  m = re.search(r"PID (\d+)", result.stderr)
-  assert m, f"Expected 'nemo started (PID N)' in stderr, got: {result.stderr!r}"
-  daemon_pid = int(m.group(1))
+  assert result.returncode != 0
+  assert "unrecognized arguments" in result.stderr or "unrecognized" in result.stderr
 
-  # Daemon should be alive
-  try:
-    os.kill(daemon_pid, 0)
-  except ProcessLookupError:
-    pytest.fail(f"Daemon PID {daemon_pid} is not alive")
 
-  # Daemon PPID should be 1 (reparented to init/launchd)
-  ps = subprocess.run(
-    ["ps", "-p", str(daemon_pid), "-o", "ppid="],
-    capture_output=True, text=True,
+def test_cli_subprocess_does_not_leak_nemo_foreground():
+  """Run `python -m nemo --version` in a subprocess and verify it
+  does not set NEMO_FOREGROUND in its own or descendant env.
+
+  We check this by exporting env from a child that imports nemo.__main__
+  at module load time (same import surface as the real CLI entry).
+  """
+  probe = (
+    "import os, nemo.__main__;"
+    "print('HAS_NEMO_FOREGROUND=' + str('NEMO_FOREGROUND' in os.environ))"
   )
-  ppid = ps.stdout.strip()
-  assert ppid == "1", f"Daemon PPID should be 1, got {ppid}"
-
-  # Cleanup
-  os.kill(daemon_pid, 15)
-
-
-@pytest.mark.slow
-def test_double_fork_daemon_survives_parent_kill():
-  """Daemon should survive even if the launching shell is killed."""
-  # Start nemo daemonize in a subprocess
-  proc = subprocess.Popen(
-    [sys.executable, "-c", """
-import os, sys, time
-sys.path.insert(0, ".")
-from nemo.__main__ import _daemonize, signal_ready
-_daemonize()
-signal_ready()
-time.sleep(10)
-"""],
-    stderr=subprocess.PIPE, stdout=subprocess.PIPE,
-    cwd=os.path.dirname(os.path.dirname(__file__)),
-  )
-  stdout, stderr = proc.communicate(timeout=10)
-  m = re.search(r"PID (\d+)", stderr.decode())
-  assert m
-  daemon_pid = int(m.group(1))
-
-  # Give daemon a moment to settle
-  time.sleep(0.3)
-
-  # Daemon should be alive after parent exited
-  try:
-    os.kill(daemon_pid, 0)
-  except ProcessLookupError:
-    pytest.fail(f"Daemon PID {daemon_pid} died when parent exited")
-
-  # Cleanup
-  os.kill(daemon_pid, 15)
-
-
-@pytest.mark.slow
-def test_double_fork_reports_correct_pid():
-  """The PID printed to stderr should match the actual daemon process."""
+  env = {k: v for k, v in os.environ.items() if k != "NEMO_FOREGROUND"}
   result = subprocess.run(
-    [sys.executable, "-c", """
-import os, sys, time
-sys.path.insert(0, ".")
-from nemo.__main__ import _daemonize, signal_ready
-_daemonize()
-# Write our actual PID to a file for verification
-with open("/tmp/.nemo_test_pid", "w") as f:
-    f.write(str(os.getpid()))
-signal_ready()
-time.sleep(5)
-"""],
+    [sys.executable, "-c", probe],
     capture_output=True, text=True, timeout=10,
-    cwd=os.path.dirname(os.path.dirname(__file__)),
+    cwd=REPO_ROOT, env=env,
   )
-  m = re.search(r"PID (\d+)", result.stderr)
-  assert m
-  reported_pid = int(m.group(1))
-
-  time.sleep(0.3)
-  with open("/tmp/.nemo_test_pid") as f:
-    actual_pid = int(f.read().strip())
-
-  assert reported_pid == actual_pid, (
-    f"Reported PID {reported_pid} != actual daemon PID {actual_pid}"
+  assert result.returncode == 0, result.stderr
+  assert "HAS_NEMO_FOREGROUND=False" in result.stdout, (
+    f"nemo import leaked NEMO_FOREGROUND into env: {result.stdout!r}"
   )
 
-  # Cleanup
-  os.kill(reported_pid, 15)
-  os.unlink("/tmp/.nemo_test_pid")
+

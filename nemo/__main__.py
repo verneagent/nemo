@@ -1,4 +1,12 @@
-"""CLI entry point: python -m nemo"""
+"""CLI entry point: python -m nemo
+
+Nemo always runs in the foreground. The caller is responsible for
+detaching the process (tmux / `setsid nohup ... </dev/null >/dev/null 2>&1 &`).
+We used to double-fork here, but the parent-set env marker leaked into
+every subprocess — including bash invocations inside the Claude SDK —
+and caused child nemos launched from those contexts to silently skip
+daemonization and die with their spawning subprocess.
+"""
 
 from __future__ import annotations
 
@@ -64,99 +72,6 @@ def _ensure_provider_runtime(provider: str) -> None:
     return
   print(f"Error: unsupported provider '{provider}'", file=sys.stderr)
   sys.exit(1)
-
-
-_ready_fd: int | None = None  # write-end of readiness pipe (grandchild only)
-
-
-def signal_ready() -> None:
-  """Signal the waiting parent that the daemon is ready."""
-  global _ready_fd
-  if _ready_fd is not None:
-    try:
-      os.write(_ready_fd, f"ready:{os.getpid()}\n".encode())
-    except OSError:
-      pass  # Parent already exited — pipe broken, harmless
-    try:
-      os.close(_ready_fd)
-    except OSError:
-      pass  # fd already closed
-    _ready_fd = None
-
-
-def signal_error(msg: str) -> None:
-  """Signal the waiting parent that startup failed."""
-  global _ready_fd
-  if _ready_fd is not None:
-    try:
-      os.write(_ready_fd, f"error:{msg}\n".encode())
-    except OSError:
-      pass  # pipe broken, parent exited
-    try:
-      os.close(_ready_fd)
-    except OSError:
-      pass  # fd already closed
-    _ready_fd = None
-
-
-def _daemonize():
-  """Double-fork into background, fully detach from parent process tree.
-
-  Single fork + setsid is not enough: the Claude SDK Bash tool tracks the
-  child PID and kills it when the turn ends. Double-fork ensures the
-  actual daemon (grandchild) is reparented to PID 1 and invisible to any
-  parent process tree cleanup.
-
-  The parent blocks until the daemon signals readiness (after the start
-  card is sent) or the pipe closes on error.
-  """
-  # Pipe to communicate readiness back to original parent
-  r_fd, w_fd = os.pipe()
-
-  # First fork
-  pid = os.fork()
-  if pid > 0:
-    # Original parent — wait for readiness signal from daemon
-    os.close(w_fd)
-    data = b""
-    while True:
-      chunk = os.read(r_fd, 256)
-      if not chunk:
-        break
-      data += chunk
-      if b"\n" in data:
-        break
-    os.close(r_fd)
-    os.waitpid(pid, 0)
-    msg = data.decode().strip()
-    if msg.startswith("ready:"):
-      daemon_pid = msg.split(":", 1)[1]
-      print(f"nemo started (PID {daemon_pid})", file=sys.stderr)
-      sys.exit(0)
-    else:
-      print("nemo failed to start", file=sys.stderr)
-      if msg:
-        print(msg, file=sys.stderr)
-      sys.exit(1)
-
-  # Intermediate child — new session, fork again, exit immediately
-  os.close(r_fd)
-  os.setsid()
-
-  pid2 = os.fork()
-  if pid2 > 0:
-    os.close(w_fd)
-    os._exit(0)
-
-  # Grandchild — the actual daemon; keep w_fd for readiness signal
-  global _ready_fd
-  _ready_fd = w_fd
-  devnull = os.open(os.devnull, os.O_RDWR)
-  os.dup2(devnull, 0)
-  os.dup2(devnull, 1)
-  os.dup2(devnull, 2)
-  os.close(devnull)
-  os.environ["NEMO_FOREGROUND"] = "1"
 
 
 def _setup_crash_diagnostics(log_path: str) -> None:
@@ -368,8 +283,6 @@ def main():
   parser.add_argument("--permission-mode", default="bypassPermissions",
                       choices=["default", "acceptEdits", "plan", "bypassPermissions"],
                       help="SDK permission mode (default: bypassPermissions)")
-  parser.add_argument("--foreground", "-f", action="store_true",
-                      help="Run in foreground (default: daemonize)")
   parser.add_argument("--verbose", "-v", action="store_true", help="Debug logging")
   args = parser.parse_args()
 
@@ -378,10 +291,6 @@ def main():
   # Set active profile before any config loading
   from .config import set_profile, profile_path
   set_profile(args.profile)
-
-  # Daemonize unless --foreground
-  if not args.foreground and not os.environ.get("NEMO_FOREGROUND"):
-    _daemonize()
 
   # Ignore SIGPIPE — broken pipe from parent exit is harmless
   signal.signal(signal.SIGPIPE, signal.SIG_IGN)
