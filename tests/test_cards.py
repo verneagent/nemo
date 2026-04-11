@@ -88,7 +88,8 @@ def test_collapsible_thinking_mixed():
   ]
   panel = _collapsible_thinking(steps)
   assert panel["tag"] == "collapsible_panel"
-  assert panel["header"]["title"]["content"] == "Thinking (4)"
+  # Header shows group count (2 texts = 2 groups), not total step count
+  assert panel["header"]["title"]["content"] == "Thinking (2)"
   content = _panel_content(panel)
   assert "Let me check..." in content
   assert "Read:" in content
@@ -98,14 +99,18 @@ def test_collapsible_thinking_mixed():
 
 
 def test_collapsible_thinking_groups_consecutive_tools():
-  """7 consecutive Grep calls should merge into one line."""
+  """When tools exceed limit, only last 5 are kept (still coalesced)."""
+  # 7 grep tools, limit is 5, so 2 dropped + 5 kept (all same type → 1 line)
   steps = [ThinkingStep("tool", f"Grep: pattern{i}") for i in range(7)]
   panel = _collapsible_thinking(steps)
   content = _panel_content(panel)
-  # Should be one grouped line, not 7 bullet points
   assert content.count("Grep:") == 1
-  assert "pattern0" in content
+  # First 2 patterns dropped (pattern0, pattern1)
+  assert "pattern0" not in content
+  assert "pattern1" not in content
   assert "pattern6" in content
+  # Indicator for dropped tools
+  assert "+2 earlier" in content
 
 
 def test_collapsible_thinking_separates_different_tool_types():
@@ -120,6 +125,74 @@ def test_collapsible_thinking_separates_different_tool_types():
   content = _panel_content(panel)
   assert content.count("Read:") == 2  # two separate Read groups
   assert content.count("Grep:") == 1
+
+
+def test_collapsible_thinking_limits_tools_per_group_to_5():
+  """Each group shows at most 5 tool calls; older ones get 'N earlier'."""
+  steps = [ThinkingStep("text", "Doing stuff")]
+  # 8 different tool types so coalescing doesn't merge them
+  steps.extend([
+    ThinkingStep("tool", "Read: a.py"),
+    ThinkingStep("tool", "Grep: foo"),
+    ThinkingStep("tool", "Bash: ls"),
+    ThinkingStep("tool", "Edit: b.py"),
+    ThinkingStep("tool", "Read: c.py"),
+    ThinkingStep("tool", "Grep: bar"),
+    ThinkingStep("tool", "Bash: pwd"),
+    ThinkingStep("tool", "Edit: d.py"),
+  ])
+  panel = _collapsible_thinking(steps)
+  content = _panel_content(panel)
+  # Indicator for 3 dropped (8 - 5 = 3)
+  assert "+3 earlier" in content
+  # First 3 tools dropped
+  assert "a.py" not in content
+  assert "foo" not in content
+  assert " ls" not in content  # leading space to avoid "tool calls"
+  # Last 5 kept
+  assert "b.py" in content
+  assert "c.py" in content
+  assert "bar" in content
+  assert "pwd" in content
+  assert "d.py" in content
+
+
+def test_collapsible_thinking_group_count_in_header():
+  """Header shows number of groups (text-initiated)."""
+  steps = [
+    ThinkingStep("text", "Step 1"),
+    ThinkingStep("tool", "Read: a.py"),
+    ThinkingStep("text", "Step 2"),
+    ThinkingStep("tool", "Read: b.py"),
+    ThinkingStep("text", "Step 3"),
+  ]
+  panel = _collapsible_thinking(steps)
+  assert panel["header"]["title"]["content"] == "Thinking (3)"
+
+
+def test_collapsible_thinking_leading_tool_group():
+  """If no leading text, the first tool-only group still counts as 1."""
+  steps = [
+    ThinkingStep("tool", "Read: a.py"),
+    ThinkingStep("text", "After tool"),
+    ThinkingStep("tool", "Edit: a.py"),
+  ]
+  panel = _collapsible_thinking(steps)
+  assert panel["header"]["title"]["content"] == "Thinking (2)"
+
+
+def test_collapsible_thinking_thinking_not_counted_toward_tool_limit():
+  """Thinking blocks don't count against the 5-tool limit."""
+  steps = [ThinkingStep("text", "Working")]
+  steps.extend([ThinkingStep("thinking", f"thought {i}") for i in range(3)])
+  steps.extend([ThinkingStep("tool", f"Bash: cmd{i}") for i in range(6)])
+  panel = _collapsible_thinking(steps)
+  content = _panel_content(panel)
+  # 6 tools - limit 5 = 1 dropped
+  assert "+1 earlier" in content
+  # All 3 thinking blocks present
+  assert "thought 0" in content
+  assert "thought 2" in content
 
 
 def test_collapsible_thinking_text_separates_groups_with_divider():
@@ -202,7 +275,8 @@ def test_working_card_with_steps():
   assert elements[0]["tag"] == "markdown"
   assert "`Edit: b.py`" in elements[0]["content"]
   assert elements[1]["tag"] == "collapsible_panel"
-  assert "Thinking (3)" in elements[1]["header"]["title"]["content"]
+  # 1 text = 1 group
+  assert "Thinking (1)" in elements[1]["header"]["title"]["content"]
 
 
 def test_working_card_escalating_title():

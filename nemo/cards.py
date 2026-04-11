@@ -160,22 +160,44 @@ def _tool_type_and_detail(summary: str) -> tuple[str, str]:
   return summary.strip(), ""
 
 
-def _collapsible_thinking(steps: list[ThinkingStep]) -> JsonObject:
-  """Build a collapsible_panel with narrative text + grouped tool lines.
+MAX_TOOLS_PER_GROUP = 5
 
-  Consecutive tool calls of the same type are merged into one line.
-  Each narrative text starts a new "group"; groups are separated by
-  a horizontal divider. Tool lines render in smaller font; text and
-  thinking render in default size.
+
+def _split_into_groups(steps: list[ThinkingStep]) -> list[tuple[str, list[ThinkingStep]]]:
+  """Split steps into groups. Each group = (text or '', [tool/thinking steps]).
+
+  A new group starts at each text step. Tool/thinking steps attach to
+  the current group. If the first step isn't text, the first group
+  has empty text.
   """
-  # Each entry: ("tool" | "text" | "divider", content)
-  entries: list[tuple[str, str]] = []
+  groups: list[tuple[str, list[ThinkingStep]]] = []
+  cur_text: str = ""
+  cur_steps: list[ThinkingStep] = []
+  started = False
+
+  for s in steps:
+    if s.kind == "text":
+      if started:
+        groups.append((cur_text, cur_steps))
+      cur_text = s.content
+      cur_steps = []
+      started = True
+    else:
+      if not started:
+        started = True  # first group with no leading text
+      cur_steps.append(s)
+  if started:
+    groups.append((cur_text, cur_steps))
+  return groups
+
+
+def _render_tool_lines(tool_steps: list[ThinkingStep]) -> list[str]:
+  """Coalesce consecutive same-type tool steps into rendered lines."""
+  lines: list[str] = []
   pending_type: str = ""
   pending_details: list[str] = []
-  group_has_content = False
 
-  def _flush_tools() -> None:
-    nonlocal group_has_content
+  def _flush() -> None:
     if not pending_type:
       return
     details = [d for d in pending_details if d]
@@ -183,50 +205,74 @@ def _collapsible_thinking(steps: list[ThinkingStep]) -> JsonObject:
       joined = ", ".join(details)
       if len(joined) > 200:
         joined = joined[:197] + "..."
-      entries.append((
-        "tool",
-        f"<font color='grey'>{pending_type}:</font> {_escape_md(joined)}",
-      ))
+      lines.append(
+        f"<font color='grey'>{pending_type}:</font> {_escape_md(joined)}")
     else:
+      lines.append(
+        f"<font color='grey'>{pending_type}</font> × {len(pending_details)}")
+
+  for s in tool_steps:
+    ttype, detail = _tool_type_and_detail(s.content)
+    if ttype == pending_type:
+      pending_details.append(detail)
+    else:
+      _flush()
+      pending_type = ttype
+      pending_details = [detail]
+  _flush()
+  return lines
+
+
+def _collapsible_thinking(steps: list[ThinkingStep]) -> JsonObject:
+  """Build a collapsible_panel with grouped narrative text + tool lines.
+
+  Steps are split into groups at each text step. Each group shows:
+  - The group's text (default font)
+  - Any thinking steps (default font)
+  - The last MAX_TOOLS_PER_GROUP tool calls (small font, grey type)
+  - A "+N earlier" indicator if tools were dropped
+
+  Header shows the number of groups, not the total step count.
+  Groups are separated by a horizontal rule.
+  """
+  groups = _split_into_groups(steps)
+
+  # Each entry: ("text" | "tool" | "divider", content)
+  entries: list[tuple[str, str]] = []
+  for i, (text, grp_steps) in enumerate(groups):
+    if i > 0:
+      entries.append(("divider", "---"))
+
+    if text:
+      t = _sanitize_markdown(text)
+      if len(t) > 300:
+        t = t[:297] + "..."
+      entries.append(("text", _escape_md(t)))
+
+    # Separate thinking and tool steps while preserving order
+    thinkings = [s for s in grp_steps if s.kind == "thinking"]
+    tools = [s for s in grp_steps if s.kind == "tool"]
+
+    # Render thinking blocks (all of them — not counted toward tool limit)
+    for th in thinkings:
+      tx = _sanitize_markdown(th.content)
+      if len(tx) > 200:
+        tx = tx[:197] + "..."
+      entries.append(("text", _escape_md(tx)))
+
+    # Apply 5-tool limit: keep the last MAX_TOOLS_PER_GROUP
+    dropped = max(0, len(tools) - MAX_TOOLS_PER_GROUP)
+    kept_tools = tools[dropped:]
+    if dropped > 0:
       entries.append((
         "tool",
-        f"<font color='grey'>{pending_type}</font> × {len(pending_details)}",
+        f"<font color='grey'>… +{dropped} earlier tool call"
+        f"{'s' if dropped > 1 else ''}</font>",
       ))
-    group_has_content = True
-
-  for s in steps:
-    if s.kind == "tool":
-      ttype, detail = _tool_type_and_detail(s.content)
-      if ttype == pending_type:
-        pending_details.append(detail)
-      else:
-        _flush_tools()
-        pending_type = ttype
-        pending_details = [detail]
-    elif s.kind == "thinking":
-      _flush_tools()
-      pending_type = ""
-      pending_details = []
-      text = _sanitize_markdown(s.content)
-      if len(text) > 200:
-        text = text[:197] + "..."
-      entries.append(("text", _escape_md(text)))
-      group_has_content = True
-    else:  # text — start of a new group
-      _flush_tools()
-      pending_type = ""
-      pending_details = []
-      if group_has_content:
-        entries.append(("divider", "---"))
-      text = _sanitize_markdown(s.content)
-      if len(text) > 300:
-        text = text[:297] + "..."
-      entries.append(("text", _escape_md(text)))
-      group_has_content = True
-  _flush_tools()
+    for line in _render_tool_lines(kept_tools):
+      entries.append(("tool", line))
 
   # Coalesce consecutive entries of the same kind into markdown blocks.
-  # Each block becomes a separate markdown element with its own text_size.
   elements: list[JsonObject] = []
   buf: list[str] = []
   buf_kind: str = ""
@@ -234,7 +280,7 @@ def _collapsible_thinking(steps: list[ThinkingStep]) -> JsonObject:
   def _emit() -> None:
     if not buf:
       return
-    content = "  \n".join(buf)  # hard-break between lines within block
+    content = "  \n".join(buf)
     el: JsonObject = {"tag": "markdown", "content": content}
     if buf_kind == "tool":
       el["text_size"] = "notation"
@@ -263,7 +309,7 @@ def _collapsible_thinking(steps: list[ThinkingStep]) -> JsonObject:
     "header": {
       "title": {
         "tag": "plain_text",
-        "content": f"Thinking ({len(steps)})",
+        "content": f"Thinking ({len(groups)})",
       },
     },
     "vertical_spacing": "4px",
