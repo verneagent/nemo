@@ -279,6 +279,8 @@ def main():
   parser.add_argument("--provider", default="claude", choices=["claude", "codex"],
                       help="Coding agent provider (default: claude)")
   parser.add_argument("--model", default="", help="Model to use (provider default if omitted)")
+  parser.add_argument("--effort", default="", choices=["", "low", "medium", "high"],
+                      help="Reasoning effort for the coding agent (default: provider default)")
   parser.add_argument("--profile", default="default", help="Config profile name (default: default)")
   parser.add_argument("--permission-mode", default="bypassPermissions",
                       choices=["default", "acceptEdits", "plan", "bypassPermissions"],
@@ -389,7 +391,8 @@ def main():
   try:
     return asyncio.run(main_loop(chat_id, project_dir, model,
                                  provider=args.provider,
-                                 permission_mode=args.permission_mode))
+                                 permission_mode=args.permission_mode,
+                                 effort=args.effort))
   except KeyboardInterrupt:
     return 0
   except BaseException as e:

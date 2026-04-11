@@ -25,6 +25,9 @@ _SIDE_CAR_DIR = _REPO_ROOT / "codex_sidecar"
 _SIDE_CAR_SCRIPT = _SIDE_CAR_DIR / "run_turn.mjs"
 _SIDE_CAR_PACKAGE = _SIDE_CAR_DIR / "package.json"
 
+# Valid values for Codex SDK's ThreadOptions.modelReasoningEffort.
+_CODEX_EFFORT_LEVELS = frozenset({"low", "medium", "high"})
+
 
 class CodexCodingAgent(CodingAgent):
   """CodingAgent adapter for the local Codex SDK sidecar runtime."""
@@ -42,8 +45,12 @@ class CodexCodingAgent(CodingAgent):
     self._project_dir = ""
     self._model = ""
     self._session_id = ""
+    self._effort = ""
     self._proc: Process | None = None
     self._interrupted = False
+
+  def set_effort(self, effort: str) -> None:
+    self._effort = effort if effort in _CODEX_EFFORT_LEVELS else ""
 
   async def start(self, project_dir: str, model: str, resume: str = "") -> None:
     self._ensure_runtime()
@@ -179,6 +186,8 @@ class CodexCodingAgent(CodingAgent):
     args.extend(["--cwd", self._project_dir])
     if self._model:
       args.extend(["--model", self._model])
+    if self._effort:
+      args.extend(["--effort", self._effort])
     if self._session_id:
       args.extend(["--resume", self._session_id])
     return args

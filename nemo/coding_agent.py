@@ -52,3 +52,12 @@ class CodingAgent(ABC):
   async def stop(self) -> None:
     """Shut down the agent and release resources."""
     ...
+
+  def set_effort(self, effort: str) -> None:
+    """Set reasoning effort for subsequent turns.
+
+    `effort` is one of "", "low", "medium", "high". Empty string clears
+    the setting. Concrete adapters override this to apply the value
+    (as a prompt prefix, CLI flag, etc). Default is no-op.
+    """
+    del effort

@@ -153,6 +153,7 @@ async def main_loop(
   model: str,
   provider: AgentProvider = "claude",
   permission_mode: str = "bypassPermissions",
+  effort: str = "",
 ) -> int:
   """Run the agent main loop."""
   session_id = str(uuid.uuid4())
@@ -280,6 +281,8 @@ async def main_loop(
     credentials, chat_id, db, channel,
     permission_mode=permission_mode,
   )
+  if effort:
+    agent.set_effort(effort)
   # Resume previous SDK session if available
   _sdk_session_id: str = _resume_sdk_id
   if _sdk_session_id:
@@ -298,6 +301,7 @@ async def main_loop(
 
   # Context
   ctx = commands.AgentContext(model, project_dir, time.time())
+  ctx.effort = effort
   main_loop_ref = asyncio.get_running_loop()
   running = True
   _dissolve_on_exit = False
@@ -432,6 +436,13 @@ async def main_loop(
           log.info("Model switch to %s (resume=%s)", model, _sdk_session_id[:8] if _sdk_session_id else "none")
           await _restart_client(resume=_sdk_session_id)
           await _send_response(channel, chat_id, f"Model switched to **{model}**.", db)
+        elif response and response.startswith("__effort__:"):
+          new_effort = response.split(":", 1)[1]
+          ctx.effort = new_effort
+          agent.set_effort(new_effort)
+          label = new_effort if new_effort else "off"
+          log.info("Reasoning effort set to %s", label)
+          await _send_response(channel, chat_id, f"Reasoning effort: **{label}**.", db)
         elif response and response.startswith("__cd__:"):
           new_dir = response.split(":", 1)[1]
           project_dir = new_dir
@@ -808,6 +819,12 @@ async def main_loop(
               await _send_response(channel, chat_id, f"Norm **{name}** not found.", db)
           elif response == "__diag__":
             await _handle_diag(channel, chat_id, project_dir, db)
+          elif response and response.startswith("__effort__:"):
+            new_effort = response.split(":", 1)[1]
+            ctx.effort = new_effort
+            agent.set_effort(new_effort)
+            label = new_effort if new_effort else "off"
+            await _send_response(channel, chat_id, f"Reasoning effort: **{label}**.", db)
           elif response:
             # Text responses: /ping, /cost, /help, /usage, /guest help, /norm help
             await _send_response(channel, chat_id, response, db)

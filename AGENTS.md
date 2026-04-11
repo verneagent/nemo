@@ -2,13 +2,15 @@
 
 Lark-connected coding agent daemon. Repo focus:
 - Lark/relay-facing orchestration in Python
-- coding-agent runtime behind `CodingAgent`
+- coding-agent runtime behind `CodingAgent` (Claude or Codex)
 - channel I/O behind `Channel`
 
 ## Working Model
 
-- Keep `nemo/agent.py` as orchestration only. Push provider-specific logic into concrete adapters such as `LarkChannel` and `ClaudeCodingAgent`.
-- `agent.py` is channel-agnostic and agent-agnostic. It only sees `Channel` and `CodingAgent` abstractions. Lark-specific logic (file download, message enrichment, API calls) belongs in `LarkChannel`. SDK-specific logic belongs in `ClaudeCodingAgent`.
+- Keep `nemo/agent.py` as orchestration only. Push provider-specific logic into concrete adapters such as `LarkChannel`, `ClaudeCodingAgent`, and `CodexCodingAgent`.
+- `agent.py` is channel-agnostic and agent-agnostic. It only sees `Channel` and `CodingAgent` abstractions. Lark-specific logic (file download, message enrichment, API calls) belongs in `LarkChannel`. SDK-specific logic belongs in the concrete `CodingAgent` adapters.
+- The coding agent is selected by `--provider claude|codex` (default `claude`). `nemo/agent_factory.py` maps provider → adapter and enforces provider/model compatibility.
+- Reasoning effort is a shared `low/medium/high` knob (`--effort` at startup, `/effort` at runtime) exposed on `CodingAgent.set_effort`. Each adapter translates: `ClaudeCodingAgent` prepends `think` / `think hard` / `ultrathink` to the prompt in `run_turn`; `CodexCodingAgent` passes `--effort` to the sidecar, which sets `ThreadOptions.modelReasoningEffort`. Effort changes apply to the next turn without reconnecting, so session context is preserved.
 - Prefer relay-backed event delivery. Direct Lark 长连接 is only a fallback when relay is not configured.
 - Preserve the one-card-per-turn model: turn cards evolve through PATCH instead of emitting a new card for each phase.
 - Keep turn execution event-driven. `run_turn()` should emit typed events and the main loop should react to them.
@@ -29,8 +31,11 @@ Lark-connected coding agent daemon. Repo focus:
 
 - `nemo/channel.py`: abstract user/channel boundary
 - `nemo/coding_agent.py`: abstract coding-agent boundary
+- `nemo/agent_factory.py`: provider → `CodingAgent` adapter, provider/model compatibility
 - `nemo/lark_channel.py`: Lark-backed channel implementation
-- `nemo/claude_agent.py`: Claude-backed coding-agent implementation
+- `nemo/claude_agent.py`: Claude Agent SDK adapter (in-process Python SDK via `SDKThread`)
+- `nemo/codex_agent.py`: Codex adapter that spawns the node sidecar per turn
+- `codex_sidecar/run_turn.mjs`: node sidecar around `@openai/codex-sdk` — streams JSON events on stdout, reads prompt from stdin. Requires `node` and the `codex` CLI on `PATH`.
 - `nemo/turn.py`: typed turn events and streaming turn runner
 - `nemo/relay_events.py`: relay WebSocket / poll event source
 - `nemo/lark/`: Lark API/auth/direct-event plumbing

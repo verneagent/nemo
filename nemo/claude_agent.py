@@ -17,6 +17,16 @@ from .types import JsonObject
 log = logging.getLogger(__name__)
 
 
+# Claude Agent SDK triggers extended thinking via keywords embedded in the
+# user prompt. Map nemo's shared effort levels to the strongest keyword that
+# still reliably maps to a distinct thinking budget inside Claude Code.
+_EFFORT_TO_KEYWORD: dict[str, str] = {
+  "low": "think",
+  "medium": "think hard",
+  "high": "ultrathink",
+}
+
+
 class ClaudeCodingAgent(CodingAgent):
   """CodingAgent adapter for the Claude Agent SDK."""
 
@@ -36,6 +46,10 @@ class ClaudeCodingAgent(CodingAgent):
     self._sdk = SDKThread()
     self._sdk_started = False
     self._options: object = None
+    self._effort = ""
+
+  def set_effort(self, effort: str) -> None:
+    self._effort = effort if effort in _EFFORT_TO_KEYWORD else ""
 
   async def start(self, project_dir: str, model: str, resume: str = "") -> None:
     if not self._sdk_started:
@@ -51,7 +65,14 @@ class ClaudeCodingAgent(CodingAgent):
     stale_tasks: set[str] | None = None,
   ) -> tuple[float, JsonObject]:
     return await self._sdk.run_turn_with_reconnect(
-      prompt, on_event, stale_tasks=stale_tasks, options=self._options)
+      self._prefix_prompt(prompt), on_event,
+      stale_tasks=stale_tasks, options=self._options)
+
+  def _prefix_prompt(self, prompt: str) -> str:
+    keyword = _EFFORT_TO_KEYWORD.get(self._effort, "")
+    if not keyword:
+      return prompt
+    return f"{keyword}\n\n{prompt}"
 
   async def interrupt(self) -> None:
     self._sdk.cancel()

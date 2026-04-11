@@ -111,6 +111,41 @@ def test_codex_build_command_resume():
   assert cmd[-2:] == ["--resume", "sess-123"]
 
 
+def test_codex_build_command_effort():
+  agent = CodexCodingAgent({}, "oc_1", _DummyDB(), _DummyChannel())
+  agent._project_dir = "/tmp/project"
+  agent._model = "gpt-5-codex"
+  agent.set_effort("high")
+  cmd = agent._build_command()
+  assert "--effort" in cmd
+  assert cmd[cmd.index("--effort") + 1] == "high"
+
+
+def test_codex_set_effort_rejects_invalid():
+  agent = CodexCodingAgent({}, "oc_1", _DummyDB(), _DummyChannel())
+  agent.set_effort("bogus")
+  assert agent._effort == ""
+  agent.set_effort("medium")
+  assert agent._effort == "medium"
+  agent.set_effort("")
+  assert agent._effort == ""
+
+
+def test_claude_prefix_prompt_effort_keywords():
+  agent = ClaudeCodingAgent({}, "oc_1", _DummyDB(), _DummyChannel())
+  assert agent._prefix_prompt("fix bug") == "fix bug"
+  agent.set_effort("low")
+  assert agent._prefix_prompt("fix bug") == "think\n\nfix bug"
+  agent.set_effort("medium")
+  assert agent._prefix_prompt("fix bug") == "think hard\n\nfix bug"
+  agent.set_effort("high")
+  assert agent._prefix_prompt("fix bug") == "ultrathink\n\nfix bug"
+  agent.set_effort("")
+  assert agent._prefix_prompt("fix bug") == "fix bug"
+  agent.set_effort("bogus")
+  assert agent._prefix_prompt("fix bug") == "fix bug"
+
+
 def test_codex_build_command_rejects_permission_mode():
   agent = CodexCodingAgent({}, "oc_1", _DummyDB(), _DummyChannel(), permission_mode="default")
   agent._project_dir = "/tmp/project"

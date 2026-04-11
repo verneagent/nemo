@@ -3,11 +3,14 @@
 import { stdin, stdout, stderr, exit, argv } from "node:process";
 import { Codex } from "@openai/codex-sdk";
 
+const VALID_EFFORTS = new Set(["minimal", "low", "medium", "high", "xhigh"]);
+
 function parseArgs(rawArgs) {
   const options = {
     cwd: "",
     model: "",
     resume: "",
+    effort: "",
   };
   for (let i = 0; i < rawArgs.length; i += 1) {
     const arg = rawArgs[i];
@@ -17,6 +20,12 @@ function parseArgs(rawArgs) {
       options.model = rawArgs[++i] ?? "";
     } else if (arg === "--resume") {
       options.resume = rawArgs[++i] ?? "";
+    } else if (arg === "--effort") {
+      const value = rawArgs[++i] ?? "";
+      if (value && !VALID_EFFORTS.has(value)) {
+        throw new Error(`invalid --effort value: ${value}`);
+      }
+      options.effort = value;
     } else {
       throw new Error(`unknown arg: ${arg}`);
     }
@@ -39,6 +48,7 @@ async function main() {
   const threadOptions = {
     workingDirectory: options.cwd || undefined,
     model: options.model || undefined,
+    modelReasoningEffort: options.effort || undefined,
     skipGitRepoCheck: true,
     sandboxMode: "danger-full-access",
     approvalPolicy: "never",

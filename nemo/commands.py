@@ -7,6 +7,9 @@ import re
 import time
 
 
+_EFFORT_LEVELS = ("low", "medium", "high")
+
+
 class AgentContext:
   """Minimal context for command handlers."""
 
@@ -16,6 +19,7 @@ class AgentContext:
     self.start_time = start_time
     self.msg_count = 0
     self.total_cost = 0.0
+    self.effort = ""
 
 
 # Each handler returns (handled: bool, response_text: str | None).
@@ -38,6 +42,25 @@ def try_dispatch(text: str, ctx: AgentContext) -> tuple[bool, str | None]:
       new_model = parts[1].strip()
       return True, f"__model__:{new_model}"
     return True, f"Current model: **{ctx.model}**\n\nUsage: `/model claude-sonnet-4-6`"
+
+  # /effort
+  if t.startswith("/effort"):
+    parts = text.strip().split(None, 1)
+    if len(parts) >= 2:
+      arg = parts[1].strip().lower()
+      if arg in ("off", "none", "clear", ""):
+        return True, "__effort__:"
+      if arg in _EFFORT_LEVELS:
+        return True, f"__effort__:{arg}"
+      return True, (
+        f"Unknown effort level: `{arg}`. "
+        f"Use `/effort low|medium|high|off`."
+      )
+    current = ctx.effort or "off"
+    return True, (
+      f"Current effort: **{current}**\n\n"
+      f"Usage: `/effort low|medium|high|off`"
+    )
 
   # /esc
   if t in ("/esc", "esc", "cancel", "取消"):
@@ -88,6 +111,8 @@ def try_dispatch(text: str, ctx: AgentContext) -> tuple[bool, str | None]:
       "|---|---|\n"
       "| `/model` | Show current model |\n"
       "| `/model <name>` | Switch model |\n"
+      "| `/effort` | Show current reasoning effort |\n"
+      "| `/effort <low\\|medium\\|high\\|off>` | Set reasoning effort |\n"
       "| `/clear` | Reset conversation |\n"
       "| `/cd <dir>` | Change working directory |\n"
       "| `/esc` | Cancel current operation |\n"

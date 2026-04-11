@@ -318,3 +318,58 @@ def test_not_inline_safe_esc():
 
 def test_not_inline_safe_none():
   assert not is_inline_safe(None)
+
+
+# ---------------------------------------------------------------------------
+# /effort command
+# ---------------------------------------------------------------------------
+
+def test_effort_show_default():
+  handled, resp = try_dispatch("/effort", _ctx())
+  assert handled
+  assert "off" in resp
+  assert "Usage" in resp
+
+
+def test_effort_show_current():
+  ctx = _ctx()
+  ctx.effort = "medium"
+  handled, resp = try_dispatch("/effort", ctx)
+  assert handled
+  assert "medium" in resp
+
+
+def test_effort_set_low():
+  handled, resp = try_dispatch("/effort low", _ctx())
+  assert handled
+  assert resp == "__effort__:low"
+
+
+def test_effort_set_medium():
+  handled, resp = try_dispatch("/effort medium", _ctx())
+  assert handled
+  assert resp == "__effort__:medium"
+
+
+def test_effort_set_high():
+  handled, resp = try_dispatch("/effort high", _ctx())
+  assert handled
+  assert resp == "__effort__:high"
+
+
+def test_effort_off_clears():
+  for arg in ("off", "none", "clear"):
+    handled, resp = try_dispatch(f"/effort {arg}", _ctx())
+    assert handled
+    assert resp == "__effort__:"
+
+
+def test_effort_invalid():
+  handled, resp = try_dispatch("/effort maximum", _ctx())
+  assert handled
+  assert "Unknown" in resp
+
+
+def test_effort_inline_safe():
+  _, resp = try_dispatch("/effort low", _ctx())
+  assert is_inline_safe(resp)
