@@ -205,7 +205,7 @@ def _collapsible_thinking(steps: list[ThinkingStep]) -> JsonObject:
       text = _sanitize_markdown(s.content)
       if len(text) > 200:
         text = text[:197] + "..."
-      lines.append(f"_{_escape_md(text)}_")
+      lines.append(_escape_md(text))
       group_has_content = True
     else:  # text — start of a new group
       _flush_tools()
@@ -220,7 +220,17 @@ def _collapsible_thinking(steps: list[ThinkingStep]) -> JsonObject:
       group_has_content = True
   _flush_tools()
 
-  content = "\n\n".join(lines) if lines else "_none_"
+  # Use markdown hard-break (two spaces + newline) for tight spacing
+  # between items within a group; keep blank line around --- dividers.
+  joined: list[str] = []
+  for i, line in enumerate(lines):
+    if line == "---":
+      joined.append("\n---\n")
+    else:
+      if i > 0 and lines[i - 1] != "---":
+        joined.append("  \n")  # hard break
+      joined.append(line)
+  content = "".join(joined) if joined else "_none_"
   return {
     "tag": "collapsible_panel",
     "expanded": False,
@@ -230,9 +240,9 @@ def _collapsible_thinking(steps: list[ThinkingStep]) -> JsonObject:
         "content": f"Thinking ({len(steps)})",
       },
     },
-    "vertical_spacing": "8px",
+    "vertical_spacing": "4px",
     "elements": [
-      {"tag": "markdown", "content": content},
+      {"tag": "markdown", "content": content, "text_size": "notation"},
     ],
   }
 
