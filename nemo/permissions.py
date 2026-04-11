@@ -37,6 +37,8 @@ def is_auto_approve(tool_name: str, tool_input: JsonObject) -> bool:
   if tool_name != "Bash":
     return False
   cmd = tool_input.get("command", "")
+  if not isinstance(cmd, str):
+    return False
   return any(pat in cmd for pat in AUTO_APPROVE_PATTERNS)
 
 
@@ -45,13 +47,16 @@ def format_tool(tool_name: str, tool_input: JsonObject) -> str:
   if tool_name == "Bash":
     desc = tool_input.get("description", "")
     cmd = tool_input.get("command", "")
-    label = desc or cmd
+    desc_s = desc if isinstance(desc, str) else ""
+    cmd_s = cmd if isinstance(cmd, str) else ""
+    label = desc_s or cmd_s
     if len(label) > 200:
       label = label[:197] + "..."
     return f"**Bash**: `{label}`"
   if tool_name in ("Edit", "Write", "Read"):
     fp = tool_input.get("file_path", "")
-    name = os.path.basename(fp) if fp else "file"
+    fp_s = fp if isinstance(fp, str) else ""
+    name = os.path.basename(fp_s) if fp_s else "file"
     return f"**{tool_name}**: `{name}`"
   return f"**{tool_name}**"
 
@@ -278,3 +283,332 @@ def build_permission_handler(
     return PermissionResultDeny()
 
   return can_use_tool
+
+
+# ----------------------------------------------------------------------------
+# AskUserQuestion handler
+# ----------------------------------------------------------------------------
+#
+# AskUserQuestion is a Claude built-in tool registered with shouldDefer=true,
+# requiresUserInteraction=true. In headless SDK mode the CLI has no UI to
+# fill in the `answers` field, so without a can_use_tool hook the tool's
+# call() runs with empty answers and the model gets back an empty response —
+# which is exactly the "skill silently exits without asking" symptom.
+#
+# This handler intercepts AskUserQuestion via can_use_tool, renders the
+# questions as a Lark card with one button per option, waits for the user
+# to click (or type a free-text answer), and returns
+# PermissionResultAllow(updated_input={..., answers: {q: label}}) so the
+# tool's call() formats a proper tool_result for the model.
+#
+# Same event-loop bridging as build_permission_handler. Same permission_active
+# flag so card actions get routed to this handler instead of being dropped
+# at the top level of agent.py.
+
+
+def _parse_askq_action(action_value: JsonObject, nonce: str) -> tuple[str, int, str] | None:
+  """Parse an askq action string into (kind, qidx, payload).
+
+  kind ∈ {"option", "other", "done"}.
+  Returns None if the action doesn't belong to this handler/nonce.
+  """
+  action = action_value.get("action", "")
+  if not isinstance(action, str) or not action.startswith(f"askq:{nonce}:"):
+    return None
+  parts = action.split(":", 3)
+  # parts: ["askq", nonce, qidx, payload]
+  if len(parts) < 4:
+    return None
+  try:
+    qidx = int(parts[2])
+  except ValueError:
+    return None
+  payload = parts[3]
+  if payload == "other":
+    return ("other", qidx, "")
+  if payload == "done":
+    return ("done", qidx, "")
+  try:
+    int(payload)
+  except ValueError:
+    return None
+  return ("option", qidx, payload)
+
+
+def build_ask_user_question_handler(
+  credentials: dict[str, str],
+  chat_id: str,
+  events_source: Channel,
+  max_wait_seconds: float = 600,
+) -> Callable[[str, JsonObject, object], object]:
+  """Build a can_use_tool handler that ONLY handles AskUserQuestion calls.
+
+  Should be composed with the regular permission handler in claude_agent.py.
+  Other tool calls passed to this function will be allowed without prompting.
+
+  `max_wait_seconds` is the wall-clock deadline for collecting all answers
+  (default 10 minutes). Exists mainly so tests can pass a smaller value.
+  """
+  import asyncio as _asyncio
+
+  from claude_agent_sdk import PermissionResultAllow
+
+  _main_loop = _asyncio.get_event_loop()
+
+  async def _read_from_main_loop(timeout: float) -> object:
+    return await events_source.receive(timeout=timeout)
+
+  def _set_permission_flag(active: bool) -> None:
+    events_source.permission_active = active
+
+  def _push_back_on_main(msg: object) -> None:
+    from .channel import IncomingMessage
+
+    if isinstance(msg, IncomingMessage):
+      events_source.push_back(msg)
+
+  async def can_use_ask_user_question(
+    tool_name: str,
+    tool_input: JsonObject,
+    _context: object,
+  ) -> object:
+    if tool_name != "AskUserQuestion":
+      return PermissionResultAllow()
+
+    raw_questions = tool_input.get("questions", [])
+    if not isinstance(raw_questions, list) or not raw_questions:
+      # Malformed call — let the model see an empty answers dict so it
+      # doesn't loop. Same shape as Claude Code's CLI fallback.
+      return PermissionResultAllow(updated_input={
+        "questions": [],
+        "answers": {},
+        "metadata": {"source": "nemo", "error": "no_questions"},
+      })
+    questions: list[JsonObject] = [q for q in raw_questions if isinstance(q, dict)]
+    if not questions:
+      return PermissionResultAllow(updated_input={
+        "questions": [],
+        "answers": {},
+        "metadata": {"source": "nemo", "error": "no_questions"},
+      })
+
+    nonce = uuid.uuid4().hex[:12]
+
+    from .lark.auth import get_token
+    from .lark.api import send_card, update_card
+    from .cards import build_ask_user_question_card
+
+    token = get_token(credentials["app_id"], credentials["app_secret"])
+    card = build_ask_user_question_card(questions, chat_id, nonce)
+    msg_id = send_card(token, chat_id, card)
+    log.info("AskUserQuestion: %d question(s) (card=%s, nonce=%s)",
+             len(questions), msg_id, nonce)
+
+    # answers[qidx] = str (single-select) or list[str] (multi-select)
+    answers: dict[int, object] = {}
+    # multi_done tracks which multiSelect questions the user has finalized
+    # with the "Submit" button. A multiSelect question counts as "answered"
+    # only after it lands in multi_done — otherwise toggling a single option
+    # would prematurely close the loop before the user picks the rest.
+    multi_done: set[int] = set()
+    awaiting_other_for: int | None = None
+
+    import time as _time
+    deadline = _time.time() + max_wait_seconds
+    _pending: list[object] = []
+
+    try:
+      _current_loop = _asyncio.get_running_loop()
+    except RuntimeError:
+      _current_loop = None
+    _on_main_loop = _current_loop is _main_loop
+
+    if _on_main_loop:
+      _set_permission_flag(True)
+    else:
+      _main_loop.call_soon_threadsafe(_set_permission_flag, True)
+
+    def _all_answered() -> bool:
+      for qidx, question in enumerate(questions):
+        if question.get("multiSelect"):
+          # Must wait for explicit Submit click (see multi_done comment).
+          if qidx not in multi_done:
+            return False
+        else:
+          if qidx not in answers:
+            return False
+      return True
+
+    def _redraw_card() -> None:
+      try:
+        new_token = get_token(credentials["app_id"], credentials["app_secret"])
+        update_card(new_token, msg_id, build_ask_user_question_card(
+          questions, chat_id, nonce, answers=answers))
+      except Exception as e:
+        log.warning("Failed to redraw askq card: %s", e)
+
+    try:
+      while not _all_answered():
+        remaining = deadline - _time.time()
+        if remaining <= 0:
+          break
+        timeout = min(remaining, 30)
+        try:
+          if _on_main_loop:
+            reply = await _read_from_main_loop(timeout)
+          else:
+            future = _asyncio.run_coroutine_threadsafe(
+              _read_from_main_loop(timeout), _main_loop)
+            reply = await _asyncio.wrap_future(future)
+        except Exception:
+          break
+        if reply is None:
+          continue
+
+        event_type = getattr(reply, "event_type", "")
+        reply_chat = getattr(reply, "chat_id", "")
+
+        if reply_chat and reply_chat != chat_id:
+          _pending.append(reply)
+          continue
+
+        # 1. Card button click
+        if event_type == "card.action.trigger":
+          parsed = _parse_askq_action(getattr(reply, "action_value", {}), nonce)
+          if parsed is None:
+            _pending.append(reply)
+            continue
+          kind, qidx, payload = parsed
+          if qidx >= len(questions):
+            continue
+          question = questions[qidx]
+          raw_options = question.get("options", [])
+          options: list[JsonObject] = (
+            [o for o in raw_options if isinstance(o, dict)]
+            if isinstance(raw_options, list) else []
+          )
+          multi = bool(question.get("multiSelect"))
+
+          if kind == "option":
+            try:
+              oidx = int(payload)
+            except ValueError:
+              continue
+            if oidx >= len(options):
+              continue
+            label = str(options[oidx].get("label", ""))
+            if multi:
+              cur = answers.get(qidx)
+              cur_list: list[str] = list(cur) if isinstance(cur, list) else []
+              if label in cur_list:
+                cur_list.remove(label)
+              else:
+                cur_list.append(label)
+              answers[qidx] = cur_list
+            else:
+              answers[qidx] = label
+            _redraw_card()
+            continue
+
+          if kind == "done":
+            # Multi-select submission — finalize whatever was toggled.
+            if qidx not in answers:
+              answers[qidx] = []
+            multi_done.add(qidx)
+            continue
+
+          if kind == "other":
+            awaiting_other_for = qidx
+            try:
+              from .lark.api import send_text
+              send_text(
+                get_token(credentials["app_id"], credentials["app_secret"]),
+                chat_id,
+                f'Type your answer for "{question.get("header", "")}":',
+              )
+            except Exception:
+              pass
+            continue
+
+        # 2. Free-text reply
+        if event_type == "im.message.receive_v1":
+          text = (getattr(reply, "text", "") or "").strip()
+          if not text:
+            _pending.append(reply)
+            continue
+          # Route to whichever question we're waiting on. If user typed
+          # without clicking "Other", route to the first unanswered question.
+          target_qidx = awaiting_other_for
+          if target_qidx is None:
+            for qidx, _q in enumerate(questions):
+              if qidx not in answers:
+                target_qidx = qidx
+                break
+          if target_qidx is None:
+            _pending.append(reply)
+            continue
+          question = questions[target_qidx]
+          if question.get("multiSelect"):
+            answers[target_qidx] = [text]
+          else:
+            answers[target_qidx] = text
+          awaiting_other_for = None
+          _redraw_card()
+          continue
+
+        _pending.append(reply)
+
+    finally:
+      if _on_main_loop:
+        _set_permission_flag(False)
+      else:
+        _main_loop.call_soon_threadsafe(_set_permission_flag, False)
+
+    for msg in _pending:
+      if _on_main_loop:
+        _push_back_on_main(msg)
+      else:
+        _main_loop.call_soon_threadsafe(_push_back_on_main, msg)
+
+    if not _all_answered():
+      log.info("AskUserQuestion: timed out without all answers; using partials")
+      try:
+        token = get_token(credentials["app_id"], credentials["app_secret"])
+        update_card(token, msg_id, build_ask_user_question_card(
+          questions, chat_id, nonce, answers=answers))
+      except Exception:
+        pass
+      # Even on timeout, return whatever we got — the model can decide
+      # to file with defaults rather than retry forever.
+
+    # Build the answers map keyed by question text (the format the SDK
+    # tool's call() echoes back into the tool_result message).
+    answers_by_text: dict[str, object] = {}
+    for qidx, question in enumerate(questions):
+      key = str(question.get("question", f"question_{qidx}"))
+      if qidx in answers:
+        answers_by_text[key] = answers[qidx]
+      else:
+        answers_by_text[key] = ""
+
+    log.info("AskUserQuestion answered: %s", {k: str(v)[:60] for k, v in answers_by_text.items()})
+
+    try:
+      token = get_token(credentials["app_id"], credentials["app_secret"])
+      update_card(token, msg_id, build_ask_user_question_card(
+        questions, chat_id, nonce, answers=answers))
+    except Exception:
+      pass
+
+    metadata: JsonObject = {"source": "nemo"}
+    if not _all_answered():
+      # Partial answers due to timeout — signal to the model so it can
+      # decide whether to proceed with defaults or retry.
+      metadata["timeout"] = True
+    return PermissionResultAllow(updated_input={
+      "questions": questions,
+      "answers": answers_by_text,
+      "metadata": metadata,
+    })
+
+  return can_use_ask_user_question

@@ -2,6 +2,7 @@
 
 from nemo.permissions import (
   is_auto_approve, format_tool, _classify_action, _classify_reaction,
+  _parse_askq_action,
 )
 
 
@@ -124,9 +125,16 @@ def test_classify_reaction_unrelated():
 import asyncio
 import sys
 import types
+from typing import Awaitable, Protocol, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from nemo.permissions import build_permission_handler
+from nemo.types import JsonObject
+
+
+class _AllowResult(Protocol):
+  """Minimal protocol for the fake PermissionResultAllow created in tests."""
+  updated_input: JsonObject
 
 
 def _make_fixtures(reply_event=None, timeout=False, autoapprove=False):
@@ -137,8 +145,8 @@ def _make_fixtures(reply_event=None, timeout=False, autoapprove=False):
   """
   # Mock SDK permission result classes
   sdk_mod = types.ModuleType("claude_agent_sdk")
-  sdk_mod.PermissionResultAllow = type("PermissionResultAllow", (), {})
-  sdk_mod.PermissionResultDeny = type("PermissionResultDeny", (), {})
+  setattr(sdk_mod, "PermissionResultAllow", type("PermissionResultAllow", (), {}))
+  setattr(sdk_mod, "PermissionResultDeny", type("PermissionResultDeny", (), {}))
   sys.modules["claude_agent_sdk"] = sdk_mod
 
   credentials = {"app_id": "test_app", "app_secret": "test_secret"}
@@ -171,13 +179,12 @@ def _make_fixtures(reply_event=None, timeout=False, autoapprove=False):
 
 def _run_with_handler(fixtures, tool_name="Bash", tool_input=None):
   """Build handler and run can_use_tool inside an event loop."""
-  creds, chat_id, db, events, sdk = fixtures
-  if tool_input is None:
-    tool_input = {"command": "ls"}
+  creds, chat_id, db, events, _sdk = fixtures
+  ti: JsonObject = tool_input if tool_input is not None else {"command": "ls"}
 
   async def _go():
     handler = build_permission_handler(creds, chat_id, db, events)
-    return handler, await handler(tool_name, tool_input, None)
+    return handler, await cast(Awaitable[object], handler(tool_name, ti, None))
 
   return asyncio.run(_go())
 
@@ -401,3 +408,270 @@ def test_embedded_test_image_exists():
   with open(img_path, "rb") as f:
     header = f.read(8)
   assert header[:4] == b'\x89PNG'
+
+
+# ---------------------------------------------------------------------------
+# _parse_askq_action — parse action strings from card button clicks
+# ---------------------------------------------------------------------------
+
+def test_parse_askq_action_option():
+  result = _parse_askq_action({"action": "askq:N1:0:2"}, "N1")
+  assert result == ("option", 0, "2")
+
+
+def test_parse_askq_action_other():
+  result = _parse_askq_action({"action": "askq:N1:1:other"}, "N1")
+  assert result == ("other", 1, "")
+
+
+def test_parse_askq_action_done():
+  result = _parse_askq_action({"action": "askq:N1:0:done"}, "N1")
+  assert result == ("done", 0, "")
+
+
+def test_parse_askq_action_wrong_nonce():
+  assert _parse_askq_action({"action": "askq:WRONG:0:0"}, "N1") is None
+
+
+def test_parse_askq_action_unrelated_prefix():
+  assert _parse_askq_action({"action": "perm_approve:N1"}, "N1") is None
+
+
+def test_parse_askq_action_empty():
+  assert _parse_askq_action({}, "N1") is None
+
+
+def test_parse_askq_action_malformed_qidx():
+  assert _parse_askq_action({"action": "askq:N1:notanint:0"}, "N1") is None
+
+
+def test_parse_askq_action_malformed_payload():
+  # Payload not "other"/"done"/int → invalid
+  assert _parse_askq_action({"action": "askq:N1:0:bogus"}, "N1") is None
+
+
+# ---------------------------------------------------------------------------
+# build_ask_user_question_handler — interactive AskUserQuestion bridge
+# ---------------------------------------------------------------------------
+
+from nemo.permissions import build_ask_user_question_handler
+
+
+def _make_askq_fixtures(events_seq=None):
+  """Like _make_fixtures but for the askq handler.
+
+  events_seq: list of LarkEvent-shaped MagicMocks to return from receive(),
+    in order. After exhausting the list, receive() returns None (timeout).
+  """
+  sdk_mod = types.ModuleType("claude_agent_sdk")
+  # Capture updated_input on PermissionResultAllow so tests can introspect it.
+  class _Allow:
+    def __init__(self, updated_input=None):
+      self.updated_input = updated_input
+  class _Deny:
+    def __init__(self, message=""):
+      self.message = message
+  setattr(sdk_mod, "PermissionResultAllow", _Allow)
+  setattr(sdk_mod, "PermissionResultDeny", _Deny)
+  sys.modules["claude_agent_sdk"] = sdk_mod
+
+  credentials = {"app_id": "test_app", "app_secret": "test_secret"}
+  chat_id = "oc_test_chat"
+
+  events = MagicMock()
+  events.permission_active = False
+  events.push_back = MagicMock()
+
+  seq = list(events_seq or [])
+
+  async def _receive(timeout=None):
+    if seq:
+      return seq.pop(0)
+    return None
+
+  events.receive = AsyncMock(side_effect=_receive)
+  return credentials, chat_id, events, sdk_mod
+
+
+def _askq_event(action_str, chat_id="oc_test_chat"):
+  # Use real IncomingMessage so _push_back_on_main's isinstance check passes.
+  from nemo.channel import IncomingMessage
+  return IncomingMessage(
+    event_type="card.action.trigger",
+    chat_id=chat_id,
+    action_value={"action": action_str},
+  )
+
+
+def _text_event(text, chat_id="oc_test_chat"):
+  from nemo.channel import IncomingMessage
+  return IncomingMessage(
+    event_type="im.message.receive_v1",
+    chat_id=chat_id,
+    text=text,
+  )
+
+
+def _run_askq(fixtures, questions, nonce_patcher_value="abc123") -> _AllowResult:
+  creds, chat_id, events, _sdk = fixtures
+  # Patch nonce to a fixed value so the action strings in the test events line up.
+  with patch("nemo.permissions.uuid.uuid4") as uu, \
+       patch("nemo.lark.api.send_card", return_value="msg_001"), \
+       patch("nemo.lark.api.update_card"), \
+       patch("nemo.lark.api.send_text"), \
+       patch("nemo.lark.auth.get_token", return_value="tok"):
+    # Handler does `nonce = uuid.uuid4().hex[:12]`, and test events use
+    # action strings with nonce=nonce_patcher_value. Give the mock a hex
+    # value that slices to exactly nonce_patcher_value.
+    uu.return_value = MagicMock(hex=nonce_patcher_value)
+
+    async def _go():
+      handler = build_ask_user_question_handler(creds, chat_id, events)
+      ti: JsonObject = {"questions": questions}
+      return await cast(Awaitable[object],
+                        handler("AskUserQuestion", ti, None))
+
+    return cast(_AllowResult, asyncio.run(_go()))
+
+
+def test_askq_handler_returns_callable():
+  creds, chat_id, events, _sdk = _make_askq_fixtures()
+  loop = asyncio.new_event_loop()
+  asyncio.set_event_loop(loop)
+  try:
+    handler = build_ask_user_question_handler(creds, chat_id, events)
+    import inspect
+    assert callable(handler)
+    assert inspect.iscoroutinefunction(handler)
+  finally:
+    asyncio.set_event_loop(None)
+    loop.close()
+
+
+def test_askq_handler_non_askq_tool_passes_through():
+  """Handler called with a non-AskUserQuestion tool returns Allow without UI."""
+  fixtures = _make_askq_fixtures()
+  creds, chat_id, events, _sdk = fixtures
+  with patch("nemo.lark.api.send_card") as send:
+    async def _go():
+      handler = build_ask_user_question_handler(creds, chat_id, events)
+      ti: JsonObject = {"command": "ls"}
+      return await cast(Awaitable[object], handler("Bash", ti, None))
+    result = asyncio.run(_go())
+  assert type(result).__name__ == "_Allow"
+  assert send.call_count == 0  # no card sent for non-askq
+
+
+def test_askq_handler_empty_questions_returns_empty_answers():
+  """Malformed call with no questions returns empty answers without prompting."""
+  fixtures = _make_askq_fixtures()
+  result = _run_askq(fixtures, questions=[])
+  assert type(result).__name__ == "_Allow"
+  assert result.updated_input["answers"] == {}
+  metadata = cast(JsonObject, result.updated_input["metadata"])
+  assert metadata["error"] == "no_questions"
+
+
+def test_askq_handler_single_button_click_resolves():
+  """One button click on a single-question card produces the right answer."""
+  questions = [{
+    "question": "Where?",
+    "header": "Screen",
+    "options": [{"label": "Login"}, {"label": "Match"}],
+    "multiSelect": False,
+  }]
+  fixtures = _make_askq_fixtures(events_seq=[_askq_event("askq:abc123:0:0")])
+  result = _run_askq(fixtures, questions)
+  assert type(result).__name__ == "_Allow"
+  assert result.updated_input["answers"] == {"Where?": "Login"}
+  assert result.updated_input["questions"] == questions
+
+
+def test_askq_handler_text_reply_routes_to_first_unanswered():
+  """A free-text reply (no button click) is routed to the first unanswered question."""
+  questions = [{
+    "question": "What?",
+    "header": "What",
+    "options": [{"label": "a"}],
+    "multiSelect": False,
+  }]
+  fixtures = _make_askq_fixtures(events_seq=[_text_event("custom answer")])
+  result = _run_askq(fixtures, questions)
+  assert type(result).__name__ == "_Allow"
+  assert result.updated_input["answers"] == {"What?": "custom answer"}
+
+
+def test_askq_handler_other_button_then_text():
+  """Clicking 'Other' followed by a text reply uses the text as the answer."""
+  questions = [{
+    "question": "Where?",
+    "header": "Screen",
+    "options": [{"label": "Login"}],
+    "multiSelect": False,
+  }]
+  fixtures = _make_askq_fixtures(events_seq=[
+    _askq_event("askq:abc123:0:other"),
+    _text_event("Settings page"),
+  ])
+  result = _run_askq(fixtures, questions)
+  assert type(result).__name__ == "_Allow"
+  assert result.updated_input["answers"] == {"Where?": "Settings page"}
+
+
+def test_askq_handler_multi_question_two_clicks():
+  """Two questions resolved by two clicks."""
+  questions = [
+    {
+      "question": "Where?", "header": "Screen",
+      "options": [{"label": "Login"}, {"label": "Match"}],
+      "multiSelect": False,
+    },
+    {
+      "question": "Severity?", "header": "How bad?",
+      "options": [{"label": "P0"}, {"label": "P3"}],
+      "multiSelect": False,
+    },
+  ]
+  fixtures = _make_askq_fixtures(events_seq=[
+    _askq_event("askq:abc123:0:1"),  # q0 → Match
+    _askq_event("askq:abc123:1:0"),  # q1 → P0
+  ])
+  result = _run_askq(fixtures, questions)
+  assert type(result).__name__ == "_Allow"
+  assert result.updated_input["answers"] == {"Where?": "Match", "Severity?": "P0"}
+
+
+def test_askq_handler_multi_select_accumulates_then_done():
+  """multiSelect=True: clicking two options + done returns a list."""
+  questions = [{
+    "question": "Pick?",
+    "header": "Tags",
+    "options": [{"label": "a"}, {"label": "b"}, {"label": "c"}],
+    "multiSelect": True,
+  }]
+  fixtures = _make_askq_fixtures(events_seq=[
+    _askq_event("askq:abc123:0:0"),  # toggle a
+    _askq_event("askq:abc123:0:2"),  # toggle c
+    _askq_event("askq:abc123:0:done"),
+  ])
+  result = _run_askq(fixtures, questions)
+  assert type(result).__name__ == "_Allow"
+  assert result.updated_input["answers"] == {"Pick?": ["a", "c"]}
+
+
+def test_askq_handler_wrong_chat_pushed_back():
+  """Card actions from a different chat are re-queued, not consumed."""
+  questions = [{
+    "question": "Q?", "header": "Q",
+    "options": [{"label": "x"}],
+    "multiSelect": False,
+  }]
+  wrong = _askq_event("askq:abc123:0:0", chat_id="oc_other")
+  right = _askq_event("askq:abc123:0:0", chat_id="oc_test_chat")
+  fixtures = _make_askq_fixtures(events_seq=[wrong, right])
+  result = _run_askq(fixtures, questions)
+  assert type(result).__name__ == "_Allow"
+  assert result.updated_input["answers"] == {"Q?": "x"}
+  # The wrong-chat event was pushed back at end
+  creds, chat_id, events, _sdk = fixtures
+  events.push_back.assert_called()

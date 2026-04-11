@@ -2,7 +2,7 @@
 
 from nemo.cards import (
   ToolRecord, ThinkingStep, build_turn_card, build_card, build_markdown_card,
-  build_form_select, build_form_input,
+  build_form_select, build_form_input, build_ask_user_question_card,
   tool_use_summary, _elapsed_title, _elapsed_text, _usage_text,
   _collapsible_thinking,
 )
@@ -518,3 +518,150 @@ def test_form_input_with_chat_id():
   card = build_form_input("Q", chat_id="oc_42")
   inp = card["body"]["elements"][0]
   assert inp["value"]["chat_id"] == "oc_42"
+
+
+# ---------------------------------------------------------------------------
+# build_ask_user_question_card
+# ---------------------------------------------------------------------------
+
+def _question(text, header, options, multi_select=False):
+  return {
+    "question": text,
+    "header": header,
+    "options": [{"label": label} for label in options],
+    "multiSelect": multi_select,
+  }
+
+
+def test_askq_card_single_question_basic():
+  card = build_ask_user_question_card(
+    questions=[_question("Where?", "Screen", ["Login", "Match"])],
+    chat_id="oc_42",
+    nonce="abc123",
+  )
+  assert card["schema"] == "2.0"
+  assert card["header"]["title"]["content"] == "Question from Claude"
+  # header markdown + question markdown + button row(s) + Other row + footer note
+  elements = card["body"]["elements"]
+  # Last element is the footer note
+  assert any("notation" in str(e) or "10-min" in str(e) for e in elements)
+  # Verify at least one column_set with our action prefix
+  found = False
+  for el in elements:
+    if el.get("tag") == "column_set":
+      for col in el.get("columns", []):
+        for child in col.get("elements", []):
+          action = child.get("value", {}).get("action", "")
+          if action.startswith("askq:abc123:0:"):
+            found = True
+  assert found, "expected at least one askq:abc123:0:* button"
+
+
+def test_askq_card_button_action_strings():
+  """Each option button gets action `askq:{nonce}:{qidx}:{oidx}`."""
+  card = build_ask_user_question_card(
+    questions=[_question("Where?", "Screen", ["Login", "Match", "Profile"])],
+    chat_id="oc_x",
+    nonce="N1",
+  )
+  actions: list[str] = []
+  for el in card["body"]["elements"]:
+    if el.get("tag") == "column_set":
+      for col in el.get("columns", []):
+        for child in col.get("elements", []):
+          a = child.get("value", {}).get("action", "")
+          if a:
+            actions.append(a)
+  # 3 option buttons + 1 "Other" button
+  assert "askq:N1:0:0" in actions
+  assert "askq:N1:0:1" in actions
+  assert "askq:N1:0:2" in actions
+  assert "askq:N1:0:other" in actions
+
+
+def test_askq_card_multi_question():
+  """Multiple questions are stacked with hr separators."""
+  card = build_ask_user_question_card(
+    questions=[
+      _question("Where?", "Screen", ["A", "B"]),
+      _question("Severity?", "How bad?", ["P0", "P3"]),
+    ],
+    chat_id="oc_x",
+    nonce="abc",
+  )
+  elements = card["body"]["elements"]
+  hr_count = sum(1 for e in elements if e.get("tag") == "hr")
+  assert hr_count == 1, "expected one hr divider between two questions"
+  # Verify both q0 and q1 buttons are present
+  actions: list[str] = []
+  for el in elements:
+    if el.get("tag") == "column_set":
+      for col in el.get("columns", []):
+        for child in col.get("elements", []):
+          a = child.get("value", {}).get("action", "")
+          if a:
+            actions.append(a)
+  assert any(a.startswith("askq:abc:0:") for a in actions)
+  assert any(a.startswith("askq:abc:1:") for a in actions)
+
+
+def test_askq_card_multi_select_has_done_button():
+  card = build_ask_user_question_card(
+    questions=[_question("Pick any", "Tags", ["a", "b", "c"], multi_select=True)],
+    chat_id="oc_x",
+    nonce="N",
+  )
+  actions: list[str] = []
+  for el in card["body"]["elements"]:
+    if el.get("tag") == "column_set":
+      for col in el.get("columns", []):
+        for child in col.get("elements", []):
+          a = child.get("value", {}).get("action", "")
+          if a:
+            actions.append(a)
+  assert "askq:N:0:done" in actions
+
+
+def test_askq_card_renders_selected_with_check():
+  """Already-selected options show with a leading check mark and primary color."""
+  card = build_ask_user_question_card(
+    questions=[_question("Where?", "Screen", ["Login", "Match"])],
+    chat_id="oc_x",
+    nonce="N",
+    answers={0: "Login"},
+  )
+  found_check = False
+  for el in card["body"]["elements"]:
+    if el.get("tag") == "column_set":
+      for col in el.get("columns", []):
+        for child in col.get("elements", []):
+          label = child.get("text", {}).get("content", "")
+          if label.startswith("✓ Login"):
+            assert child.get("type") == "primary"
+            found_check = True
+  assert found_check, "expected selected option to render with ✓ and primary type"
+
+
+def test_askq_card_chat_id_in_buttons():
+  """Every button carries chat_id so card actions route correctly."""
+  card = build_ask_user_question_card(
+    questions=[_question("Q?", "Q", ["a"])],
+    chat_id="oc_42",
+    nonce="N",
+  )
+  for el in card["body"]["elements"]:
+    if el.get("tag") == "column_set":
+      for col in el.get("columns", []):
+        for child in col.get("elements", []):
+          assert child.get("value", {}).get("chat_id") == "oc_42"
+
+
+def test_askq_card_no_questions_still_renders():
+  """Empty questions list produces a card with just the footer (defensive)."""
+  card = build_ask_user_question_card(
+    questions=[],
+    chat_id="oc_x",
+    nonce="N",
+  )
+  assert card["schema"] == "2.0"
+  assert isinstance(card["body"]["elements"], list)

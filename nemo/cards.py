@@ -576,6 +576,93 @@ def build_form_input(title: str, placeholder: str = "",
   }
 
 
+def build_ask_user_question_card(
+  questions: list[JsonObject],
+  chat_id: str,
+  nonce: str,
+  answers: dict[int, object] | None = None,
+) -> JsonObject:
+  """Build a card that renders an AskUserQuestion tool call.
+
+  Each question is a section with header text and one button per option.
+  Action strings are `askq:{nonce}:{qidx}:{oidx}` for option clicks and
+  `askq:{nonce}:done` for the "Submit" button (multi-select only).
+
+  `answers` is the in-progress selection: maps question index → selected
+  label (str) for single-select, or list[str] for multi-select. When
+  rendering an "answered" view, render selected options with a check mark.
+  """
+  answers = answers or {}
+  elements: list[JsonObject] = []
+
+  for qidx, question in enumerate(questions):
+    if qidx > 0:
+      elements.append({"tag": "hr"})
+
+    header = str(question.get("header") or question.get("question") or "Question")
+    q_text = str(question.get("question", ""))
+    multi_select = bool(question.get("multiSelect", False))
+    options = question.get("options", []) or []
+
+    elements.append({
+      "tag": "markdown",
+      "content": f"**{_escape_md(header)}**",
+    })
+    if q_text and q_text != header:
+      elements.append({"tag": "markdown", "content": _escape_md(q_text)})
+
+    selected = answers.get(qidx)
+    selected_set: set[str] = set()
+    if isinstance(selected, list):
+      selected_set = {str(x) for x in selected}
+    elif isinstance(selected, str):
+      selected_set = {selected}
+
+    # Render each option as a button. Lark cards lack visual radio
+    # buttons; primary color marks selected ones.
+    button_rows: list[tuple[str, str, str]] = []
+    for oidx, opt in enumerate(options):
+      label = str(opt.get("label") or opt.get("description") or f"Option {oidx + 1}")
+      check = "✓ " if label in selected_set else ""
+      btn_type = "primary" if label in selected_set else "default"
+      button_rows.append((
+        f"{check}{label}",
+        f"askq:{nonce}:{qidx}:{oidx}",
+        btn_type,
+      ))
+    # Always offer an "Other" → text input fallback
+    button_rows.append((
+      "Other (type below)",
+      f"askq:{nonce}:{qidx}:other",
+      "default",
+    ))
+
+    # Pack options into rows of 2 to keep mobile width manageable
+    for start in range(0, len(button_rows), 2):
+      elements.append(_buttons_row(button_rows[start:start + 2], chat_id))
+
+    if multi_select:
+      done_label = "Submit ✓" if selected_set else "Submit"
+      elements.append(_buttons_row(
+        [(done_label, f"askq:{nonce}:{qidx}:done", "primary")],
+        chat_id,
+      ))
+
+  elements.append(_note_element(
+    "Tap a button, or type your answer in chat. 10-min timeout."
+  ))
+
+  return {
+    "schema": "2.0",
+    "config": {"update_multi": True},
+    "header": {
+      "title": {"tag": "plain_text", "content": "Question from Claude"},
+      "template": "blue",
+    },
+    "body": {"direction": "vertical", "elements": elements},
+  }
+
+
 def build_markdown_card(content: str, title: str = "", color: str = "") -> JsonObject:
   """Build a Card V2 with markdown content."""
   card: JsonObject = {

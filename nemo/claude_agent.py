@@ -4,12 +4,12 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Callable, cast
+from typing import Awaitable, Callable, cast
 
 from .channel import Channel
 from .coding_agent import CodingAgent
 from .db import Database
-from .permissions import build_permission_handler
+from .permissions import build_ask_user_question_handler, build_permission_handler
 from .sdk_thread import SDKThread
 from .turn import TurnEvent
 from .types import JsonObject
@@ -112,16 +112,42 @@ class ClaudeCodingAgent(CodingAgent):
       if val:
         env[key] = val
 
+    from claude_agent_sdk import PermissionResultAllow
+
+    # AskUserQuestion is a built-in tool with shouldDefer=true,
+    # requiresUserInteraction=true. Without a can_use_tool hook in headless
+    # SDK mode it executes with empty `answers` and the model gets nothing —
+    # which is the "skill silently exits without asking" failure mode.
+    # We always attach an askq handler so AskUserQuestion can render to Lark
+    # regardless of permission_mode. In bypass mode the dispatcher allows
+    # everything else; in non-bypass mode it delegates to the regular
+    # permission handler.
+    askq_handler = build_ask_user_question_handler(
+      self._credentials, self._chat_id, self._channel)
     perm_handler = None
     if self._permission_mode != "bypassPermissions":
       perm_handler = build_permission_handler(
         self._credentials, self._chat_id, self._db, self._channel)
 
+    async def _can_use_tool(
+      tool_name: str,
+      tool_input: JsonObject,
+      context: object,
+    ) -> object:
+      if tool_name == "AskUserQuestion":
+        return await cast(Awaitable[object], askq_handler(tool_name, tool_input, context))
+      if perm_handler is not None:
+        return await cast(Awaitable[object], perm_handler(tool_name, tool_input, context))
+      return PermissionResultAllow()
+
     def _stderr_handler(line: str) -> None:
       log.info("[sdk-stderr] %s", line.rstrip())
 
     opts: dict[str, object] = dict(
-      allowed_tools=["Agent", "Skill", "Read", "Write", "Edit", "Bash", "Glob", "Grep"],
+      allowed_tools=[
+        "Agent", "Skill", "Read", "Write", "Edit", "Bash", "Glob", "Grep",
+        "AskUserQuestion",
+      ],
       setting_sources=["user", "project"],
       permission_mode=cast(PermissionMode, self._permission_mode),
       system_prompt={
@@ -134,9 +160,8 @@ class ClaudeCodingAgent(CodingAgent):
       env=env,
       stderr=_stderr_handler,
       hooks={},
+      can_use_tool=_can_use_tool,
     )
-    if perm_handler is not None:
-      opts["can_use_tool"] = perm_handler
     if resume:
       opts["resume"] = resume
 
