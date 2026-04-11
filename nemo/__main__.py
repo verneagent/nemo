@@ -335,6 +335,18 @@ def _cmd_list() -> int:
   return 0
 
 
+def _get_version() -> str:
+  """Return the installed captain-nemo version, or 'unknown' if unavailable."""
+  try:
+    from importlib.metadata import version, PackageNotFoundError
+    try:
+      return version("captain-nemo")
+    except PackageNotFoundError:
+      return "unknown"
+  except Exception:
+    return "unknown"
+
+
 def main():
   # Intercept subcommands before argparse
   if len(sys.argv) >= 2 and sys.argv[1] == "list":
@@ -344,6 +356,8 @@ def main():
     prog="nemo",
     description="Lark-connected coding agent daemon",
   )
+  parser.add_argument("--version", "-V", action="version",
+                      version=f"nemo {_get_version()}")
   parser.add_argument("--chat-id", default="", help="Lark chat ID (auto-discovered if omitted)")
   parser.add_argument("--chat-name", default="", help="Find chat by name substring")
   parser.add_argument("--project-dir", default=".", help="Project directory (default: cwd)")
