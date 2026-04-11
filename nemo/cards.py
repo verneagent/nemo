@@ -165,12 +165,13 @@ def _collapsible_thinking(steps: list[ThinkingStep]) -> JsonObject:
 
   Consecutive tool calls of the same type are merged into one line.
   Each narrative text starts a new "group"; groups are separated by
-  a horizontal divider.
+  a horizontal divider. Tool lines render in smaller font; text and
+  thinking render in default size.
   """
-  lines: list[str] = []
+  # Each entry: ("tool" | "text" | "divider", content)
+  entries: list[tuple[str, str]] = []
   pending_type: str = ""
   pending_details: list[str] = []
-  # Track whether the current group has any content yet (for divider logic)
   group_has_content = False
 
   def _flush_tools() -> None:
@@ -182,11 +183,15 @@ def _collapsible_thinking(steps: list[ThinkingStep]) -> JsonObject:
       joined = ", ".join(details)
       if len(joined) > 200:
         joined = joined[:197] + "..."
-      lines.append(
-        f"<font color='grey'>{pending_type}:</font> {_escape_md(joined)}")
+      entries.append((
+        "tool",
+        f"<font color='grey'>{pending_type}:</font> {_escape_md(joined)}",
+      ))
     else:
-      lines.append(
-        f"<font color='grey'>{pending_type}</font> × {len(pending_details)}")
+      entries.append((
+        "tool",
+        f"<font color='grey'>{pending_type}</font> × {len(pending_details)}",
+      ))
     group_has_content = True
 
   for s in steps:
@@ -205,32 +210,53 @@ def _collapsible_thinking(steps: list[ThinkingStep]) -> JsonObject:
       text = _sanitize_markdown(s.content)
       if len(text) > 200:
         text = text[:197] + "..."
-      lines.append(_escape_md(text))
+      entries.append(("text", _escape_md(text)))
       group_has_content = True
     else:  # text — start of a new group
       _flush_tools()
       pending_type = ""
       pending_details = []
       if group_has_content:
-        lines.append("---")  # horizontal divider
+        entries.append(("divider", "---"))
       text = _sanitize_markdown(s.content)
       if len(text) > 300:
         text = text[:297] + "..."
-      lines.append(_escape_md(text))
+      entries.append(("text", _escape_md(text)))
       group_has_content = True
   _flush_tools()
 
-  # Use markdown hard-break (two spaces + newline) for tight spacing
-  # between items within a group; keep blank line around --- dividers.
-  joined: list[str] = []
-  for i, line in enumerate(lines):
-    if line == "---":
-      joined.append("\n---\n")
-    else:
-      if i > 0 and lines[i - 1] != "---":
-        joined.append("  \n")  # hard break
-      joined.append(line)
-  content = "".join(joined) if joined else "_none_"
+  # Coalesce consecutive entries of the same kind into markdown blocks.
+  # Each block becomes a separate markdown element with its own text_size.
+  elements: list[JsonObject] = []
+  buf: list[str] = []
+  buf_kind: str = ""
+
+  def _emit() -> None:
+    if not buf:
+      return
+    content = "  \n".join(buf)  # hard-break between lines within block
+    el: JsonObject = {"tag": "markdown", "content": content}
+    if buf_kind == "tool":
+      el["text_size"] = "notation"
+    elements.append(el)
+
+  for kind, content in entries:
+    if kind == "divider":
+      _emit()
+      buf = []
+      buf_kind = ""
+      elements.append({"tag": "hr"})
+      continue
+    if kind != buf_kind:
+      _emit()
+      buf = []
+      buf_kind = kind
+    buf.append(content)
+  _emit()
+
+  if not elements:
+    elements = [{"tag": "markdown", "content": "_none_"}]
+
   return {
     "tag": "collapsible_panel",
     "expanded": False,
@@ -241,9 +267,7 @@ def _collapsible_thinking(steps: list[ThinkingStep]) -> JsonObject:
       },
     },
     "vertical_spacing": "4px",
-    "elements": [
-      {"tag": "markdown", "content": content, "text_size": "notation"},
-    ],
+    "elements": elements,
   }
 
 

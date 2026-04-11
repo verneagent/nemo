@@ -67,6 +67,18 @@ def test_tool_summary_unknown():
 # ThinkingStep & _collapsible_thinking
 # ---------------------------------------------------------------------------
 
+
+def _panel_content(panel):
+  """Join all markdown element contents; use '---' for hr elements."""
+  parts = []
+  for el in panel["elements"]:
+    if el["tag"] == "hr":
+      parts.append("---")
+    else:
+      parts.append(el.get("content", ""))
+  return "\n".join(parts)
+
+
 def test_collapsible_thinking_mixed():
   steps = [
     ThinkingStep("text", "Let me check..."),
@@ -77,7 +89,7 @@ def test_collapsible_thinking_mixed():
   panel = _collapsible_thinking(steps)
   assert panel["tag"] == "collapsible_panel"
   assert panel["header"]["title"]["content"] == "Thinking (4)"
-  content = panel["elements"][0]["content"]
+  content = _panel_content(panel)
   assert "Let me check..." in content
   assert "Read:" in content
   assert "main.py" in content
@@ -89,7 +101,7 @@ def test_collapsible_thinking_groups_consecutive_tools():
   """7 consecutive Grep calls should merge into one line."""
   steps = [ThinkingStep("tool", f"Grep: pattern{i}") for i in range(7)]
   panel = _collapsible_thinking(steps)
-  content = panel["elements"][0]["content"]
+  content = _panel_content(panel)
   # Should be one grouped line, not 7 bullet points
   assert content.count("Grep:") == 1
   assert "pattern0" in content
@@ -105,7 +117,7 @@ def test_collapsible_thinking_separates_different_tool_types():
     ThinkingStep("tool", "Read: c.py"),
   ]
   panel = _collapsible_thinking(steps)
-  content = panel["elements"][0]["content"]
+  content = _panel_content(panel)
   assert content.count("Read:") == 2  # two separate Read groups
   assert content.count("Grep:") == 1
 
@@ -119,7 +131,7 @@ def test_collapsible_thinking_text_separates_groups_with_divider():
     ThinkingStep("tool", "Edit: a.py"),
   ]
   panel = _collapsible_thinking(steps)
-  content = panel["elements"][0]["content"]
+  content = _panel_content(panel)
   assert "---" in content
   # Divider appears between groups, not at the start
   assert not content.startswith("---")
@@ -134,7 +146,7 @@ def test_collapsible_thinking_no_divider_for_single_group():
     ThinkingStep("tool", "Read: a.py"),
   ]
   panel = _collapsible_thinking(steps)
-  content = panel["elements"][0]["content"]
+  content = _panel_content(panel)
   assert "---" not in content
 
 
@@ -142,7 +154,7 @@ def test_collapsible_thinking_escapes_angle_brackets():
   """Grep patterns with <<<< should not render as &lt;&lt;&lt;."""
   steps = [ThinkingStep("tool", "Grep: <<<<<<<")]
   panel = _collapsible_thinking(steps)
-  content = panel["elements"][0]["content"]
+  content = _panel_content(panel)
   assert "<<" not in content  # raw pattern stripped
   assert "&lt;" not in content
   assert "‹‹‹‹‹‹‹" in content
@@ -152,7 +164,7 @@ def test_collapsible_thinking_text_truncated():
   long_text = "x" * 500
   steps = [ThinkingStep("text", long_text)]
   panel = _collapsible_thinking(steps)
-  content = panel["elements"][0]["content"]
+  content = _panel_content(panel)
   assert len(content) <= 310  # 300 + "..."
   assert content.endswith("...")
 
