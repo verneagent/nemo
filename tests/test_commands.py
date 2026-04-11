@@ -202,6 +202,34 @@ def test_diag_bare():
 
 
 # ---------------------------------------------------------------------------
+# /name command
+# ---------------------------------------------------------------------------
+
+def test_name_rename():
+  handled, resp = try_dispatch("/name My Project", _ctx())
+  assert handled
+  assert resp == "__name__:My Project"
+
+
+def test_name_single_word():
+  handled, resp = try_dispatch("/name foo", _ctx())
+  assert handled
+  assert resp == "__name__:foo"
+
+
+def test_name_empty_shows_usage():
+  handled, resp = try_dispatch("/name", _ctx())
+  assert handled
+  assert "Usage" in resp
+
+
+def test_name_whitespace_only_shows_usage():
+  handled, resp = try_dispatch("/name   ", _ctx())
+  assert handled
+  assert "Usage" in resp
+
+
+# ---------------------------------------------------------------------------
 # /mention command
 # ---------------------------------------------------------------------------
 

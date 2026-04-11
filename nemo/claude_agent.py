@@ -84,6 +84,7 @@ class ClaudeCodingAgent(CodingAgent):
       "- /norm add <name> <text> — add a group norm\n"
       "- /norm remove <name> — remove a norm\n"
       "- /mention on|off — toggle @mention requirement\n"
+      "- /name <name> — rename the current group\n"
       "- /model <name> — switch model\n"
       "When users ask to do these things in natural language, tell them "
       "the exact slash command to use. Do NOT try to execute them yourself.\n\n"

@@ -95,6 +95,7 @@ def try_dispatch(text: str, ctx: AgentContext) -> tuple[bool, str | None]:
       "| `/cost` | Session API cost |\n"
       "| `/usage` | Plan usage limits |\n"
       "| `/mention` | Toggle @mention requirement |\n"
+      "| `/name <name>` | Rename this group |\n"
       "| `/norm` | Manage group norms |\n"
       "| `/guest` | Manage guests |\n"
       "| `/diag` | Run diagnostics |\n"
@@ -131,6 +132,14 @@ def try_dispatch(text: str, ctx: AgentContext) -> tuple[bool, str | None]:
     return True, "__mention__:on"
   if t in ("/mention off", "mention off"):
     return True, "__mention__:off"
+
+  # /name <new name>
+  if t.startswith("/name"):
+    parts = text.strip().split(None, 1)
+    if len(parts) < 2 or not parts[1].strip():
+      return True, "Usage: `/name <new group name>`"
+    new_name = parts[1].strip()
+    return True, f"__name__:{new_name}"
 
   # /diag
   if t in ("/diag", "diag"):

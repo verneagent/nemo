@@ -519,6 +519,14 @@ async def main_loop(
             await _send_response(channel, chat_id, f"Removed **{name}**.", db)
           else:
             await _send_response(channel, chat_id, f"Guest **{name}** not found.", db)
+        elif response and response.startswith("__name__:"):
+          new_name = response.split(":", 1)[1]
+          try:
+            from .lark import api as lark_api
+            lark_api.update_chat_info(channel.token, chat_id, {"name": new_name})
+            await _send_response(channel, chat_id, f"Renamed to **{new_name}**.", db)
+          except Exception as e:
+            await _send_response(channel, chat_id, f"Rename failed: {e}", db)
         elif response == "__diag__":
           await _handle_diag(channel, chat_id, project_dir, db)
         elif response == "__exit__":
