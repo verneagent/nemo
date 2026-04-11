@@ -16,8 +16,9 @@ def test_double_fork_reparents_to_pid1():
     [sys.executable, "-c", """
 import os, sys, time
 sys.path.insert(0, ".")
-from nemo.__main__ import _daemonize
+from nemo.__main__ import _daemonize, signal_ready
 _daemonize()
+signal_ready()
 # We are the daemon — sleep so the test can inspect us
 time.sleep(5)
 """],
@@ -55,8 +56,9 @@ def test_double_fork_daemon_survives_parent_kill():
     [sys.executable, "-c", """
 import os, sys, time
 sys.path.insert(0, ".")
-from nemo.__main__ import _daemonize
+from nemo.__main__ import _daemonize, signal_ready
 _daemonize()
+signal_ready()
 time.sleep(10)
 """],
     stderr=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -87,11 +89,12 @@ def test_double_fork_reports_correct_pid():
     [sys.executable, "-c", """
 import os, sys, time
 sys.path.insert(0, ".")
-from nemo.__main__ import _daemonize
+from nemo.__main__ import _daemonize, signal_ready
 _daemonize()
 # Write our actual PID to a file for verification
 with open("/tmp/.nemo_test_pid", "w") as f:
     f.write(str(os.getpid()))
+signal_ready()
 time.sleep(5)
 """],
     capture_output=True, text=True, timeout=10,
