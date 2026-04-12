@@ -327,16 +327,18 @@ def test_not_inline_safe_none():
 def test_effort_show_default():
   handled, resp = try_dispatch("/effort", _ctx())
   assert handled
-  assert "off" in resp
+  assert "default" in resp
+  assert "medium in Claude Code" in resp
   assert "Usage" in resp
 
 
 def test_effort_show_current():
   ctx = _ctx()
-  ctx.effort = "medium"
+  ctx.effort = "high"
   handled, resp = try_dispatch("/effort", ctx)
   assert handled
-  assert "medium" in resp
+  assert "high" in resp
+  assert "ultrathink" in resp
 
 
 def test_effort_set_low():
@@ -358,7 +360,7 @@ def test_effort_set_high():
 
 
 def test_effort_off_clears():
-  for arg in ("off", "none", "clear"):
+  for arg in ("off", "none", "clear", "default"):
     handled, resp = try_dispatch(f"/effort {arg}", _ctx())
     assert handled
     assert resp == "__effort__:"

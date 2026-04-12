@@ -303,6 +303,7 @@ async def main_loop(
 
   # Context
   ctx = commands.AgentContext(model, project_dir, time.time())
+  ctx.provider = provider
   ctx.effort = effort
   main_loop_ref = asyncio.get_running_loop()
   running = True
@@ -446,9 +447,12 @@ async def main_loop(
           new_effort = response.split(":", 1)[1]
           ctx.effort = new_effort
           agent.set_effort(new_effort)
-          label = new_effort if new_effort else "off"
+          label = new_effort if new_effort else "default"
+          detail_map = commands._EFFORT_DETAIL.get(provider, {})
+          detail = detail_map.get(new_effort, "")
+          hint = f" — {detail}" if detail else ""
           log.info("Reasoning effort set to %s", label)
-          await _send_response(channel, chat_id, f"Reasoning effort: **{label}**.", db)
+          await _send_response(channel, chat_id, f"Reasoning effort: **{label}**{hint}.", db)
         elif response and response.startswith("__cd__:"):
           new_dir = response.split(":", 1)[1]
           project_dir = new_dir
@@ -829,8 +833,11 @@ async def main_loop(
             new_effort = response.split(":", 1)[1]
             ctx.effort = new_effort
             agent.set_effort(new_effort)
-            label = new_effort if new_effort else "off"
-            await _send_response(channel, chat_id, f"Reasoning effort: **{label}**.", db)
+            label = new_effort if new_effort else "default"
+            detail_map = commands._EFFORT_DETAIL.get(provider, {})
+            detail = detail_map.get(new_effort, "")
+            hint = f" — {detail}" if detail else ""
+            await _send_response(channel, chat_id, f"Reasoning effort: **{label}**{hint}.", db)
           elif response:
             # Text responses: /ping, /cost, /help, /usage, /guest help, /norm help
             await _send_response(channel, chat_id, response, db)
