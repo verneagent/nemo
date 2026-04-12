@@ -17,6 +17,8 @@ from collections.abc import Coroutine
 from concurrent.futures import Future
 from typing import Callable
 
+from claude_agent_sdk import CLIConnectionError as _CLIConnectionError
+
 from .turn import TurnEvent, run_turn
 from .types import ClaudeSDKClientLike, JsonObject
 
@@ -171,8 +173,12 @@ class SDKThread:
         raise asyncio.CancelledError("SDK turn cancelled")
       try:
         return await self.run_turn(prompt, on_event, stale_tasks=stale_tasks)
-      except (TimeoutError, RuntimeError) as exc:
-        is_disconnected = isinstance(exc, RuntimeError) and "not connected" in str(exc)
+      except (TimeoutError, RuntimeError, _CLIConnectionError) as exc:
+        exc_msg = str(exc).lower()
+        is_disconnected = (
+          isinstance(exc, _CLIConnectionError)
+          or (isinstance(exc, RuntimeError) and "not connected" in exc_msg)
+        )
         if isinstance(exc, TimeoutError) or is_disconnected:
           label = "disconnected" if is_disconnected else "hung"
           log.warning("SDK turn %s (attempt %d/%d)", label, attempt + 1, max_attempts)

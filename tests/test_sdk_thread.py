@@ -6,6 +6,7 @@ from unittest import mock
 
 import pytest
 
+from claude_agent_sdk import CLIConnectionError
 from nemo.sdk_thread import SDKThread, MAX_CONNECT_ATTEMPTS
 
 
@@ -333,6 +334,30 @@ class TestRunTurnWithReconnect:
 
     # Should have only attempted once before cancel took effect
     assert call_count == 1
+
+  def test_retries_on_terminated_process(self, sdk_thread: SDKThread):
+    """Should reconnect when subprocess terminated (CLIConnectionError)."""
+    expected = (0.5, {})
+    call_count = 0
+
+    async def fake_turn(prompt, on_event, stale_tasks=None):
+      nonlocal call_count
+      call_count += 1
+      if call_count < 2:
+        raise CLIConnectionError("Cannot write to terminated process (exit code: 1)")
+      return expected
+
+    sdk_thread._client = mock.MagicMock()
+
+    with mock.patch.object(sdk_thread, "run_turn", side_effect=fake_turn):
+      with mock.patch.object(sdk_thread, "reconnect", new_callable=mock.AsyncMock):
+        result = _run(sdk_thread.run_turn_with_reconnect(
+          "hello", on_event=lambda e: None,
+          options=mock.MagicMock(), max_attempts=3,
+        ))
+
+    assert result == expected
+    assert call_count == 2
 
   def test_other_runtime_error_not_retried(self, sdk_thread: SDKThread):
     """RuntimeError without 'not connected' should not be retried."""
