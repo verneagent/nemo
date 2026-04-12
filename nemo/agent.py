@@ -17,6 +17,7 @@ import logging
 import os
 import signal
 import time
+import urllib.error
 import uuid
 
 from . import cards, commands, messages, monitor
@@ -716,15 +717,21 @@ async def main_loop(
               elapsed=elapsed, usage=event.usage,
               session_id=_sdk_session_id,
             )
-            _card_update_failed = False
+            _card_update_error: Exception | None = None
             try:
               _await_channel(channel.update_card(_turn_card_id, card))
             except Exception as e:
               log.warning("Failed to update done card: %s", e)
-              _card_update_failed = True
-            # Fallback: if card update failed (typically table limit), send
-            # the full response as a markdown file and retry with preview.
-            if _card_update_failed and final_text:
+              _card_update_error = e
+            # Fallback: if card update failed due to content size (not auth/
+            # transport errors), send the full response as a markdown file.
+            # HTTP errors (403, 401, etc.) indicate token/permission issues
+            # — sending as file won't help and would confuse the user.
+            _is_content_error = (
+              _card_update_error is not None
+              and not isinstance(_card_update_error, urllib.error.HTTPError)
+            )
+            if _is_content_error and final_text:
               try:
                 import tempfile
                 file_dir = os.path.join("/tmp/nemo", "nemo-files")
