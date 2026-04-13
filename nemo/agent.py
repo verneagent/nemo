@@ -26,9 +26,7 @@ from .channel import IncomingMessage
 from .config import load_credentials
 from .db import Database
 from .lark_channel import LarkChannel
-from .turn import (
-  DoneEvent, TextEvent, ThinkingEvent, ToolProgressEvent, ToolStartEvent,
-)
+from .turn import AnswerEvent, DoneEvent, ProgressEvent
 
 log = logging.getLogger(__name__)
 
@@ -687,18 +685,15 @@ async def main_loop(
           except Exception as e:
             log.debug("Failed to update working card: %s", e)
 
-        if isinstance(event, (ToolStartEvent, ToolProgressEvent)):
-          _turn_steps.append(cards.ThinkingStep("tool", event.tool.summary))
-          _turn_current_tool = event.tool.summary
-          _ensure_card()
-          _update_working(current_tool=event.tool.summary)
+        if isinstance(event, ProgressEvent):
+          _turn_steps.append(cards.ThinkingStep(event.kind, event.summary))
+          _turn_current_tool = event.summary if event.kind == "tool" else _turn_current_tool
+          if event.first:
+            _ensure_card()
+          _update_working(current_tool=_turn_current_tool if event.kind == "tool" else None)
 
-        elif isinstance(event, ThinkingEvent):
-          _turn_steps.append(cards.ThinkingStep("thinking", event.text))
-          _update_working()
-
-        elif isinstance(event, TextEvent):
-          _turn_steps.append(cards.ThinkingStep("text", event.text))
+        elif isinstance(event, AnswerEvent):
+          _turn_steps.append(cards.ThinkingStep("answer", event.text))
           # Don't create card for text-only responses — let them go as
           # plain text messages. Only update if card already exists.
           _update_working()
@@ -713,11 +708,11 @@ async def main_loop(
               db.clear_working(session_id)
             return
           elapsed = int(time.time() - _turn_start)
-          # Final response = last text step (if any)
-          text_steps = [s for s in _turn_steps if s.kind == "text"]
-          final_text = text_steps[-1].content if text_steps else ""
-          # Thinking timeline = all steps except the last text
-          thinking = _turn_steps[:-1] if text_steps and _turn_steps and _turn_steps[-1].kind == "text" else list(_turn_steps)
+          # Final response = last answer step (if any)
+          answer_steps = [s for s in _turn_steps if s.kind == "answer"]
+          final_text = answer_steps[-1].content if answer_steps else ""
+          # Thinking timeline = all non-answer steps
+          thinking = [s for s in _turn_steps if s.kind != "answer"]
           if _turn_card_id:
             card = cards.build_turn_card(
               "done", body=final_text, steps=thinking,

@@ -81,9 +81,9 @@ def _panel_content(panel):
 
 def test_collapsible_thinking_mixed():
   steps = [
-    ThinkingStep("text", "Let me check..."),
+    ThinkingStep("answer", "Let me check..."),
     ThinkingStep("tool", "Read: main.py"),
-    ThinkingStep("text", "Found the issue"),
+    ThinkingStep("answer", "Found the issue"),
     ThinkingStep("tool", "Edit: main.py"),
   ]
   panel = _collapsible_thinking(steps)
@@ -129,7 +129,7 @@ def test_collapsible_thinking_separates_different_tool_types():
 
 def test_collapsible_thinking_limits_tools_per_group_to_5():
   """Each group shows at most 5 tool calls; older ones get 'N earlier'."""
-  steps = [ThinkingStep("text", "Doing stuff")]
+  steps = [ThinkingStep("answer", "Doing stuff")]
   # 8 different tool types so coalescing doesn't merge them
   steps.extend([
     ThinkingStep("tool", "Read: a.py"),
@@ -160,11 +160,11 @@ def test_collapsible_thinking_limits_tools_per_group_to_5():
 def test_collapsible_thinking_group_count_in_header():
   """Header shows number of groups (text-initiated)."""
   steps = [
-    ThinkingStep("text", "Step 1"),
+    ThinkingStep("answer", "Step 1"),
     ThinkingStep("tool", "Read: a.py"),
-    ThinkingStep("text", "Step 2"),
+    ThinkingStep("answer", "Step 2"),
     ThinkingStep("tool", "Read: b.py"),
-    ThinkingStep("text", "Step 3"),
+    ThinkingStep("answer", "Step 3"),
   ]
   panel = _collapsible_thinking(steps)
   assert panel["header"]["title"]["content"] == "Thinking (3)"
@@ -174,7 +174,7 @@ def test_collapsible_thinking_leading_tool_group():
   """If no leading text, the first tool-only group still counts as 1."""
   steps = [
     ThinkingStep("tool", "Read: a.py"),
-    ThinkingStep("text", "After tool"),
+    ThinkingStep("answer", "After tool"),
     ThinkingStep("tool", "Edit: a.py"),
   ]
   panel = _collapsible_thinking(steps)
@@ -183,7 +183,7 @@ def test_collapsible_thinking_leading_tool_group():
 
 def test_collapsible_thinking_thinking_not_counted_toward_tool_limit():
   """Thinking blocks don't count against the 5-tool limit."""
-  steps = [ThinkingStep("text", "Working")]
+  steps = [ThinkingStep("answer", "Working")]
   steps.extend([ThinkingStep("thinking", f"thought {i}") for i in range(3)])
   steps.extend([ThinkingStep("tool", f"Bash: cmd{i}") for i in range(6)])
   panel = _collapsible_thinking(steps)
@@ -198,9 +198,9 @@ def test_collapsible_thinking_thinking_not_counted_toward_tool_limit():
 def test_collapsible_thinking_text_separates_groups_with_divider():
   """Each narrative text starts a new group with a --- divider."""
   steps = [
-    ThinkingStep("text", "Let me check"),
+    ThinkingStep("answer", "Let me check"),
     ThinkingStep("tool", "Read: a.py"),
-    ThinkingStep("text", "Now fixing"),
+    ThinkingStep("answer", "Now fixing"),
     ThinkingStep("tool", "Edit: a.py"),
   ]
   panel = _collapsible_thinking(steps)
@@ -215,7 +215,7 @@ def test_collapsible_thinking_text_separates_groups_with_divider():
 def test_collapsible_thinking_no_divider_for_single_group():
   """A single group (no second text) should have no divider."""
   steps = [
-    ThinkingStep("text", "Let me check"),
+    ThinkingStep("answer", "Let me check"),
     ThinkingStep("tool", "Read: a.py"),
   ]
   panel = _collapsible_thinking(steps)
@@ -235,7 +235,7 @@ def test_collapsible_thinking_escapes_angle_brackets():
 
 def test_collapsible_thinking_text_truncated():
   long_text = "x" * 500
-  steps = [ThinkingStep("text", long_text)]
+  steps = [ThinkingStep("answer", long_text)]
   panel = _collapsible_thinking(steps)
   content = _panel_content(panel)
   assert len(content) <= 310  # 300 + "..."
@@ -265,7 +265,7 @@ def test_working_card_basic():
 
 def test_working_card_with_steps():
   steps = [
-    ThinkingStep("text", "Checking..."),
+    ThinkingStep("answer", "Checking..."),
     ThinkingStep("tool", "Read: a.py"),
     ThinkingStep("tool", "Edit: b.py"),
   ]
@@ -302,7 +302,7 @@ def test_working_card_with_body_only():
 
 
 def test_stopping_card_preserves_working_content():
-  steps = [ThinkingStep("tool", "Read: a.py"), ThinkingStep("text", "Checking")]
+  steps = [ThinkingStep("tool", "Read: a.py"), ThinkingStep("answer", "Checking")]
   card = build_turn_card("stopping", current_tool="Read: a.py", steps=steps)
   assert card["header"]["title"]["content"] == "Stopping..."
   assert card["header"]["template"] == "orange"
@@ -352,7 +352,7 @@ def test_done_card_with_usage():
 
 
 def test_done_card_with_steps():
-  steps = [ThinkingStep("tool", "Read: x.py"), ThinkingStep("text", "Found it")]
+  steps = [ThinkingStep("tool", "Read: x.py"), ThinkingStep("answer", "Found it")]
   card = build_turn_card("done", body="Done.", steps=steps, elapsed=5)
   elements = card["body"]["elements"]
   # Body inline, then thinking collapsible, then note

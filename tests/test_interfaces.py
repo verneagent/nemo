@@ -4,7 +4,7 @@ import asyncio
 
 from nemo.channel import Channel, IncomingMessage
 from nemo.coding_agent import CodingAgent
-from nemo.turn import ToolStartEvent, TextEvent, DoneEvent
+from nemo.turn import ProgressEvent, AnswerEvent, DoneEvent
 
 
 # ---------------------------------------------------------------------------
@@ -171,8 +171,8 @@ class FakeAgent(CodingAgent):
 
   async def run_turn(self, prompt, on_event, stale_tasks=None):
     self.turns.append(prompt)
-    on_event(ToolStartEvent(tool=None))
-    on_event(TextEvent(text="response"))
+    on_event(ProgressEvent(kind="tool", summary="Read /a/b.py", first=True))
+    on_event(AnswerEvent(text="response"))
     on_event(DoneEvent(cost=0.01, usage={"input_tokens": 100}))
     return 0.01, {"input_tokens": 100}
 
@@ -200,8 +200,8 @@ def test_agent_run_turn():
     events = []
     await agent.run_turn("fix the bug", lambda e: events.append(e))
     assert len(events) == 3
-    assert isinstance(events[0], ToolStartEvent)
-    assert isinstance(events[1], TextEvent)
+    assert isinstance(events[0], ProgressEvent)
+    assert isinstance(events[1], AnswerEvent)
     assert events[1].text == "response"
     assert isinstance(events[2], DoneEvent)
     assert agent.turns == ["fix the bug"]

@@ -4,7 +4,7 @@ import asyncio
 from unittest import mock
 
 from nemo.agent import main_loop
-from nemo.turn import DoneEvent, TextEvent
+from nemo.turn import AnswerEvent, DoneEvent
 
 
 class _FakeDB:
@@ -151,7 +151,7 @@ class _FakeAgent:
   async def run_turn(self, _prompt, on_event, stale_tasks=None):
     del stale_tasks
     def _emit():
-      on_event(TextEvent("hi! how can i help?"))
+      on_event(AnswerEvent("hi! how can i help?"))
       on_event(DoneEvent(cost=0.01, usage={"input_tokens": 1}))
 
     await asyncio.to_thread(_emit)

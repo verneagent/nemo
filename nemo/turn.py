@@ -11,7 +11,7 @@ import logging
 from dataclasses import dataclass
 from typing import Callable
 
-from .cards import ToolRecord, tool_use_summary
+from .cards import tool_use_summary
 from .types import JsonObject, TurnClient
 
 log = logging.getLogger(__name__)
@@ -28,26 +28,25 @@ HEARTBEAT_TIMEOUT = 300  # seconds
 # ---------------------------------------------------------------------------
 
 @dataclass
-class ToolStartEvent:
-  """First tool use in a turn — create the Working card."""
-  tool: ToolRecord
+class ProgressEvent:
+  """Any intermediate step — thinking, tool use, reasoning.
+
+  Feeds the Working card and the Done card's collapsible timeline.
+  ``kind`` values: "thinking", "tool", "reasoning".
+  ``first`` is True for the very first progress event in a turn (signals
+  the consumer to create the Working card).
+  """
+  kind: str
+  summary: str
+  first: bool = False
 
 
 @dataclass
-class ToolProgressEvent:
-  """Subsequent tool use — update the Working card."""
-  tool: ToolRecord
+class AnswerEvent:
+  """Visible text answer from the agent.
 
-
-@dataclass
-class ThinkingEvent:
-  """Agent produced thinking/reasoning output."""
-  text: str
-
-
-@dataclass
-class TextEvent:
-  """Agent produced text output."""
+  The last AnswerEvent in a turn becomes the Done card body.
+  """
   text: str
   task_id: str | None = None
   pending_tasks: int = 0
@@ -79,7 +78,7 @@ class ErrorEvent:
 
 
 TurnEvent = (
-  ToolStartEvent | ToolProgressEvent | ThinkingEvent | TextEvent |
+  ProgressEvent | AnswerEvent |
   TaskStartedEvent | TaskDoneEvent | DoneEvent | ErrorEvent
 )
 
@@ -117,9 +116,11 @@ async def run_turn(
   usage: JsonObject = {}
   sdk_session_id = ""
   pending_tasks: set[str] = set()
-  working_started = False
+  progress_started = False
   found_stale = False
   timed_out = False
+  last_emitted: str = ""  # "progress" or "answer" — for trailing thinking compensation
+  last_thinking: str = ""  # last thinking text, used for compensation
 
   # The SDK uses anyio internally. Neither asyncio.wait_for nor anyio.fail_after
   # can reliably cancel stuck anyio operations from asyncio context.
@@ -165,8 +166,8 @@ async def run_turn(
 
     # --- Normal message handling ---
     if isinstance(message, AssistantMessage):
-      text_parts = []
-      thinking_parts = []
+      text_parts: list[str] = []
+      thinking_parts: list[str] = []
       tool_summary = ""
       for block in message.content:
         if isinstance(block, ThinkingBlock) and block.thinking:
@@ -177,28 +178,32 @@ async def run_turn(
           tool_summary = tool_use_summary(block.name, block.input)
 
       if thinking_parts:
-        on_event(ThinkingEvent(text="\n".join(thinking_parts)))
+        thinking_text = "\n".join(thinking_parts)
+        is_first = not progress_started
+        progress_started = True
+        on_event(ProgressEvent(kind="thinking", summary=thinking_text, first=is_first))
+        last_emitted = "progress"
+        last_thinking = thinking_text
 
       text = "\n".join(text_parts)
       if not text and message.content:
         # Tool-only message → working card
         if tool_summary:
-          record = ToolRecord(name="", summary=tool_summary)
-          if not working_started:
-            on_event(ToolStartEvent(tool=record))
-            working_started = True
-          else:
-            on_event(ToolProgressEvent(tool=record))
+          is_first = not progress_started
+          progress_started = True
+          on_event(ProgressEvent(kind="tool", summary=tool_summary, first=is_first))
+          last_emitted = "progress"
       elif text:
-        # Text output
+        # Text output → answer
         task_id = None
         parent = getattr(message, "parent_tool_use_id", None)
         if parent and pending_tasks:
           task_id = next(iter(pending_tasks))
-        on_event(TextEvent(
+        on_event(AnswerEvent(
           text=text, task_id=task_id,
           pending_tasks=len(pending_tasks),
         ))
+        last_emitted = "answer"
 
     elif isinstance(message, TaskStartedMessage):
       pending_tasks.add(message.task_id)
@@ -206,9 +211,8 @@ async def run_turn(
 
     elif isinstance(message, TaskProgressMessage):
       desc = getattr(message, "description", "") or ""
-      if desc and working_started:
-        record = ToolRecord(name="", summary=desc)
-        on_event(ToolProgressEvent(tool=record))
+      if desc and progress_started:
+        on_event(ProgressEvent(kind="tool", summary=desc))
 
     elif isinstance(message, TaskNotificationMessage):
       pending_tasks.discard(message.task_id)
@@ -242,6 +246,14 @@ async def run_turn(
       client, prompt, on_event,
       stale_tasks=stale_tasks, _retry=_retry + 1,
     )
+
+  # --- Trailing thinking compensation ---
+  # If the last emitted event was a ProgressEvent (thinking), the Done card
+  # would miss the model's final reasoning.  Synthesize an AnswerEvent so
+  # the consumer always has a complete final answer.
+  if last_emitted == "progress" and last_thinking:
+    log.info("Compensating trailing thinking (%d chars)", len(last_thinking))
+    on_event(AnswerEvent(text=last_thinking))
 
   log.info("turn done (cost=%.4f, session=%s)", cost, sdk_session_id[:8] if sdk_session_id else "?")
   on_event(DoneEvent(cost=cost, usage=usage, session_id=sdk_session_id))

@@ -9,7 +9,7 @@ from unittest import mock
 from nemo.agent_factory import build_coding_agent, default_model_for_provider, is_model_compatible
 from nemo.claude_agent import ClaudeCodingAgent
 from nemo.codex_agent import CodexCodingAgent, _SIDE_CAR_SCRIPT
-from nemo.turn import DoneEvent, TextEvent, ToolProgressEvent, ToolStartEvent
+from nemo.turn import AnswerEvent, DoneEvent, ProgressEvent
 
 
 class _DummyDB:
@@ -255,9 +255,11 @@ def test_codex_run_turn_maps_events():
     assert cost == 0.0
     assert usage["input_tokens"] == 10
     assert agent._session_id == "sess-1"
-    assert isinstance(events[0], ToolStartEvent)
-    assert isinstance(events[1], ToolProgressEvent)
-    assert isinstance(events[2], TextEvent)
+    assert isinstance(events[0], ProgressEvent)
+    assert events[0].first is True
+    assert isinstance(events[1], ProgressEvent)
+    assert events[1].first is False
+    assert isinstance(events[2], AnswerEvent)
     assert events[2].text == "Done"
     assert isinstance(events[3], DoneEvent)
     assert proc.stdin.writes == [b"fix it"]

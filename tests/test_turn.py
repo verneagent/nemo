@@ -7,11 +7,10 @@ from unittest import mock
 import pytest
 
 from nemo.turn import (
-  run_turn, ToolStartEvent, ToolProgressEvent, TextEvent,
+  run_turn, ProgressEvent, AnswerEvent,
   TaskStartedEvent, TaskDoneEvent, DoneEvent, ErrorEvent,
   TurnEvent,
 )
-from nemo.cards import ToolRecord
 
 
 # ---------------------------------------------------------------------------
@@ -125,12 +124,12 @@ def test_text_only_turn():
       assert cost == 0.02
       assert usage["input_tokens"] == 200
   asyncio.run(_run())
-  assert any(isinstance(e, TextEvent) and e.text == "Hello world" for e in events)
+  assert any(isinstance(e, AnswerEvent) and e.text == "Hello world" for e in events)
   assert any(isinstance(e, DoneEvent) for e in events)
 
 
 def test_tool_use_turn():
-  """A turn with tool use should emit ToolStartEvent then ToolProgressEvent."""
+  """A turn with tool use should emit ProgressEvents (first=True then first=False)."""
   messages = [
     FakeAssistantMessage(content=[FakeToolUseBlock(name="Read", input={"file_path": "/a/b.py"})]),
     FakeAssistantMessage(content=[FakeToolUseBlock(name="Edit", input={"file_path": "/a/c.py"})]),
@@ -143,10 +142,10 @@ def test_tool_use_turn():
       client = FakeClient(messages)
       await run_turn(client, "fix bug", events.append)
   asyncio.run(_run())
-  tool_events = [e for e in events if isinstance(e, (ToolStartEvent, ToolProgressEvent))]
+  tool_events = [e for e in events if isinstance(e, ProgressEvent) and e.kind == "tool"]
   assert len(tool_events) == 2
-  assert isinstance(tool_events[0], ToolStartEvent)
-  assert isinstance(tool_events[1], ToolProgressEvent)
+  assert tool_events[0].first is True
+  assert tool_events[1].first is False
 
 
 def test_task_lifecycle():
@@ -207,8 +206,8 @@ def test_stale_task_detection():
       assert cost == 0.02
   asyncio.run(_run())
   assert call_count == 2  # original + re-query
-  text_events = [e for e in events if isinstance(e, TextEvent)]
-  assert any(e.text == "Fresh response" for e in text_events)
+  answer_events = [e for e in events if isinstance(e, AnswerEvent)]
+  assert any(e.text == "Fresh response" for e in answer_events)
 
 
 def test_empty_turn():
@@ -226,7 +225,7 @@ def test_empty_turn():
 
 
 def test_task_progress_event():
-  """TaskProgressMessage should emit ToolProgressEvent when working."""
+  """TaskProgressMessage should emit ProgressEvent when working."""
   messages = [
     FakeAssistantMessage(content=[FakeToolUseBlock(name="Bash", input={"command": "ls"})]),
     FakeTaskProgressMessage(description="Searching files..."),
@@ -238,8 +237,8 @@ def test_task_progress_event():
       client = FakeClient(messages)
       await run_turn(client, "test", events.append)
   asyncio.run(_run())
-  progress = [e for e in events if isinstance(e, ToolProgressEvent)]
-  assert any(e.tool.summary == "Searching files..." for e in progress)
+  progress = [e for e in events if isinstance(e, ProgressEvent) and e.kind == "tool"]
+  assert any(e.summary == "Searching files..." for e in progress)
 
 
 def test_mixed_text_and_tool():
@@ -258,9 +257,53 @@ def test_mixed_text_and_tool():
       await run_turn(client, "test", events.append)
   asyncio.run(_run())
   # Text takes priority when present
-  text_events = [e for e in events if isinstance(e, TextEvent)]
-  assert len(text_events) == 1
-  assert text_events[0].text == "Let me check"
+  answer_events = [e for e in events if isinstance(e, AnswerEvent)]
+  assert len(answer_events) == 1
+  assert answer_events[0].text == "Let me check"
+
+
+def test_trailing_thinking_compensation():
+  """When the last event is thinking (no text), an AnswerEvent should be synthesized."""
+  messages = [
+    FakeAssistantMessage(content=[
+      FakeThinkingBlock(thinking="Let me analyze this"),
+      FakeToolUseBlock(name="Read", input={"file_path": "/a.py"}),
+    ]),
+    FakeAssistantMessage(content=[
+      FakeThinkingBlock(thinking="I see the issue, the fix is to change line 42"),
+    ]),
+    FakeResultMessage(),
+  ]
+  events = []
+  async def _run():
+    with mock.patch.dict("sys.modules", _sdk_modules()):
+      client = FakeClient(messages)
+      await run_turn(client, "fix bug", events.append)
+  asyncio.run(_run())
+  answer_events = [e for e in events if isinstance(e, AnswerEvent)]
+  assert len(answer_events) == 1
+  assert answer_events[0].text == "I see the issue, the fix is to change line 42"
+  assert any(isinstance(e, DoneEvent) for e in events)
+
+
+def test_no_compensation_when_answer_is_last():
+  """No trailing thinking compensation when the last event is an AnswerEvent."""
+  messages = [
+    FakeAssistantMessage(content=[
+      FakeThinkingBlock(thinking="thinking..."),
+      FakeTextBlock(text="Here is my answer"),
+    ]),
+    FakeResultMessage(),
+  ]
+  events = []
+  async def _run():
+    with mock.patch.dict("sys.modules", _sdk_modules()):
+      client = FakeClient(messages)
+      await run_turn(client, "test", events.append)
+  asyncio.run(_run())
+  answer_events = [e for e in events if isinstance(e, AnswerEvent)]
+  assert len(answer_events) == 1
+  assert answer_events[0].text == "Here is my answer"
 
 
 def test_stale_task_retry_exhaustion():
@@ -400,7 +443,7 @@ def test_heartbeat_timeout():
         except TimeoutError:
           pass
     # Should have the text event from first message
-    assert any(isinstance(e, TextEvent) and e.text == "thinking..." for e in events)
+    assert any(isinstance(e, AnswerEvent) and e.text == "thinking..." for e in events)
     # Should have error event from timeout
     assert any(isinstance(e, ErrorEvent) for e in events)
 

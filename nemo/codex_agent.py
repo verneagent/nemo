@@ -11,11 +11,10 @@ import shutil
 from asyncio.subprocess import Process
 from typing import Callable
 
-from .cards import ToolRecord
 from .channel import Channel
 from .coding_agent import CodingAgent
 from .db import Database
-from .turn import DoneEvent, ErrorEvent, TextEvent, ToolProgressEvent, ToolStartEvent, TurnEvent
+from .turn import AnswerEvent, DoneEvent, ErrorEvent, ProgressEvent, TurnEvent
 from .types import JsonObject
 
 log = logging.getLogger(__name__)
@@ -92,7 +91,7 @@ class CodexCodingAgent(CodingAgent):
     proc.stdin.close()
 
     usage: JsonObject = {}
-    saw_tool = False
+    progress_started = False
     failure: str | None = None
 
     try:
@@ -127,17 +126,15 @@ class CodexCodingAgent(CodingAgent):
         if item_type == "agent_message":
           text = str(item.get("text", "") or "")
           if text:
-            await self._emit_event(on_event, TextEvent(text=text))
+            await self._emit_event(on_event, AnswerEvent(text=text))
         else:
           summary = self._item_summary(item)
           if not summary:
             continue
-          record = ToolRecord(name=item_type, summary=summary)
-          if not saw_tool:
-            await self._emit_event(on_event, ToolStartEvent(tool=record))
-            saw_tool = True
-          else:
-            await self._emit_event(on_event, ToolProgressEvent(tool=record))
+          kind = "reasoning" if item_type == "reasoning" else "tool"
+          is_first = not progress_started
+          progress_started = True
+          await self._emit_event(on_event, ProgressEvent(kind=kind, summary=summary, first=is_first))
 
       rc = await proc.wait()
       if failure is None and rc != 0 and not self._interrupted:

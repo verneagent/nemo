@@ -33,8 +33,8 @@ class ToolRecord:
 
 @dataclass
 class ThinkingStep:
-  """One entry in the unified thinking timeline (text or tool)."""
-  kind: str       # "text" | "tool"
+  """One entry in the unified thinking timeline."""
+  kind: str       # "thinking" | "tool" | "reasoning" | "answer"
   content: str    # text content or tool summary
 
 
@@ -166,9 +166,9 @@ MAX_TOOLS_PER_GROUP = 5
 def _split_into_groups(steps: list[ThinkingStep]) -> list[tuple[str, list[ThinkingStep]]]:
   """Split steps into groups. Each group = (text or '', [tool/thinking steps]).
 
-  A new group starts at each text step. Tool/thinking steps attach to
-  the current group. If the first step isn't text, the first group
-  has empty text.
+  A new group starts at each answer step. Tool/thinking/reasoning steps
+  attach to the current group. If the first step isn't an answer, the
+  first group has empty text.
   """
   groups: list[tuple[str, list[ThinkingStep]]] = []
   cur_text: str = ""
@@ -176,7 +176,7 @@ def _split_into_groups(steps: list[ThinkingStep]) -> list[tuple[str, list[Thinki
   started = False
 
   for s in steps:
-    if s.kind == "text":
+    if s.kind == "answer":
       if started:
         groups.append((cur_text, cur_steps))
       cur_text = s.content
@@ -184,7 +184,7 @@ def _split_into_groups(steps: list[ThinkingStep]) -> list[tuple[str, list[Thinki
       started = True
     else:
       if not started:
-        started = True  # first group with no leading text
+        started = True  # first group with no leading answer
       cur_steps.append(s)
   if started:
     groups.append((cur_text, cur_steps))
@@ -249,8 +249,8 @@ def _collapsible_thinking(steps: list[ThinkingStep]) -> JsonObject:
         t = t[:297] + "..."
       entries.append(("text", _escape_md(t)))
 
-    # Separate thinking and tool steps while preserving order
-    thinkings = [s for s in grp_steps if s.kind == "thinking"]
+    # Separate thinking/reasoning and tool steps while preserving order
+    thinkings = [s for s in grp_steps if s.kind in ("thinking", "reasoning")]
     tools = [s for s in grp_steps if s.kind == "tool"]
 
     # Render thinking blocks (all of them — not counted toward tool limit)
