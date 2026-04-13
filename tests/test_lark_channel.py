@@ -389,7 +389,8 @@ def test_update_card_retries_on_http_403():
 
 def test_update_card_falls_back_to_new_card_when_refresh_fails():
   """If token refresh doesn't fix 403, send as a new card instead of
-  surfacing the error — the user still sees the response."""
+  surfacing the error — the user still sees the response. The new
+  message_id is returned so callers can retarget subsequent updates."""
   ch = _build_topic_channel()
   ch._chat_mode = "group"
 
@@ -399,8 +400,40 @@ def test_update_card_falls_back_to_new_card_when_refresh_fails():
                   side_effect=_make_http_error(403)), \
        mock.patch("nemo.lark_channel.lark_api.send_card",
                   return_value="om_new") as mock_send:
-    asyncio.run(ch.update_card("om_old", {"title": "x"}))
+    new_id = asyncio.run(ch.update_card("om_old", {"title": "x"}))
   mock_send.assert_called_once()
+  assert new_id == "om_new"
+
+
+def test_update_card_topic_fallback_replies_to_failed_card():
+  """In topic chats the fallback card must reply to the failed message,
+  not to self._reply_anchor (which may have drifted)."""
+  ch = _build_topic_channel()
+  ch._reply_anchor = "om_newer_inbound"  # drifted since old card was posted
+
+  with mock.patch("nemo.lark_channel.lark_auth.get_token", return_value="t"), \
+       mock.patch("nemo.lark_channel.lark_auth.invalidate"), \
+       mock.patch("nemo.lark_channel.lark_api.update_card",
+                  side_effect=_make_http_error(403)), \
+       mock.patch("nemo.lark_channel.lark_api.reply_card",
+                  return_value="om_new") as mock_reply, \
+       mock.patch("nemo.lark_channel.lark_api.send_card") as mock_send:
+    new_id = asyncio.run(ch.update_card("om_original", {"title": "x"}))
+  assert new_id == "om_new"
+  # Anchored to the FAILED card, not the drifted _reply_anchor.
+  mock_reply.assert_called_once_with("t", "om_original", {"title": "x"}, True)
+  mock_send.assert_not_called()
+
+
+def test_update_card_returns_input_id_on_success():
+  """When update succeeds in-place, the input message_id is returned."""
+  ch = _build_topic_channel()
+  ch._chat_mode = "group"
+
+  with mock.patch("nemo.lark_channel.lark_auth.get_token", return_value="t"), \
+       mock.patch("nemo.lark_channel.lark_api.update_card"):
+    result = asyncio.run(ch.update_card("om_1", {"title": "x"}))
+  assert result == "om_1"
 
 
 def test_update_card_propagates_non_auth_http_errors():

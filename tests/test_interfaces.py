@@ -60,6 +60,7 @@ class FakeChannel(Channel):
 
   async def update_card(self, message_id, card):
     self.updated_cards.append((message_id, card))
+    return message_id
 
   async def send_text(self, chat_id, text):
     self.sent_texts.append((chat_id, text))

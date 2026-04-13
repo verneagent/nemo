@@ -60,8 +60,12 @@ class Channel(ABC):
     ...
 
   @abstractmethod
-  async def update_card(self, message_id: str, card: JsonObject) -> None:
-    """Update (PATCH) an existing card message."""
+  async def update_card(self, message_id: str, card: JsonObject) -> str:
+    """Update (PATCH) an existing card message. Returns the effective
+    message_id — normally the input, but implementations may return a
+    different id if they had to send a replacement card (e.g. the
+    original message is no longer editable). Callers tracking the card
+    id should update their stored id to the returned value."""
     ...
 
   @abstractmethod

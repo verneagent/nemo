@@ -635,7 +635,10 @@ async def main_loop(
             current_tool=_turn_current_tool,
             elapsed=int(time.time() - _turn_start),
           )
-          await channel.update_card(_turn_card_id, card)
+          prev_id = _turn_card_id
+          _turn_card_id = await channel.update_card(_turn_card_id, card)
+          if _turn_card_id != prev_id:
+            _register_msg(_turn_card_id, chat_id)
         except Exception as e:
           log.warning("Failed to update interrupt card: %s", e)
 
@@ -665,6 +668,7 @@ async def main_loop(
 
         def _update_working(**kwargs):
           """Update the working card with current state."""
+          nonlocal _turn_card_id
           if not _turn_card_id or _turn_interrupt_phase:
             return
           elapsed = int(time.time() - _turn_start)
@@ -676,7 +680,10 @@ async def main_loop(
             **kwargs,
           )
           try:
-            _await_channel(channel.update_card(_turn_card_id, card))
+            prev_id = _turn_card_id
+            _turn_card_id = _await_channel(channel.update_card(_turn_card_id, card))
+            if _turn_card_id != prev_id:
+              _register_msg(_turn_card_id, chat_id)
           except Exception as e:
             log.debug("Failed to update working card: %s", e)
 
@@ -719,7 +726,11 @@ async def main_loop(
             )
             _card_update_error: Exception | None = None
             try:
-              _await_channel(channel.update_card(_turn_card_id, card))
+              prev_id = _turn_card_id
+              _turn_card_id = _await_channel(
+                channel.update_card(_turn_card_id, card))
+              if _turn_card_id != prev_id:
+                _register_msg(_turn_card_id, chat_id)
             except Exception as e:
               log.warning("Failed to update done card: %s", e)
               _card_update_error = e
@@ -753,7 +764,11 @@ async def main_loop(
                   elapsed=elapsed, usage=event.usage,
                   session_id=_sdk_session_id,
                 )
-                _await_channel(channel.update_card(_turn_card_id, fallback_card))
+                prev_id = _turn_card_id
+                _turn_card_id = _await_channel(
+                  channel.update_card(_turn_card_id, fallback_card))
+                if _turn_card_id != prev_id:
+                  _register_msg(_turn_card_id, chat_id)
               except Exception as e:
                 log.warning("Failed to send overflow fallback: %s", e)
             db.clear_working(session_id)

@@ -368,19 +368,27 @@ class LarkChannel(Channel):
         lark_api.reply_card, self._reply_anchor, card, True)
     return self._retry_on_auth_error(lark_api.send_card, chat_id, card)
 
-  async def update_card(self, message_id: str, card: JsonObject) -> None:
+  async def update_card(self, message_id: str, card: JsonObject) -> str:
     # PATCH /im/v1/messages/{id} works identically for threaded replies
     # since they are still plain messages, so no topic-specific routing.
     try:
       self._retry_on_auth_error(lark_api.update_card, message_id, card)
+      return message_id
     except urllib.error.HTTPError as e:
       # Token refresh didn't help. Likely causes: message too old to edit
       # (Lark limits card edits after some hours) or bot lost chat permission.
-      # Send as a new card so the user still sees the response.
+      # Send as a new card so the user still sees the response, and return
+      # the new id so callers can retarget subsequent updates in the turn.
       if e.code not in (401, 403):
         raise
       log.warning("update_card failed after refresh (HTTP %d) — sending as new card", e.code)
-      await self.send_card(self.chat_id, card)
+      # In topic chats, reply to the failed card (not self._reply_anchor,
+      # which may have drifted to a newer inbound message) so the fallback
+      # stays in the same thread as the original.
+      if self._should_thread(self.chat_id):
+        return self._retry_on_auth_error(
+          lark_api.reply_card, message_id, card, True)
+      return await self.send_card(self.chat_id, card)
 
   async def send_text(self, chat_id: str, text: str) -> str:
     if self._should_thread(chat_id):
