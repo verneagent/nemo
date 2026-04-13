@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import urllib.error
 from typing import Callable
 
 log = logging.getLogger(__name__)
@@ -332,11 +333,20 @@ class LarkChannel(Channel):
     self._events.push_back(event)
 
   def _retry_on_auth_error(self, fn, *args):
-    """Call fn(token, *args); on auth error invalidate token and retry once."""
+    """Call fn(token, *args); on auth error invalidate token and retry once.
+
+    Handles both Lark API error codes (99991663/99991668 — token expired) and
+    HTTP 401/403 (raw HTTPError when the response body isn't parseable JSON).
+    """
     try:
       return fn(self.token, *args)
     except RuntimeError as e:
       if "99991663" in str(e) or "99991668" in str(e):
+        lark_auth.invalidate()
+        return fn(self.token, *args)
+      raise
+    except urllib.error.HTTPError as e:
+      if e.code in (401, 403):
         lark_auth.invalidate()
         return fn(self.token, *args)
       raise
@@ -361,7 +371,16 @@ class LarkChannel(Channel):
   async def update_card(self, message_id: str, card: JsonObject) -> None:
     # PATCH /im/v1/messages/{id} works identically for threaded replies
     # since they are still plain messages, so no topic-specific routing.
-    self._retry_on_auth_error(lark_api.update_card, message_id, card)
+    try:
+      self._retry_on_auth_error(lark_api.update_card, message_id, card)
+    except urllib.error.HTTPError as e:
+      # Token refresh didn't help. Likely causes: message too old to edit
+      # (Lark limits card edits after some hours) or bot lost chat permission.
+      # Send as a new card so the user still sees the response.
+      if e.code not in (401, 403):
+        raise
+      log.warning("update_card failed after refresh (HTTP %d) — sending as new card", e.code)
+      await self.send_card(self.chat_id, card)
 
   async def send_text(self, chat_id: str, text: str) -> str:
     if self._should_thread(chat_id):

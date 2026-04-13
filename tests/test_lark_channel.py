@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import urllib.error
 from unittest import mock
 
 from nemo.lark.events import LarkEvent
@@ -359,6 +360,64 @@ def test_send_card_plain_in_topic_without_anchor():
   assert result == "om_start"
   mock_send.assert_called_once_with("t", "oc_topic", card)
   mock_reply.assert_not_called()
+
+
+def _make_http_error(code: int) -> urllib.error.HTTPError:
+  return urllib.error.HTTPError(
+    "https://test/url", code, "Forbidden", hdrs=None, fp=None)  # type: ignore[arg-type]
+
+
+def test_update_card_retries_on_http_403():
+  """HTTP 403 should invalidate token and retry once with fresh token."""
+  ch = _build_topic_channel()
+  ch._chat_mode = "group"
+  call_count = 0
+
+  def fake_update(_token, _msg_id, _card):
+    nonlocal call_count
+    call_count += 1
+    if call_count == 1:
+      raise _make_http_error(403)
+
+  with mock.patch("nemo.lark_channel.lark_auth.get_token", return_value="t"), \
+       mock.patch("nemo.lark_channel.lark_auth.invalidate") as mock_invalidate, \
+       mock.patch("nemo.lark_channel.lark_api.update_card", side_effect=fake_update):
+    asyncio.run(ch.update_card("om_1", {"title": "x"}))
+  assert call_count == 2
+  mock_invalidate.assert_called_once()
+
+
+def test_update_card_falls_back_to_new_card_when_refresh_fails():
+  """If token refresh doesn't fix 403, send as a new card instead of
+  surfacing the error — the user still sees the response."""
+  ch = _build_topic_channel()
+  ch._chat_mode = "group"
+
+  with mock.patch("nemo.lark_channel.lark_auth.get_token", return_value="t"), \
+       mock.patch("nemo.lark_channel.lark_auth.invalidate"), \
+       mock.patch("nemo.lark_channel.lark_api.update_card",
+                  side_effect=_make_http_error(403)), \
+       mock.patch("nemo.lark_channel.lark_api.send_card",
+                  return_value="om_new") as mock_send:
+    asyncio.run(ch.update_card("om_old", {"title": "x"}))
+  mock_send.assert_called_once()
+
+
+def test_update_card_propagates_non_auth_http_errors():
+  """Non-auth HTTP errors (500 etc.) must propagate — no fallback."""
+  ch = _build_topic_channel()
+  ch._chat_mode = "group"
+
+  with mock.patch("nemo.lark_channel.lark_auth.get_token", return_value="t"), \
+       mock.patch("nemo.lark_channel.lark_api.update_card",
+                  side_effect=_make_http_error(500)), \
+       mock.patch("nemo.lark_channel.lark_api.send_card") as mock_send:
+    try:
+      asyncio.run(ch.update_card("om_1", {"title": "x"}))
+      assert False, "expected HTTPError to propagate"
+    except urllib.error.HTTPError as e:
+      assert e.code == 500
+  mock_send.assert_not_called()
 
 
 def test_send_card_plain_in_non_topic_chat():
