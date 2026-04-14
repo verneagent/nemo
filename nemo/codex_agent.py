@@ -31,6 +31,13 @@ _SIDE_CAR_NODE_MODULES = _SIDE_CAR_DIR / "node_modules"
 _CODEX_EFFORT_LEVELS = frozenset({"low", "medium", "high"})
 
 
+def _short(text: str, limit: int) -> str:
+  """Truncate ``text`` to ``limit`` chars with an ellipsis when oversized."""
+  if len(text) <= limit:
+    return text
+  return text[: limit - 3] + "..."
+
+
 class CodexCodingAgent(CodingAgent):
   """CodingAgent adapter for the local Codex SDK sidecar runtime."""
 
@@ -284,13 +291,22 @@ class CodexCodingAgent(CodingAgent):
     return {}
 
   def _item_summary(self, item: JsonObject) -> str:
+    """Short, one-line label for progress card — mirrors cards.tool_use_summary.
+
+    Codex emits free-form shell / Python / file paths; we truncate each to
+    the same ~60-char budget Claude's Bash line uses so the Working card
+    preview doesn't overflow with multi-hundred-char heredocs.
+    """
     item_type = str(item.get("type", ""))
     if item_type == "reasoning":
-      text = str(item.get("text", "") or "")
-      return text[:200] + "..." if len(text) > 200 else text
+      return _short(str(item.get("text", "") or ""), 200)
     if item_type == "command_execution":
       command = str(item.get("command", "") or "")
-      return f"$ {command}" if command else "command"
+      if not command:
+        return "command"
+      # Flatten multi-line commands (heredocs, etc.) for the preview line.
+      flat = " ".join(command.split())
+      return f"$ {_short(flat, 60)}"
     if item_type == "file_change":
       changes = item.get("changes")
       if isinstance(changes, list):
@@ -299,19 +315,21 @@ class CodexCodingAgent(CodingAgent):
           if isinstance(change, dict):
             path = str(change.get("path", "") or "")
             kind = str(change.get("kind", "") or "")
-            if path:
-              paths.append(f"{kind}:{path}" if kind else path)
-        return ", ".join(paths)
+            # Show just the basename; full paths are noisy in a one-liner.
+            base = os.path.basename(path) if path else ""
+            if base:
+              paths.append(f"{kind}:{base}" if kind else base)
+        return _short(", ".join(paths), 80)
       return "file change"
     if item_type == "mcp_tool_call":
       server = str(item.get("server", "") or "")
       tool = str(item.get("tool", "") or "")
-      return ": ".join(part for part in (server, tool) if part)
+      return _short(": ".join(part for part in (server, tool) if part), 60)
     if item_type == "web_search":
       query = str(item.get("query", "") or "")
-      return f"web: {query}" if query else "web search"
+      return _short(f"web: {query}", 60) if query else "web search"
     if item_type == "todo_list":
       return "todo list updated"
     if item_type == "error":
-      return str(item.get("message", "") or "error")
+      return _short(str(item.get("message", "") or "error"), 200)
     return ""

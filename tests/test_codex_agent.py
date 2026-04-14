@@ -222,10 +222,17 @@ def test_codex_ensure_runtime_checks_sidecar():
 def test_codex_item_summary_variants():
   agent = CodexCodingAgent({}, "oc_1", _DummyDB(), _DummyChannel())
   assert agent._item_summary({"type": "command_execution", "command": "ls -la"}) == "$ ls -la"
+  # File-change preview shows basename only (mirrors Claude's Edit/Write).
   assert agent._item_summary({
     "type": "file_change",
     "changes": [{"kind": "update", "path": "nemo/agent.py"}],
-  }) == "update:nemo/agent.py"
+  }) == "update:agent.py"
+  # Long commands are flattened + truncated to 60 chars with ellipsis.
+  long_cmd = "python3 - <<'PY'\n" + "x = 1\n" * 30 + "PY"
+  summary = agent._item_summary({"type": "command_execution", "command": long_cmd})
+  assert summary.startswith("$ ")
+  assert summary.endswith("...")
+  assert len(summary) <= 62  # "$ " + 60
   assert agent._item_summary({
     "type": "mcp_tool_call", "server": "github", "tool": "fetch_pr",
   }) == "github: fetch_pr"
