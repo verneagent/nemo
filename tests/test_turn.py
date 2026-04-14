@@ -48,6 +48,8 @@ class FakeAssistantMessage:
 class FakeResultMessage:
   total_cost_usd: float = 0.01
   usage: dict = None
+  is_error: bool = False
+  result: str = ""
 
   def __post_init__(self):
     if self.usage is None:
@@ -390,6 +392,84 @@ def test_stop_task_circuit_breaker_on_control_timeout():
   assert len(stop_calls) == 1, \
     f"expected only first stop_task to be attempted, got {stop_calls}"
   assert stop_calls[0] in {"t1", "t2", "t3"}
+
+
+def test_transient_api_error_in_assistant_message_raises_and_suppresses():
+  """CLI-surfaced 'API Error:' text must not reach the user as an answer.
+
+  It should instead raise TransientAPIError from _single_turn so
+  SDKThread.run_turn_with_reconnect can reconnect and retry.
+  """
+  from nemo.turn import TransientAPIError
+  messages = [
+    FakeAssistantMessage(content=[FakeTextBlock(
+      text="API Error: Unable to connect to API (ECONNRESET)")]),
+    FakeResultMessage(total_cost_usd=0.0),
+  ]
+  events: list = []
+
+  async def _run():
+    with mock.patch.dict("sys.modules", _sdk_modules()):
+      client = FakeClient(messages)
+      await run_turn(client, "hello", events.append)
+
+  with pytest.raises(TransientAPIError):
+    asyncio.run(_run())
+  # The error text must NOT have been emitted to the user.
+  assert not any(
+    isinstance(e, AnswerEvent) and "API Error" in e.text
+    for e in events
+  ), "CLI error message leaked to user as AnswerEvent"
+
+
+def test_transient_api_error_via_result_is_error_flag():
+  """ResultMessage.is_error + transient-signal body → TransientAPIError."""
+  from nemo.turn import TransientAPIError
+  messages = [
+    FakeResultMessage(
+      total_cost_usd=0.0,
+      is_error=True,
+      result="Request failed: socket hang up",
+    ),
+  ]
+  events: list = []
+
+  async def _run():
+    with mock.patch.dict("sys.modules", _sdk_modules()):
+      await run_turn(FakeClient(messages), "hi", events.append)
+
+  with pytest.raises(TransientAPIError):
+    asyncio.run(_run())
+
+
+def test_transient_api_error_detector_no_false_positive_on_user_topic():
+  """User asking 'what is ECONNRESET?' gets a normal answer — no reconnect.
+
+  Real model replies never START with 'API Error:' and is_error is False,
+  so strict prefix matching must let this through as a regular AnswerEvent.
+  """
+  messages = [
+    FakeAssistantMessage(content=[FakeTextBlock(
+      text=(
+        "ECONNRESET is a TCP error code meaning the remote peer forcibly "
+        "closed the connection (RST packet). You'll see it when the server "
+        "crashed, a firewall killed the connection, or a load balancer "
+        "dropped the socket. It's distinct from ETIMEDOUT (no response) "
+        "and EAI_AGAIN (DNS retry)."
+      ))]),
+    FakeResultMessage(total_cost_usd=0.02, is_error=False),
+  ]
+  events: list = []
+
+  async def _run():
+    with mock.patch.dict("sys.modules", _sdk_modules()):
+      await run_turn(FakeClient(messages), "what is ECONNRESET?",
+                     events.append)
+
+  asyncio.run(_run())
+  answers = [e.text for e in events if isinstance(e, AnswerEvent)]
+  assert len(answers) == 1, f"expected one AnswerEvent, got {answers!r}"
+  assert "ECONNRESET" in answers[0]
 
 
 def test_reset_clears_stale_tasks_on_claude_adapter():

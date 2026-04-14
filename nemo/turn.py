@@ -34,6 +34,61 @@ DRAIN_PROMPT = (
   "tools. Do not spawn agents, read files, or run commands."
 )
 
+
+class TransientAPIError(RuntimeError):
+  """claude CLI surfaced a recoverable API/network error as turn output.
+
+  Raised from _single_turn when an AssistantMessage / ResultMessage body
+  matches a transient-error pattern (e.g. ECONNRESET to api.anthropic.com).
+  The claude subprocess is usually wedged in this state; SDKThread's
+  reconnect loop catches this and spawns a fresh CLI.
+  """
+
+
+# The claude CLI surfaces API/network failures with a hard-coded "API Error:"
+# prefix at the START of the result text. We only match that exact prefix to
+# avoid false positives when the model is legitimately discussing these error
+# codes (e.g. user asks "what does ECONNRESET mean?" — the model's answer
+# wouldn't START with "API Error:").
+_CLI_ERROR_PREFIX = "API Error:"
+
+# Finer-grained body patterns; these are checked ONLY when the CLI-error
+# prefix is present OR ResultMessage.is_error=True is set. They help us log
+# a useful label; they are NOT used for standalone string matching.
+_TRANSIENT_ERROR_SIGNALS: tuple[str, ...] = (
+  "unable to connect",
+  "econnreset",
+  "econnrefused",
+  "etimedout",
+  "enetunreach",
+  "eai_again",
+  "socket hang up",
+  "fetch failed",
+  "timed out",
+  "network",
+)
+
+
+def _looks_like_transient_api_error(text: str, *, is_error_flag: bool = False) -> bool:
+  """Return True only when the body clearly came from the CLI error channel.
+
+  Matches if EITHER:
+    - the text starts with the CLI's 'API Error:' prefix, OR
+    - ResultMessage.is_error was set AND at least one transient signal
+      (ECONNRESET, timed out, etc) appears in the body.
+  Prefix-anchored matching means user messages like
+  "what does ECONNRESET mean?" will NOT trip the detector.
+  """
+  if not text:
+    return False
+  stripped = text.lstrip()
+  if stripped.startswith(_CLI_ERROR_PREFIX):
+    return True
+  if is_error_flag:
+    lowered = text.lower()
+    return any(sig in lowered for sig in _TRANSIENT_ERROR_SIGNALS)
+  return False
+
 # If receive_response() yields nothing for this long, assume the turn is stuck.
 # SDK docs: "If no ResultMessage is received, the iterator continues indefinitely."
 # Must be generous — Agent spawning and complex edits can go quiet for minutes.
@@ -155,6 +210,7 @@ async def _single_turn(
   timed_out = False
   last_emitted: str = ""
   last_thinking: str = ""
+  transient_error_text: str = ""  # set if AssistantMessage body looked like API error
 
   FIRST_MSG_TIMEOUT = 30
   msg_count = 0
@@ -220,15 +276,23 @@ async def _single_turn(
           on_event(ProgressEvent(kind="tool", summary=tool_summary, first=is_first))
           last_emitted = "progress"
       elif text:
-        task_id = None
-        parent = getattr(message, "parent_tool_use_id", None)
-        if parent and pending_tasks:
-          task_id = next(iter(pending_tasks))
-        on_event(AnswerEvent(
-          text=text, task_id=task_id,
-          pending_tasks=len(pending_tasks),
-        ))
-        last_emitted = "answer"
+        # Detect claude-CLI-surfaced transient API errors BEFORE emitting as
+        # a user-facing AnswerEvent. If we see this pattern, the subprocess
+        # is wedged; suppress the event and raise after ResultMessage so
+        # SDKThread.run_turn_with_reconnect can spawn a fresh CLI.
+        if _looks_like_transient_api_error(text):
+          log.warning("Transient API error in AssistantMessage: %r", text[:200])
+          transient_error_text = text
+        else:
+          task_id = None
+          parent = getattr(message, "parent_tool_use_id", None)
+          if parent and pending_tasks:
+            task_id = next(iter(pending_tasks))
+          on_event(AnswerEvent(
+            text=text, task_id=task_id,
+            pending_tasks=len(pending_tasks),
+          ))
+          last_emitted = "answer"
 
     elif isinstance(message, TaskStartedMessage):
       pending_tasks.add(message.task_id)
@@ -250,6 +314,30 @@ async def _single_turn(
       cost = getattr(message, "total_cost_usd", 0) or 0.0
       usage = getattr(message, "usage", None) or {}
       sdk_session_id = getattr(message, "session_id", "") or ""
+
+      # Transient API error detection:
+      #   1) An AssistantMessage body earlier was recognised (strict prefix
+      #      check), OR
+      #   2) ResultMessage.is_error is set AND the result text contains a
+      #      transient-signal keyword.
+      # In either case the claude subprocess is wedged — bubble out as
+      # TransientAPIError so SDKThread.run_turn_with_reconnect spawns a
+      # fresh CLI for the retry.
+      is_error_flag = bool(getattr(message, "is_error", False))
+      result_text = getattr(message, "result", "") or ""
+      if (transient_error_text
+          or _looks_like_transient_api_error(result_text,
+                                             is_error_flag=is_error_flag)):
+        err_sample = (transient_error_text or result_text)[:200]
+        log.warning("Transient API error in turn result — will reconnect: %r",
+                    err_sample)
+        # Clean up pending tasks before raising so stale bookkeeping stays
+        # consistent.
+        for tid in list(pending_tasks):
+          stale_tasks.add(tid)
+        pending_tasks.clear()
+        raise TransientAPIError(err_sample)
+
       # Mark remaining pending tasks as stale for future turns.
       for tid in list(pending_tasks):
         stale_tasks.add(tid)

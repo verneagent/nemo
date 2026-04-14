@@ -167,20 +167,29 @@ class SDKThread:
     last attempt, raises immediately without wasting a reconnect.
     Checks _cancelled flag between attempts so interrupt can abort.
     """
+    from .turn import TransientAPIError  # avoid import cycle
     self._cancelled.clear()
     for attempt in range(max_attempts):
       if self._cancelled.is_set():
         raise asyncio.CancelledError("SDK turn cancelled")
       try:
         return await self.run_turn(prompt, on_event, stale_tasks=stale_tasks)
-      except (TimeoutError, RuntimeError, _CLIConnectionError) as exc:
+      except (TimeoutError, TransientAPIError, RuntimeError, _CLIConnectionError) as exc:
         exc_msg = str(exc).lower()
+        is_transient_api = isinstance(exc, TransientAPIError)
         is_disconnected = (
           isinstance(exc, _CLIConnectionError)
-          or (isinstance(exc, RuntimeError) and "not connected" in exc_msg)
+          or (isinstance(exc, RuntimeError)
+              and not is_transient_api
+              and "not connected" in exc_msg)
         )
-        if isinstance(exc, TimeoutError) or is_disconnected:
-          label = "disconnected" if is_disconnected else "hung"
+        if isinstance(exc, TimeoutError) or is_disconnected or is_transient_api:
+          if is_transient_api:
+            label = "transient-api-error"
+          elif is_disconnected:
+            label = "disconnected"
+          else:
+            label = "hung"
           log.warning("SDK turn %s (attempt %d/%d)", label, attempt + 1, max_attempts)
           if attempt == max_attempts - 1 or options is None:
             raise
