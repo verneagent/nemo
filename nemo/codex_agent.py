@@ -63,9 +63,7 @@ class CodexCodingAgent(CodingAgent):
     self,
     prompt: str,
     on_event: Callable[[TurnEvent], None],
-    stale_tasks: set[str] | None = None,
   ) -> tuple[float, JsonObject]:
-    del stale_tasks
     self._ensure_runtime()
     self._interrupted = False
 

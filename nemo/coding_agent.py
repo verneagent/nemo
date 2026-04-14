@@ -24,7 +24,6 @@ class CodingAgent(ABC):
     self,
     prompt: str,
     on_event: Callable[[TurnEvent], None],
-    stale_tasks: set[str] | None = None,
   ) -> tuple[float, JsonObject]:
     """Execute one agent turn with the given prompt.
 

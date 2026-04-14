@@ -49,6 +49,10 @@ class ClaudeCodingAgent(CodingAgent):
     self._sdk_started = False
     self._options: object = None
     self._effort = ""
+    # SDK #788 workaround — stale task ids carry across turns inside this
+    # adapter. Kept here (not in the abstract CodingAgent interface) because
+    # only the Claude SDK exhibits the bug.
+    self._stale_tasks: set[str] = set()
 
   def set_effort(self, effort: str) -> None:
     self._effort = effort if effort in _EFFORT_TO_KEYWORD else ""
@@ -57,6 +61,9 @@ class ClaudeCodingAgent(CodingAgent):
     if not self._sdk_started:
       self._sdk.start()
       self._sdk_started = True
+    # Fresh session — any task ids we thought were stale belong to no
+    # session now.
+    self._stale_tasks.clear()
     self._options = self._build_options(project_dir, model, resume=resume)
     await self._sdk.create_client(self._options)
 
@@ -64,11 +71,10 @@ class ClaudeCodingAgent(CodingAgent):
     self,
     prompt: str,
     on_event: Callable[[TurnEvent], None],
-    stale_tasks: set[str] | None = None,
   ) -> tuple[float, JsonObject]:
     return await self._sdk.run_turn_with_reconnect(
       self._prefix_prompt(prompt), on_event,
-      stale_tasks=stale_tasks, options=self._options)
+      stale_tasks=self._stale_tasks, options=self._options)
 
   def _prefix_prompt(self, prompt: str) -> str:
     keyword = _EFFORT_TO_KEYWORD.get(self._effort, "")
@@ -81,6 +87,10 @@ class ClaudeCodingAgent(CodingAgent):
     await self._sdk.interrupt()
 
   async def reset(self, project_dir: str, model: str, resume: str = "") -> None:
+    # Reconnecting spawns a new CLI / SDK session. Any task ids previously
+    # marked stale belong to the old session and will never be delivered
+    # on the new one — keeping them would force a pointless drain turn.
+    self._stale_tasks.clear()
     self._options = self._build_options(project_dir, model, resume=resume)
     await self._sdk.reconnect(self._options)
 

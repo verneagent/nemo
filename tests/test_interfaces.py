@@ -169,7 +169,7 @@ class FakeAgent(CodingAgent):
     self.turns = []
     self._interrupted = False
 
-  async def run_turn(self, prompt, on_event, stale_tasks=None):
+  async def run_turn(self, prompt, on_event):
     self.turns.append(prompt)
     on_event(ProgressEvent(kind="tool", summary="Read /a/b.py", first=True))
     on_event(AnswerEvent(text="response"))

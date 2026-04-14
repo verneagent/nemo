@@ -148,8 +148,7 @@ class _FakeAgent:
   async def stop(self):
     pass
 
-  async def run_turn(self, _prompt, on_event, stale_tasks=None):
-    del stale_tasks
+  async def run_turn(self, _prompt, on_event):
     def _emit():
       on_event(AnswerEvent("hi! how can i help?"))
       on_event(DoneEvent(cost=0.01, usage={"input_tokens": 1}))

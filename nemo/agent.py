@@ -307,7 +307,6 @@ async def main_loop(
   main_loop_ref = asyncio.get_running_loop()
   running = True
   _dissolve_on_exit = False
-  _stale_tasks: set[str] = set()
 
   def handle_sig(_sig, _frame):
     nonlocal running
@@ -776,7 +775,7 @@ async def main_loop(
           ctx.total_cost += event.cost
 
       sdk_task = asyncio.create_task(
-        agent.run_turn(user_message, _on_event, stale_tasks=_stale_tasks)
+        agent.run_turn(user_message, _on_event)
       )
 
       # Concurrent signal watcher: read events during SDK execution

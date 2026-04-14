@@ -16,7 +16,24 @@ from .types import JsonObject, TurnClient
 
 log = logging.getLogger(__name__)
 
-MAX_RETRIES = 5
+# Max turns we'll burn to drain stale TaskNotifications + retry the real turn.
+# With drain-prompt strategy, each drain turn clears exactly one stale without
+# spawning new tasks, so this caps the number of accumulated stales we can
+# recover from in a single user turn. See SDK #788.
+MAX_RETRIES = 20
+
+# Drain prompt: deliberately minimal and tool-forbidding so it cannot
+# trigger Agent/subagent calls that would spawn new background tasks (the
+# amplification trap). The whole point is to consume a stale TaskNotification
+# without adding state. See SDK #788 analysis. Note: this arrives as a USER
+# message — it has no actual system privilege, so we don't pretend otherwise
+# with a "(system)" prefix. Tool suppression is best-effort model compliance.
+DRAIN_PROMPT = (
+  "Ignore any prior background-task notifications; they are stale leftovers "
+  "from earlier turns. Reply with exactly the single word 'ack' and use NO "
+  "tools. Do not spawn agents, read files, or run commands."
+)
+
 # If receive_response() yields nothing for this long, assume the turn is stuck.
 # SDK docs: "If no ResultMessage is received, the iterator continues indefinitely."
 # Must be generous — Agent spawning and complex edits can go quiet for minutes.
@@ -87,27 +104,44 @@ TurnEvent = (
 # Turn runner
 # ---------------------------------------------------------------------------
 
-async def run_turn(
+@dataclass
+class _TurnResult:
+  found_stale: bool
+  cost: float
+  usage: JsonObject
+  session_id: str
+  last_emitted: str
+  last_thinking: str
+
+
+_NOOP_EVENT: Callable[[TurnEvent], None] = lambda _e: None
+
+
+async def _single_turn(
   client: TurnClient,
   prompt: str,
   on_event: Callable[[TurnEvent], None],
-  stale_tasks: set[str] | None = None,
-  _retry: int = 0,
-) -> tuple[float, JsonObject]:
-  """Send prompt to SDK client, stream responses, emit events.
+  stale_tasks: set[str],
+  stop_task_disabled: list[bool],
+) -> _TurnResult:
+  """Issue one query() and consume its receive_response() stream.
 
-  Returns (cost, usage_dict).
+  If a stale TaskNotification (id in ``stale_tasks``) appears at the front of
+  the stream, set ``found_stale=True`` and suppress downstream events until
+  ResultMessage. The outer ``run_turn`` uses this flag to decide whether to
+  emit drain/retry turns.
+
+  ``stop_task_disabled`` is a one-element mutable flag: once ``stop_task``
+  returns "Control request timeout" the control channel is presumed wedged
+  and we skip further stop_task calls for the remainder of this orchestration.
   """
   from claude_agent_sdk import (
     AssistantMessage, TextBlock, ThinkingBlock, ToolUseBlock, ResultMessage,
     TaskStartedMessage, TaskNotificationMessage, TaskProgressMessage,
   )
 
-  if stale_tasks is None:
-    stale_tasks = set()
-
   import anyio as _anyio
-  log.info("query() prompt=%d chars retry=%d", len(prompt), _retry)
+  log.info("query() prompt=%d chars", len(prompt))
   with _anyio.fail_after(15):
     await client.query(prompt)
   log.info("query() sent to CLI")
@@ -119,24 +153,17 @@ async def run_turn(
   progress_started = False
   found_stale = False
   timed_out = False
-  last_emitted: str = ""  # "progress" or "answer" — for trailing thinking compensation
-  last_thinking: str = ""  # last thinking text, used for compensation
+  last_emitted: str = ""
+  last_thinking: str = ""
 
-  # The SDK uses anyio internally. Neither asyncio.wait_for nor anyio.fail_after
-  # can reliably cancel stuck anyio operations from asyncio context.
-  # Workaround: run __anext__() as a task and use asyncio.wait() with a
-  # separate sleep task as the timeout.  If the timeout wins, we just abandon
-  # the stuck task (it will be cleaned up when the client is closed).
-  FIRST_MSG_TIMEOUT = 30  # seconds
+  FIRST_MSG_TIMEOUT = 30
   msg_count = 0
-
   response = client.receive_response()
   while True:
     timeout = FIRST_MSG_TIMEOUT if msg_count == 0 else HEARTBEAT_TIMEOUT
     next_task = asyncio.ensure_future(response.__anext__())
     done, _ = await asyncio.wait({next_task}, timeout=timeout)
     if not done:
-      # Timeout — next_task is still pending
       next_task.cancel()
       log.error("receive_response() timeout (%ds, msgs=%d) — forcing reconnect",
                 timeout, msg_count)
@@ -153,7 +180,7 @@ async def run_turn(
     if isinstance(message, TaskNotificationMessage) and message.task_id in stale_tasks:
       stale_tasks.discard(message.task_id)
       found_stale = True
-      log.warning("Stale TaskNotification task=%s — will re-query", message.task_id)
+      log.warning("Stale TaskNotification task=%s — will drain", message.task_id)
       continue
 
     if found_stale:
@@ -161,7 +188,7 @@ async def run_turn(
         cost = getattr(message, "total_cost_usd", 0) or 0.0
         usage = getattr(message, "usage", None) or {}
         sdk_session_id = getattr(message, "session_id", "") or ""
-        break  # Don't wait for StopAsyncIteration in stale path either
+        break
       continue
 
     # --- Normal message handling ---
@@ -187,14 +214,12 @@ async def run_turn(
 
       text = "\n".join(text_parts)
       if not text and message.content:
-        # Tool-only message → working card
         if tool_summary:
           is_first = not progress_started
           progress_started = True
           on_event(ProgressEvent(kind="tool", summary=tool_summary, first=is_first))
           last_emitted = "progress"
       elif text:
-        # Text output → answer
         task_id = None
         parent = getattr(message, "parent_tool_use_id", None)
         if parent and pending_tasks:
@@ -225,36 +250,144 @@ async def run_turn(
       cost = getattr(message, "total_cost_usd", 0) or 0.0
       usage = getattr(message, "usage", None) or {}
       sdk_session_id = getattr(message, "session_id", "") or ""
-      # Mark remaining pending tasks as stale
+      # Mark remaining pending tasks as stale for future turns.
       for tid in list(pending_tasks):
         stale_tasks.add(tid)
+        if stop_task_disabled[0]:
+          continue
         try:
           await client.stop_task(tid)
         except Exception as e:
           log.warning("Failed to stop stale task %s: %s", tid, e)
+          if "control request timeout" in str(e).lower():
+            stop_task_disabled[0] = True
+            log.warning("stop_task control channel wedged — skipping further stops")
       pending_tasks.clear()
-      break  # ResultMessage is the final message — don't wait for StopAsyncIteration
+      break
 
   if timed_out:
     on_event(ErrorEvent(message="Turn timed out — SDK stopped responding"))
     raise TimeoutError("receive_response() heartbeat timeout")
 
-  # If stale notification contaminated this turn, re-query
-  if found_stale and _retry < MAX_RETRIES:
-    log.info("Stale turn — re-querying (retry %d/%d)", _retry + 1, MAX_RETRIES)
-    return await run_turn(
-      client, prompt, on_event,
-      stale_tasks=stale_tasks, _retry=_retry + 1,
-    )
+  return _TurnResult(
+    found_stale=found_stale,
+    cost=cost,
+    usage=usage,
+    session_id=sdk_session_id,
+    last_emitted=last_emitted,
+    last_thinking=last_thinking,
+  )
 
-  # --- Trailing thinking compensation ---
-  # If the last emitted event was a ProgressEvent (thinking), the Done card
-  # would miss the model's final reasoning.  Synthesize an AnswerEvent so
-  # the consumer always has a complete final answer.
-  if last_emitted == "progress" and last_thinking:
-    log.info("Compensating trailing thinking (%d chars)", len(last_thinking))
-    on_event(AnswerEvent(text=last_thinking))
 
-  log.info("turn done (cost=%.4f, session=%s)", cost, sdk_session_id[:8] if sdk_session_id else "?")
-  on_event(DoneEvent(cost=cost, usage=usage, session_id=sdk_session_id))
-  return cost, usage
+async def run_turn(
+  client: TurnClient,
+  prompt: str,
+  on_event: Callable[[TurnEvent], None],
+  stale_tasks: set[str] | None = None,
+) -> tuple[float, JsonObject]:
+  """Send prompt to SDK client, stream responses, emit events.
+
+  Orchestrates the SDK #788 workaround: if a stale TaskNotification leaks
+  into the front of a turn, we discard that turn's events and then alternate
+  between *drain* turns (using DRAIN_PROMPT, which cannot spawn new tasks)
+  and *real* retries of the user's prompt. A drain turn clears at most one
+  stale notification at a time, but crucially never adds to the pending-task
+  backlog, so the retry budget converges instead of amplifying.
+
+  Returns (cost, usage_dict).
+  """
+  if stale_tasks is None:
+    stale_tasks = set()
+  stop_task_disabled: list[bool] = [False]
+
+  # Always start in real mode: attempting the user's prompt first is the
+  # minimum cost in the common case (stale_tasks populated but stop_task
+  # succeeded → no notification ever arrives). If a stale does leak in at the
+  # front of the stream, `found_stale` will trip and we'll switch to drain
+  # mode for the retry.
+  mode = "real"
+  mode_final = "real"
+  total_cost = 0.0
+  total_usage: JsonObject = {}
+  result: _TurnResult | None = None
+  exhausted = False
+
+  for attempt in range(MAX_RETRIES + 1):
+    cur_prompt = DRAIN_PROMPT if mode == "drain" else prompt
+    cur_on_event = _NOOP_EVENT if mode == "drain" else on_event
+    log.info("turn attempt=%d mode=%s pending_stales=%d",
+             attempt, mode, len(stale_tasks))
+
+    try:
+      result = await _single_turn(
+        client, cur_prompt, cur_on_event, stale_tasks, stop_task_disabled,
+      )
+    except TimeoutError:
+      # _single_turn already emitted ErrorEvent on its on_event. In drain
+      # mode that was _NOOP_EVENT — the user saw nothing. Surface it now
+      # via the real on_event so the caller knows the turn failed.
+      if mode == "drain":
+        on_event(ErrorEvent(message="Turn timed out while draining stale notifications"))
+      raise
+
+    mode_final = mode
+    total_cost += result.cost
+    if result.usage:
+      total_usage = result.usage
+
+    if mode == "real" and not result.found_stale:
+      # Clean real turn. Any stale ids still in the set never arrived in
+      # this turn and likely never will (bug #788 only leaks them at the
+      # front of the next turn). Clearing avoids an unnecessary future
+      # drain, at the cost of missing truly late deliveries — see comment
+      # in module docstring.
+      if stale_tasks:
+        log.info("Clean real turn with %d never-surfaced stales — dropping",
+                 len(stale_tasks))
+        stale_tasks.clear()
+      break
+    if result.found_stale:
+      mode = "drain"
+      continue
+    # mode == "drain" and no found_stale.
+    if not stale_tasks:
+      mode = "real"
+      continue
+    # Drain clean but stale_tasks still populated — dead-session ids.
+    log.info("Drain turn clean but %d stales not surfaced — dropping",
+             len(stale_tasks))
+    stale_tasks.clear()
+    mode = "real"
+  else:
+    exhausted = True
+    log.warning("Exhausted MAX_RETRIES=%d draining stales; stale_tasks=%s",
+                MAX_RETRIES, stale_tasks)
+    on_event(ErrorEvent(
+      message=(
+        f"Stale-task drain exhausted after {MAX_RETRIES} retries — user "
+        "prompt may not have reached the model. Consider /clear."
+      )
+    ))
+
+  if result is None:
+    raise RuntimeError("run_turn exited without executing any _single_turn")
+
+  # Trailing thinking compensation only makes sense when the last turn was a
+  # real turn whose thinking-only tail was shown to the user as a
+  # ProgressEvent.  Drain-turn thinking was suppressed via _NOOP_EVENT, so
+  # synthesizing it here would surface content the user never saw building up.
+  if (mode_final == "real"
+      and not exhausted
+      and result.last_emitted == "progress"
+      and result.last_thinking):
+    log.info("Compensating trailing thinking (%d chars)",
+             len(result.last_thinking))
+    on_event(AnswerEvent(text=result.last_thinking))
+
+  log.info("turn done (cost=%.4f cumulative, session=%s, final_mode=%s)",
+           total_cost,
+           result.session_id[:8] if result.session_id else "?",
+           mode_final)
+  on_event(DoneEvent(cost=total_cost, usage=total_usage,
+                     session_id=result.session_id))
+  return total_cost, total_usage
