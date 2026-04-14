@@ -430,6 +430,14 @@ async def run_turn(
     stale_tasks = set()
   stop_task_disabled: list[bool] = [False]
 
+  # Snapshot the ids we inherited from prior turns. The ResultMessage
+  # handler may promote fresh pending_tasks into ``stale_tasks`` mid-run;
+  # those newcomers must NOT be swept by the "clean real turn" /
+  # "drain clean but stales not surfaced" drop paths, otherwise we lose
+  # the legitimately-pending task ids that the SDK will deliver on a
+  # future turn.
+  stale_at_start: set[str] = set(stale_tasks)
+
   # Always start in real mode: attempting the user's prompt first is the
   # minimum cost in the common case (stale_tasks populated but stop_task
   # succeeded → no notification ever arrives). If a stale does leak in at the
@@ -466,15 +474,17 @@ async def run_turn(
       total_usage = result.usage
 
     if mode == "real" and not result.found_stale:
-      # Clean real turn. Any stale ids still in the set never arrived in
-      # this turn and likely never will (bug #788 only leaks them at the
-      # front of the next turn). Clearing avoids an unnecessary future
-      # drain, at the cost of missing truly late deliveries — see comment
-      # in module docstring.
-      if stale_tasks:
-        log.info("Clean real turn with %d never-surfaced stales — dropping",
-                 len(stale_tasks))
-        stale_tasks.clear()
+      # Clean real turn. Any stale ids that were INHERITED from prior
+      # turns (stale_at_start) and still remain never arrived and likely
+      # never will (bug #788 only leaks them at the front of the next
+      # turn). Drop ONLY those — freshly promoted ids (added by this
+      # turn's ResultMessage handler) must stay so the SDK's future
+      # delivery is recognised as stale.
+      never_surfaced = stale_at_start & stale_tasks
+      if never_surfaced:
+        log.info("Clean real turn: dropping %d never-surfaced inherited stales",
+                 len(never_surfaced))
+        stale_tasks -= never_surfaced
       break
     if result.found_stale:
       mode = "drain"
@@ -483,10 +493,14 @@ async def run_turn(
     if not stale_tasks:
       mode = "real"
       continue
-    # Drain clean but stale_tasks still populated — dead-session ids.
-    log.info("Drain turn clean but %d stales not surfaced — dropping",
-             len(stale_tasks))
-    stale_tasks.clear()
+    # Drain clean but stale_tasks still populated — inherited ids that
+    # never surfaced (likely dead-session). Drop ONLY inherited ids, not
+    # newly promoted ones.
+    inherited_remaining = stale_at_start & stale_tasks
+    if inherited_remaining:
+      log.info("Drain turn clean: dropping %d never-surfaced inherited stales",
+               len(inherited_remaining))
+      stale_tasks -= inherited_remaining
     mode = "real"
   else:
     exhausted = True

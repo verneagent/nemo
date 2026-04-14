@@ -472,6 +472,66 @@ def test_transient_api_error_detector_no_false_positive_on_user_topic():
   assert "ECONNRESET" in answers[0]
 
 
+def test_clean_real_turn_preserves_freshly_promoted_stales():
+  """Regression: pending_tasks promoted to stale at ResultMessage must
+  survive the "clean real turn" drop path.
+
+  Previous behavior: after a clean real turn, ALL stale_tasks were cleared
+  under the assumption that nothing surfaced means nothing will. But the
+  ResultMessage handler had just promoted N still-pending tasks into
+  stale_tasks seconds earlier — those legitimate future-stale ids got
+  wiped, so the next turn saw unexpected TaskNotificationMessages that
+  weren't in stale_tasks and leaked as TaskDoneEvents / contaminated the
+  model context.
+  """
+  # Turn 1: two background tasks start but never complete before
+  # ResultMessage. Neither id was in stale_tasks at turn start.
+  messages = [
+    FakeTaskStartedMessage(task_id="fresh_x"),
+    FakeTaskStartedMessage(task_id="fresh_y"),
+    FakeAssistantMessage(content=[FakeTextBlock(text="kicking off tasks")]),
+    FakeResultMessage(total_cost_usd=0.1),
+  ]
+  events: list = []
+  stale: set[str] = set()
+
+  async def _run():
+    with mock.patch.dict("sys.modules", _sdk_modules()):
+      await run_turn(FakeClient(messages), "do stuff",
+                     events.append, stale_tasks=stale)
+
+  asyncio.run(_run())
+
+  # Both freshly promoted ids must remain in stale_tasks for the NEXT turn
+  # to recognise late TaskNotifications as stale.
+  assert stale == {"fresh_x", "fresh_y"}, \
+    f"freshly promoted stales were wrongly dropped: {stale}"
+
+
+def test_clean_real_turn_drops_inherited_never_surfaced_stales():
+  """Inherited stale ids that never surface ARE dropped on clean real turn.
+
+  This is the anti-amplification guard: if the prior turn left phantom
+  ids (e.g. dead-session ids) and a clean real turn goes through without
+  any stale notification appearing, we should not carry them forever.
+  """
+  # Inherited {ghost}; current turn sees neither a stale notification
+  # nor any new TaskStarted. Clean turn → inherited 'ghost' must be dropped.
+  messages = [
+    FakeAssistantMessage(content=[FakeTextBlock(text="hi")]),
+    FakeResultMessage(total_cost_usd=0.01),
+  ]
+  stale = {"ghost"}
+
+  async def _run():
+    with mock.patch.dict("sys.modules", _sdk_modules()):
+      await run_turn(FakeClient(messages), "hello", lambda _e: None,
+                     stale_tasks=stale)
+
+  asyncio.run(_run())
+  assert stale == set(), "inherited 'ghost' must be dropped after clean turn"
+
+
 def test_progress_timeout_fires_on_systemmessage_storm(monkeypatch):
   """SDK emitting SystemMessages indefinitely must not keep a dead turn alive.
 
