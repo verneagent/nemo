@@ -472,6 +472,57 @@ def test_transient_api_error_detector_no_false_positive_on_user_topic():
   assert "ECONNRESET" in answers[0]
 
 
+def test_progress_timeout_fires_on_systemmessage_storm(monkeypatch):
+  """SDK emitting SystemMessages indefinitely must not keep a dead turn alive.
+
+  Observed in production: claude CLI enters a rate-limit retry loop that
+  emits a SystemMessage every ~1 min. Each SystemMessage used to reset
+  HEARTBEAT_TIMEOUT, so the turn was never declared stuck. Progress-only
+  timeout should trigger after PROGRESS_TIMEOUT seconds regardless.
+  """
+  from nemo import turn as turn_module
+
+  # Shrink both timeouts so the test runs fast.
+  monkeypatch.setattr(turn_module, "PROGRESS_TIMEOUT", 0.5)
+  monkeypatch.setattr(turn_module, "HEARTBEAT_TIMEOUT", 5)
+
+  # A fake "SystemMessage" class (outside our claude_agent_sdk imports) whose
+  # class name matches the non-progress set.
+  @dataclass
+  class SystemMessage:
+    subtype: str = "rate_limit"
+
+  # Yield SystemMessages forever (simulating rate-limit retry loop).
+  # The progress timeout should fire first and break out.
+  async def forever_system():
+    while True:
+      await asyncio.sleep(0.2)
+      yield SystemMessage()
+
+  class StormClient:
+    async def query(self, prompt):
+      pass
+
+    def receive_response(self):
+      return forever_system()
+
+    async def stop_task(self, task_id):
+      pass
+
+  events: list = []
+
+  async def _run():
+    with mock.patch.dict("sys.modules", _sdk_modules()):
+      await run_turn(StormClient(), "hello", events.append)
+
+  with pytest.raises(TimeoutError):
+    asyncio.run(_run())
+
+  # The user should see an ErrorEvent documenting the stuck turn.
+  assert any(isinstance(e, ErrorEvent) for e in events), \
+    "progress-timeout abort must surface as ErrorEvent"
+
+
 def test_reset_clears_stale_tasks_on_claude_adapter():
   """ClaudeCodingAgent.reset() must clear self._stale_tasks.
 

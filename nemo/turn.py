@@ -94,6 +94,24 @@ def _looks_like_transient_api_error(text: str, *, is_error_flag: bool = False) -
 # Must be generous — Agent spawning and complex edits can go quiet for minutes.
 HEARTBEAT_TIMEOUT = 300  # seconds
 
+# If the SDK keeps emitting non-progress messages (SystemMessage,
+# RateLimitEvent) but never resumes real work, we'd wait forever because every
+# such message resets HEARTBEAT_TIMEOUT above. PROGRESS_TIMEOUT caps the
+# duration between two REAL progress events (AssistantMessage, tool use,
+# ResultMessage, Task* messages). When exceeded we raise TimeoutError so the
+# SDKThread reconnect loop spawns a fresh CLI. Observed case: claude CLI
+# enters a rate-limit retry loop that emits SystemMessage every ~1 min
+# indefinitely.
+PROGRESS_TIMEOUT = 240  # seconds — 4 minutes without real work = stuck
+
+# Messages that do NOT count as real progress. Anything outside this set
+# refreshes the progress clock. Checked by class name to avoid importing
+# optional SDK types (RateLimitEvent may not exist on older SDKs).
+_NON_PROGRESS_MESSAGE_TYPES: frozenset[str] = frozenset({
+  "SystemMessage",
+  "RateLimitEvent",
+})
+
 
 # ---------------------------------------------------------------------------
 # Turn events
@@ -196,6 +214,7 @@ async def _single_turn(
   )
 
   import anyio as _anyio
+  import time as _time
   log.info("query() prompt=%d chars", len(prompt))
   with _anyio.fail_after(15):
     await client.query(prompt)
@@ -214,15 +233,31 @@ async def _single_turn(
 
   FIRST_MSG_TIMEOUT = 30
   msg_count = 0
+  last_progress_at = _time.monotonic()
   response = client.receive_response()
   while True:
-    timeout = FIRST_MSG_TIMEOUT if msg_count == 0 else HEARTBEAT_TIMEOUT
+    # Per-iteration timeout is the heartbeat budget, but we also cap it at
+    # the remaining progress budget so SDK-internal retry loops (which emit
+    # SystemMessage every ~1 min indefinitely) cannot keep a dead turn alive.
+    heartbeat_budget = FIRST_MSG_TIMEOUT if msg_count == 0 else HEARTBEAT_TIMEOUT
+    progress_budget = PROGRESS_TIMEOUT - (_time.monotonic() - last_progress_at)
+    if progress_budget <= 0:
+      log.error("no progress for %ds (msgs=%d) — forcing reconnect",
+                PROGRESS_TIMEOUT, msg_count)
+      timed_out = True
+      break
+    iter_timeout = max(1, min(heartbeat_budget, progress_budget))
     next_task = asyncio.ensure_future(response.__anext__())
-    done, _ = await asyncio.wait({next_task}, timeout=timeout)
+    done, _ = await asyncio.wait({next_task}, timeout=iter_timeout)
     if not done:
       next_task.cancel()
-      log.error("receive_response() timeout (%ds, msgs=%d) — forcing reconnect",
-                timeout, msg_count)
+      since_progress = _time.monotonic() - last_progress_at
+      if since_progress >= PROGRESS_TIMEOUT:
+        log.error("no progress for %.0fs (msgs=%d) — forcing reconnect",
+                  since_progress, msg_count)
+      else:
+        log.error("receive_response() heartbeat timeout (%ds, msgs=%d) — forcing reconnect",
+                  heartbeat_budget, msg_count)
       timed_out = True
       break
     try:
@@ -230,7 +265,14 @@ async def _single_turn(
     except StopAsyncIteration:
       break
     msg_count += 1
-    log.info("turn msg: %s", type(message).__name__)
+    msg_type = type(message).__name__
+    if msg_type in _NON_PROGRESS_MESSAGE_TYPES:
+      since_progress = _time.monotonic() - last_progress_at
+      log.warning("turn msg: %s (non-progress, idle=%.0fs/%ds)",
+                  msg_type, since_progress, PROGRESS_TIMEOUT)
+    else:
+      log.info("turn msg: %s", msg_type)
+      last_progress_at = _time.monotonic()
 
     # --- Stale task detection (SDK bug #788 workaround) ---
     if isinstance(message, TaskNotificationMessage) and message.task_id in stale_tasks:
