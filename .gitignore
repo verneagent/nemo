@@ -9,4 +9,4 @@ build/
 .env
 .idea/
 .DS_Store
-codex_sidecar/node_modules/
+nemo/codex_sidecar/node_modules/

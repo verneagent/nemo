@@ -292,13 +292,18 @@ async def main_loop(
     await agent.start(project_dir, model, resume=_sdk_session_id)
   except Exception as e:
     log.error("SDK startup failed: %s", e)
-    err_card = cards.build_card("Error", body=f"```\n{e}\n```", color="red")
+    err_card = cards.build_card(
+      "Error", body=f"Startup failed:\n```\n{e}\n```", color="red"
+    )
     try:
       await channel.send_card(chat_id, err_card)
-    except Exception as e:
-      log.warning("Failed to send SDK startup error card: %s", e)
-    # Continue into the main loop — run_turn_with_reconnect will
-    # attempt to reconnect when the user sends a message.
+    except Exception as send_err:
+      log.warning("Failed to send SDK startup error card: %s", send_err)
+    # Structural startup failures (missing CLI / sidecar / credentials) do
+    # not recover by retrying later turns. Exit so a supervisor can
+    # restart us cleanly rather than stay in a half-alive zombie state
+    # where every user message produces another obscure error.
+    raise
 
   # Context
   ctx = commands.AgentContext(model, project_dir, time.time())
