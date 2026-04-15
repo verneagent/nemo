@@ -60,3 +60,13 @@ class CodingAgent(ABC):
     (as a prompt prefix, CLI flag, etc). Default is no-op.
     """
     del effort
+
+  def trailing_note(self, sdk_session_id: str) -> str:
+    """Return an optional markdown note to append to the final turn response.
+
+    Concrete adapters use this to surface provider-specific health signals
+    (e.g. "session context is getting large, consider /clear"). Default
+    returns empty string — no note appended.
+    """
+    del sdk_session_id
+    return ""

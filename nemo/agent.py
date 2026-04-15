@@ -717,6 +717,13 @@ async def main_loop(
           # Final response = last answer step (if any)
           answer_steps = [s for s in _turn_steps if s.kind == "answer"]
           final_text = answer_steps[-1].content if answer_steps else ""
+          # Ask the active coding agent for any provider-specific note to tack
+          # onto the response (e.g. Claude warns when the session jsonl is
+          # getting large so the user remembers to /clear).
+          if final_text:
+            trailing = agent.trailing_note(_sdk_session_id)
+            if trailing:
+              final_text = final_text + trailing
           # Thinking timeline = all non-answer steps
           thinking = [s for s in _turn_steps if s.kind != "answer"]
           if _turn_card_id:

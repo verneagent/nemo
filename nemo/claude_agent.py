@@ -27,6 +27,35 @@ _EFFORT_TO_KEYWORD: dict[str, str] = {
 }
 
 
+# Session jsonl size thresholds for the /clear reminder. The Claude CLI
+# appends every user/assistant/tool message to ~/.claude/projects/<slug>/
+# <session_id>.jsonl. When this file grows past ~30MB the resumed context
+# starts pressuring the CLI: we've seen it wedge in silent retry loops
+# (SystemMessage every ~50s, no real progress) around 100MB. We nudge the
+# user to /clear well before that cliff. Sizes are in bytes.
+_SESSION_SIZE_NUDGE = 30 * 1024 * 1024
+_SESSION_SIZE_STRONG = 60 * 1024 * 1024
+
+
+def _session_jsonl_path(project_dir: str, sdk_session_id: str) -> str:
+  """Compute the absolute path to a Claude session's jsonl transcript."""
+  config_dir = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
+  slug = project_dir.replace("/", "-")
+  return os.path.join(config_dir, "projects", slug, f"{sdk_session_id}.jsonl")
+
+
+def _format_size_warning(size_bytes: int) -> str:
+  """Return a markdown note for an oversized session, or '' if under threshold."""
+  if size_bytes < _SESSION_SIZE_NUDGE:
+    return ""
+  mb = size_bytes / 1024 / 1024
+  marker = "⚠️⚠️" if size_bytes >= _SESSION_SIZE_STRONG else "⚠️"
+  return (
+    f"\n\n---\n{marker} 当前会话上下文已 {mb:.0f} MB，"
+    "建议发送 `/clear` 重置，避免响应变慢或卡死。"
+  )
+
+
 class ClaudeCodingAgent(CodingAgent):
   """CodingAgent adapter for the Claude Agent SDK."""
 
@@ -49,6 +78,7 @@ class ClaudeCodingAgent(CodingAgent):
     self._sdk_started = False
     self._options: object = None
     self._effort = ""
+    self._project_dir = ""
     # SDK #788 workaround — stale task ids carry across turns inside this
     # adapter. Kept here (not in the abstract CodingAgent interface) because
     # only the Claude SDK exhibits the bug.
@@ -64,6 +94,7 @@ class ClaudeCodingAgent(CodingAgent):
     # Fresh session — any task ids we thought were stale belong to no
     # session now.
     self._stale_tasks.clear()
+    self._project_dir = project_dir
     self._options = self._build_options(project_dir, model, resume=resume)
     await self._sdk.create_client(self._options)
 
@@ -91,8 +122,19 @@ class ClaudeCodingAgent(CodingAgent):
     # marked stale belong to the old session and will never be delivered
     # on the new one — keeping them would force a pointless drain turn.
     self._stale_tasks.clear()
+    self._project_dir = project_dir
     self._options = self._build_options(project_dir, model, resume=resume)
     await self._sdk.reconnect(self._options)
+
+  def trailing_note(self, sdk_session_id: str) -> str:
+    if not sdk_session_id or not self._project_dir:
+      return ""
+    path = _session_jsonl_path(self._project_dir, sdk_session_id)
+    try:
+      size = os.path.getsize(path)
+    except OSError:
+      return ""
+    return _format_size_warning(size)
 
   async def stop(self) -> None:
     await self._sdk.close_client()
