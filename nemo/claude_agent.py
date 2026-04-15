@@ -200,6 +200,10 @@ class ClaudeCodingAgent(CodingAgent):
       stderr=_stderr_handler,
       hooks={},
       can_use_tool=_can_use_tool,
+      # Single stream_json messages can exceed the SDK's 1 MB default when
+      # a tool result (large file read, heavy bash output) lands in one chunk.
+      # Raise to 16 MB so the reader doesn't kill the turn with a decode error.
+      max_buffer_size=16 * 1024 * 1024,
     )
     if resume:
       opts["resume"] = resume
