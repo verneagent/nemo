@@ -247,7 +247,7 @@ async def main_loop(
     start_lines.append(f"Session `{_resume_sdk_id[:8]}` resumed")
   start_note = project_dir
   start_card = cards.build_card(
-    f"Nemo v{__version__} ({model})",
+    f"Nemo v{__version__} ({provider} · {model})",
     body="\n".join(start_lines),
     color="blue",
     note=start_note,
@@ -363,8 +363,10 @@ async def main_loop(
       if bot_open_id and sender == bot_open_id:
         log.debug("Skipping: own message from bot %s", sender)
         continue  # Skip own messages
-      if not monitor.is_authorized(sender, operator_open_id, _member_roles):
-        log.debug("Skipping: unauthorized sender %s (operator=%s)", sender, operator_open_id)
+      from .guests import is_authorized_sender
+      if operator_open_id and not is_authorized_sender(
+          sender, operator_open_id, _member_roles):
+        log.info("Skipping: unauthorized sender %s (operator=%s)", sender, operator_open_id)
         continue
 
       # need_mention mode: only respond to @mentions and interactions
@@ -892,7 +894,7 @@ async def main_loop(
             if action == "stop":
               signal_detected = "stop"
               return
-            if action == "__stop__" and monitor.is_authorized(
+            if action == "__stop__" and monitor.is_privileged(
                 msg.operator_id, operator_open_id, _member_roles):
               signal_detected = "stop"
               return

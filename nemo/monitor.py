@@ -47,12 +47,16 @@ def is_permission_reply(text: str) -> str | None:
   return None
 
 
-def is_authorized(
+def is_privileged(
   sender_id: str,
   operator_open_id: str,
   member_roles: dict[str, str] | None = None,
 ) -> bool:
-  """Check if a sender is authorized (operator or coowner)."""
+  """Check if a sender has privileged rights (operator or coowner).
+
+  Used for actions that guests should not perform (e.g. stopping a turn).
+  For ordinary message-relay authorization see ``guests.is_authorized_sender``.
+  """
   if not operator_open_id:
     return True
   if sender_id == operator_open_id:

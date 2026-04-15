@@ -9,6 +9,19 @@ import time
 
 _EFFORT_LEVELS = ("low", "medium", "high")
 
+
+def _format_model_catalog(catalog) -> str:
+  """Render a ModelCatalog as a markdown block grouped by visibility + aliases."""
+  lines: list[str] = []
+  if catalog.visible:
+    lines.append("Available: " + ", ".join(f"`{m}`" for m in catalog.visible))
+  if catalog.hidden:
+    lines.append("Legacy: " + ", ".join(f"`{m}`" for m in catalog.hidden))
+  if catalog.aliases:
+    pairs = ", ".join(f"`{a}` → `{full}`" for a, full in catalog.aliases.items())
+    lines.append("Aliases: " + pairs)
+  return "\n".join(lines) if lines else "(no models configured)"
+
 # What each effort level actually does per provider.
 _EFFORT_DETAIL: dict[str, dict[str, str]] = {
   "claude": {
@@ -30,13 +43,14 @@ class AgentContext:
   """Minimal context for command handlers."""
 
   def __init__(self, model: str, project_dir: str, start_time: float):
+    from .agent_factory import AgentProvider
     self.model = model
     self.project_dir = project_dir
     self.start_time = start_time
     self.msg_count = 0
     self.total_cost = 0.0
     self.effort = ""
-    self.provider = "claude"
+    self.provider: AgentProvider = "claude"
 
 
 # Each handler returns (handled: bool, response_text: str | None).
@@ -54,11 +68,22 @@ def try_dispatch(text: str, ctx: AgentContext) -> tuple[bool, str | None]:
 
   # /model
   if t.startswith("/model"):
+    from .agent_factory import is_model_compatible, model_catalog_for_provider
+    catalog = model_catalog_for_provider(ctx.provider)
+    listing = _format_model_catalog(catalog)
     parts = text.strip().split(None, 1)
     if len(parts) >= 2:
       new_model = parts[1].strip()
+      if not is_model_compatible(ctx.provider, new_model):
+        return True, (
+          f"Unknown model `{new_model}` for provider **{ctx.provider}**.\n\n"
+          f"{listing}"
+        )
       return True, f"__model__:{new_model}"
-    return True, f"Current model: **{ctx.model}**\n\nUsage: `/model claude-sonnet-4-6`"
+    return True, (
+      f"Current model: **{ctx.model}** (provider **{ctx.provider}**)\n\n"
+      f"{listing}\n\nUsage: `/model <name>`"
+    )
 
   # /effort
   if t.startswith("/effort"):

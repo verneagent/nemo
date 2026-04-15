@@ -131,19 +131,13 @@ def _create_config_pin(token: str, chat_id: str,
   return msg_id
 
 
-def _update_config_pin(token: str, chat_id: str,
-                       pin_msg_id: str,
+def _update_config_pin(token: str, pin_msg_id: str,
                        config: JsonObject) -> str:
-  """Update existing config message. Deletes old and creates new."""
+  """Update existing config message in place via PUT edit."""
   from .lark import api as lark_api
 
-  # Text messages can't be PATCHed, so replace: unpin+delete old, create new
-  try:
-    lark_api.delete_pin(token, pin_msg_id)
-    lark_api.delete_message(token, pin_msg_id)
-  except Exception as e:
-    log.warning("Failed to delete old config pin %s: %s", pin_msg_id, e)
-  return _create_config_pin(token, chat_id, config)
+  lark_api.edit_text(token, pin_msg_id, _build_config_text(config))
+  return pin_msg_id
 
 
 # ---------------------------------------------------------------------------
@@ -167,7 +161,7 @@ def save_config(token: str, chat_id: str, config: JsonObject) -> str:
     result = _find_config_pin(token, chat_id)
     if result is not None:
       pin_msg_id, _old = result
-      return _update_config_pin(token, chat_id, pin_msg_id, config)
+      return _update_config_pin(token, pin_msg_id, config)
     return _create_config_pin(token, chat_id, config)
 
 

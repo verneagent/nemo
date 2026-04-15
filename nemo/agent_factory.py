@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from typing import Literal
 
 from .channel import Channel
@@ -20,19 +21,73 @@ _DEFAULT_MODEL_BY_PROVIDER: dict[AgentProvider, str] = {
 }
 
 
+@dataclass(frozen=True)
+class ModelCatalog:
+  """Model catalog for a provider.
+
+  - ``visible``: full slugs shown in the picker.
+  - ``hidden``: full slugs accepted but not shown (legacy / experimental).
+  - ``aliases``: short name → canonical full slug (e.g. ``opus`` → ``claude-opus-4-6``).
+  """
+  visible: tuple[str, ...] = ()
+  hidden: tuple[str, ...] = ()
+  aliases: dict[str, str] = field(default_factory=dict)
+
+  def all_names(self) -> tuple[str, ...]:
+    return self.visible + self.hidden + tuple(self.aliases.keys())
+
+
+# Claude aliases mirror the Claude CLI's /model picker.
+# Codex slugs come from github.com/openai/codex `models-manager/models.json`.
+# Older bundled `codex` binaries may reject newer slugs at turn time.
+_CATALOG_BY_PROVIDER: dict[AgentProvider, ModelCatalog] = {
+  "claude": ModelCatalog(
+    visible=(
+      "claude-opus-4-6",
+      "claude-sonnet-4-6",
+      "claude-haiku-4-5",
+      "opusplan",
+    ),
+    hidden=(),
+    aliases={
+      "opus": "claude-opus-4-6",
+      "sonnet": "claude-sonnet-4-6",
+      "haiku": "claude-haiku-4-5",
+    },
+  ),
+  "codex": ModelCatalog(
+    visible=(
+      "gpt-5.4",
+      "gpt-5.3-codex",
+      "gpt-5.2-codex",
+      "gpt-5.2",
+      "gpt-5.1-codex-max",
+      "gpt-5.1-codex-mini",
+    ),
+    hidden=(
+      "gpt-5.1-codex",
+      "gpt-5.1",
+      "gpt-5-codex",
+      "gpt-5-codex-mini",
+      "gpt-5",
+      "gpt-oss-120b",
+      "gpt-oss-20b",
+    ),
+    aliases={},
+  ),
+}
+
+
 def default_model_for_provider(provider: AgentProvider) -> str:
   return _DEFAULT_MODEL_BY_PROVIDER[provider]
 
 
+def model_catalog_for_provider(provider: AgentProvider) -> ModelCatalog:
+  return _CATALOG_BY_PROVIDER.get(provider, ModelCatalog())
+
+
 def is_model_compatible(provider: AgentProvider, model: str) -> bool:
-  normalized = model.strip().lower()
-  if not normalized:
-    return False
-  if provider == "claude":
-    return not normalized.startswith(("gpt-", "o1", "o3", "o4", "codex"))
-  if provider == "codex":
-    return not normalized.startswith("claude-")
-  return False
+  return model.strip().lower() in model_catalog_for_provider(provider).all_names()
 
 
 def build_coding_agent(

@@ -155,18 +155,21 @@ def test_save_config_concurrent_safety():
   assert call_count["create_pin"] == 5
 
 
-def test_save_config_updates_existing():
+def test_save_config_updates_existing_in_place():
+  """Edit path: save_config edits existing pin in place, keeping its id."""
   old_config = {"autoapprove": False, "guests": []}
-  old_text = _build_config_text(old_config)
-  old_msg = _text_msg(old_text)
+  old_msg = _text_msg(_build_config_text(old_config))
   with mock.patch("nemo.lark.api.list_pins", return_value=[
     {"message_id": "msg_old"},
   ]):
     with mock.patch("nemo.lark.api.get_message", return_value=old_msg):
-      with mock.patch("nemo.lark.api.delete_pin"):
-        with mock.patch("nemo.lark.api.delete_message"):
-          with mock.patch("nemo.lark.api.send_text", return_value="msg_new"):
-            with mock.patch("nemo.lark.api.create_pin"):
-              new_config = {**old_config, "autoapprove": True}
-              msg_id = save_config("tok", "oc_1", new_config)
-  assert msg_id == "msg_new"
+      with mock.patch("nemo.lark.api.edit_text") as mock_edit:
+        new_config = {**old_config, "autoapprove": True}
+        msg_id = save_config("tok", "oc_1", new_config)
+  assert msg_id == "msg_old"
+  mock_edit.assert_called_once()
+  edited_text = mock_edit.call_args[0][2]
+  assert edited_text.startswith(CONFIG_MARKER)
+  assert "autoapprove: true" in edited_text
+
+

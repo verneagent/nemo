@@ -26,6 +26,24 @@ def test_model_switch():
   assert resp == "__model__:sonnet"
 
 
+def test_model_typo_rejected():
+  """Unknown model must not emit __model__:, so SDK isn't restarted."""
+  handled, resp = try_dispatch("/model sonet", _ctx())
+  assert handled
+  assert resp is not None and not resp.startswith("__model__:")
+  assert "Unknown model" in resp
+  assert "sonnet" in resp  # available list included
+
+
+def test_model_typo_for_codex():
+  ctx = _ctx()
+  ctx.provider = "codex"
+  handled, resp = try_dispatch("/model claude-sonnet-4-6", ctx)
+  assert handled
+  assert resp is not None and not resp.startswith("__model__:")
+  assert "gpt-5-codex" in resp
+
+
 def test_esc():
   for cmd in ("/esc", "esc", "cancel", "取消"):
     handled, resp = try_dispatch(cmd, _ctx())

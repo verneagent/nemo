@@ -82,6 +82,18 @@ def send_text(token: str, chat_id: str, text: str) -> str:
   raise RuntimeError(f"Failed to send text: {data}")
 
 
+def edit_text(token: str, message_id: str, text: str) -> None:
+  """Edit a text message in place via PUT."""
+  url = f"{BASE_URL}/im/v1/messages/{message_id}"
+  payload = {
+    "msg_type": "text",
+    "content": json.dumps({"text": text}),
+  }
+  data = _request(url, token, payload, method="PUT")
+  if data.get("code") != 0:
+    raise RuntimeError(f"Failed to edit text: {data}")
+
+
 # ---------------------------------------------------------------------------
 # User & chat info
 # ---------------------------------------------------------------------------

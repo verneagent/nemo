@@ -1,6 +1,6 @@
 """Tests for nemo.monitor — signal detection."""
 
-from nemo.monitor import is_esc, is_exit, is_dissolve, is_permission_reply, is_authorized
+from nemo.monitor import is_esc, is_exit, is_dissolve, is_permission_reply, is_privileged
 
 
 def test_is_esc():
@@ -46,10 +46,12 @@ def test_is_permission_reply():
   assert is_permission_reply("") is None
 
 
-def test_is_authorized():
-  assert is_authorized("ou_1", "ou_1")
-  assert not is_authorized("ou_2", "ou_1")
-  assert is_authorized("ou_2", "ou_1", {"ou_2": "coowner"})
-  assert not is_authorized("ou_3", "ou_1", {"ou_2": "coowner"})
+def test_is_privileged():
+  assert is_privileged("ou_1", "ou_1")
+  assert not is_privileged("ou_2", "ou_1")
+  assert is_privileged("ou_2", "ou_1", {"ou_2": "coowner"})
+  assert not is_privileged("ou_3", "ou_1", {"ou_2": "coowner"})
+  # Guests are not privileged — only coowner is.
+  assert not is_privileged("ou_2", "ou_1", {"ou_2": "guest"})
   # No operator = everyone authorized
-  assert is_authorized("anyone", "")
+  assert is_privileged("anyone", "")

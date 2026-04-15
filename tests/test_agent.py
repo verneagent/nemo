@@ -227,9 +227,11 @@ def test_codex_provider_rejects_claude_model_switch(tmp_path):
 
   assert result == 0
   agent.reset.assert_not_awaited()
-  send_response.assert_any_await(
-    queued,
-    "oc_test",
-    "Model **claude-sonnet-4-6** is not supported by provider **codex**.",
-    mock.ANY,
+  call = next(
+    c for c in send_response.await_args_list
+    if "claude-sonnet-4-6" in c.args[2]
   )
+  body = call.args[2]
+  assert "Unknown model" in body
+  assert "codex" in body
+  assert "gpt-5-codex" in body  # available list shown
