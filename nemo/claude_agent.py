@@ -226,7 +226,9 @@ class ClaudeCodingAgent(CodingAgent):
 
     opts: dict[str, object] = dict(
       allowed_tools=[
-        "Agent", "Skill", "Read", "Write", "Edit", "Bash", "Glob", "Grep",
+        "Agent", "Skill", "Read", "Write", "Edit", "NotebookEdit",
+        "Bash", "BashOutput", "KillShell",
+        "Glob", "Grep", "WebSearch", "WebFetch", "TodoWrite",
         "AskUserQuestion",
       ],
       setting_sources=["user", "project"],
