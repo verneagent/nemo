@@ -1,9 +1,10 @@
 """Tests for nemo.agent main loop behavior."""
 
 import asyncio
+import urllib.error
 from unittest import mock
 
-from nemo.agent import main_loop
+from nemo.agent import _update_done_card_with_fallback, main_loop
 from nemo.turn import AnswerEvent, DoneEvent
 
 
@@ -235,3 +236,108 @@ def test_codex_provider_rejects_claude_model_switch(tmp_path):
   assert "Unknown model" in body
   assert "codex" in body
   assert "gpt-5-codex" in body  # available list shown
+
+
+# ---------------------------------------------------------------------------
+# Done-card tiered fallback
+# ---------------------------------------------------------------------------
+
+
+class _FakeUpdateChannel:
+  """Channel stub exposing a controllable synchronous update_card."""
+
+  def __init__(self, outcomes):
+    # outcomes: list where each item is either an Exception (raise) or a
+    # string (return as new card id). Consumed in order.
+    self._outcomes = list(outcomes)
+    self.calls = []  # captured (card_id, card) tuples
+    self.token = "tok"
+
+  def update_card(self, card_id, card):
+    self.calls.append((card_id, card))
+    outcome = self._outcomes.pop(0)
+    if isinstance(outcome, Exception):
+      raise outcome
+    return outcome
+
+
+def _run_fallback(channel, final_text="answer body"):
+  """Drive _update_done_card_with_fallback with identity await_channel."""
+  register_calls = []
+  return _update_done_card_with_fallback(
+    channel=channel,
+    chat_id="oc_test",
+    turn_card_id="om_card0",
+    final_text=final_text,
+    thinking=[],
+    elapsed=1,
+    usage={"input_tokens": 1},
+    session_id="sess_x",
+    await_channel=lambda x: x,
+    register_msg=lambda msg_id, chat_id: register_calls.append((msg_id, chat_id)),
+  )
+
+
+def test_done_card_full_body_success_single_update():
+  channel = _FakeUpdateChannel(outcomes=["om_card1"])
+  result = _run_fallback(channel)
+  assert result == "om_card1"
+  assert len(channel.calls) == 1
+
+
+def test_done_card_transport_error_recovers_via_preview_retry():
+  # Tier 1 fails with RemoteDisconnected (transport), tier 2 (preview)
+  # succeeds. No file upload should happen.
+  transport_err = ConnectionError("Remote end closed connection without response")
+  channel = _FakeUpdateChannel(outcomes=[transport_err, "om_card1"])
+
+  # Even a tiny body must still go through preview retry, not file upload,
+  # since the first failure was transport (not content-size).
+  with mock.patch("nemo.lark.api.upload_file") as upload, \
+       mock.patch("nemo.lark.api.send_file") as send_file:
+    result = _run_fallback(channel, final_text="short answer")
+
+  assert result == "om_card1"
+  assert len(channel.calls) == 2
+  upload.assert_not_called()
+  send_file.assert_not_called()
+
+
+def test_done_card_falls_back_to_file_when_preview_also_fails():
+  # Both tier 1 and tier 2 fail — tier 3 uploads file and updates card.
+  err1 = ConnectionError("closed")
+  err2 = ConnectionError("closed again")
+  channel = _FakeUpdateChannel(outcomes=[err1, err2, "om_card_final"])
+
+  with mock.patch("nemo.lark.api.upload_file", return_value="file_key_1") as upload, \
+       mock.patch("nemo.lark.api.send_file") as send_file:
+    result = _run_fallback(channel, final_text="body " * 50)
+
+  assert result == "om_card_final"
+  assert len(channel.calls) == 3
+  upload.assert_called_once()
+  send_file.assert_called_once()
+  # Third card body should include the "sent as file" note.
+  _, final_card = channel.calls[2]
+  serialized = repr(final_card)
+  assert "sent as file" in serialized
+
+
+def test_done_card_auth_error_skips_fallback_chain():
+  # HTTPError 403 → not retriable; no tier 2/3 attempts.
+  import http.client
+  http_err = urllib.error.HTTPError(
+    url="http://x", code=403, msg="forbidden",
+    hdrs=http.client.HTTPMessage(), fp=None,
+  )
+  channel = _FakeUpdateChannel(outcomes=[http_err])
+
+  with mock.patch("nemo.lark.api.upload_file") as upload, \
+       mock.patch("nemo.lark.api.send_file") as send_file:
+    result = _run_fallback(channel)
+
+  # Returns the original card id; only one update_card attempt made.
+  assert result == "om_card0"
+  assert len(channel.calls) == 1
+  upload.assert_not_called()
+  send_file.assert_not_called()

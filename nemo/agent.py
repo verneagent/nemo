@@ -59,6 +59,98 @@ def _register_msg(msg_id: str, chat_id: str) -> None:
     relay_client.register_message(msg_id, chat_id)
 
 
+def _truncate_for_preview(text: str, limit: int = 2000) -> str:
+  """Return text clipped to ``limit`` chars at a line boundary."""
+  if len(text) <= limit:
+    return text
+  return text[:limit].rsplit("\n", 1)[0] + "\n\n_…truncated_"
+
+
+def _update_done_card_with_fallback(
+  *,
+  channel: LarkChannel,
+  chat_id: str,
+  turn_card_id: str,
+  final_text: str,
+  thinking,
+  elapsed: int,
+  usage,
+  session_id: str,
+  await_channel,
+  register_msg,
+) -> str:
+  """Update the done card with tiered fallback; return the resulting id.
+
+  1. Try the full-body card.
+  2. On failure (other than auth-class HTTPError), retry with a truncated
+     preview — this recovers transport blips and card-body-too-large alike.
+  3. If the preview retry also fails, upload the full text as a .md file
+     and update the card with a short preview + "sent as file" note.
+  """
+  full_card = cards.build_turn_card(
+    "done", body=final_text, steps=thinking,
+    elapsed=elapsed, usage=usage, session_id=session_id,
+  )
+  try:
+    prev_id = turn_card_id
+    turn_card_id = await_channel(channel.update_card(turn_card_id, full_card))
+    if turn_card_id != prev_id:
+      register_msg(turn_card_id, chat_id)
+    return turn_card_id
+  except Exception as e:
+    log.warning("Failed to update done card: %s", e)
+    first_err = e
+
+  # Auth-class HTTP errors won't be fixed by shrinking or uploading a file.
+  if (
+    isinstance(first_err, urllib.error.HTTPError)
+    and first_err.code in (401, 403, 404)
+  ) or not final_text:
+    return turn_card_id
+
+  preview_body = _truncate_for_preview(final_text)
+  preview_card = cards.build_turn_card(
+    "done", body=preview_body, steps=thinking,
+    elapsed=elapsed, usage=usage, session_id=session_id,
+  )
+  try:
+    prev_id = turn_card_id
+    turn_card_id = await_channel(
+      channel.update_card(turn_card_id, preview_card))
+    if turn_card_id != prev_id:
+      register_msg(turn_card_id, chat_id)
+    return turn_card_id
+  except Exception as e:
+    log.warning("Preview card update also failed: %s", e)
+
+  try:
+    import tempfile
+    file_dir = os.path.join("/tmp/nemo", "nemo-files")
+    os.makedirs(file_dir, exist_ok=True)
+    fd, overflow_path = tempfile.mkstemp(
+      suffix=".md", prefix="nemo-response-", dir=file_dir)
+    with os.fdopen(fd, "w") as f:
+      f.write(final_text)
+    from .lark import api as lark_api
+    file_key = lark_api.upload_file(channel.token, overflow_path)
+    lark_api.send_file(channel.token, chat_id, file_key)
+    log.info("Sent overflow response as file: %s", overflow_path)
+    preview = final_text[:500].rsplit("\n", 1)[0]
+    preview += f"\n\n_…full response ({len(final_text)} chars) sent as file_"
+    fallback_card = cards.build_turn_card(
+      "done", body=preview, steps=thinking,
+      elapsed=elapsed, usage=usage, session_id=session_id,
+    )
+    prev_id = turn_card_id
+    turn_card_id = await_channel(
+      channel.update_card(turn_card_id, fallback_card))
+    if turn_card_id != prev_id:
+      register_msg(turn_card_id, chat_id)
+  except Exception as e:
+    log.warning("Failed to send overflow fallback: %s", e)
+  return turn_card_id
+
+
 async def _handle_turn_error(
   message: str,
   exc: Exception,
@@ -727,58 +819,18 @@ async def main_loop(
           # Thinking timeline = all non-answer steps
           thinking = [s for s in _turn_steps if s.kind != "answer"]
           if _turn_card_id:
-            card = cards.build_turn_card(
-              "done", body=final_text, steps=thinking,
-              elapsed=elapsed, usage=event.usage,
+            _turn_card_id = _update_done_card_with_fallback(
+              channel=channel,
+              chat_id=chat_id,
+              turn_card_id=_turn_card_id,
+              final_text=final_text,
+              thinking=thinking,
+              elapsed=elapsed,
+              usage=event.usage,
               session_id=_sdk_session_id,
+              await_channel=_await_channel,
+              register_msg=_register_msg,
             )
-            _card_update_error: Exception | None = None
-            try:
-              prev_id = _turn_card_id
-              _turn_card_id = _await_channel(
-                channel.update_card(_turn_card_id, card))
-              if _turn_card_id != prev_id:
-                _register_msg(_turn_card_id, chat_id)
-            except Exception as e:
-              log.warning("Failed to update done card: %s", e)
-              _card_update_error = e
-            # Fallback: if card update failed due to content size (not auth/
-            # transport errors), send the full response as a markdown file.
-            # HTTP errors (403, 401, etc.) indicate token/permission issues
-            # — sending as file won't help and would confuse the user.
-            _is_content_error = (
-              _card_update_error is not None
-              and not isinstance(_card_update_error, urllib.error.HTTPError)
-            )
-            if _is_content_error and final_text:
-              try:
-                import tempfile
-                file_dir = os.path.join("/tmp/nemo", "nemo-files")
-                os.makedirs(file_dir, exist_ok=True)
-                fd, overflow_path = tempfile.mkstemp(
-                  suffix=".md", prefix="nemo-response-", dir=file_dir)
-                with os.fdopen(fd, "w") as f:
-                  f.write(final_text)
-                # Send as file
-                from .lark import api as lark_api
-                file_key = lark_api.upload_file(channel.token, overflow_path)
-                lark_api.send_file(channel.token, chat_id, file_key)
-                log.info("Sent overflow response as file: %s", overflow_path)
-                # Retry card with a short preview
-                preview = final_text[:500].rsplit("\n", 1)[0]
-                preview += f"\n\n_…full response ({len(final_text)} chars) sent as file_"
-                fallback_card = cards.build_turn_card(
-                  "done", body=preview, steps=thinking,
-                  elapsed=elapsed, usage=event.usage,
-                  session_id=_sdk_session_id,
-                )
-                prev_id = _turn_card_id
-                _turn_card_id = _await_channel(
-                  channel.update_card(_turn_card_id, fallback_card))
-                if _turn_card_id != prev_id:
-                  _register_msg(_turn_card_id, chat_id)
-              except Exception as e:
-                log.warning("Failed to send overflow fallback: %s", e)
             db.clear_working(session_id)
             if final_text:
               db.record_sent(_turn_card_id, text=final_text[:500], chat_id=chat_id)
