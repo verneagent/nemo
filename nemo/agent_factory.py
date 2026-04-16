@@ -17,7 +17,10 @@ DEFAULT_PROVIDER: AgentProvider = "claude"
 
 _DEFAULT_MODEL_BY_PROVIDER: dict[AgentProvider, str] = {
   "claude": "claude-opus-4-6",
-  "codex": "gpt-5-codex",
+  # gpt-5.4 works for both ChatGPT subscribers and API users. The codex-
+  # specialized slugs (-codex variants) are API-only and return HTTP 400
+  # for ChatGPT accounts, so they make a poor default.
+  "codex": "gpt-5.4",
 }
 
 
@@ -26,15 +29,22 @@ class ModelCatalog:
   """Model catalog for a provider.
 
   - ``visible``: full slugs shown in the picker.
+  - ``api_only``: full slugs that require API auth (ChatGPT subscribers
+    can't use these — e.g. codex-specialized variants). Still accepted
+    by the picker; rendered in a separate help section.
   - ``hidden``: full slugs accepted but not shown (legacy / experimental).
   - ``aliases``: short name → canonical full slug (e.g. ``opus`` → ``claude-opus-4-6``).
   """
   visible: tuple[str, ...] = ()
+  api_only: tuple[str, ...] = ()
   hidden: tuple[str, ...] = ()
   aliases: dict[str, str] = field(default_factory=dict)
 
   def all_names(self) -> tuple[str, ...]:
-    return self.visible + self.hidden + tuple(self.aliases.keys())
+    return (
+      self.visible + self.api_only + self.hidden
+      + tuple(self.aliases.keys())
+    )
 
 
 # Claude aliases mirror the Claude CLI's /model picker.
@@ -56,20 +66,27 @@ _CATALOG_BY_PROVIDER: dict[AgentProvider, ModelCatalog] = {
     },
   ),
   "codex": ModelCatalog(
+    # ChatGPT-account-compatible slugs. The bare gpt-5.x variants work
+    # for both ChatGPT subscribers and API users.
     visible=(
       "gpt-5.4",
+      "gpt-5.2",
+      "gpt-5.1",
+      "gpt-5",
+    ),
+    # API-only (codex-specialized): OpenAI rejects these with
+    # "not supported when using Codex with a ChatGPT account" (HTTP 400)
+    # unless the codex CLI is logged in with an API key.
+    api_only=(
       "gpt-5.3-codex",
       "gpt-5.2-codex",
-      "gpt-5.2",
       "gpt-5.1-codex-max",
       "gpt-5.1-codex-mini",
-    ),
-    hidden=(
       "gpt-5.1-codex",
-      "gpt-5.1",
       "gpt-5-codex",
       "gpt-5-codex-mini",
-      "gpt-5",
+    ),
+    hidden=(
       "gpt-oss-120b",
       "gpt-oss-20b",
     ),

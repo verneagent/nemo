@@ -151,5 +151,5 @@ def test_codex_provider_uses_provider_default_model(tmp_path):
             assert result == 0
             frame = captured["frame"]
             assert frame is not None
-            assert frame.f_locals["model"] == "gpt-5-codex"
+            assert frame.f_locals["model"] == "gpt-5.4"
             assert frame.f_locals["provider"] == "codex"

@@ -15,6 +15,11 @@ def _format_model_catalog(catalog) -> str:
   lines: list[str] = []
   if catalog.visible:
     lines.append("Available: " + ", ".join(f"`{m}`" for m in catalog.visible))
+  if getattr(catalog, "api_only", ()):
+    lines.append(
+      "API-only (ChatGPT account rejects these): "
+      + ", ".join(f"`{m}`" for m in catalog.api_only)
+    )
   if catalog.hidden:
     lines.append("Legacy: " + ", ".join(f"`{m}`" for m in catalog.hidden))
   if catalog.aliases:
