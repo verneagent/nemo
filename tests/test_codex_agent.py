@@ -275,3 +275,34 @@ def test_codex_run_turn_maps_events():
     assert proc.stdin.closed is True
 
   asyncio.run(_run())
+
+
+def test_codex_run_turn_raises_stdout_buffer_limit():
+  # A single sidecar JSON event (large reasoning / agent_message) must not
+  # be capped at asyncio's 64 KB default, which would raise
+  # "Separator is found, but chunk is longer than limit".
+  async def _run():
+    proc = _FakeProc([
+      b'{"type":"turn.completed","usage":{}}\n',
+    ])
+    captured: dict[str, object] = {}
+
+    async def _fake_exec(*args: object, **kwargs: object):
+      captured["kwargs"] = kwargs
+      return proc
+
+    agent = CodexCodingAgent({}, "oc_1", _DummyDB(), _DummyChannel())
+    await agent.start("/tmp/project", "gpt-5-codex")
+
+    with mock.patch("shutil.which", side_effect=lambda name: f"/usr/bin/{name}"), \
+         mock.patch("nemo.codex_agent._SIDE_CAR_SCRIPT", Path("/tmp/run_turn.mjs")), \
+         mock.patch("nemo.codex_agent._SIDE_CAR_PACKAGE", Path("/tmp/package.json")), \
+         mock.patch.object(Path, "is_file", return_value=True), \
+         mock.patch("asyncio.create_subprocess_exec", side_effect=_fake_exec):
+      await agent.run_turn("hi", lambda _e: None)
+
+    kwargs = captured["kwargs"]
+    assert isinstance(kwargs, dict)
+    assert kwargs.get("limit") == 16 * 1024 * 1024
+
+  asyncio.run(_run())

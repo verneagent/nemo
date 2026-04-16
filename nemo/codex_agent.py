@@ -86,6 +86,11 @@ class CodexCodingAgent(CodingAgent):
       stderr=asyncio.subprocess.PIPE,
       cwd=self._project_dir or None,
       env=self._build_env(),
+      # A single JSON event from the sidecar (large reasoning block or
+      # agent_message) can exceed asyncio's 64 KB default line buffer and
+      # make readline() raise "Separator is found, but chunk is longer
+      # than limit". Match the Claude SDK cap at 16 MB.
+      limit=16 * 1024 * 1024,
     )
     self._proc = proc
 
