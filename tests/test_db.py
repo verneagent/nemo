@@ -27,13 +27,34 @@ def test_get_session_nonexistent(tmp_path):
     db.close()
 
 
-def test_deactivate(tmp_path):
+def test_deactivate_keeps_row_for_resume(tmp_path):
+  # deactivate must preserve the sessions row so sdk_session_id survives
+  # clean shutdown and the next boot can resume the coding-agent thread.
+  # Ownership fields get overwritten by the next activate().
   with mock.patch("nemo.db.DB_BASE", str(tmp_path)):
     db = Database(str(tmp_path / "project"))
     db.activate("sess1", "chat1", "opus")
+    db.set_sdk_session_id("chat1", "thread-abc")
     chat_id = db.deactivate("sess1")
     assert chat_id == "chat1"
-    assert db.get_session("sess1") is None
+    # Row survives — resume state is still queryable by chat_id.
+    assert db.get_sdk_session_id("chat1") == "thread-abc"
+    assert db.get_chat_owner("chat1") == "sess1"
+    db.close()
+
+
+def test_activate_after_deactivate_preserves_sdk_session_id(tmp_path):
+  # Simulates the real restart flow: old daemon deactivates, new daemon
+  # activates with a fresh session_id. The INSERT OR REPLACE on the
+  # chat_id UNIQUE conflict must carry sdk_session_id over.
+  with mock.patch("nemo.db.DB_BASE", str(tmp_path)):
+    db = Database(str(tmp_path / "project"))
+    db.activate("sess1", "chat1", "opus")
+    db.set_sdk_session_id("chat1", "thread-abc")
+    db.deactivate("sess1")
+    db.activate("sess2", "chat1", "opus")
+    assert db.get_sdk_session_id("chat1") == "thread-abc"
+    assert db.get_chat_owner("chat1") == "sess2"
     db.close()
 
 

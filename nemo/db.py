@@ -115,13 +115,17 @@ class Database:
     self._conn.commit()
 
   def deactivate(self, session_id: str) -> str | None:
+    # Keep the sessions row so sdk_session_id (codex thread / Claude SDK
+    # session) survives clean shutdown and the next daemon's boot can
+    # resume. The row's ownership fields are naturally overwritten by the
+    # next activate() via INSERT OR REPLACE on the chat_id UNIQUE conflict.
+    # Only working_state (per-session UI state) is ephemeral.
     row = self._conn.execute(
       "SELECT chat_id FROM sessions WHERE session_id = ?", (session_id,)
     ).fetchone()
     if not row:
       return None
     chat_id = row["chat_id"]
-    self._conn.execute("DELETE FROM sessions WHERE session_id = ?", (session_id,))
     self._conn.execute("DELETE FROM working_state WHERE session_id = ?", (session_id,))
     self._conn.commit()
     return chat_id
