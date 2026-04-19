@@ -15,6 +15,7 @@ import asyncio
 import datetime
 import logging
 import os
+import re
 import signal
 import time
 import urllib.error
@@ -35,13 +36,80 @@ log = logging.getLogger(__name__)
 # Response helpers
 # ---------------------------------------------------------------------------
 
+_INLINE_CODE_RE = re.compile(r"`[^`\n]+`")
+_MARKDOWN_LINK_RE = re.compile(r"\[[^\]\n]+\]\([^)]+\)")
+_TABLE_LINE_RE = re.compile(r"^\s*\|(?:[^|\n]+\|){1,}.*$")
+_NUMBERED_LIST_RE = re.compile(r"\s*\d+[.)]\s+")
+_BULLET_LIST_RE = re.compile(r"\s*[-*+]\s+")
+_HEADING_RE = re.compile(r"\s{0,3}#{1,6}\s+\S")
+_SETEXT_HEADING_UNDERLINE_RE = re.compile(r"\s{0,3}(?:=+|-+)\s*$")
+_CONTROL_TAG_RE = re.compile(r"</?[a-zA-Z][^>\n]*>")
+_EMPHASIS_RES = (
+  re.compile(r"(?<!\*)\*\*[^*\n]+\*\*(?!\*)"),
+  re.compile(r"(?<!\*)\*[^*\n]+\*(?!\*)"),
+  re.compile(r"(?<!_)__[^_\n]+__(?!_)"),
+  re.compile(r"(?<![\w_])_[^_\n]+_(?![\w_])"),
+  re.compile(r"~~[^~\n]+~~"),
+)
+
+
+def _should_send_plain_text(text: str) -> bool:
+  """Return True only for short, unformatted natural-language replies."""
+  stripped = text.strip()
+  if not stripped:
+    return True
+
+  if len(stripped) > 280:
+    return False
+  if "```" in stripped:
+    return False
+  if _INLINE_CODE_RE.search(stripped):
+    return False
+  if any(regex.search(stripped) for regex in _EMPHASIS_RES):
+    return False
+  if _MARKDOWN_LINK_RE.search(stripped):
+    return False
+  if _CONTROL_TAG_RE.search(stripped):
+    return False
+
+  lines = stripped.splitlines()
+  if len(lines) > 6:
+    return False
+
+  non_empty_lines = [line.strip() for line in lines if line.strip()]
+  if not non_empty_lines:
+    return True
+
+  if any(_HEADING_RE.match(line) for line in non_empty_lines):
+    return False
+  for prev_line, line in zip(non_empty_lines, non_empty_lines[1:]):
+    if prev_line and _SETEXT_HEADING_UNDERLINE_RE.match(line):
+      return False
+  if any(line.startswith("> ") for line in non_empty_lines):
+    return False
+  if any(_TABLE_LINE_RE.match(line) for line in non_empty_lines):
+    return False
+  if "\n\n" in stripped:
+    return False
+
+  for line in non_empty_lines:
+    if _BULLET_LIST_RE.match(line) or _NUMBERED_LIST_RE.match(line):
+      return False
+
+  if len(non_empty_lines) >= 4:
+    return False
+
+  return True
+
 async def _send_response(
   channel: LarkChannel, chat_id: str, text: str, db: Database,
 ) -> str | None:
-  """Send a markdown response card. Returns message_id."""
-  card = cards.build_markdown_card(text)
   try:
-    msg_id = await channel.send_card(chat_id, card)
+    if _should_send_plain_text(text):
+      msg_id = await channel.send_text(chat_id, text)
+    else:
+      card = cards.build_markdown_card(text)
+      msg_id = await channel.send_card(chat_id, card)
     db.record_sent(msg_id, text=text[:500], chat_id=chat_id)
     _register_msg(msg_id, chat_id)
     return msg_id

@@ -4,7 +4,12 @@ import asyncio
 import urllib.error
 from unittest import mock
 
-from nemo.agent import _update_done_card_with_fallback, main_loop
+from nemo.agent import (
+  _send_response,
+  _should_send_plain_text,
+  _update_done_card_with_fallback,
+  main_loop,
+)
 from nemo.turn import AnswerEvent, DoneEvent
 
 
@@ -66,6 +71,9 @@ class _FakeChannel:
 
   async def send_card(self, _chat_id, _card):
     return "om_reply"
+
+  async def send_text(self, _chat_id, _text):
+    return "om_text"
 
   async def update_status(self, _model, _state):
     pass
@@ -156,6 +164,21 @@ class _FakeAgent:
 
     await asyncio.to_thread(_emit)
     return 0.01, {"input_tokens": 1}
+
+
+class _RecordingChannel(_FakeChannel):
+  def __init__(self, _chat_id):
+    super().__init__(_chat_id)
+    self.sent_cards = []
+    self.sent_texts = []
+
+  async def send_card(self, chat_id, card):
+    self.sent_cards.append((chat_id, card))
+    return "om_card"
+
+  async def send_text(self, chat_id, text):
+    self.sent_texts.append((chat_id, text))
+    return "om_text"
 
 
 def test_text_only_turn_clears_thinking_reaction(tmp_path):
@@ -341,3 +364,115 @@ def test_done_card_auth_error_skips_fallback_chain():
   assert len(channel.calls) == 1
   upload.assert_not_called()
   send_file.assert_not_called()
+
+
+def test_should_send_plain_text_for_short_natural_language():
+  assert _should_send_plain_text("收到，我现在去看发送链路。")
+
+
+def test_should_send_plain_text_for_simple_two_sentence_reply():
+  text = "我已经看过了。接下来会把策略收口到 Nemo。"
+  assert _should_send_plain_text(text)
+
+
+def test_should_not_send_plain_text_for_code_fence():
+  assert not _should_send_plain_text("这里有代码：\n```python\nprint('hi')\n```")
+  assert not _should_send_plain_text("运行 `nemo --help` 看一下。")
+
+
+def test_should_not_send_plain_text_for_list_link_and_emphasis():
+  assert not _should_send_plain_text("- one")
+  assert not _should_send_plain_text("- one\n- two")
+  assert not _should_send_plain_text("+ one")
+  assert not _should_send_plain_text("1. one")
+  assert not _should_send_plain_text("1) one")
+  assert not _should_send_plain_text("详情见 [文档](https://example.com)")
+  assert not _should_send_plain_text("这是 **重点**。")
+  assert not _should_send_plain_text("这是 *强调*。")
+  assert not _should_send_plain_text("这是 __重点__。")
+  assert not _should_send_plain_text("这是 ~~删除线~~。")
+
+
+def test_should_not_send_plain_text_for_control_tags():
+  assert not _should_send_plain_text('<at user_id="all">everyone</at> 请看这里')
+
+
+def test_should_not_send_plain_text_for_structured_multiline_layout():
+  assert not _should_send_plain_text("第一段。\n\n第二段。")
+  assert not _should_send_plain_text("一\n二\n三\n四")
+  assert not _should_send_plain_text("# 标题\n内容")
+  assert not _should_send_plain_text("> 引用")
+  assert not _should_send_plain_text("| a | b |\n| - | - |")
+  assert not _should_send_plain_text("标题\n---")
+
+
+def test_send_response_uses_plain_text_for_short_reply():
+  channel = _RecordingChannel("oc_test")
+  db = mock.Mock()
+
+  with mock.patch("nemo.agent._register_msg"):
+    msg_id = asyncio.run(
+      _send_response(channel, "oc_test", "收到，我现在去处理。", db)
+    )
+
+  assert msg_id == "om_text"
+  assert channel.sent_texts == [("oc_test", "收到，我现在去处理。")]
+  assert channel.sent_cards == []
+  db.record_sent.assert_called_once_with(
+    "om_text", text="收到，我现在去处理。", chat_id="oc_test")
+
+
+def test_send_response_uses_card_for_structured_markdown():
+  channel = _RecordingChannel("oc_test")
+  db = mock.Mock()
+  text = "- first\n- second"
+
+  with mock.patch("nemo.agent._register_msg"):
+    msg_id = asyncio.run(_send_response(channel, "oc_test", text, db))
+
+  assert msg_id == "om_card"
+  assert channel.sent_texts == []
+  assert len(channel.sent_cards) == 1
+  db.record_sent.assert_called_once_with("om_card", text=text, chat_id="oc_test")
+
+
+def test_send_response_uses_card_for_inline_code():
+  channel = _RecordingChannel("oc_test")
+  db = mock.Mock()
+  text = "运行 `nemo --help` 看一下。"
+
+  with mock.patch("nemo.agent._register_msg"):
+    msg_id = asyncio.run(_send_response(channel, "oc_test", text, db))
+
+  assert msg_id == "om_card"
+  assert channel.sent_texts == []
+  assert len(channel.sent_cards) == 1
+  db.record_sent.assert_called_once_with("om_card", text=text, chat_id="oc_test")
+
+
+def test_send_response_uses_card_for_control_tags():
+  channel = _RecordingChannel("oc_test")
+  db = mock.Mock()
+  text = '<at user_id="all">everyone</at> 请看这里'
+
+  with mock.patch("nemo.agent._register_msg"):
+    msg_id = asyncio.run(_send_response(channel, "oc_test", text, db))
+
+  assert msg_id == "om_card"
+  assert channel.sent_texts == []
+  assert len(channel.sent_cards) == 1
+  db.record_sent.assert_called_once_with("om_card", text=text, chat_id="oc_test")
+
+
+def test_send_response_uses_card_for_structured_multiline_layout():
+  channel = _RecordingChannel("oc_test")
+  db = mock.Mock()
+  text = "第一段。\n\n第二段。"
+
+  with mock.patch("nemo.agent._register_msg"):
+    msg_id = asyncio.run(_send_response(channel, "oc_test", text, db))
+
+  assert msg_id == "om_card"
+  assert channel.sent_texts == []
+  assert len(channel.sent_cards) == 1
+  db.record_sent.assert_called_once_with("om_card", text=text, chat_id="oc_test")
