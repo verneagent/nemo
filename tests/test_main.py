@@ -153,3 +153,29 @@ def test_codex_provider_uses_provider_default_model(tmp_path):
             assert frame is not None
             assert frame.f_locals["model"] == "gpt-5.4"
             assert frame.f_locals["provider"] == "codex"
+
+
+def test_opencode_provider_uses_provider_default_model(tmp_path):
+  project = str(tmp_path)
+  captured = {}
+
+  def _capture_asyncio_run(coro):
+    captured["frame"] = coro.cr_frame
+    coro.close()
+    return 0
+
+  with mock.patch("sys.argv", ["nemo", "--chat-id", "oc_1",
+                                "--project-dir", project,
+                                "--provider", "opencode"]):
+    with mock.patch("nemo.__main__._ensure_provider_runtime"):
+      with mock.patch("nemo.config.load_credentials",
+                      return_value={"app_id": "a", "app_secret": "s", "email": ""}):
+        with mock.patch("nemo.preflight.run_preflight", return_value=[]):
+          with mock.patch("nemo.__main__.asyncio") as mock_asyncio:
+            mock_asyncio.run.side_effect = _capture_asyncio_run
+            result = main()
+            assert result == 0
+            frame = captured["frame"]
+            assert frame is not None
+            assert frame.f_locals["model"] == "default"
+            assert frame.f_locals["provider"] == "opencode"

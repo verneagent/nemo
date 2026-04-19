@@ -63,6 +63,32 @@ def test_model_list_separates_chatgpt_from_api_only_codex():
   assert "ChatGPT" in api_line  # explains why they're segregated
 
 
+def test_model_list_for_opencode_shows_dynamic_note():
+  ctx = _ctx()
+  ctx.provider = "opencode"
+  with __import__("unittest").mock.patch(
+      "nemo.opencode_agent.query_opencode_model_catalog_data",
+      return_value=(("anthropic/claude-sonnet-4-5",), "Config default: `anthropic/claude-sonnet-4-5`."),
+  ):
+    handled, resp = try_dispatch("/model", ctx)
+    assert handled
+    assert resp is not None
+    assert "anthropic/claude-sonnet-4-5" in resp
+    assert "Config default" in resp
+
+
+def test_model_switch_for_opencode_accepts_provider_model():
+  ctx = _ctx()
+  ctx.provider = "opencode"
+  with __import__("unittest").mock.patch(
+      "nemo.opencode_agent.query_opencode_model_catalog_data",
+      return_value=(("anthropic/claude-sonnet-4-5",), "note"),
+  ):
+    handled, resp = try_dispatch("/model anthropic/claude-sonnet-4-5", ctx)
+    assert handled
+    assert resp == "__model__:anthropic/claude-sonnet-4-5"
+
+
 def test_esc():
   for cmd in ("/esc", "esc", "cancel", "取消"):
     handled, resp = try_dispatch(cmd, _ctx())
@@ -104,6 +130,14 @@ def test_usage():
   handled, resp = try_dispatch("/usage", _ctx())
   assert handled
   assert "usage" in resp.lower()
+
+
+def test_usage_for_opencode():
+  ctx = _ctx()
+  ctx.provider = "opencode"
+  handled, resp = try_dispatch("/usage", ctx)
+  assert handled
+  assert "opencode stats" in resp
 
 
 def test_help():

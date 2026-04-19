@@ -25,6 +25,8 @@ def _format_model_catalog(catalog) -> str:
   if catalog.aliases:
     pairs = ", ".join(f"`{a}` → `{full}`" for a, full in catalog.aliases.items())
     lines.append("Aliases: " + pairs)
+  if getattr(catalog, "note", ""):
+    lines.append("Note: " + catalog.note)
   return "\n".join(lines) if lines else "(no models configured)"
 
 # What each effort level actually does per provider.
@@ -40,6 +42,12 @@ _EFFORT_DETAIL: dict[str, dict[str, str]] = {
     "low": "low",
     "medium": "medium",
     "high": "high",
+  },
+  "opencode": {
+    "": "normal reasoning",
+    "low": "lighter prompt guidance",
+    "medium": "default",
+    "high": "stronger prompt guidance",
   },
 }
 
@@ -74,12 +82,12 @@ def try_dispatch(text: str, ctx: AgentContext) -> tuple[bool, str | None]:
   # /model
   if t.startswith("/model"):
     from .agent_factory import is_model_compatible, model_catalog_for_provider
-    catalog = model_catalog_for_provider(ctx.provider)
+    catalog = model_catalog_for_provider(ctx.provider, ctx.project_dir)
     listing = _format_model_catalog(catalog)
     parts = text.strip().split(None, 1)
     if len(parts) >= 2:
       new_model = parts[1].strip()
-      if not is_model_compatible(ctx.provider, new_model):
+      if not is_model_compatible(ctx.provider, new_model, ctx.project_dir):
         return True, (
           f"Unknown model `{new_model}` for provider **{ctx.provider}**.\n\n"
           f"{listing}"
@@ -151,7 +159,11 @@ def try_dispatch(text: str, ctx: AgentContext) -> tuple[bool, str | None]:
 
   # /usage
   if t in ("/usage", "usage"):
-    return True, "Plan usage: [claude.ai/settings/usage](https://claude.ai/settings/usage)"
+    if ctx.provider == "claude":
+      return True, "Plan usage: [claude.ai/settings/usage](https://claude.ai/settings/usage)"
+    if ctx.provider == "opencode":
+      return True, "Usage is provider-specific under OpenCode. Run `opencode stats` locally for totals."
+    return True, "Usage is provider-specific for this agent. Check the local CLI/account UI for totals."
 
   # /help
   if t in ("/help", "help", "帮助"):

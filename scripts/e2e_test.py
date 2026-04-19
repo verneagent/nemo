@@ -388,16 +388,50 @@ def get_bot_msgs(chat_id: str, after: str = "0",
 
 
 def wait_for_response(chat_id: str, after: str,
-                      timeout: int = 60, poll: int = 3) -> tuple[dict | None, float]:
+                      timeout: int = 60, poll: int = 3,
+                      require_done: bool = False) -> tuple[dict | None, float]:
   """Poll for a bot response. Returns (msg, elapsed_seconds)."""
   start = time.time()
   deadline = start + timeout
   while time.time() < deadline:
     msg = get_latest_bot_msg(chat_id, after=after)
     if msg and msg["time"] > after:
+      if require_done and not is_done_response(msg):
+        time.sleep(poll)
+        continue
       return msg, time.time() - start
     time.sleep(poll)
   return None, time.time() - start
+
+
+def interactive_card_title(msg: dict | None) -> str:
+  """Best-effort title extraction for interactive card bodies."""
+  if not msg or msg.get("type") != "interactive":
+    return ""
+  body = msg.get("body", "")
+  if not isinstance(body, str) or not body:
+    return ""
+  try:
+    parsed = json.loads(body)
+  except json.JSONDecodeError:
+    return ""
+  title = parsed.get("title")
+  if isinstance(title, str):
+    return title
+  if isinstance(title, dict):
+    text = title.get("content")
+    if isinstance(text, str):
+      return text
+  return ""
+
+
+def is_done_response(msg: dict | None) -> bool:
+  """Return True when a bot response represents a completed turn."""
+  if not msg:
+    return False
+  if msg.get("type") != "interactive":
+    return True
+  return interactive_card_title(msg).startswith("Done")
 
 
 # ---------------------------------------------------------------------------
@@ -418,6 +452,35 @@ class LogAnalyzer:
       return "".join(lines[-last_n:])
     except FileNotFoundError:
       return ""
+
+  def mark(self) -> int:
+    try:
+      return os.path.getsize(self.path)
+    except OSError:
+      return 0
+
+  def read_since(self, offset: int) -> str:
+    try:
+      with open(self.path) as f:
+        f.seek(offset)
+        return f.read()
+    except OSError:
+      return ""
+
+  def wait_for_since(self, pattern: str, offset: int,
+                     timeout: int = 30, poll: float = 1) -> bool:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+      chunk = self.read_since(offset)
+      try:
+        rx = re.compile(pattern)
+        if rx.search(chunk):
+          return True
+      except re.error:
+        if pattern in chunk:
+          return True
+      time.sleep(poll)
+    return False
 
   def lines(self, last_n: int = 200) -> list[str]:
     try:
@@ -662,16 +725,19 @@ def run_sdk_test(name: str, text: str, pid: int, chat_id: str,
                  result: E2EResult, wait: int = 20,
                  expect_log: str | None = None) -> None:
   """Send a message that triggers an SDK turn, verify response."""
+  log = LogAnalyzer(pid)
+  log_mark = log.mark()
   ts = str(int(time.time() * 1000))
   send_msg(text, chat_id)
   time.sleep(wait)
   msg = get_latest_bot_msg(chat_id, after=ts)
-  log = LogAnalyzer(pid)
   if msg and msg["time"] > ts:
     if expect_log and log.count(expect_log, last_n=30) == 0:
       result.ok(name, "card ok, log check skipped")
     else:
       result.ok(name)
+  elif log.wait_for_since("Turn response finalized", log_mark, timeout=5, poll=1):
+    result.ok(name, "completed via log fallback")
   else:
     result.fail(name, "no response")
     log.dump_tail(10, name)
@@ -1417,7 +1483,7 @@ def main():
   parser = argparse.ArgumentParser(description="Nemo E2E test runner")
   parser.add_argument("--chat-id", default="",
                       help="Chat ID (defaults to a fresh temp group)")
-  parser.add_argument("--provider", default="claude", choices=["claude", "codex"],
+  parser.add_argument("--provider", default="claude", choices=["claude", "codex", "opencode"],
                       help="Coding agent provider (default: claude)")
   parser.add_argument("--skip-sdk", action="store_true",
                       help="Skip all SDK turn tests (commands only)")

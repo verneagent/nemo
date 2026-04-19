@@ -37,6 +37,9 @@ nemo = [
   "codex_sidecar/package.json",
   "codex_sidecar/package-lock.json",
   "codex_sidecar/run_turn.mjs",
+  "opencode_sidecar/package.json",
+  "opencode_sidecar/list_models.mjs",
+  "opencode_sidecar/run_turn.mjs",
 ]
 
 [tool.pytest.ini_options]

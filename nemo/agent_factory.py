@@ -10,8 +10,9 @@ from .claude_agent import ClaudeCodingAgent
 from .coding_agent import CodingAgent
 from .codex_agent import CodexCodingAgent
 from .db import Database
+from .opencode_agent import OpenCodeCodingAgent
 
-type AgentProvider = Literal["claude", "codex"]
+type AgentProvider = Literal["claude", "codex", "opencode"]
 
 DEFAULT_PROVIDER: AgentProvider = "claude"
 
@@ -21,6 +22,8 @@ _DEFAULT_MODEL_BY_PROVIDER: dict[AgentProvider, str] = {
   # specialized slugs (-codex variants) are API-only and return HTTP 400
   # for ChatGPT accounts, so they make a poor default.
   "codex": "gpt-5.4",
+  # OpenCode resolves the configured default model on its side.
+  "opencode": "default",
 }
 
 
@@ -39,6 +42,7 @@ class ModelCatalog:
   api_only: tuple[str, ...] = ()
   hidden: tuple[str, ...] = ()
   aliases: dict[str, str] = field(default_factory=dict)
+  note: str = ""
 
   def all_names(self) -> tuple[str, ...]:
     return (
@@ -92,6 +96,13 @@ _CATALOG_BY_PROVIDER: dict[AgentProvider, ModelCatalog] = {
     ),
     aliases={},
   ),
+  "opencode": ModelCatalog(
+    note=(
+      "Dynamic models come from the local OpenCode config. Use full "
+      "`provider/model` names from `opencode models`, or `default` to keep "
+      "OpenCode's configured default."
+    ),
+  ),
 }
 
 
@@ -99,12 +110,34 @@ def default_model_for_provider(provider: AgentProvider) -> str:
   return _DEFAULT_MODEL_BY_PROVIDER[provider]
 
 
-def model_catalog_for_provider(provider: AgentProvider) -> ModelCatalog:
+def model_catalog_for_provider(
+  provider: AgentProvider,
+  project_dir: str = "",
+) -> ModelCatalog:
+  if provider == "opencode":
+    from .opencode_agent import query_opencode_model_catalog_data
+    models, note = query_opencode_model_catalog_data(project_dir)
+    return ModelCatalog(visible=models, note=note)
   return _CATALOG_BY_PROVIDER.get(provider, ModelCatalog())
 
 
-def is_model_compatible(provider: AgentProvider, model: str) -> bool:
-  return model.strip().lower() in model_catalog_for_provider(provider).all_names()
+def is_model_compatible(
+  provider: AgentProvider,
+  model: str,
+  project_dir: str = "",
+) -> bool:
+  if provider == "opencode":
+    candidate = model.strip().lower()
+    if candidate == "default":
+      return True
+    catalog = model_catalog_for_provider(provider, project_dir)
+    if catalog.visible:
+      return candidate in catalog.all_names()
+    return "/" in candidate
+  return model.strip().lower() in model_catalog_for_provider(
+    provider,
+    project_dir,
+  ).all_names()
 
 
 def build_coding_agent(
@@ -125,6 +158,12 @@ def build_coding_agent(
     )
   if provider == "codex":
     return CodexCodingAgent(
+      credentials, chat_id, db, channel,
+      permission_mode=permission_mode,
+      system_prompt=system_prompt,
+    )
+  if provider == "opencode":
+    return OpenCodeCodingAgent(
       credentials, chat_id, db, channel,
       permission_mode=permission_mode,
       system_prompt=system_prompt,

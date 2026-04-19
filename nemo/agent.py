@@ -107,9 +107,11 @@ async def _send_response(
   try:
     if _should_send_plain_text(text):
       msg_id = await channel.send_text(chat_id, text)
+      log.info("Response sent transport=text chat=%s msg=%s", chat_id, msg_id)
     else:
       card = cards.build_markdown_card(text)
       msg_id = await channel.send_card(chat_id, card)
+      log.info("Response sent transport=card chat=%s msg=%s", chat_id, msg_id)
     db.record_sent(msg_id, text=text[:500], chat_id=chat_id)
     _register_msg(msg_id, chat_id)
     return msg_id
