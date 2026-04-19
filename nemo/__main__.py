@@ -63,12 +63,23 @@ def _ensure_codex_cli() -> None:
   sys.exit(1)
 
 
+def _ensure_opencode_cli() -> None:
+  """Ensure the local opencode CLI is available."""
+  if shutil.which("opencode"):
+    return
+  print("Error: opencode CLI not found in PATH.", file=sys.stderr)
+  sys.exit(1)
+
+
 def _ensure_provider_runtime(provider: str) -> None:
   if provider == "claude":
     _ensure_claude_sdk()
     return
   if provider == "codex":
     _ensure_codex_cli()
+    return
+  if provider == "opencode":
+    _ensure_opencode_cli()
     return
   print(f"Error: unsupported provider '{provider}'", file=sys.stderr)
   sys.exit(1)
@@ -276,7 +287,7 @@ def main():
   parser.add_argument("--chat-id", default="", help="Lark chat ID (auto-discovered if omitted)")
   parser.add_argument("--chat-name", default="", help="Find chat by name substring")
   parser.add_argument("--project-dir", default=".", help="Project directory (default: cwd)")
-  parser.add_argument("--provider", default="claude", choices=["claude", "codex"],
+  parser.add_argument("--provider", default="claude", choices=["claude", "codex", "opencode"],
                       help="Coding agent provider (default: claude)")
   parser.add_argument("--model", default="", help="Model to use (provider default if omitted)")
   parser.add_argument("--effort", default="", choices=["", "low", "medium", "high"],
