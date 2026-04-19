@@ -136,6 +136,19 @@ def _truncate_for_preview(text: str, limit: int = 2000) -> str:
   return text[:limit].rsplit("\n", 1)[0] + "\n\n_…truncated_"
 
 
+def _cancel_emoji(elapsed: float) -> str:
+  """Pick an emoji based on how long the turn ran before cancellation."""
+  if elapsed < 3:
+    return "👋"
+  if elapsed < 30:
+    return "🛑"
+  if elapsed < 120:
+    return "😮‍💨"
+  if elapsed < 300:
+    return "💨"
+  return "🫠"
+
+
 def _update_done_card_with_fallback(
   *,
   channel: LarkChannel,
@@ -593,7 +606,8 @@ async def main_loop(
           log.info("Session cleared card sent: %s", msg_id)
           await _restart_client()
         elif response == "__esc__":
-          await _send_response(channel, chat_id, "Operation cancelled.", db)
+          elapsed = time.time() - _turn_start
+          await _send_response(channel, chat_id, f"{_cancel_emoji(elapsed)} Operation cancelled.", db)
         elif response and response.startswith("__model__:"):
           new_model = response.split(":", 1)[1]
           if not is_model_compatible(provider, new_model):
@@ -1073,7 +1087,8 @@ async def main_loop(
           except Exception as exc:
             log.warning("SDK interrupt failed (%s), cancelling task", exc)
             sdk_task.cancel()
-          await _send_response(channel, chat_id, "Operation cancelled.", db)
+          elapsed = time.time() - _turn_start
+          await _send_response(channel, chat_id, f"{_cancel_emoji(elapsed)} Operation cancelled.", db)
           await _update_interrupt_card("stopped")
 
         elif signal_detected in ("exit", "dissolve"):
