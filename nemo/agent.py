@@ -101,6 +101,78 @@ def _should_send_plain_text(text: str) -> bool:
 
   return True
 
+
+def _merge_pending(pending: list[IncomingMessage]) -> IncomingMessage | None:
+  """Merge multiple pending messages into a single IncomingMessage.
+
+  Messages collected during a turn are combined so that the coding agent
+  receives one turn instead of N separate turns.  A short header tells
+  the model how many messages were merged.
+  """
+  if not pending:
+    return None
+  if len(pending) == 1:
+    return pending[0]
+
+  # Separate regular text messages from non-text (commands, card actions, etc.)
+  text_msgs: list[IncomingMessage] = []
+  other_msgs: list[IncomingMessage] = []
+  for msg in pending:
+    if msg.event_type in ("", "message") and msg.text.strip():
+      text_msgs.append(msg)
+    else:
+      other_msgs.append(msg)
+
+  merged: IncomingMessage | None = None
+  if text_msgs:
+    if len(text_msgs) == 1:
+      merged = text_msgs[0]
+    else:
+      lines = [f"[用户在上一轮工作期间发送了 {len(text_msgs)} 条消息]"]
+      for m in text_msgs:
+        lines.append(m.text.strip())
+      base = text_msgs[0]
+      merged = IncomingMessage(
+        event_type=base.event_type,
+        chat_id=base.chat_id,
+        chat_type=base.chat_type,
+        sender_id=base.sender_id,
+        message_id=text_msgs[-1].message_id,
+        msg_type="text",
+        text="\n".join(lines),
+        mentions=base.mentions,
+        create_time=text_msgs[-1].create_time,
+        raw=base.raw,
+      )
+
+  # Return merged text + any non-text messages that need separate handling
+  if other_msgs:
+    # Non-text messages (card actions, commands) stay individual
+    return merged, other_msgs  # type: ignore[return-value]
+  return merged
+
+
+def _requeue_pending(
+  pending: list[IncomingMessage],
+  channel: LarkChannel,
+) -> None:
+  """Merge pending messages and push back into the channel queue."""
+  if not pending:
+    return
+  result = _merge_pending(pending)
+  if result is None:
+    return
+  # _merge_pending returns a tuple when there are non-text messages
+  if isinstance(result, tuple):
+    merged, others = result
+    if merged is not None:
+      channel.push_back(merged)
+    for msg in others:
+      channel.push_back(msg)
+  else:
+    channel.push_back(result)
+
+
 async def _send_response(
   channel: LarkChannel, chat_id: str, text: str, db: Database,
 ) -> str | None:
@@ -932,6 +1004,8 @@ async def main_loop(
       signal_detected = None
 
       _pending_msgs: list = []
+      _pending_ack_msg_id: str = ""
+      _pending_ack_reaction_id: str = ""
 
       async def _dispatch_inline(response: str | None, msg: IncomingMessage) -> None:
         """Handle an inline-safe command during an active turn."""
@@ -1010,6 +1084,39 @@ async def main_loop(
         except Exception as e:
           log.warning("Inline command error: %s", e)
 
+      async def _ack_pending(msg: IncomingMessage) -> None:
+        """Move the OneSecond reaction to the latest pending message."""
+        nonlocal _pending_ack_msg_id, _pending_ack_reaction_id
+        # Remove from previous message
+        if _pending_ack_msg_id and _pending_ack_reaction_id:
+          try:
+            await channel.remove_reaction(
+              _pending_ack_msg_id, _pending_ack_reaction_id)
+          except Exception:
+            pass
+          _pending_ack_msg_id = ""
+          _pending_ack_reaction_id = ""
+        # Add to new message
+        if msg.message_id:
+          try:
+            _pending_ack_reaction_id = await channel.add_reaction(
+              msg.message_id, "OneSecond")
+            _pending_ack_msg_id = msg.message_id
+          except Exception as exc:
+            log.warning("Failed to ack pending message: %s", exc)
+
+      async def _clear_pending_ack() -> None:
+        """Remove the OneSecond reaction (before THINKING replaces it)."""
+        nonlocal _pending_ack_msg_id, _pending_ack_reaction_id
+        if _pending_ack_msg_id and _pending_ack_reaction_id:
+          try:
+            await channel.remove_reaction(
+              _pending_ack_msg_id, _pending_ack_reaction_id)
+          except Exception:
+            pass
+          _pending_ack_msg_id = ""
+          _pending_ack_reaction_id = ""
+
       async def _watch_signals():
         nonlocal signal_detected
         while not sdk_task.done():
@@ -1064,9 +1171,11 @@ async def main_loop(
             elif handled:
               # Needs SDK restart — re-queue for after turn
               _pending_msgs.append(msg)
+              await _ack_pending(msg)
               continue
           # Re-queue non-signal messages so they aren't lost
           _pending_msgs.append(msg)
+          await _ack_pending(msg)
 
       watcher = asyncio.create_task(_watch_signals())
 
@@ -1124,8 +1233,8 @@ async def main_loop(
             _turn_card_id, _turn_steps, _turn_start,
           )
           await _clear_ack()
-          for pending in _pending_msgs:
-            channel.push_back(pending)
+          await _clear_pending_ack()
+          _requeue_pending(_pending_msgs, channel)
           continue
         except Exception as exc:
           await _handle_turn_error(
@@ -1133,13 +1242,13 @@ async def main_loop(
             _turn_card_id, _turn_steps, _turn_start,
           )
           await _clear_ack()
-          for pending in _pending_msgs:
-            channel.push_back(pending)
+          await _clear_pending_ack()
+          _requeue_pending(_pending_msgs, channel)
           continue
 
       # Re-queue any messages consumed during the turn
-      for pending in _pending_msgs:
-        channel.push_back(pending)
+      await _clear_pending_ack()
+      _requeue_pending(_pending_msgs, channel)
 
     except KeyboardInterrupt:
       running = False

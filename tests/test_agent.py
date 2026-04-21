@@ -5,6 +5,8 @@ import urllib.error
 from unittest import mock
 
 from nemo.agent import (
+  _merge_pending,
+  _requeue_pending,
   _send_response,
   _should_send_plain_text,
   _update_done_card_with_fallback,
@@ -476,3 +478,79 @@ def test_send_response_uses_card_for_structured_multiline_layout():
   assert channel.sent_texts == []
   assert len(channel.sent_cards) == 1
   db.record_sent.assert_called_once_with("om_card", text=text, chat_id="oc_test")
+
+
+# ---------------------------------------------------------------------------
+# Pending message merging
+# ---------------------------------------------------------------------------
+
+from nemo.channel import IncomingMessage as _IM
+
+
+def _msg(text: str, **kw) -> _IM:
+  return _IM(event_type="message", chat_id="oc_test",
+             sender_id="ou_user", msg_type="text", text=text,
+             message_id=kw.get("message_id", "om_1"),
+             create_time=kw.get("create_time", "1"), **{
+               k: v for k, v in kw.items()
+               if k not in ("message_id", "create_time")
+             })
+
+
+def test_merge_pending_empty():
+  assert _merge_pending([]) is None
+
+
+def test_merge_pending_single():
+  m = _msg("hello")
+  result = _merge_pending([m])
+  assert result is m
+
+
+def test_merge_pending_multiple_text():
+  msgs = [
+    _msg("帮我改一下登录页", message_id="om_1", create_time="1"),
+    _msg("就是那个颜色太丑了", message_id="om_2", create_time="2"),
+    _msg("改成蓝色的", message_id="om_3", create_time="3"),
+  ]
+  result = _merge_pending(msgs)
+  assert isinstance(result, _IM)
+  assert "[用户在上一轮工作期间发送了 3 条消息]" in result.text
+  assert "帮我改一下登录页" in result.text
+  assert "改成蓝色的" in result.text
+  # Uses last message's id and create_time
+  assert result.message_id == "om_3"
+  assert result.create_time == "3"
+
+
+def test_merge_pending_with_non_text():
+  """Non-text messages (card actions) are returned separately."""
+  text_msg = _msg("hello", message_id="om_1")
+  card_msg = _IM(event_type="card.action.trigger", chat_id="oc_test",
+                 action_value={"action": "approve"})
+  result = _merge_pending([text_msg, card_msg])
+  # Returns tuple: (merged_text, [non_text_msgs])
+  assert isinstance(result, tuple)
+  merged, others = result
+  assert merged.text == "hello"  # single text msg, no header
+  assert len(others) == 1
+  assert others[0].event_type == "card.action.trigger"
+
+
+def test_requeue_pending_merges():
+  """_requeue_pending pushes a single merged message back."""
+  pushed: list[_IM] = []
+
+  class _FakeCh:
+    def push_back(self, msg):
+      pushed.append(msg)
+
+  msgs = [
+    _msg("first", message_id="om_1"),
+    _msg("second", message_id="om_2"),
+  ]
+  _requeue_pending(msgs, _FakeCh())  # type: ignore[arg-type]
+  assert len(pushed) == 1
+  assert "[用户在上一轮工作期间发送了 2 条消息]" in pushed[0].text
+  assert "first" in pushed[0].text
+  assert "second" in pushed[0].text
