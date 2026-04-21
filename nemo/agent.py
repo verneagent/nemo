@@ -596,6 +596,10 @@ async def main_loop(
         log.info("Ignoring card action outside turn: %s", reply.action_value)
         continue
 
+      # Skip recall events at top level (handled during turns)
+      if reply.event_type == "im.message.recalled_v1":
+        continue
+
       # Scope to this session's chat (WebSocket receives all chats)
       if reply.chat_id and reply.chat_id != chat_id:
         log.debug("Skipping: wrong chat %s (expected %s)", reply.chat_id, chat_id)
@@ -1135,6 +1139,21 @@ async def main_loop(
             continue
           # Scope to this session's chat
           if msg.chat_id and msg.chat_id != chat_id:
+            continue
+          # Handle message recall: remove from pending queue
+          if msg.event_type == "im.message.recalled_v1":
+            recalled_id = msg.message_id
+            before = len(_pending_msgs)
+            _pending_msgs[:] = [
+              m for m in _pending_msgs if m.message_id != recalled_id
+            ]
+            if len(_pending_msgs) < before:
+              log.info("Recalled message %s removed from pending queue", recalled_id)
+              # Update OneSecond ack to the new last pending message
+              if _pending_msgs:
+                await _ack_pending(_pending_msgs[-1])
+              else:
+                await _clear_pending_ack()
             continue
           # Handle Stop button card action (check authorization)
           if msg.event_type == "card.action.trigger":

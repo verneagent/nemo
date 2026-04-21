@@ -554,3 +554,29 @@ def test_requeue_pending_merges():
   assert "[用户在上一轮工作期间发送了 2 条消息]" in pushed[0].text
   assert "first" in pushed[0].text
   assert "second" in pushed[0].text
+
+
+def test_merge_pending_after_recall():
+  """Recalling a message should leave it out of the merge."""
+  msgs = [
+    _msg("first", message_id="om_1"),
+    _msg("second", message_id="om_2"),
+    _msg("third", message_id="om_3"),
+  ]
+  # Simulate recall of om_2
+  recalled_id = "om_2"
+  msgs[:] = [m for m in msgs if m.message_id != recalled_id]
+
+  result = _merge_pending(msgs)
+  assert isinstance(result, _IM)
+  assert "[用户在上一轮工作期间发送了 2 条消息]" in result.text
+  assert "first" in result.text
+  assert "second" not in result.text
+  assert "third" in result.text
+
+
+def test_merge_pending_all_recalled():
+  """If all messages are recalled, nothing to merge."""
+  msgs = [_msg("only", message_id="om_1")]
+  msgs[:] = [m for m in msgs if m.message_id != "om_1"]
+  assert _merge_pending(msgs) is None

@@ -139,6 +139,17 @@ def _parse_card_action(payload: JsonObject) -> LarkEvent:
   )
 
 
+def _parse_recall_event(payload: JsonObject) -> LarkEvent:
+  """Parse an im.message.recalled_v1 event."""
+  event = payload.get("event", {})
+  return LarkEvent(
+    event_type="im.message.recalled_v1",
+    message_id=event.get("message_id", ""),
+    chat_id=event.get("chat_id", ""),
+    raw=payload,
+  )
+
+
 def _parse_reaction_event(payload: JsonObject) -> LarkEvent:
   """Parse an im.message.reaction.created_v1 event."""
   event = payload.get("event", {})
@@ -161,6 +172,8 @@ def parse_event(payload: JsonObject) -> LarkEvent:
     return _parse_card_action(payload)
   elif event_type == "im.message.reaction.created_v1":
     return _parse_reaction_event(payload)
+  elif event_type == "im.message.recalled_v1":
+    return _parse_recall_event(payload)
   else:
     return LarkEvent(event_type=event_type, raw=payload)
 

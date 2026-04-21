@@ -194,6 +194,22 @@ def test_convert_reaction():
 
 
 # ---------------------------------------------------------------------------
+# Recall conversion
+# ---------------------------------------------------------------------------
+
+def test_convert_recall():
+    msg = {
+        "msg_type": "recall",
+        "message_id": "om_recalled1",
+        "create_time": "1700000040000",
+    }
+    ev = _relay_msg_to_event(msg, "oc_chat1")
+    assert ev.event_type == "im.message.recalled_v1"
+    assert ev.message_id == "om_recalled1"
+    assert ev.chat_id == "oc_chat1"
+
+
+# ---------------------------------------------------------------------------
 # Missing fields — graceful defaults
 # ---------------------------------------------------------------------------
 

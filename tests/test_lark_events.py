@@ -147,6 +147,24 @@ def test_parse_reaction():
 
 
 # ---------------------------------------------------------------------------
+# _parse_recall_event
+# ---------------------------------------------------------------------------
+
+def test_parse_recall():
+  payload = {
+    "header": {"event_type": "im.message.recalled_v1"},
+    "event": {
+      "message_id": "om_recalled1",
+      "chat_id": "oc_chat1",
+    },
+  }
+  ev = parse_event(payload)
+  assert ev.event_type == "im.message.recalled_v1"
+  assert ev.message_id == "om_recalled1"
+  assert ev.chat_id == "oc_chat1"
+
+
+# ---------------------------------------------------------------------------
 # Unknown event type
 # ---------------------------------------------------------------------------
 

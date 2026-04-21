@@ -50,6 +50,15 @@ def _relay_msg_to_event(msg: JsonObject, chat_id: str) -> LarkEvent:
             create_time=msg.get("create_time", ""),
         )
 
+    # Message recall
+    if msg_type == "recall":
+        return LarkEvent(
+            event_type="im.message.recalled_v1",
+            chat_id=chat_id,
+            message_id=msg.get("message_id", ""),
+            create_time=msg.get("create_time", ""),
+        )
+
     # Reaction
     if msg_type == "reaction":
         return LarkEvent(
