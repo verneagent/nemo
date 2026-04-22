@@ -176,6 +176,9 @@ def _requeue_pending(
 async def _send_response(
   channel: LarkChannel, chat_id: str, text: str, db: Database,
 ) -> str | None:
+  text = text.strip()
+  if not text:
+    return None
   try:
     if _should_send_plain_text(text):
       msg_id = await channel.send_text(chat_id, text)

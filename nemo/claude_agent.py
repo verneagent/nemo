@@ -230,6 +230,7 @@ class ClaudeCodingAgent(CodingAgent):
         "Bash", "BashOutput", "KillShell",
         "Glob", "Grep", "WebSearch", "WebFetch", "TodoWrite",
         "AskUserQuestion",
+        "mcp__*",
       ],
       setting_sources=["user", "project"],
       permission_mode=cast(PermissionMode, self._permission_mode),
