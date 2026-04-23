@@ -10,3 +10,7 @@ build/
 .idea/
 .DS_Store
 nemo/codex_sidecar/node_modules/
+.claude/
+.playwright-cli/
+pytest-of-*/
+nemo-card-preview.png
