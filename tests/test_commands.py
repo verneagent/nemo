@@ -367,6 +367,12 @@ def test_inline_safe_diag():
   assert is_inline_safe(resp)
 
 
+def test_inline_safe_name():
+  _, resp = try_dispatch("/name New Group", _ctx())
+  assert is_inline_safe(resp)
+  assert resp == "__name__:New Group"
+
+
 def test_not_inline_safe_clear():
   _, resp = try_dispatch("/clear", _ctx())
   assert not is_inline_safe(resp)
