@@ -1,7 +1,7 @@
 """Status tabs — show model and WebSocket status as separate chat tabs.
 
 Two tabs:
-  1. Model tab: shows the model name (e.g. "claude-opus-4-6")
+  1. Model tab: shows the model name (e.g. "claude-opus-4-7")
   2. WS status tab: emoji only (🟢 idle, 🟡 working, 🔴 stopped)
 
 Tabs are identified by URL markers (?type=nemo-status, ?type=nemo-model),

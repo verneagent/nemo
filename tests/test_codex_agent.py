@@ -69,13 +69,14 @@ class _FakeProc:
 
 
 def test_default_model_for_provider():
-  assert default_model_for_provider("claude") == "claude-opus-4-6"
+  assert default_model_for_provider("claude") == "claude-opus-4-7"
   # Codex default must work for both ChatGPT subscribers and API users —
   # the codex-specialized (-codex) slugs are API-only.
   assert default_model_for_provider("codex") == "gpt-5.4"
 
 
 def test_is_model_compatible():
+  assert is_model_compatible("claude", "claude-opus-4-7")
   assert is_model_compatible("claude", "claude-opus-4-6")
   assert not is_model_compatible("claude", "gpt-5-codex")
   assert is_model_compatible("codex", "gpt-5-codex")

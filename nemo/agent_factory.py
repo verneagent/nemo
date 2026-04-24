@@ -17,7 +17,7 @@ type AgentProvider = Literal["claude", "codex", "opencode"]
 DEFAULT_PROVIDER: AgentProvider = "claude"
 
 _DEFAULT_MODEL_BY_PROVIDER: dict[AgentProvider, str] = {
-  "claude": "claude-opus-4-6",
+  "claude": "claude-opus-4-7",
   # gpt-5.4 works for both ChatGPT subscribers and API users. The codex-
   # specialized slugs (-codex variants) are API-only and return HTTP 400
   # for ChatGPT accounts, so they make a poor default.
@@ -36,7 +36,7 @@ class ModelCatalog:
     can't use these — e.g. codex-specialized variants). Still accepted
     by the picker; rendered in a separate help section.
   - ``hidden``: full slugs accepted but not shown (legacy / experimental).
-  - ``aliases``: short name → canonical full slug (e.g. ``opus`` → ``claude-opus-4-6``).
+  - ``aliases``: short name → canonical full slug (e.g. ``opus`` → ``claude-opus-4-7``).
   """
   visible: tuple[str, ...] = ()
   api_only: tuple[str, ...] = ()
@@ -57,14 +57,16 @@ class ModelCatalog:
 _CATALOG_BY_PROVIDER: dict[AgentProvider, ModelCatalog] = {
   "claude": ModelCatalog(
     visible=(
-      "claude-opus-4-6",
+      "claude-opus-4-7",
       "claude-sonnet-4-6",
       "claude-haiku-4-5",
       "opusplan",
     ),
-    hidden=(),
+    hidden=(
+      "claude-opus-4-6",
+    ),
     aliases={
-      "opus": "claude-opus-4-6",
+      "opus": "claude-opus-4-7",
       "sonnet": "claude-sonnet-4-6",
       "haiku": "claude-haiku-4-5",
     },

@@ -68,7 +68,7 @@ nemo -v
 
 | Provider | Default model | Runtime | Extra requirements |
 |---|---|---|---|
-| `claude` (default) | `claude-opus-4-6` | In-process Claude Agent SDK | `ANTHROPIC_API_KEY` or logged-in Claude credentials |
+| `claude` (default) | `claude-opus-4-7` | In-process Claude Agent SDK | `ANTHROPIC_API_KEY` or logged-in Claude credentials |
 | `codex` | `gpt-5-codex` | Node sidecar (`codex_sidecar/run_turn.mjs`) around `@openai/codex-sdk` | `node`, the `codex` CLI on `PATH`, and `OPENAI_API_KEY` (or `CODEX_API_KEY`). Install sidecar deps with `npm --prefix codex_sidecar install`. |
 
 Switch at startup with `--provider`, or at runtime with `/model <name>` — nemo auto-rejects models that don't match the current provider.

@@ -58,7 +58,7 @@ def test_valid_args_calls_main_loop(tmp_path):
 
 
 def test_default_model(tmp_path):
-  """Default model should be claude-opus-4-6."""
+  """Default model should be claude-opus-4-7."""
   project = str(tmp_path)
   with mock.patch("sys.argv", ["nemo", "--chat-id", "oc_1",
                                 "--project-dir", project]):
