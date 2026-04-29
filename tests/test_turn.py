@@ -179,13 +179,13 @@ def test_stale_task_detection():
     attempt 1 (drain):              clean response, mode → real;
     attempt 2 (real, clean):        real answer delivered.
   """
-  from nemo.turn import DRAIN_PROMPT
+  from nemo.turn import DRAIN_PROMPT_MARKER
   stale_messages = [
     FakeTaskNotificationMessage(task_id="stale_1", status="completed"),
     FakeResultMessage(total_cost_usd=0.01),
   ]
   drain_clean_messages = [
-    FakeAssistantMessage(content=[FakeTextBlock(text="ack")]),
+    FakeAssistantMessage(content=[FakeTextBlock(text="NEMO_DRAIN_OK xxxx")]),
     FakeResultMessage(total_cost_usd=0.0),
   ]
   real_messages = [
@@ -226,24 +226,25 @@ def test_stale_task_detection():
   assert call_count == 3, f"expected 3 turns (real+drain+real), got {call_count}"
   # Prompt ordering: real (contaminated), drain, real (clean).
   assert sent_prompts[0] == "test"
-  assert sent_prompts[1] == DRAIN_PROMPT
+  assert sent_prompts[1].startswith(DRAIN_PROMPT_MARKER), \
+    f"drain prompt must carry the drain marker, got: {sent_prompts[1][:80]!r}"
   assert sent_prompts[2] == "test"
   # Drain turn's AssistantMessage must not surface as AnswerEvent.
   answer_events = [e for e in events if isinstance(e, AnswerEvent)]
   assert any(e.text == "Fresh response" for e in answer_events)
-  assert not any(e.text == "ack" for e in answer_events), \
-    "drain turn's 'ack' reply must not leak to on_event"
+  assert not any(e.text.startswith("NEMO_DRAIN_OK") for e in answer_events), \
+    "drain turn's reply must not leak to on_event"
 
 
 def test_drain_does_not_amplify_stale_tasks():
-  """Drain turns use DRAIN_PROMPT and must not emit TaskStartedEvents.
+  """Drain turns use a drain prompt that must not emit TaskStartedEvents.
 
   Even if the SDK delivers a TaskStartedMessage during a drain turn (which
-  shouldn't happen because DRAIN_PROMPT forbids tools, but we verify
+  shouldn't happen because the drain prompt forbids tools, but we verify
   defensively), the event must be suppressed so the consumer doesn't think
   the user turn is spawning tasks.
   """
-  from nemo.turn import DRAIN_PROMPT
+  from nemo.turn import DRAIN_PROMPT_MARKER
   stale_messages = [
     FakeTaskNotificationMessage(task_id="stale_1", status="completed"),
     FakeTaskStartedMessage(task_id="rogue_in_drain"),
@@ -278,8 +279,9 @@ def test_drain_does_not_amplify_stale_tasks():
                      stale_tasks={"stale_1"})
   asyncio.run(_run())
 
-  # Drain prompt must have been used
-  assert DRAIN_PROMPT in sent_prompts
+  # Drain prompt must have been used (identified by its marker).
+  assert any(p.startswith(DRAIN_PROMPT_MARKER) for p in sent_prompts), \
+    "no drain-marked prompt was sent"
   # No TaskStartedEvent must reach the consumer
   assert not any(isinstance(e, TaskStartedEvent) for e in events), \
     "drain-turn TaskStartedMessage leaked as TaskStartedEvent"
@@ -293,7 +295,7 @@ def test_multiple_stales_drained_without_amplification():
   clears exactly one stale notification, and after all are drained the
   real prompt runs cleanly. Cost is cumulative across all turns.
   """
-  from nemo.turn import DRAIN_PROMPT
+  from nemo.turn import DRAIN_PROMPT_MARKER
   ids = ["stale_a", "stale_b", "stale_c"]
   # Turn 0 (real, contaminated): sees first stale, suppresses rest.
   # Turns 1-2 (drain): each sees one more stale.
@@ -306,7 +308,7 @@ def test_multiple_stales_drained_without_amplification():
      FakeResultMessage(total_cost_usd=0.0)],
     [FakeTaskNotificationMessage(task_id=ids[2], status="completed"),
      FakeResultMessage(total_cost_usd=0.0)],
-    [FakeAssistantMessage(content=[FakeTextBlock(text="ack")]),
+    [FakeAssistantMessage(content=[FakeTextBlock(text="NEMO_DRAIN_OK xxxx")]),
      FakeResultMessage(total_cost_usd=0.0)],
     [FakeAssistantMessage(content=[FakeTextBlock(text="final answer")]),
      FakeResultMessage(total_cost_usd=0.05, usage={"input_tokens": 50})],
@@ -339,7 +341,14 @@ def test_multiple_stales_drained_without_amplification():
   assert call_count == 5, f"expected 5 turns (real+3 drain+real), got {call_count}"
   # First prompt is real (contaminated), next three are drain, last is real.
   assert sent_prompts[0] == "real"
-  assert sent_prompts[1:4] == [DRAIN_PROMPT] * 3
+  drain_prompts = sent_prompts[1:4]
+  assert all(p.startswith(DRAIN_PROMPT_MARKER) for p in drain_prompts), \
+    f"drain prompts must carry the drain marker, got: {drain_prompts!r}"
+  # Each drain must be UNIQUE — that's the whole point of fix 1: no fixed
+  # answer template can poison the model into replying the same way to the
+  # next real user message.
+  assert len(set(drain_prompts)) == len(drain_prompts), \
+    "drain prompts must be unique per call (nonce-bearing)"
   assert sent_prompts[4] == "real"
   # Only the final real answer must surface.
   answer_texts = [e.text for e in events if isinstance(e, AnswerEvent)]

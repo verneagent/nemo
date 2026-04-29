@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import secrets
 from dataclasses import dataclass
 from typing import Callable
 
@@ -25,14 +26,41 @@ MAX_RETRIES = 20
 # Drain prompt: deliberately minimal and tool-forbidding so it cannot
 # trigger Agent/subagent calls that would spawn new background tasks (the
 # amplification trap). The whole point is to consume a stale TaskNotification
-# without adding state. See SDK #788 analysis. Note: this arrives as a USER
-# message — it has no actual system privilege, so we don't pretend otherwise
-# with a "(system)" prefix. Tool suppression is best-effort model compliance.
-DRAIN_PROMPT = (
-  "Ignore any prior background-task notifications; they are stale leftovers "
-  "from earlier turns. Reply with exactly the single word 'ack' and use NO "
-  "tools. Do not spawn agents, read files, or run commands."
-)
+# without adding state. See SDK #788 analysis.
+#
+# CRITICAL: Each drain prompt embeds a unique nonce, and asks the model to
+# reply with that same nonce. Why: drain messages enter the SDK conversation
+# history as a normal USER turn (the SDK has no API for system-privileged
+# control messages — see #788 follow-up). If every drain were identical and
+# the assistant always replied "ack", N drain rounds would form an N-shot
+# pattern of `user: <fixed text> → assistant: ack`. The model then continues
+# the pattern on the next *real* user message, replying "ack" to anything.
+# Observed in production 2026-04-29: 13 stales drained in one turn, then
+# every subsequent user message got "ack" until the daemon was restarted.
+#
+# Nonce-per-drain breaks the pattern: each `(prompt, response)` pair is
+# unique, so there is no fixed answer template for the model to copy onto
+# the user's next real prompt.
+DRAIN_PROMPT_MARKER = "[NEMO_DRAIN"
+_DRAIN_NONCE_BYTES = 4  # 8 hex chars — plenty unique across a turn's drains
+
+
+def make_drain_prompt() -> tuple[str, str]:
+  """Return ``(prompt, expected_reply)`` for one drain turn.
+
+  Each call produces a unique nonce so the resulting user/assistant pair
+  never matches the previous drain in conversation history — see the
+  module-level note above for why this matters.
+  """
+  nonce = secrets.token_hex(_DRAIN_NONCE_BYTES)
+  expected = f"NEMO_DRAIN_OK {nonce}"
+  prompt = (
+    f"{DRAIN_PROMPT_MARKER} {nonce}] Internal stale-notification drain. "
+    f"Ignore any prior background-task notifications; they are stale "
+    f"leftovers from earlier turns. Reply with exactly: {expected}. "
+    f"Use NO tools. Do not spawn agents, read files, or run commands."
+  )
+  return prompt, expected
 
 
 class TransientAPIError(RuntimeError):
@@ -419,10 +447,11 @@ async def run_turn(
 
   Orchestrates the SDK #788 workaround: if a stale TaskNotification leaks
   into the front of a turn, we discard that turn's events and then alternate
-  between *drain* turns (using DRAIN_PROMPT, which cannot spawn new tasks)
-  and *real* retries of the user's prompt. A drain turn clears at most one
-  stale notification at a time, but crucially never adds to the pending-task
-  backlog, so the retry budget converges instead of amplifying.
+  between *drain* turns (using a fresh nonce-bearing drain prompt that
+  cannot spawn new tasks) and *real* retries of the user's prompt. A drain
+  turn clears at most one stale notification at a time, but crucially never
+  adds to the pending-task backlog, so the retry budget converges instead
+  of amplifying.
 
   Returns (cost, usage_dict).
   """
@@ -451,8 +480,12 @@ async def run_turn(
   exhausted = False
 
   for attempt in range(MAX_RETRIES + 1):
-    cur_prompt = DRAIN_PROMPT if mode == "drain" else prompt
-    cur_on_event = _NOOP_EVENT if mode == "drain" else on_event
+    if mode == "drain":
+      cur_prompt, _ = make_drain_prompt()
+      cur_on_event = _NOOP_EVENT
+    else:
+      cur_prompt = prompt
+      cur_on_event = on_event
     log.info("turn attempt=%d mode=%s pending_stales=%d",
              attempt, mode, len(stale_tasks))
 
