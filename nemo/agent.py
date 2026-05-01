@@ -392,6 +392,18 @@ async def _handle_diag(
     log.error("Failed to send diag card: %s", e)
 
 
+# When an SDK turn times out the underlying CLI/agent is usually choking on a
+# heavy context that's been asked to do too much at once. The next user turn
+# gets this preamble so the agent paces itself instead of repeating the
+# overrun. One-shot per timeout — cleared on /clear or after one use.
+_PACING_HINT_PREFIX = (
+  "[Nemo 系统提示] 上一回合超时了——通常是上下文较重、一次想做太多事造成的。"
+  "这一回合请放慢节奏：把工作拆成多个小步，每回合只做一步，做完等用户确认再继续，"
+  "不要试图一次完成所有事。\n\n"
+  "（以下是用户的新消息）\n"
+)
+
+
 # ---------------------------------------------------------------------------
 # Main loop
 # ---------------------------------------------------------------------------
@@ -562,6 +574,9 @@ async def main_loop(
   main_loop_ref = asyncio.get_running_loop()
   running = True
   _dissolve_on_exit = False
+  # One-shot flag: prepend a pacing hint to the next user prompt after an
+  # SDK timeout. Cleared after use or on /clear.
+  _pending_pacing_hint = False
 
   def handle_sig(_sig, _frame):
     nonlocal running
@@ -684,6 +699,7 @@ async def main_loop(
           _register_msg(msg_id, chat_id)
           log.info("Session cleared card sent: %s", msg_id)
           await _restart_client()
+          _pending_pacing_hint = False
         elif response == "__esc__":
           elapsed = time.time() - _turn_start
           await _send_response(channel, chat_id, f"{_cancel_emoji(elapsed)} Operation cancelled.", db)
@@ -1003,8 +1019,14 @@ async def main_loop(
               _await_channel(_send_response(channel, chat_id, final_text, db))
           ctx.total_cost += event.cost
 
+      if _pending_pacing_hint:
+        log.info("Prepending pacing hint after prior timeout")
+        prompt_for_agent = _PACING_HINT_PREFIX + user_message
+        _pending_pacing_hint = False
+      else:
+        prompt_for_agent = user_message
       sdk_task = asyncio.create_task(
-        agent.run_turn(user_message, _on_event)
+        agent.run_turn(prompt_for_agent, _on_event)
       )
 
       # Concurrent signal watcher: read events during SDK execution
@@ -1262,6 +1284,7 @@ async def main_loop(
             exc, channel, chat_id, db, session_id,
             _turn_card_id, _turn_steps, _turn_start,
           )
+          _pending_pacing_hint = True
           await _clear_ack()
           await _clear_pending_ack()
           _requeue_pending(_pending_msgs, channel)

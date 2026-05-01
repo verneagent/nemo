@@ -206,6 +206,75 @@ def test_text_only_turn_clears_thinking_reaction(tmp_path):
   remove_reaction.assert_awaited_once_with("om_src", "r_thinking")
 
 
+def test_pacing_hint_prepended_after_timeout(tmp_path):
+  """After a TimeoutError the next turn's prompt is prefixed with a pacing hint;
+  the hint is not applied to subsequent turns."""
+  from nemo.channel import IncomingMessage
+
+  class _TimeoutThenOkAgent(_FakeAgent):
+    def __init__(self):
+      self.prompts: list[str] = []
+      self._calls = 0
+
+    async def run_turn(self, prompt, on_event):
+      self.prompts.append(prompt)
+      self._calls += 1
+      if self._calls == 1:
+        raise TimeoutError("simulated SDK heartbeat timeout")
+      def _emit():
+        on_event(AnswerEvent("ok"))
+        on_event(DoneEvent(cost=0.0, usage={}))
+      await asyncio.to_thread(_emit)
+      return 0.0, {}
+
+  class _PushBackChannel(_QueuedChannel):
+    """_QueuedChannel that actually re-inserts pushed-back messages so the
+    timeout requeue path is observable in tests."""
+    def push_back(self, message):
+      self._messages.insert(0, message)
+
+  msg_user = lambda mid, text, ts: IncomingMessage(
+    event_type="im.message.receive_v1", chat_id="oc_test",
+    sender_id="ou_user", message_id=mid, msg_type="text",
+    text=text, create_time=ts,
+  )
+
+  agent = _TimeoutThenOkAgent()
+  # /clear between turns 2 and 3 ensures /exit is consumed at top-of-loop
+  # rather than caught mid-turn by the signal watcher.
+  queued = _PushBackChannel("oc_test", [
+    msg_user("om1", "do the big task", "1"),
+    msg_user("om2", "continue", "2"),
+    msg_user("om3", "and then this", "3"),
+    msg_user("om_exit", "/exit", "4"),
+  ])
+
+  with mock.patch("nemo.agent.load_credentials", return_value={
+    "app_id": "app_id",
+    "app_secret": "app_secret",
+    "email": "user@example.com",
+  }), \
+       mock.patch("nemo.agent.Database", _FakeDB), \
+       mock.patch("nemo.agent.LarkChannel", return_value=queued), \
+       mock.patch("nemo.agent.build_coding_agent", return_value=agent), \
+       mock.patch("nemo.group_config.load_config", return_value={}), \
+       mock.patch("nemo.config.load_relay_config", return_value=("", "")), \
+       mock.patch("signal.signal"):
+    result = asyncio.run(main_loop("oc_test", str(tmp_path), "claude-opus-4-6"))
+
+  assert result == 0
+  # We only assert that the second turn (post-timeout) has the hint and the
+  # first turn does not. Whether a third user turn lands before /exit's signal
+  # depends on watcher scheduling, which is out of scope for this test.
+  assert len(agent.prompts) >= 2
+  assert agent.prompts[0] == "do the big task"
+  assert agent.prompts[1].startswith("[Nemo 系统提示]")
+  assert "continue" in agent.prompts[1]
+  # Any later prompt must not carry the hint — one-shot semantics.
+  for later in agent.prompts[2:]:
+    assert not later.startswith("[Nemo 系统提示]"), later
+
+
 def test_codex_provider_rejects_claude_model_switch(tmp_path):
   from nemo.channel import IncomingMessage
 
