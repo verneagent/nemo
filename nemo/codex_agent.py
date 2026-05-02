@@ -29,6 +29,9 @@ _SIDE_CAR_NODE_MODULES = _SIDE_CAR_DIR / "node_modules"
 
 # Valid values for Codex SDK's ThreadOptions.modelReasoningEffort.
 _CODEX_EFFORT_LEVELS = frozenset({"low", "medium", "high"})
+# Shared knob accepts "max" (Claude's top tier). Codex tops out at "high",
+# so we clamp instead of rejecting.
+_CLAUDE_TO_CODEX_EFFORT = {"max": "high"}
 
 
 def _short(text: str, limit: int) -> str:
@@ -61,7 +64,8 @@ class CodexCodingAgent(CodingAgent):
     self._interrupted = False
 
   def set_effort(self, effort: str) -> None:
-    self._effort = effort if effort in _CODEX_EFFORT_LEVELS else ""
+    mapped = _CLAUDE_TO_CODEX_EFFORT.get(effort, effort)
+    self._effort = mapped if mapped in _CODEX_EFFORT_LEVELS else ""
 
   async def start(self, project_dir: str, model: str, resume: str = "") -> None:
     self._ensure_runtime()

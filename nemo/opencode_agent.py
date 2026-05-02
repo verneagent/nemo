@@ -91,6 +91,9 @@ class OpenCodeCodingAgent(CodingAgent):
     self._interrupted = False
 
   def set_effort(self, effort: str) -> None:
+    # OpenCode prefix tops out at "high"; clamp Claude's "max" down.
+    if effort == "max":
+      effort = "high"
     self._effort = effort if effort in ("", "low", "medium", "high") else ""
 
   async def start(self, project_dir: str, model: str, resume: str = "") -> None:

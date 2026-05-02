@@ -290,7 +290,7 @@ def main():
   parser.add_argument("--provider", default="claude", choices=["claude", "codex", "opencode"],
                       help="Coding agent provider (default: claude)")
   parser.add_argument("--model", default="", help="Model to use (provider default if omitted)")
-  parser.add_argument("--effort", default="", choices=["", "low", "medium", "high"],
+  parser.add_argument("--effort", default="", choices=["", "low", "medium", "high", "max"],
                       help="Reasoning effort for the coding agent (default: provider default)")
   parser.add_argument("--profile", default="default", help="Config profile name (default: default)")
   parser.add_argument("--permission-mode", default="bypassPermissions",

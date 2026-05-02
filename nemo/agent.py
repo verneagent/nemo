@@ -727,7 +727,12 @@ async def main_loop(
           detail_map = commands._EFFORT_DETAIL.get(provider, {})
           detail = detail_map.get(new_effort, "")
           hint = f" — {detail}" if detail else ""
-          log.info("Reasoning effort set to %s", label)
+          log.info("Reasoning effort set to %s — restarting client (resume=%s)",
+                   label, _sdk_session_id[:8] if _sdk_session_id else "none")
+          # Effort lives on SDK options for native-effort backends (Claude),
+          # so we must rebuild options + reconnect for the change to apply.
+          # Codex/OpenCode reset is essentially free.
+          await _restart_client(resume=_sdk_session_id)
           await _send_response(channel, chat_id, f"Reasoning effort: **{label}**{hint}.", db)
         elif response and response.startswith("__cd__:"):
           new_dir = response.split(":", 1)[1]
@@ -1114,6 +1119,7 @@ async def main_loop(
             detail_map = commands._EFFORT_DETAIL.get(provider, {})
             detail = detail_map.get(new_effort, "")
             hint = f" — {detail}" if detail else ""
+            await _restart_client(resume=_sdk_session_id)
             await _send_response(channel, chat_id, f"Reasoning effort: **{label}**{hint}.", db)
           elif response:
             # Text responses: /ping, /cost, /help, /usage, /guest help, /norm help

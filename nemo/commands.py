@@ -7,7 +7,7 @@ import re
 import time
 
 
-_EFFORT_LEVELS = ("low", "medium", "high")
+_EFFORT_LEVELS = ("low", "medium", "high", "max")
 
 
 def _format_model_catalog(catalog) -> str:
@@ -32,22 +32,25 @@ def _format_model_catalog(catalog) -> str:
 # What each effort level actually does per provider.
 _EFFORT_DETAIL: dict[str, dict[str, str]] = {
   "claude": {
-    "": "medium in Claude Code",
-    "low": "think",
-    "medium": "think hard",
-    "high": "ultrathink",
+    "": "high (SDK default)",
+    "low": "low effort",
+    "medium": "medium effort",
+    "high": "high effort",
+    "max": "max effort (no token cap)",
   },
   "codex": {
     "": "medium in Codex",
     "low": "low",
     "medium": "medium",
     "high": "high",
+    "max": "high (Codex tops out at high)",
   },
   "opencode": {
     "": "normal reasoning",
     "low": "lighter prompt guidance",
     "medium": "default",
     "high": "stronger prompt guidance",
+    "max": "stronger prompt guidance (max → high)",
   },
 }
 
@@ -109,7 +112,7 @@ def try_dispatch(text: str, ctx: AgentContext) -> tuple[bool, str | None]:
         return True, f"__effort__:{arg}"
       return True, (
         f"Unknown effort level: `{arg}`. "
-        f"Use `/effort low|medium|high|default`."
+        f"Use `/effort low|medium|high|max|default`."
       )
     current = ctx.effort or "default"
     detail_map = _EFFORT_DETAIL.get(ctx.provider, {})
@@ -117,7 +120,7 @@ def try_dispatch(text: str, ctx: AgentContext) -> tuple[bool, str | None]:
     hint = f" — {detail}" if detail else ""
     return True, (
       f"Current effort: **{current}**{hint}\n\n"
-      f"Usage: `/effort low|medium|high|default`"
+      f"Usage: `/effort low|medium|high|max|default`"
     )
 
   # /esc
@@ -174,7 +177,7 @@ def try_dispatch(text: str, ctx: AgentContext) -> tuple[bool, str | None]:
       "| `/model` | Show current model |\n"
       "| `/model <name>` | Switch model |\n"
       "| `/effort` | Show current reasoning effort |\n"
-      "| `/effort <low\\|medium\\|high\\|default>` | Set reasoning effort |\n"
+      "| `/effort <low\\|medium\\|high\\|max\\|default>` | Set reasoning effort |\n"
       "| `/clear` | Reset conversation |\n"
       "| `/cd <dir>` | Change working directory |\n"
       "| `/esc` | Cancel current operation |\n"

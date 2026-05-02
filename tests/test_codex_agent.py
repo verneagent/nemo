@@ -134,19 +134,43 @@ def test_codex_set_effort_rejects_invalid():
   assert agent._effort == ""
 
 
-def test_claude_prefix_prompt_effort_keywords():
+def test_codex_set_effort_clamps_max_to_high():
+  # Codex SDK has no `max` tier — clamp Claude's max down to high so the
+  # shared knob accepts it without rejecting the user's intent.
+  agent = CodexCodingAgent({}, "oc_1", _DummyDB(), _DummyChannel())
+  agent.set_effort("max")
+  assert agent._effort == "high"
+
+
+def test_claude_set_effort_uses_native_sdk_field():
   agent = ClaudeCodingAgent({}, "oc_1", _DummyDB(), _DummyChannel())
-  assert agent._prefix_prompt("fix bug") == "fix bug"
-  agent.set_effort("low")
-  assert agent._prefix_prompt("fix bug") == "think\n\nfix bug"
-  agent.set_effort("medium")
-  assert agent._prefix_prompt("fix bug") == "think hard\n\nfix bug"
-  agent.set_effort("high")
-  assert agent._prefix_prompt("fix bug") == "ultrathink\n\nfix bug"
+  # All four levels supported by claude-agent-sdk's effort literal.
+  for level in ("low", "medium", "high", "max"):
+    agent.set_effort(level)
+    assert agent._effort == level
   agent.set_effort("")
-  assert agent._prefix_prompt("fix bug") == "fix bug"
+  assert agent._effort == ""
   agent.set_effort("bogus")
-  assert agent._prefix_prompt("fix bug") == "fix bug"
+  assert agent._effort == ""
+  agent.set_effort("ultrathink")  # old keyword, no longer accepted as a level
+  assert agent._effort == ""
+
+
+def test_claude_build_options_passes_native_effort():
+  # _build_options grabs the running loop for the askq handler, so wrap
+  # the assertions in an async context.
+  async def _run():
+    agent = ClaudeCodingAgent({}, "oc_1", _DummyDB(), _DummyChannel())
+    agent.set_effort("max")
+    opts = agent._build_options("/tmp/project", "claude-opus-4-7")
+    assert getattr(opts, "effort", None) == "max"
+
+    agent.set_effort("")
+    opts = agent._build_options("/tmp/project", "claude-opus-4-7")
+    # Empty string clears effort — option should be unset (None).
+    assert getattr(opts, "effort", None) is None
+
+  asyncio.run(_run())
 
 
 def test_codex_prepare_prompt_injects_system_prompt_on_first_turn():

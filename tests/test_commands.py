@@ -405,7 +405,7 @@ def test_effort_show_default():
   handled, resp = try_dispatch("/effort", _ctx())
   assert handled
   assert "default" in resp
-  assert "medium in Claude Code" in resp
+  assert "SDK default" in resp
   assert "Usage" in resp
 
 
@@ -415,7 +415,6 @@ def test_effort_show_current():
   handled, resp = try_dispatch("/effort", ctx)
   assert handled
   assert "high" in resp
-  assert "ultrathink" in resp
 
 
 def test_effort_set_low():
@@ -434,6 +433,12 @@ def test_effort_set_high():
   handled, resp = try_dispatch("/effort high", _ctx())
   assert handled
   assert resp == "__effort__:high"
+
+
+def test_effort_set_max():
+  handled, resp = try_dispatch("/effort max", _ctx())
+  assert handled
+  assert resp == "__effort__:max"
 
 
 def test_effort_off_clears():

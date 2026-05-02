@@ -55,9 +55,12 @@ class CodingAgent(ABC):
   def set_effort(self, effort: str) -> None:
     """Set reasoning effort for subsequent turns.
 
-    `effort` is one of "", "low", "medium", "high". Empty string clears
-    the setting. Concrete adapters override this to apply the value
-    (as a prompt prefix, CLI flag, etc). Default is no-op.
+    `effort` is one of "", "low", "medium", "high", "max". Empty string
+    clears the setting. Adapters whose backend tops out below `max`
+    should clamp it down (e.g. Codex/OpenCode → `high`). Default is no-op.
+
+    Effort is stored in the adapter; the host typically calls `reset()`
+    afterwards so the new value flows into the next turn.
     """
     del effort
 
