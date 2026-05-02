@@ -76,6 +76,12 @@ class ClaudeCodingAgent(CodingAgent):
     self._options: object = None
     self._effort = ""
     self._project_dir = ""
+    self._model = ""
+    # Latest sdk_session_id observed via DoneEvent. Used by the options
+    # factory so a mid-turn watchdog reconnect (sdk_thread.run_turn_with_reconnect)
+    # resumes the live session instead of starting a fresh one and dropping
+    # conversation context.
+    self._latest_session_id: str = ""
     # SDK #788 workaround — stale task ids carry across turns inside this
     # adapter. Kept here (not in the abstract CodingAgent interface) because
     # only the Claude SDK exhibits the bug.
@@ -92,6 +98,8 @@ class ClaudeCodingAgent(CodingAgent):
     # session now.
     self._stale_tasks.clear()
     self._project_dir = project_dir
+    self._model = model
+    self._latest_session_id = resume
     self._options = self._build_options(project_dir, model, resume=resume)
     await self._sdk.create_client(self._options)
 
@@ -100,9 +108,22 @@ class ClaudeCodingAgent(CodingAgent):
     prompt: str,
     on_event: Callable[[TurnEvent], None],
   ) -> tuple[float, JsonObject]:
+    from .turn import DoneEvent
+
+    def _wrapped(ev: TurnEvent) -> None:
+      if isinstance(ev, DoneEvent) and ev.session_id:
+        self._latest_session_id = ev.session_id
+      on_event(ev)
+
+    def _options_factory() -> object:
+      return self._build_options(
+        self._project_dir, self._model, resume=self._latest_session_id)
+
     return await self._sdk.run_turn_with_reconnect(
-      prompt, on_event,
-      stale_tasks=self._stale_tasks, options=self._options)
+      prompt, _wrapped,
+      stale_tasks=self._stale_tasks,
+      options=self._options,
+      options_factory=_options_factory)
 
   async def interrupt(self) -> None:
     self._sdk.cancel()
@@ -114,6 +135,8 @@ class ClaudeCodingAgent(CodingAgent):
     # on the new one — keeping them would force a pointless drain turn.
     self._stale_tasks.clear()
     self._project_dir = project_dir
+    self._model = model
+    self._latest_session_id = resume
     self._options = self._build_options(project_dir, model, resume=resume)
     await self._sdk.reconnect(self._options)
 

@@ -159,6 +159,7 @@ class SDKThread:
     on_event: Callable[[TurnEvent], None],
     stale_tasks: set[str] | None = None,
     options: object = None,
+    options_factory: Callable[[], object] | None = None,
     max_attempts: int = 3,
   ) -> tuple[float, JsonObject]:
     """Run turn with automatic reconnect on timeout or disconnection.
@@ -166,6 +167,12 @@ class SDKThread:
     On timeout or client disconnection, reconnects and retries. On the
     last attempt, raises immediately without wasting a reconnect.
     Checks _cancelled flag between attempts so interrupt can abort.
+
+    options_factory: optional callable invoked before each reconnect to
+    produce fresh options. Used by ClaudeCodingAgent to inject
+    `resume=<latest_session_id>` so a mid-turn watchdog reconnect
+    preserves conversation context. Falls back to the static `options`
+    parameter when not provided.
     """
     from .turn import TransientAPIError  # avoid import cycle
     self._cancelled.clear()
@@ -191,12 +198,13 @@ class SDKThread:
           else:
             label = "hung"
           log.warning("SDK turn %s (attempt %d/%d)", label, attempt + 1, max_attempts)
-          if attempt == max_attempts - 1 or options is None:
+          fresh_options = options_factory() if options_factory is not None else options
+          if attempt == max_attempts - 1 or fresh_options is None:
             raise
           if self._cancelled.is_set():
             raise asyncio.CancelledError("SDK turn cancelled")
           log.info("Reconnecting...")
-          await self.reconnect(options)
+          await self.reconnect(fresh_options)
         else:
           raise  # Other RuntimeErrors should not be retried
     raise RuntimeError(f"SDK turn failed after {max_attempts} attempts")

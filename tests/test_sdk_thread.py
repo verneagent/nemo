@@ -359,6 +359,59 @@ class TestRunTurnWithReconnect:
     assert result == expected
     assert call_count == 2
 
+  def test_reconnect_uses_options_factory(self, sdk_thread: SDKThread):
+    """When options_factory is provided, reconnect uses its return value
+    instead of the static `options` snapshot. This is what lets the host
+    inject `resume=<latest_session_id>` so a watchdog-forced reconnect
+    preserves conversation context (chat-amnesia regression).
+    """
+    expected = (0.5, {})
+    turn_calls = 0
+    factory_calls = 0
+
+    async def fake_turn(prompt, on_event, stale_tasks=None):
+      nonlocal turn_calls
+      turn_calls += 1
+      if turn_calls < 2:
+        raise TimeoutError("hung")
+      return expected
+
+    def factory():
+      nonlocal factory_calls
+      factory_calls += 1
+      return "FRESH_OPTIONS"
+
+    reconnect_options: list[object] = []
+
+    async def fake_reconnect(opts):
+      reconnect_options.append(opts)
+
+    with mock.patch.object(sdk_thread, "run_turn", side_effect=fake_turn):
+      with mock.patch.object(sdk_thread, "reconnect", side_effect=fake_reconnect):
+        result = _run(sdk_thread.run_turn_with_reconnect(
+          "hello", on_event=lambda e: None,
+          options="STATIC", options_factory=factory, max_attempts=3,
+        ))
+
+    assert result == expected
+    assert factory_calls == 1
+    assert reconnect_options == ["FRESH_OPTIONS"]
+
+  def test_factory_returning_none_raises_immediately(self, sdk_thread: SDKThread):
+    """If options_factory returns None, treat it like no-options and raise."""
+    async def fake_turn(prompt, on_event, stale_tasks=None):
+      raise TimeoutError("hung")
+
+    with mock.patch.object(sdk_thread, "run_turn", side_effect=fake_turn):
+      with mock.patch.object(sdk_thread, "reconnect", new_callable=mock.AsyncMock) as mock_reconn:
+        with pytest.raises(TimeoutError):
+          _run(sdk_thread.run_turn_with_reconnect(
+            "hello", on_event=lambda e: None,
+            options=None, options_factory=lambda: None,
+          ))
+
+    mock_reconn.assert_not_awaited()
+
   def test_other_runtime_error_not_retried(self, sdk_thread: SDKThread):
     """RuntimeError without 'not connected' should not be retried."""
     call_count = 0
