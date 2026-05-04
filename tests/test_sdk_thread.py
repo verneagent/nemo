@@ -540,3 +540,76 @@ class TestReconnect:
         _run(sdk_thread.reconnect(options=mock.MagicMock()))
 
     assert calls == ["close", "create"]
+
+
+# ---------------------------------------------------------------------------
+# Regression: __aenter__ and __aexit__ MUST run on the same asyncio.Task.
+#
+# anyio cancel scopes are task-bound; mixing them across tasks raised
+# "Attempted to exit cancel scope in a different task than it was entered in"
+# and left orphan tasks spinning on sdk-loop forever (30–40% idle CPU).
+# ---------------------------------------------------------------------------
+
+class TestLifecycleSameTask:
+  def test_aenter_and_aexit_run_on_same_task(self, sdk_thread: SDKThread):
+    """Open then close — both calls must observe the same current Task."""
+    captured: dict[str, object] = {}
+
+    class TaskCapturingClient:
+      def __init__(self, *args, **kwargs):
+        self._transport = None
+
+      async def __aenter__(self):
+        captured["aenter"] = asyncio.current_task()
+        return self
+
+      async def __aexit__(self, exc_type, exc, tb):
+        captured["aexit"] = asyncio.current_task()
+        return False
+
+    with mock.patch("claude_agent_sdk.ClaudeSDKClient", TaskCapturingClient):
+      _run(sdk_thread.create_client(options=mock.MagicMock()))
+      _run(sdk_thread.close_client())
+
+    assert captured["aenter"] is not None
+    assert captured["aenter"] is captured["aexit"], (
+      "aenter and aexit ran on different tasks — anyio cancel scope will "
+      "raise and leak orphan tasks"
+    )
+
+  def test_aexit_on_owner_task_after_failed_close(self, sdk_thread: SDKThread):
+    """Even if a previous __aexit__ raised, the next open/close pair still
+    binds aenter+aexit to the (same) owner task. Verifies the owner task
+    survives exceptions and keeps processing.
+    """
+    seq: list[tuple[str, object]] = []
+
+    class SometimesFailingClient:
+      _instances = 0
+
+      def __init__(self, *args, **kwargs):
+        self._transport = None
+        SometimesFailingClient._instances += 1
+        self._idx = SometimesFailingClient._instances
+
+      async def __aenter__(self):
+        seq.append(("aenter", asyncio.current_task()))
+        return self
+
+      async def __aexit__(self, exc_type, exc, tb):
+        seq.append(("aexit", asyncio.current_task()))
+        if self._idx == 1:
+          raise RuntimeError("Attempted to exit cancel scope in a different task")
+        return False
+
+    with mock.patch("claude_agent_sdk.ClaudeSDKClient", SometimesFailingClient):
+      _run(sdk_thread.create_client(options=mock.MagicMock()))
+      _run(sdk_thread.close_client())  # first __aexit__ raises (logged)
+      _run(sdk_thread.create_client(options=mock.MagicMock()))
+      _run(sdk_thread.close_client())
+
+    aenter_tasks = [t for k, t in seq if k == "aenter"]
+    aexit_tasks = [t for k, t in seq if k == "aexit"]
+    # All aenters and aexits run on the same single owner task.
+    all_tasks = set(aenter_tasks + aexit_tasks)
+    assert len(all_tasks) == 1, f"expected one owner task, got {all_tasks}"
