@@ -217,3 +217,56 @@ def test_init_exception_logged_and_returns_1(tmp_path, caplog):
   assert "Token error" in msg
   # Traceback must be attached so the log file gets the full diagnostic
   assert rec.exc_info is not None and rec.exc_info[0] is RuntimeError
+
+
+def test_preflight_failure_logged_and_returns_1(tmp_path, caplog):
+  """Regression: 'clean return 1' paths (preflight errors, missing
+  credentials, etc.) print to stderr and return — they don't raise. With
+  nemobg redirecting stderr to /dev/null, those failures left a 0-byte
+  per-PID log too. _startup_fail must dual-write to log + stderr.
+  """
+  import logging
+
+  project = str(tmp_path)
+  with mock.patch("sys.argv",
+                  ["nemo", "--chat-id", "oc_x", "--project-dir", project]):
+    with mock.patch("nemo.__main__._ensure_provider_runtime"):
+      with mock.patch("nemo.config.load_credentials",
+                      return_value={"app_id": "a", "app_secret": "s", "email": ""}):
+        # Preflight returns errors (Lark API hiccup) — main should log
+        # each one to per-PID file before returning 1.
+        with mock.patch("nemo.preflight.run_preflight",
+                        return_value=[
+                          "Bot info check failed: Remote end closed connection",
+                          "Chat access check failed for oc_x: timeout",
+                        ]):
+          with caplog.at_level(logging.ERROR, logger="nemo"):
+            result = main()
+
+  assert result == 1
+  preflight_errors = [
+    r for r in caplog.records
+    if r.levelno >= logging.ERROR and "Preflight error" in r.getMessage()
+  ]
+  assert len(preflight_errors) == 2, (
+    f"expected both preflight errors logged, got: "
+    f"{[r.getMessage() for r in preflight_errors]}"
+  )
+  assert any("Bot info check failed" in r.getMessage() for r in preflight_errors)
+  assert any("Chat access check failed" in r.getMessage() for r in preflight_errors)
+
+
+def test_invalid_project_dir_logged(tmp_path, caplog):
+  """Same dual-write requirement for the project-dir-not-a-directory path."""
+  import logging
+  with mock.patch("sys.argv",
+                  ["nemo", "--chat-id", "oc_x",
+                   "--project-dir", "/definitely/does/not/exist/anywhere"]):
+    with mock.patch("nemo.__main__._ensure_provider_runtime"):
+      with caplog.at_level(logging.ERROR, logger="nemo"):
+        result = main()
+  assert result == 1
+  assert any("is not a directory" in r.getMessage()
+             for r in caplog.records if r.levelno >= logging.ERROR), (
+    "project-dir failure must be logged via logger so per-PID file captures it"
+  )
