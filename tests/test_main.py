@@ -179,3 +179,41 @@ def test_opencode_provider_uses_provider_default_model(tmp_path):
             assert frame is not None
             assert frame.f_locals["model"] == "default"
             assert frame.f_locals["provider"] == "opencode"
+
+
+def test_init_exception_logged_and_returns_1(tmp_path, caplog):
+  """Regression: an uncaught exception during early init (e.g. get_token
+  raising on a network glitch) must reach the per-PID log file via the
+  logging system, not just stderr — `nemobg` redirects stderr to
+  /dev/null, so an unlogged init failure leaves a 0-byte log file and no
+  trace of why the daemon "didn't start".
+  """
+  import logging
+
+  project = str(tmp_path)
+  with mock.patch("sys.argv", ["nemo", "--project-dir", project]):
+    with mock.patch("nemo.__main__._ensure_provider_runtime"):
+      with mock.patch("nemo.config.load_credentials",
+                      return_value={"app_id": "a", "app_secret": "s", "email": ""}):
+        # Simulate the production failure: get_token raises during workspace
+        # discovery (the same RuntimeError as a Lark API hiccup).
+        with mock.patch("nemo.lark.auth.get_token",
+                        side_effect=RuntimeError("Token error: HTTP 502")):
+          with caplog.at_level(logging.ERROR, logger="nemo"):
+            result = main()
+
+  assert result == 1
+  startup_errors = [
+    r for r in caplog.records
+    if r.levelno >= logging.ERROR and "Startup failed" in r.getMessage()
+  ]
+  assert startup_errors, (
+    f"expected a 'Startup failed' ERROR record, got: "
+    f"{[(r.levelname, r.getMessage()) for r in caplog.records]}"
+  )
+  rec = startup_errors[0]
+  msg = rec.getMessage()
+  assert "RuntimeError" in msg
+  assert "Token error" in msg
+  # Traceback must be attached so the log file gets the full diagnostic
+  assert rec.exc_info is not None and rec.exc_info[0] is RuntimeError

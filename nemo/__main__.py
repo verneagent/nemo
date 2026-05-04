@@ -359,59 +359,71 @@ def main():
   rfh.emit = _make_flushing(rfh.emit, rfh)
   logging.getLogger().addHandler(rfh)
 
-  project_dir = os.path.abspath(args.project_dir)
-  from .agent_factory import default_model_for_provider
-  model = args.model or default_model_for_provider(args.provider)
-  if not os.path.isdir(project_dir):
-    print(f"Error: {project_dir} is not a directory", file=sys.stderr)
-    return 1
-
-  from .config import load_credentials
-  credentials = load_credentials()
-  if not credentials:
-    p = profile_path()
-    print(f"Error: No credentials configured ({p})", file=sys.stderr)
-    return 1
-
-  chat_id = args.chat_id
-
-  # --chat-name: search by name substring
-  if not chat_id and args.chat_name:
-    from .lark.auth import get_token
-    from .lark import api as lark_api
-    token = get_token(credentials["app_id"], credentials["app_secret"])
-    chats = lark_api.list_bot_chats(token)
-    query = args.chat_name.lower()
-    matches = [c for c in chats if query in (c.get("name") or "").lower()]
-    if not matches:
-      print(f"Error: No chat found matching '{args.chat_name}'", file=sys.stderr)
+  # Beyond this point any uncaught exception must reach the per-PID log
+  # file. Background launchers (e.g. `nemobg`) redirect stderr to
+  # /dev/null, so an unlogged init failure is silent — the daemon "didn't
+  # start" with no traceback, no log content, no clue. Keep imports and
+  # network calls (token fetch, workspace discovery) inside the guard.
+  try:
+    project_dir = os.path.abspath(args.project_dir)
+    from .agent_factory import default_model_for_provider
+    model = args.model or default_model_for_provider(args.provider)
+    if not os.path.isdir(project_dir):
+      print(f"Error: {project_dir} is not a directory", file=sys.stderr)
       return 1
-    if len(matches) > 1:
-      print(f"Multiple chats match '{args.chat_name}':", file=sys.stderr)
-      for c in matches:
-        print(f"  {c['chat_id']}  {c.get('name', '')}", file=sys.stderr)
-      return 1
-    chat_id = matches[0]["chat_id"]
-    logging.getLogger("nemo").info("Found chat: %s (%s)", chat_id, matches[0].get("name", ""))
 
-  if not chat_id:
-    # Auto-discover idle chat or create a new one
-    from .lark.auth import get_token
-    from .workspace import discover_or_create_chat
-    token = get_token(credentials["app_id"], credentials["app_secret"])
-    chat_id = discover_or_create_chat(token, project_dir,
-                                      email=credentials.get("email", ""))
+    from .config import load_credentials
+    credentials = load_credentials()
+    if not credentials:
+      p = profile_path()
+      print(f"Error: No credentials configured ({p})", file=sys.stderr)
+      return 1
+
+    chat_id = args.chat_id
+
+    # --chat-name: search by name substring
+    if not chat_id and args.chat_name:
+      from .lark.auth import get_token
+      from .lark import api as lark_api
+      token = get_token(credentials["app_id"], credentials["app_secret"])
+      chats = lark_api.list_bot_chats(token)
+      query = args.chat_name.lower()
+      matches = [c for c in chats if query in (c.get("name") or "").lower()]
+      if not matches:
+        print(f"Error: No chat found matching '{args.chat_name}'", file=sys.stderr)
+        return 1
+      if len(matches) > 1:
+        print(f"Multiple chats match '{args.chat_name}':", file=sys.stderr)
+        for c in matches:
+          print(f"  {c['chat_id']}  {c.get('name', '')}", file=sys.stderr)
+        return 1
+      chat_id = matches[0]["chat_id"]
+      logging.getLogger("nemo").info("Found chat: %s (%s)", chat_id, matches[0].get("name", ""))
+
     if not chat_id:
-      print("Error: Failed to find or create Lark group", file=sys.stderr)
-      return 1
-    logging.getLogger("nemo").info("Using chat: %s", chat_id)
+      # Auto-discover idle chat or create a new one
+      from .lark.auth import get_token
+      from .workspace import discover_or_create_chat
+      token = get_token(credentials["app_id"], credentials["app_secret"])
+      chat_id = discover_or_create_chat(token, project_dir,
+                                        email=credentials.get("email", ""))
+      if not chat_id:
+        print("Error: Failed to find or create Lark group", file=sys.stderr)
+        return 1
+      logging.getLogger("nemo").info("Using chat: %s", chat_id)
 
-  # Preflight checks
-  from .preflight import run_preflight
-  preflight_errors = run_preflight(credentials, chat_id)
-  if preflight_errors:
-    for err in preflight_errors:
-      print(f"Preflight error: {err}", file=sys.stderr)
+    # Preflight checks
+    from .preflight import run_preflight
+    preflight_errors = run_preflight(credentials, chat_id)
+    if preflight_errors:
+      for err in preflight_errors:
+        print(f"Preflight error: {err}", file=sys.stderr)
+      return 1
+  except Exception as e:
+    logging.getLogger("nemo").error(
+      "Startup failed: %s: %s", type(e).__name__, e, exc_info=True)
+    print(f"Error: nemo startup failed: {type(e).__name__}: {e}",
+          file=sys.stderr)
     return 1
 
   # Crash diagnostics (faulthandler, signal logging, watchdog heartbeat)
