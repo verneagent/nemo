@@ -7,12 +7,27 @@ import os
 from typing import Awaitable, Callable, cast
 
 from .channel import Channel
-from .coding_agent import CodingAgent
+from .coding_agent import CodingAgent, EndpointConfig
 from .db import Database
 from .permissions import build_ask_user_question_handler, build_permission_handler
 from .sdk_thread import SDKThread
 from .turn import TurnEvent
 from .types import JsonObject
+
+# Env vars Claude Code / claude-agent-sdk honor for endpoint overrides
+# and model routing. We passthrough whichever the host shell already exports
+# so users can configure entirely via env without touching nemo flags;
+# explicit --base-url/--api-key flags overlay on top.
+_CLAUDE_ENDPOINT_ENV_KEYS = (
+  "ANTHROPIC_BASE_URL",
+  "ANTHROPIC_AUTH_TOKEN",
+  "ANTHROPIC_API_KEY",
+  "ANTHROPIC_MODEL",
+  "ANTHROPIC_DEFAULT_OPUS_MODEL",
+  "ANTHROPIC_DEFAULT_SONNET_MODEL",
+  "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+  "CLAUDE_CODE_SUBAGENT_MODEL",
+)
 
 log = logging.getLogger(__name__)
 
@@ -64,6 +79,7 @@ class ClaudeCodingAgent(CodingAgent):
     channel: Channel,
     permission_mode: str = "bypassPermissions",
     system_prompt: str = "",
+    endpoint: EndpointConfig | None = None,
   ):
     self._credentials = credentials
     self._chat_id = chat_id
@@ -71,6 +87,7 @@ class ClaudeCodingAgent(CodingAgent):
     self._channel = channel
     self._permission_mode = permission_mode
     self._system_prompt = system_prompt
+    self._endpoint = endpoint or EndpointConfig()
     self._sdk = SDKThread()
     self._sdk_started = False
     self._options: object = None
@@ -206,6 +223,34 @@ class ClaudeCodingAgent(CodingAgent):
       val = os.environ.get(key)
       if val:
         env[key] = val
+
+    # Endpoint passthrough: shell-exported ANTHROPIC_*/CLAUDE_CODE_* vars
+    # need to reach the SDK subprocess, since this env dict starts blank
+    # rather than inheriting os.environ.
+    for key in _CLAUDE_ENDPOINT_ENV_KEYS:
+      val = os.environ.get(key)
+      if val:
+        env[key] = val
+
+    # Explicit --base-url / --api-key flags overlay on top of shell env.
+    if self._endpoint.base_url:
+      env["ANTHROPIC_BASE_URL"] = self._endpoint.base_url
+    if self._endpoint.api_key:
+      env["ANTHROPIC_AUTH_TOKEN"] = self._endpoint.api_key
+
+    # When pointing at a third-party Anthropic-compatible endpoint, the
+    # remote almost certainly does not understand the canonical Claude
+    # slugs ("claude-opus-4-7", etc.) — neither for the primary request
+    # nor for Claude Code's internal subagent / tier routing. Fan the
+    # user-supplied --model out to every routing knob so all internal
+    # paths use the same third-party slug. setdefault preserves any
+    # explicit overrides the user already set in their shell env.
+    if self._endpoint.base_url and model:
+      env.setdefault("ANTHROPIC_MODEL", model)
+      env.setdefault("ANTHROPIC_DEFAULT_OPUS_MODEL", model)
+      env.setdefault("ANTHROPIC_DEFAULT_SONNET_MODEL", model)
+      env.setdefault("ANTHROPIC_DEFAULT_HAIKU_MODEL", model)
+      env.setdefault("CLAUDE_CODE_SUBAGENT_MODEL", model)
 
     from claude_agent_sdk import PermissionResultAllow
 

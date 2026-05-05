@@ -7,7 +7,7 @@ from typing import Literal
 
 from .channel import Channel
 from .claude_agent import ClaudeCodingAgent
-from .coding_agent import CodingAgent
+from .coding_agent import CodingAgent, EndpointConfig
 from .codex_agent import CodexCodingAgent
 from .db import Database
 from .opencode_agent import OpenCodeCodingAgent
@@ -15,6 +15,17 @@ from .opencode_agent import OpenCodeCodingAgent
 type AgentProvider = Literal["claude", "codex", "opencode"]
 
 DEFAULT_PROVIDER: AgentProvider = "claude"
+
+__all__ = [
+  "AgentProvider",
+  "DEFAULT_PROVIDER",
+  "EndpointConfig",
+  "ModelCatalog",
+  "build_coding_agent",
+  "default_model_for_provider",
+  "is_model_compatible",
+  "model_catalog_for_provider",
+]
 
 _DEFAULT_MODEL_BY_PROVIDER: dict[AgentProvider, str] = {
   "claude": "claude-opus-4-7",
@@ -151,23 +162,28 @@ def build_coding_agent(
   *,
   permission_mode: str = "bypassPermissions",
   system_prompt: str = "",
+  endpoint: EndpointConfig | None = None,
 ) -> CodingAgent:
+  endpoint = endpoint or EndpointConfig()
   if provider == "claude":
     return ClaudeCodingAgent(
       credentials, chat_id, db, channel,
       permission_mode=permission_mode,
       system_prompt=system_prompt,
+      endpoint=endpoint,
     )
   if provider == "codex":
     return CodexCodingAgent(
       credentials, chat_id, db, channel,
       permission_mode=permission_mode,
       system_prompt=system_prompt,
+      endpoint=endpoint,
     )
   if provider == "opencode":
     return OpenCodeCodingAgent(
       credentials, chat_id, db, channel,
       permission_mode=permission_mode,
       system_prompt=system_prompt,
+      endpoint=endpoint,
     )
   raise ValueError(f"Unsupported provider: {provider}")

@@ -299,6 +299,20 @@ def main():
   parser.add_argument("--system-prompt-file", default="",
                       help="Path to a file whose contents are appended to the "
                            "agent's system prompt")
+  parser.add_argument("--base-url", default="",
+                      help="Custom endpoint URL. Translates per provider — "
+                           "claude→ANTHROPIC_BASE_URL, codex→OPENAI_BASE_URL, "
+                           "opencode→ANTHROPIC_BASE_URL/OPENAI_BASE_URL "
+                           "(dispatched by --model prefix).")
+  parser.add_argument("--api-key", default="",
+                      help="API key for the custom endpoint. Translates per "
+                           "provider — claude→ANTHROPIC_AUTH_TOKEN, "
+                           "codex→OPENAI_API_KEY, opencode→ANTHROPIC_API_KEY/"
+                           "OPENAI_API_KEY (dispatched by --model prefix).")
+  parser.add_argument("--api-key-env", default="",
+                      help="Read --api-key from the named environment "
+                           "variable instead of accepting it on the command "
+                           "line (avoids leaking the key into argv / ps).")
   parser.add_argument("--verbose", "-v", action="store_true", help="Debug logging")
   args = parser.parse_args()
 
@@ -434,13 +448,24 @@ def main():
   # Crash diagnostics (faulthandler, signal logging, watchdog heartbeat)
   _setup_crash_diagnostics(log_path)
 
+  api_key = args.api_key
+  if args.api_key_env:
+    api_key = os.environ.get(args.api_key_env, "")
+    if not api_key:
+      return _startup_fail(
+        f"Error: --api-key-env {args.api_key_env!r} is unset or empty")
+
+  from .coding_agent import EndpointConfig
+  endpoint = EndpointConfig(base_url=args.base_url, api_key=api_key)
+
   from .agent import main_loop
   try:
     return asyncio.run(main_loop(chat_id, project_dir, model,
                                  provider=args.provider,
                                  permission_mode=args.permission_mode,
                                  effort=args.effort,
-                                 system_prompt=system_prompt))
+                                 system_prompt=system_prompt,
+                                 endpoint=endpoint))
   except KeyboardInterrupt:
     return 0
   except BaseException as e:

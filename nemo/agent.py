@@ -23,6 +23,7 @@ import uuid
 
 from . import cards, commands, messages, monitor
 from .agent_factory import AgentProvider, build_coding_agent, is_model_compatible
+from .coding_agent import EndpointConfig
 from .channel import IncomingMessage
 from .config import load_credentials
 from .db import Database
@@ -461,6 +462,7 @@ async def main_loop(
   permission_mode: str = "bypassPermissions",
   effort: str = "",
   system_prompt: str = "",
+  endpoint: EndpointConfig | None = None,
 ) -> int:
   """Run the agent main loop."""
   session_id = str(uuid.uuid4())
@@ -588,6 +590,7 @@ async def main_loop(
     credentials, chat_id, db, channel,
     permission_mode=permission_mode,
     system_prompt=system_prompt,
+    endpoint=endpoint,
   )
   if effort:
     agent.set_effort(effort)

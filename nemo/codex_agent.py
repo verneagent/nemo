@@ -12,7 +12,7 @@ from asyncio.subprocess import Process
 from typing import Callable
 
 from .channel import Channel
-from .coding_agent import CodingAgent
+from .coding_agent import CodingAgent, EndpointConfig
 from .db import Database
 from .turn import AnswerEvent, DoneEvent, ErrorEvent, ProgressEvent, TurnEvent
 from .types import JsonObject
@@ -52,10 +52,12 @@ class CodexCodingAgent(CodingAgent):
     channel: Channel,
     permission_mode: str = "bypassPermissions",
     system_prompt: str = "",
+    endpoint: EndpointConfig | None = None,
   ):
     del credentials, chat_id, db, channel
     self._permission_mode = permission_mode
     self._system_prompt = system_prompt
+    self._endpoint = endpoint or EndpointConfig()
     self._project_dir = ""
     self._model = ""
     self._session_id = ""
@@ -227,10 +229,23 @@ class CodexCodingAgent(CodingAgent):
       "HOME": os.environ.get("HOME", ""),
       "USER": os.environ.get("USER", ""),
     }
-    for key in ("OPENAI_API_KEY", "CODEX_API_KEY", "http_proxy", "https_proxy", "all_proxy"):
+    # OPENAI_BASE_URL / OPENAI_API_BASE: point the codex CLI at any
+    # OpenAI-compatible endpoint without touching ~/.codex/config.toml.
+    passthrough = (
+      "OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_API_BASE",
+      "CODEX_API_KEY",
+      "http_proxy", "https_proxy", "all_proxy",
+    )
+    for key in passthrough:
       val = os.environ.get(key)
       if val:
         env[key] = val
+
+    # Explicit --base-url / --api-key flags overlay on top of shell env.
+    if self._endpoint.base_url:
+      env["OPENAI_BASE_URL"] = self._endpoint.base_url
+    if self._endpoint.api_key:
+      env["OPENAI_API_KEY"] = self._endpoint.api_key
     return env
 
   async def _log_stderr(self, stream: asyncio.StreamReader) -> None:

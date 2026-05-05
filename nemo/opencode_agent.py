@@ -13,7 +13,7 @@ import subprocess
 from typing import Callable
 
 from .channel import Channel
-from .coding_agent import CodingAgent
+from .coding_agent import CodingAgent, EndpointConfig
 from .db import Database
 from .turn import AnswerEvent, DoneEvent, ErrorEvent, ProgressEvent, TurnEvent
 from .types import JsonObject
@@ -78,11 +78,13 @@ class OpenCodeCodingAgent(CodingAgent):
     channel: Channel,
     permission_mode: str = "bypassPermissions",
     system_prompt: str = "",
+    endpoint: EndpointConfig | None = None,
   ):
     del credentials, db, channel
     self._chat_id = chat_id
     self._permission_mode = permission_mode
     self._system_prompt = system_prompt
+    self._endpoint = endpoint or EndpointConfig()
     self._project_dir = ""
     self._model = ""
     self._session_id = ""
@@ -253,6 +255,32 @@ class OpenCodeCodingAgent(CodingAgent):
     env["NEMO_CHAT_ID"] = self._chat_id
     env["NEMO_DB"] = _db_path(self._project_dir)
     env["NEMO_OPENCODE_SYSTEM_PROMPT"] = _build_agent_prompt(self._system_prompt)
+
+    # OpenCode is multi-provider — a single base_url is ambiguous. Dispatch
+    # by the model's `provider/` prefix:
+    #   anthropic/* → only ANTHROPIC_*
+    #   openai/*    → only OPENAI_*
+    #   anything else (no slash, "default", or third-party prefix) → set
+    #   both, defensively, since the configured opencode provider plugin
+    #   could read from either.
+    if self._endpoint.base_url or self._endpoint.api_key:
+      prefix = self._model.split("/", 1)[0].lower() if "/" in self._model else ""
+      if prefix == "anthropic":
+        targets = ("anthropic",)
+      elif prefix == "openai":
+        targets = ("openai",)
+      else:
+        targets = ("anthropic", "openai")
+      if self._endpoint.base_url:
+        if "anthropic" in targets:
+          env["ANTHROPIC_BASE_URL"] = self._endpoint.base_url
+        if "openai" in targets:
+          env["OPENAI_BASE_URL"] = self._endpoint.base_url
+      if self._endpoint.api_key:
+        if "anthropic" in targets:
+          env["ANTHROPIC_API_KEY"] = self._endpoint.api_key
+        if "openai" in targets:
+          env["OPENAI_API_KEY"] = self._endpoint.api_key
     return env
 
   async def _log_stderr(self, stream: asyncio.StreamReader) -> None:
