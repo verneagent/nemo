@@ -301,6 +301,33 @@ def test_working_card_with_body_only():
   assert elements[0]["tag"] == "column_set"
 
 
+def test_working_card_renders_rate_limit_notice_above_tool():
+  """Rate-limit banner sits above the current_tool block on the working card."""
+  card = build_turn_card(
+    "working",
+    current_tool="Read: a.py",
+    rate_limit_notice="⛔ Rate limit hit (five_hour) resets in 12m",
+    elapsed=5,
+    chat_id="oc_x",
+  )
+  elements = card["body"]["elements"]
+  # First element is the orange rate-limit banner, second is the tool box.
+  assert elements[0]["tag"] == "markdown"
+  assert "Rate limit hit" in elements[0]["content"]
+  assert "<font color='orange'>" in elements[0]["content"]
+  assert elements[1]["tag"] == "markdown"
+  assert "`Read: a.py`" in elements[1]["content"]
+
+
+def test_working_card_no_rate_limit_notice_by_default():
+  """Without an explicit notice the working card stays unchanged."""
+  card = build_turn_card("working", current_tool="Read: a.py", chat_id="oc_x")
+  elements = card["body"]["elements"]
+  assert elements[0]["tag"] == "markdown"
+  # No orange banner — the first element is the tool, not a notice.
+  assert "Rate limit" not in elements[0]["content"]
+
+
 def test_stopping_card_preserves_working_content():
   steps = [ThinkingStep("tool", "Read: a.py"), ThinkingStep("answer", "Checking")]
   card = build_turn_card("stopping", current_tool="Read: a.py", steps=steps)

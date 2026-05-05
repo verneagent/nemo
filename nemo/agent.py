@@ -27,7 +27,7 @@ from .channel import IncomingMessage
 from .config import load_credentials
 from .db import Database
 from .lark_channel import LarkChannel
-from .turn import AnswerEvent, DoneEvent, ProgressEvent
+from .turn import AnswerEvent, DoneEvent, ProgressEvent, RateLimitNoticeEvent
 
 log = logging.getLogger(__name__)
 
@@ -402,6 +402,51 @@ _PACING_HINT_PREFIX = (
   "不要试图一次完成所有事。\n\n"
   "（以下是用户的新消息）\n"
 )
+
+
+def _format_rate_limit_notice(event: RateLimitNoticeEvent) -> str:
+  """Render a RateLimitNoticeEvent as a one-line banner string.
+
+  Returns "" when the status is "allowed" (limit cleared) so callers can use
+  truthiness to know whether to show or hide the banner.
+  """
+  status = (event.status or "").lower()
+  if status == "allowed":
+    return ""
+
+  if status == "rejected":
+    head = "⛔ Rate limit hit"
+  elif status == "allowed_warning":
+    head = "⚠️ Rate limit warning"
+  else:
+    head = f"Rate limit: {status}" if status else "Rate limit"
+
+  bits = [head]
+  if event.rate_limit_type:
+    bits.append(f"({event.rate_limit_type})")
+  if event.utilization is not None:
+    try:
+      bits.append(f"{event.utilization * 100:.0f}% used")
+    except Exception:
+      pass
+  if event.resets_at:
+    delta = int(event.resets_at - time.time())
+    if delta > 0:
+      if delta < 60:
+        bits.append(f"resets in {delta}s")
+      elif delta < 3600:
+        # Ceiling so "resets in N min" doesn't visibly tick down by a minute
+        # within the first second of being shown.
+        mins = -(-delta // 60)
+        bits.append(f"resets in {mins}m")
+      else:
+        h, rem = divmod(delta, 3600)
+        mins = -(-rem // 60)
+        if mins == 60:
+          h += 1
+          mins = 0
+        bits.append(f"resets in {h}h {mins}m" if mins else f"resets in {h}h")
+  return " ".join(bits)
 
 
 # ---------------------------------------------------------------------------
@@ -902,6 +947,9 @@ async def main_loop(
       _turn_start = time.time()
       _turn_current_tool = ""
       _turn_interrupt_phase: str | None = None
+      # Latest rendered rate-limit notice for this turn. Persists on the
+      # working card and is appended to the timeout error if the turn dies.
+      _turn_rate_limit_notice = ""
 
       async def _update_interrupt_card(phase: str) -> None:
         nonlocal _turn_card_id, _turn_interrupt_phase
@@ -914,6 +962,7 @@ async def main_loop(
             steps=_turn_steps,
             current_tool=_turn_current_tool,
             elapsed=int(time.time() - _turn_start),
+            rate_limit_notice=_turn_rate_limit_notice,
           )
           prev_id = _turn_card_id
           _turn_card_id = await channel.update_card(_turn_card_id, card)
@@ -931,6 +980,7 @@ async def main_loop(
         # asyncio.wait({sdk_task, ...}) completes, which guarantees all
         # _on_event calls have finished. No lock needed.
         nonlocal _turn_card_id, _sdk_session_id, _turn_current_tool
+        nonlocal _turn_rate_limit_notice
 
         def _ensure_card():
           """Create working card if it doesn't exist yet."""
@@ -957,6 +1007,7 @@ async def main_loop(
             steps=_turn_steps,
             elapsed=elapsed,
             chat_id=chat_id,
+            rate_limit_notice=_turn_rate_limit_notice,
             **kwargs,
           )
           try:
@@ -978,6 +1029,17 @@ async def main_loop(
           _turn_steps.append(cards.ThinkingStep("answer", event.text))
           # Don't create card for text-only responses — let them go as
           # plain text messages. Only update if card already exists.
+          _update_working()
+
+        elif isinstance(event, RateLimitNoticeEvent):
+          new_notice = _format_rate_limit_notice(event)
+          if new_notice == _turn_rate_limit_notice:
+            return
+          _turn_rate_limit_notice = new_notice
+          # Surface upstream rate-limit pressure even when the turn hasn't
+          # produced any visible work yet — that silence is exactly what we
+          # want to explain.
+          _ensure_card()
           _update_working()
 
         elif isinstance(event, DoneEvent):
@@ -1285,9 +1347,11 @@ async def main_loop(
         try:
           sdk_task.result()
         except TimeoutError as exc:
+          msg = "Timed out — SDK stopped responding. Context preserved, send another message to continue."
+          if _turn_rate_limit_notice:
+            msg = f"{msg}\n\n{_turn_rate_limit_notice}"
           await _handle_turn_error(
-            "Timed out — SDK stopped responding. Context preserved, send another message to continue.",
-            exc, channel, chat_id, db, session_id,
+            msg, exc, channel, chat_id, db, session_id,
             _turn_card_id, _turn_steps, _turn_start,
           )
           _pending_pacing_hint = True

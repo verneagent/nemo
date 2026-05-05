@@ -9,7 +9,7 @@ import pytest
 from nemo.turn import (
   run_turn, ProgressEvent, AnswerEvent,
   TaskStartedEvent, TaskDoneEvent, DoneEvent, ErrorEvent,
-  TurnEvent,
+  RateLimitNoticeEvent, TurnEvent,
 )
 
 
@@ -692,6 +692,64 @@ def test_trailing_thinking_compensation():
   assert len(answer_events) == 1
   assert answer_events[0].text == "I see the issue, the fix is to change line 42"
   assert any(isinstance(e, DoneEvent) for e in events)
+
+
+def test_rate_limit_event_emits_notice():
+  """SDK's RateLimitEvent (matched by class name in non-progress branch) must
+  surface as a RateLimitNoticeEvent carrying the upstream status fields."""
+
+  @dataclass
+  class FakeRateLimitInfo:
+    status: str
+    rate_limit_type: str = ""
+    resets_at: int | None = None
+    utilization: float | None = None
+
+  @dataclass
+  class RateLimitEvent:
+    rate_limit_info: FakeRateLimitInfo
+
+  messages = [
+    RateLimitEvent(rate_limit_info=FakeRateLimitInfo(
+      status="rejected",
+      rate_limit_type="five_hour",
+      resets_at=1_700_000_000,
+      utilization=0.97,
+    )),
+    FakeAssistantMessage(content=[FakeTextBlock(text="back to work")]),
+    FakeResultMessage(),
+  ]
+  events: list = []
+  async def _run():
+    with mock.patch.dict("sys.modules", _sdk_modules()):
+      await run_turn(FakeClient(messages), "hi", events.append)
+  asyncio.run(_run())
+
+  notices = [e for e in events if isinstance(e, RateLimitNoticeEvent)]
+  assert len(notices) == 1
+  n = notices[0]
+  assert n.status == "rejected"
+  assert n.rate_limit_type == "five_hour"
+  assert n.resets_at == 1_700_000_000
+  assert abs((n.utilization or 0.0) - 0.97) < 1e-9
+
+
+def test_rate_limit_event_with_missing_info_is_skipped():
+  """If rate_limit_info is absent, no notice should be emitted (defensive)."""
+  @dataclass
+  class RateLimitEvent:
+    rate_limit_info: object = None
+
+  messages = [
+    RateLimitEvent(),
+    FakeResultMessage(),
+  ]
+  events: list = []
+  async def _run():
+    with mock.patch.dict("sys.modules", _sdk_modules()):
+      await run_turn(FakeClient(messages), "hi", events.append)
+  asyncio.run(_run())
+  assert not any(isinstance(e, RateLimitNoticeEvent) for e in events)
 
 
 def test_no_compensation_when_answer_is_last():

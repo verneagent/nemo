@@ -352,9 +352,15 @@ def _working_elements(
   current_tool: str = "",
   include_stop_button: bool,
   chat_id: str = "",
+  rate_limit_notice: str = "",
 ) -> list[JsonObject]:
   """Build the shared body for working/stopping/stopped phases."""
   elements: list[JsonObject] = []
+  if rate_limit_notice:
+    elements.append({
+      "tag": "markdown",
+      "content": f"<font color='orange'>{rate_limit_notice}</font>",
+    })
   if current_tool:
     elements.append({"tag": "markdown", "content": f"`{current_tool}`"})
   if steps:
@@ -374,12 +380,15 @@ def build_turn_card(
   usage: JsonObject | None = None,
   chat_id: str = "",
   session_id: str = "",
+  rate_limit_notice: str = "",
 ) -> JsonObject:
   """Build a unified turn card for any phase.
 
   phase: "working" | "stopping" | "stopped" | "done" | "error"
   body:  for done/error — final response or error message
   steps: unified thinking timeline (text + tool entries in order)
+  rate_limit_notice: short banner shown above the working state to flag
+    upstream rate-limit pressure (only rendered in working/stopping/stopped).
   """
   steps = steps or []
   elements: list[JsonObject] = []
@@ -388,6 +397,7 @@ def build_turn_card(
     elements = _working_elements(
       steps=steps, current_tool=current_tool,
       include_stop_button=True, chat_id=chat_id,
+      rate_limit_notice=rate_limit_notice,
     )
     title = _elapsed_title(elapsed)
     header: JsonObject | None = {
@@ -399,6 +409,7 @@ def build_turn_card(
     elements = _working_elements(
       steps=steps, current_tool=current_tool,
       include_stop_button=False,
+      rate_limit_notice=rate_limit_notice,
     )
     header = {
       "title": {"tag": "plain_text", "content": "Stopping..."},
@@ -409,6 +420,7 @@ def build_turn_card(
     elements = _working_elements(
       steps=steps, current_tool=current_tool,
       include_stop_button=False,
+      rate_limit_notice=rate_limit_notice,
     )
     header = {
       "title": {"tag": "plain_text", "content": "Stopped"},

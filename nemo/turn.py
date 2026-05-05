@@ -195,9 +195,31 @@ class ErrorEvent:
   message: str
 
 
+@dataclass
+class RateLimitNoticeEvent:
+  """Upstream rate-limit status surfaced from the SDK's RateLimitEvent.
+
+  The CLI emits its own RateLimitEvent whenever the upstream rate-limit state
+  changes (allowed → allowed_warning → rejected and back). Without this notice
+  the user sees only a silent working card during a multi-minute retry loop;
+  surfacing it lets them decide whether to wait or stop.
+
+  ``status``           — "allowed" | "allowed_warning" | "rejected"; "allowed"
+                          means the limit is no longer in effect.
+  ``rate_limit_type``  — e.g. "five_hour", "seven_day"; may be empty.
+  ``resets_at``        — unix timestamp; may be None.
+  ``utilization``      — 0.0–1.0; may be None.
+  """
+  status: str
+  rate_limit_type: str = ""
+  resets_at: int | None = None
+  utilization: float | None = None
+
+
 TurnEvent = (
   ProgressEvent | AnswerEvent |
-  TaskStartedEvent | TaskDoneEvent | DoneEvent | ErrorEvent
+  TaskStartedEvent | TaskDoneEvent | DoneEvent | ErrorEvent |
+  RateLimitNoticeEvent
 )
 
 
@@ -298,6 +320,15 @@ async def _single_turn(
       since_progress = _time.monotonic() - last_progress_at
       log.warning("turn msg: %s (non-progress, idle=%.0fs/%ds)",
                   msg_type, since_progress, PROGRESS_TIMEOUT)
+      if msg_type == "RateLimitEvent":
+        info = getattr(message, "rate_limit_info", None)
+        if info is not None:
+          on_event(RateLimitNoticeEvent(
+            status=getattr(info, "status", "") or "",
+            rate_limit_type=getattr(info, "rate_limit_type", "") or "",
+            resets_at=getattr(info, "resets_at", None),
+            utilization=getattr(info, "utilization", None),
+          ))
     else:
       log.info("turn msg: %s", msg_type)
       last_progress_at = _time.monotonic()

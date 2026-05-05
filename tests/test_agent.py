@@ -5,6 +5,7 @@ import urllib.error
 from unittest import mock
 
 from nemo.agent import (
+  _format_rate_limit_notice,
   _merge_pending,
   _requeue_pending,
   _send_response,
@@ -12,7 +13,7 @@ from nemo.agent import (
   _update_done_card_with_fallback,
   main_loop,
 )
-from nemo.turn import AnswerEvent, DoneEvent
+from nemo.turn import AnswerEvent, DoneEvent, RateLimitNoticeEvent
 
 
 class _FakeDB:
@@ -649,3 +650,57 @@ def test_merge_pending_all_recalled():
   msgs = [_msg("only", message_id="om_1")]
   msgs[:] = [m for m in msgs if m.message_id != "om_1"]
   assert _merge_pending(msgs) is None
+
+
+# ---------------------------------------------------------------------------
+# _format_rate_limit_notice
+# ---------------------------------------------------------------------------
+
+def test_format_rate_limit_notice_rejected_with_resets_in_minutes():
+  """Rejected status renders with red marker, type, utilization, and ETA."""
+  import time as _time
+  ev = RateLimitNoticeEvent(
+    status="rejected",
+    rate_limit_type="five_hour",
+    resets_at=int(_time.time()) + 12 * 60,
+    utilization=0.99,
+  )
+  out = _format_rate_limit_notice(ev)
+  assert out.startswith("⛔ Rate limit hit")
+  assert "(five_hour)" in out
+  assert "99% used" in out
+  assert "resets in 12m" in out
+
+
+def test_format_rate_limit_notice_warning_renders_yellow_marker():
+  ev = RateLimitNoticeEvent(status="allowed_warning", utilization=0.9)
+  out = _format_rate_limit_notice(ev)
+  assert out.startswith("⚠️ Rate limit warning")
+  assert "90% used" in out
+
+
+def test_format_rate_limit_notice_allowed_clears_to_empty():
+  """Status returning to 'allowed' clears the banner — caller treats '' as hide."""
+  ev = RateLimitNoticeEvent(status="allowed", rate_limit_type="five_hour")
+  assert _format_rate_limit_notice(ev) == ""
+
+
+def test_format_rate_limit_notice_resets_in_hours():
+  import time as _time
+  ev = RateLimitNoticeEvent(
+    status="rejected",
+    resets_at=int(_time.time()) + 3 * 3600 + 25 * 60,
+  )
+  out = _format_rate_limit_notice(ev)
+  assert "resets in 3h 25m" in out
+
+
+def test_format_rate_limit_notice_past_reset_omits_eta():
+  """If resets_at is already in the past, drop the misleading 'resets in -Ns'."""
+  import time as _time
+  ev = RateLimitNoticeEvent(
+    status="rejected",
+    resets_at=int(_time.time()) - 30,
+  )
+  out = _format_rate_limit_notice(ev)
+  assert "resets in" not in out
