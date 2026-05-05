@@ -352,3 +352,25 @@ def test_cli_api_key_env_unset_is_error(tmp_path):
     os.environ.pop("DEFINITELY_NOT_SET_XYZZY", None)
     rc = main()
   assert rc == 1
+
+
+def test_cli_api_key_env_rejects_literal_key(tmp_path, capsys):
+  # Common mix-up: user passes the actual secret as --api-key-env's
+  # value. Detect via the shape (env var names don't contain hyphens)
+  # and tell them to use --api-key instead.
+  from nemo.__main__ import main
+  project = str(tmp_path)
+  argv = [
+    "nemo", "--chat-id", "oc_1", "--project-dir", project,
+    "--api-key-env", "sk-77675d801b984b628a5f199488a08eee",
+  ]
+  with mock.patch("sys.argv", argv), \
+       mock.patch("nemo.__main__._ensure_provider_runtime"), \
+       mock.patch("nemo.config.load_credentials",
+                  return_value={"app_id": "a", "app_secret": "s", "email": ""}), \
+       mock.patch("nemo.preflight.run_preflight", return_value=[]):
+    rc = main()
+  assert rc == 1
+  err = capsys.readouterr().err
+  assert "NAME of an environment variable" in err
+  assert "--api-key" in err

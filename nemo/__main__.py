@@ -450,10 +450,23 @@ def main():
 
   api_key = args.api_key
   if args.api_key_env:
-    api_key = os.environ.get(args.api_key_env, "")
+    var_name = args.api_key_env
+    # Catch the common mix-up: user passed the literal key as the value
+    # of --api-key-env (which expects the *name* of an env var, not its
+    # value). Heuristic: real env var names are uppercase ASCII / digits /
+    # underscores; secret-looking values usually contain other chars.
+    if not var_name.replace("_", "").isalnum() or "-" in var_name:
+      return _startup_fail(
+        f"Error: --api-key-env expects the NAME of an environment variable "
+        f"(e.g. DEEPSEEK_API_KEY), not the key itself. Got "
+        f"{var_name[:8]!r}{'…' if len(var_name) > 8 else ''}. "
+        f"If you meant to pass the key directly, use --api-key instead.")
+    api_key = os.environ.get(var_name, "")
     if not api_key:
       return _startup_fail(
-        f"Error: --api-key-env {args.api_key_env!r} is unset or empty")
+        f"Error: --api-key-env {var_name!r} is unset or empty in the "
+        f"shell environment. Export it first (e.g. "
+        f"`export {var_name}=...`) or pass --api-key directly.")
 
   from .coding_agent import EndpointConfig
   endpoint = EndpointConfig(base_url=args.base_url, api_key=api_key)
