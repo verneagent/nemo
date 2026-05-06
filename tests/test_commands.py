@@ -41,7 +41,7 @@ def test_model_typo_for_codex():
   handled, resp = try_dispatch("/model claude-sonnet-4-6", ctx)
   assert handled
   assert resp is not None and not resp.startswith("__model__:")
-  assert "gpt-5-codex" in resp
+  assert "gpt-5.5" in resp
 
 
 def test_model_list_separates_chatgpt_from_api_only_codex():
@@ -53,13 +53,13 @@ def test_model_list_separates_chatgpt_from_api_only_codex():
   assert resp is not None
   # ChatGPT-safe defaults surface under Available.
   available_line = next(l for l in resp.split("\n") if l.startswith("Available:"))
-  assert "gpt-5.2" in available_line
+  assert "gpt-5.5" in available_line
   assert "gpt-5.4" in available_line
   # The codex-specialized variants must be in a separate API-only bucket,
   # not mixed into the plain Available list.
-  assert "gpt-5-codex" not in available_line
+  assert "gpt-5.3-codex" not in available_line
   api_line = next(l for l in resp.split("\n") if l.startswith("API-only"))
-  assert "gpt-5-codex" in api_line
+  assert "gpt-5.3-codex" in api_line
   assert "ChatGPT" in api_line  # explains why they're segregated
 
 

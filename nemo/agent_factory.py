@@ -29,10 +29,11 @@ __all__ = [
 
 _DEFAULT_MODEL_BY_PROVIDER: dict[AgentProvider, str] = {
   "claude": "claude-opus-4-7",
-  # gpt-5.4 works for both ChatGPT subscribers and API users. The codex-
-  # specialized slugs (-codex variants) are API-only and return HTTP 400
-  # for ChatGPT accounts, so they make a poor default.
-  "codex": "gpt-5.4",
+  # gpt-5.5 is the current top-priority codex model — works for both
+  # ChatGPT subscribers and API users. The codex-specialized slugs
+  # (-codex variants) are API-only and return HTTP 400 for ChatGPT
+  # accounts, so they make a poor default.
+  "codex": "gpt-5.5",
   # OpenCode resolves the configured default model on its side.
   "opencode": "default",
 }
@@ -83,27 +84,27 @@ _CATALOG_BY_PROVIDER: dict[AgentProvider, ModelCatalog] = {
     },
   ),
   "codex": ModelCatalog(
-    # ChatGPT-account-compatible slugs. The bare gpt-5.x variants work
-    # for both ChatGPT subscribers and API users.
+    # Slugs from the codex CLI's `~/.codex/models_cache.json`
+    # (priority-ordered, all marked supported_in_api). gpt-5.5 is the
+    # current default-tier coding model. Older 5.0 / 5.1 / -codex
+    # variants OpenAI dropped from the live list have been removed —
+    # passing them at /model would just 400.
     visible=(
+      "gpt-5.5",
       "gpt-5.4",
+      "gpt-5.4-mini",
       "gpt-5.2",
-      "gpt-5.1",
-      "gpt-5",
     ),
-    # API-only (codex-specialized): OpenAI rejects these with
-    # "not supported when using Codex with a ChatGPT account" (HTTP 400)
-    # unless the codex CLI is logged in with an API key.
+    # API-only codex-specialized slug — works on API auth, returns 400
+    # ("not supported when using Codex with a ChatGPT account") for
+    # ChatGPT subscribers.
     api_only=(
       "gpt-5.3-codex",
-      "gpt-5.2-codex",
-      "gpt-5.1-codex-max",
-      "gpt-5.1-codex-mini",
-      "gpt-5.1-codex",
-      "gpt-5-codex",
-      "gpt-5-codex-mini",
     ),
     hidden=(
+      # gpt-5.3-codex-spark is ChatGPT-only (supported_in_api: false in
+      # the cache), kept here so /model accepts it for users who have it.
+      "gpt-5.3-codex-spark",
       "gpt-oss-120b",
       "gpt-oss-20b",
     ),

@@ -318,7 +318,7 @@ def test_codex_provider_rejects_claude_model_switch(tmp_path):
        mock.patch("nemo.config.load_relay_config", return_value=("", "")), \
        mock.patch("signal.signal"):
     result = asyncio.run(
-      main_loop("oc_test", str(tmp_path), "gpt-5-codex", provider="codex")
+      main_loop("oc_test", str(tmp_path), "gpt-5.5", provider="codex")
     )
 
   assert result == 0
@@ -330,7 +330,7 @@ def test_codex_provider_rejects_claude_model_switch(tmp_path):
   body = call.args[2]
   assert "Unknown model" in body
   assert "codex" in body
-  assert "gpt-5-codex" in body  # available list shown
+  assert "gpt-5.5" in body  # available list shown
 
 
 # ---------------------------------------------------------------------------
