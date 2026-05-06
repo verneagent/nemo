@@ -107,6 +107,9 @@ class ClaudeCodingAgent(CodingAgent):
   def set_effort(self, effort: str) -> None:
     self._effort = effort if effort in _CLAUDE_EFFORT_LEVELS else ""
 
+  def set_endpoint(self, endpoint: EndpointConfig) -> None:
+    self._endpoint = endpoint
+
   async def start(self, project_dir: str, model: str, resume: str = "") -> None:
     if not self._sdk_started:
       self._sdk.start()

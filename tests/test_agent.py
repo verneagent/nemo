@@ -348,6 +348,64 @@ def test_main_loop_threads_provider_through_db_calls(tmp_path):
   assert ("oc_test", "codex-thread-xyz", "codex") in recorded_set, recorded_set
 
 
+def test_model_switch_to_preset_sets_endpoint_and_remote_name(tmp_path):
+  """`/model deepseek-v4-pro` must (a) flip the agent's EndpointConfig
+  to the preset's anthropic_url + api key, (b) feed the protocol-
+  specific remote name (e.g. ``deepseek-v4-pro[1m]``) into the next
+  reset(), and (c) NOT crash on the legacy is_model_compatible path."""
+  import os as _os
+  from nemo.channel import IncomingMessage
+
+  endpoint_history: list[tuple[str, str]] = []  # (base_url, api_key)
+  reset_history: list[str] = []                  # model passed to reset
+
+  class _SpyAgent(_FakeAgent):
+    def set_endpoint(self, endpoint):
+      endpoint_history.append((endpoint.base_url, endpoint.api_key))
+
+    async def reset(self, _project_dir, model, resume=""):
+      del resume
+      reset_history.append(model)
+
+  agent = _SpyAgent()
+  queued = _QueuedChannel("oc_test", [
+    IncomingMessage(
+      event_type="im.message.receive_v1", chat_id="oc_test",
+      sender_id="ou_user", message_id="om_switch", msg_type="text",
+      text="/model deepseek-v4-pro", create_time="1",
+    ),
+    IncomingMessage(
+      event_type="im.message.receive_v1", chat_id="oc_test",
+      sender_id="ou_user", message_id="om_exit", msg_type="text",
+      text="/exit", create_time="2",
+    ),
+  ])
+
+  with mock.patch.dict(_os.environ, {"DEEPSEEK_API_KEY": "sk-test"}), \
+       mock.patch("nemo.agent.load_credentials", return_value={
+         "app_id": "a", "app_secret": "s", "email": "u@e.com",
+       }), \
+       mock.patch("nemo.agent.Database", _FakeDB), \
+       mock.patch("nemo.agent.LarkChannel", return_value=queued), \
+       mock.patch("nemo.agent.build_coding_agent", return_value=agent), \
+       mock.patch("nemo.agent._send_response", new=mock.AsyncMock()), \
+       mock.patch("nemo.group_config.load_config", return_value={}), \
+       mock.patch("nemo.config.load_relay_config", return_value=("", "")), \
+       mock.patch("signal.signal"):
+    rc = asyncio.run(
+      main_loop("oc_test", str(tmp_path), "claude-opus-4-7", provider="claude")
+    )
+  assert rc == 0
+  # Endpoint gets flipped exactly once with the DeepSeek anthropic URL
+  # + key from the env var.
+  assert endpoint_history == [
+    ("https://api.deepseek.com/anthropic", "sk-test"),
+  ], endpoint_history
+  # Reset is called with the protocol-specific remote name (the [1m]
+  # variant for the Anthropic side).
+  assert "deepseek-v4-pro[1m]" in reset_history, reset_history
+
+
 def test_codex_provider_rejects_claude_model_switch(tmp_path):
   from nemo.channel import IncomingMessage
 

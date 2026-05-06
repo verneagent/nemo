@@ -124,6 +124,14 @@ def default_model_for_provider(provider: AgentProvider) -> str:
   return _DEFAULT_MODEL_BY_PROVIDER[provider]
 
 
+def _preset_names_for_provider(provider: AgentProvider) -> tuple[str, ...]:
+  """Names of presets whose endpoints are populated for ``provider``."""
+  from .presets import load_presets
+  return tuple(
+    name for name, p in load_presets().items() if p.supports(provider)
+  )
+
+
 def model_catalog_for_provider(
   provider: AgentProvider,
   project_dir: str = "",
@@ -131,8 +139,24 @@ def model_catalog_for_provider(
   if provider == "opencode":
     from .opencode_agent import query_opencode_model_catalog_data
     models, note = query_opencode_model_catalog_data(project_dir)
-    return ModelCatalog(visible=models, note=note)
-  return _CATALOG_BY_PROVIDER.get(provider, ModelCatalog())
+    presets = _preset_names_for_provider(provider)
+    visible = tuple(dict.fromkeys((*models, *presets)))
+    return ModelCatalog(visible=visible, note=note)
+  base = _CATALOG_BY_PROVIDER.get(provider, ModelCatalog())
+  presets = _preset_names_for_provider(provider)
+  if not presets:
+    return base
+  # Drop any preset name that already lives in the static catalog so
+  # /model listing doesn't duplicate.
+  existing = set(base.all_names())
+  extra = tuple(p for p in presets if p not in existing)
+  return ModelCatalog(
+    visible=base.visible + extra,
+    api_only=base.api_only,
+    hidden=base.hidden,
+    aliases=base.aliases,
+    note=base.note,
+  )
 
 
 def is_model_compatible(
@@ -140,15 +164,25 @@ def is_model_compatible(
   model: str,
   project_dir: str = "",
 ) -> bool:
+  candidate = model.strip().lower()
+  # Preset names expand to provider-specific endpoints, so they're
+  # compatible iff the preset itself supports this provider — short-
+  # circuit before falling back to the static catalog.
+  from .presets import resolve_preset
+  preset = resolve_preset(candidate)
+  if preset is not None:
+    return preset.supports(provider)
   if provider == "opencode":
-    candidate = model.strip().lower()
     if candidate == "default":
       return True
     catalog = model_catalog_for_provider(provider, project_dir)
-    if catalog.visible:
-      return candidate in catalog.all_names()
+    if candidate in catalog.all_names():
+      return True
+    # OpenCode resolves the actual provider at the SDK layer, and the
+    # live catalog isn't always reachable (pytest, fresh installs).
+    # Accept any ``provider/model`` slug as a compatibility fallback.
     return "/" in candidate
-  return model.strip().lower() in model_catalog_for_provider(
+  return candidate in model_catalog_for_provider(
     provider,
     project_dir,
   ).all_names()

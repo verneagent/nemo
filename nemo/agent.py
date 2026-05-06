@@ -757,6 +757,48 @@ async def main_loop(
           await _send_response(channel, chat_id, f"{_cancel_emoji(elapsed)} Operation cancelled.", db)
         elif response and response.startswith("__model__:"):
           new_model = response.split(":", 1)[1]
+          # Resolve against the preset registry first. A preset name
+          # expands to (endpoint, remote model id) — switching to one
+          # also flips the SDK env vars on the next reconnect, so the
+          # daemon can move between e.g. claude-opus-4-7 (real
+          # Anthropic) and deepseek-v4-pro (DeepSeek's Anthropic
+          # endpoint) on the same chat without restart.
+          from .presets import resolve_preset
+          preset = resolve_preset(new_model)
+          if preset is not None:
+            if not preset.supports(provider):
+              await _send_response(
+                channel, chat_id,
+                f"Preset **{new_model}** has no endpoint for "
+                f"provider **{provider}**.",
+                db,
+              )
+              await _clear_ack()
+              continue
+            if preset.api_key_env and not os.environ.get(preset.api_key_env):
+              await _send_response(
+                channel, chat_id,
+                f"Preset **{new_model}** requires `${preset.api_key_env}` "
+                f"in the daemon's environment.",
+                db,
+              )
+              await _clear_ack()
+              continue
+            agent.set_endpoint(preset.endpoint_for(provider))
+            switched_to = preset.remote_for(provider)
+            log.info("Model switch to preset %s → %s (resume=%s)",
+                     preset.name, switched_to,
+                     _sdk_session_id[:8] if _sdk_session_id else "none")
+            model = switched_to
+            ctx.model = model
+            await _restart_client(resume=_sdk_session_id)
+            await _send_response(
+              channel, chat_id,
+              f"Model switched to preset **{preset.name}** "
+              f"(remote: `{switched_to}`).",
+              db,
+            )
+            continue
           if not is_model_compatible(provider, new_model):
             await _send_response(
               channel,
@@ -766,6 +808,9 @@ async def main_loop(
             )
             await _clear_ack()
             continue
+          # Plain model swap. Clear any preset endpoint that was active
+          # so we go back to the provider's default auth path.
+          agent.set_endpoint(EndpointConfig())
           model = new_model
           ctx.model = model
           log.info("Model switch to %s (resume=%s)", model, _sdk_session_id[:8] if _sdk_session_id else "none")

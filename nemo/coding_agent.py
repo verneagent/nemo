@@ -81,6 +81,16 @@ class CodingAgent(ABC):
     """
     del effort
 
+  def set_endpoint(self, endpoint: EndpointConfig) -> None:
+    """Replace the active endpoint config (base_url + api_key).
+
+    Triggered by ``/model`` switching to/from a preset that points at a
+    different endpoint than the current daemon was started with. The
+    host calls ``reset()`` after this so the new env vars propagate
+    into the SDK subprocess on its next reconnect.
+    """
+    del endpoint
+
   def trailing_note(self, sdk_session_id: str) -> str:
     """Return an optional markdown note to append to the final turn response.
 

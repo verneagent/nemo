@@ -69,6 +69,9 @@ class CodexCodingAgent(CodingAgent):
     mapped = _CLAUDE_TO_CODEX_EFFORT.get(effort, effort)
     self._effort = mapped if mapped in _CODEX_EFFORT_LEVELS else ""
 
+  def set_endpoint(self, endpoint: EndpointConfig) -> None:
+    self._endpoint = endpoint
+
   async def start(self, project_dir: str, model: str, resume: str = "") -> None:
     self._ensure_runtime()
     self._project_dir = project_dir

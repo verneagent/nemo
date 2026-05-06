@@ -98,6 +98,9 @@ class OpenCodeCodingAgent(CodingAgent):
       effort = "high"
     self._effort = effort if effort in ("", "low", "medium", "high") else ""
 
+  def set_endpoint(self, endpoint: EndpointConfig) -> None:
+    self._endpoint = endpoint
+
   async def start(self, project_dir: str, model: str, resume: str = "") -> None:
     self._ensure_runtime()
     self._project_dir = project_dir

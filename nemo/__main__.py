@@ -299,20 +299,6 @@ def main():
   parser.add_argument("--system-prompt-file", default="",
                       help="Path to a file whose contents are appended to the "
                            "agent's system prompt")
-  parser.add_argument("--base-url", default="",
-                      help="Custom endpoint URL. Translates per provider — "
-                           "claude→ANTHROPIC_BASE_URL, codex→OPENAI_BASE_URL, "
-                           "opencode→ANTHROPIC_BASE_URL/OPENAI_BASE_URL "
-                           "(dispatched by --model prefix).")
-  parser.add_argument("--api-key", default="",
-                      help="API key for the custom endpoint. Translates per "
-                           "provider — claude→ANTHROPIC_AUTH_TOKEN, "
-                           "codex→OPENAI_API_KEY, opencode→ANTHROPIC_API_KEY/"
-                           "OPENAI_API_KEY (dispatched by --model prefix).")
-  parser.add_argument("--api-key-env", default="",
-                      help="Read --api-key from the named environment "
-                           "variable instead of accepting it on the command "
-                           "line (avoids leaking the key into argv / ps).")
   parser.add_argument("--verbose", "-v", action="store_true", help="Debug logging")
   args = parser.parse_args()
 
@@ -448,28 +434,31 @@ def main():
   # Crash diagnostics (faulthandler, signal logging, watchdog heartbeat)
   _setup_crash_diagnostics(log_path)
 
-  api_key = args.api_key
-  if args.api_key_env:
-    var_name = args.api_key_env
-    # Catch the common mix-up: user passed the literal key as the value
-    # of --api-key-env (which expects the *name* of an env var, not its
-    # value). Heuristic: real env var names are uppercase ASCII / digits /
-    # underscores; secret-looking values usually contain other chars.
-    if not var_name.replace("_", "").isalnum() or "-" in var_name:
-      return _startup_fail(
-        f"Error: --api-key-env expects the NAME of an environment variable "
-        f"(e.g. DEEPSEEK_API_KEY), not the key itself. Got "
-        f"{var_name[:8]!r}{'…' if len(var_name) > 8 else ''}. "
-        f"If you meant to pass the key directly, use --api-key instead.")
-    api_key = os.environ.get(var_name, "")
-    if not api_key:
-      return _startup_fail(
-        f"Error: --api-key-env {var_name!r} is unset or empty in the "
-        f"shell environment. Export it first (e.g. "
-        f"`export {var_name}=...`) or pass --api-key directly.")
-
+  # Resolve --model against the preset registry. If it matches, expand
+  # to (endpoint, remote_model) so downstream code sees both the
+  # routing config and the wire-format model id without the user having
+  # to thread three flags. Unknown models pass through unchanged — they
+  # might be a raw provider slug like "claude-opus-4-7" or a custom
+  # model the user added to ~/.nemo/models.json.
   from .coding_agent import EndpointConfig
-  endpoint = EndpointConfig(base_url=args.base_url, api_key=api_key)
+  from .presets import resolve_preset
+  endpoint = EndpointConfig()
+  preset = resolve_preset(model)
+  if preset is not None:
+    if not preset.supports(args.provider):
+      return _startup_fail(
+        f"Error: preset {model!r} has no endpoint configured for "
+        f"--provider {args.provider}. Add anthropic_url/openai_url to "
+        f"~/.nemo/models.json or pick a different provider.")
+    if preset.api_key_env and not os.environ.get(preset.api_key_env):
+      return _startup_fail(
+        f"Error: preset {model!r} requires ${preset.api_key_env}, "
+        f"which is unset. Export it (e.g. `export {preset.api_key_env}=...`) "
+        f"and re-run.")
+    endpoint = preset.endpoint_for(args.provider)
+    model = preset.remote_for(args.provider)
+    log.info("Resolved preset %s → endpoint=%s model=%s",
+             preset.name, endpoint.base_url, model)
 
   from .agent import main_loop
   try:

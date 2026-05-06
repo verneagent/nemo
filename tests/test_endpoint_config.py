@@ -1,10 +1,12 @@
-"""Tests for the cross-provider --base-url / --api-key plumbing.
+"""Tests for the EndpointConfig plumbing in each provider adapter.
 
-Each adapter must translate a shared EndpointConfig into its own vendor
-env vars. Claude additionally fans the user-supplied model out across
-the ANTHROPIC_DEFAULT_*_MODEL knobs so third-party endpoints (DeepSeek,
-etc.) that don't speak canonical Claude slugs route everything to the
-remote model.
+EndpointConfig is now sourced from the preset registry at startup
+(``--model deepseek-v4-pro``) or via ``/model`` switching, but the
+shape and the per-adapter env translation is the same as it was when
+``--base-url`` / ``--api-key`` were CLI flags. Claude additionally
+fans the user-supplied model out across the ANTHROPIC_DEFAULT_*_MODEL
+knobs so third-party endpoints that don't speak canonical Claude slugs
+route everything to the remote model.
 """
 
 from __future__ import annotations
@@ -279,7 +281,7 @@ def test_opencode_endpoint_unknown_prefix_writes_both():
 
 
 # ---------------------------------------------------------------------------
-# CLI plumbing through __main__
+# CLI preset expansion through __main__
 # ---------------------------------------------------------------------------
 
 def _fake_asyncio_run_capture(captured):
@@ -290,16 +292,20 @@ def _fake_asyncio_run_capture(captured):
   return _runner
 
 
-def test_cli_base_url_and_api_key_threaded_to_main_loop(tmp_path):
+def test_cli_preset_expands_to_endpoint_and_remote_model(tmp_path):
+  """`--model deepseek-v4-pro` resolves against the preset registry,
+  expands to the per-protocol base_url + remote model id, and reads
+  the api key from the named env var. None of the legacy
+  --base-url/--api-key flags are needed."""
   from nemo.__main__ import main
   project = str(tmp_path)
   captured: dict[str, object] = {}
   argv = [
     "nemo", "--chat-id", "oc_1", "--project-dir", project,
-    "--base-url", "https://api.deepseek.com/anthropic",
-    "--api-key", "sk-deepseek",
+    "--provider", "claude", "--model", "deepseek-v4-pro",
   ]
-  with mock.patch("sys.argv", argv), \
+  with mock.patch.dict(os.environ, {"DEEPSEEK_API_KEY": "sk-test"}), \
+       mock.patch("sys.argv", argv), \
        mock.patch("nemo.__main__._ensure_provider_runtime"), \
        mock.patch("nemo.config.load_credentials",
                   return_value={"app_id": "a", "app_secret": "s", "email": ""}), \
@@ -308,20 +314,24 @@ def test_cli_base_url_and_api_key_threaded_to_main_loop(tmp_path):
     mock_asyncio.run.side_effect = _fake_asyncio_run_capture(captured)
     rc = main()
   assert rc == 0
-  endpoint = captured["frame"].f_locals["endpoint"]
+  frame = captured["frame"]
+  endpoint = frame.f_locals["endpoint"]
+  # Claude provider → Anthropic-protocol endpoint & remote name from preset.
   assert endpoint.base_url == "https://api.deepseek.com/anthropic"
-  assert endpoint.api_key == "sk-deepseek"
+  assert endpoint.api_key == "sk-test"
+  assert frame.f_locals["model"] == "deepseek-v4-pro[1m]"
 
 
-def test_cli_api_key_env_reads_from_environment(tmp_path):
+def test_cli_preset_picks_protocol_for_provider(tmp_path):
+  """Same preset, codex provider → OpenAI-protocol fields."""
   from nemo.__main__ import main
   project = str(tmp_path)
   captured: dict[str, object] = {}
   argv = [
     "nemo", "--chat-id", "oc_1", "--project-dir", project,
-    "--api-key-env", "MY_TEST_KEY",
+    "--provider", "codex", "--model", "deepseek-v4-pro",
   ]
-  with mock.patch.dict(os.environ, {"MY_TEST_KEY": "secret-from-env"}), \
+  with mock.patch.dict(os.environ, {"DEEPSEEK_API_KEY": "sk-test"}), \
        mock.patch("sys.argv", argv), \
        mock.patch("nemo.__main__._ensure_provider_runtime"), \
        mock.patch("nemo.config.load_credentials",
@@ -331,46 +341,53 @@ def test_cli_api_key_env_reads_from_environment(tmp_path):
     mock_asyncio.run.side_effect = _fake_asyncio_run_capture(captured)
     rc = main()
   assert rc == 0
-  endpoint = captured["frame"].f_locals["endpoint"]
-  assert endpoint.api_key == "secret-from-env"
+  frame = captured["frame"]
+  endpoint = frame.f_locals["endpoint"]
+  assert endpoint.base_url == "https://api.deepseek.com"  # no /anthropic
+  assert frame.f_locals["model"] == "deepseek-v4-pro"     # no [1m] suffix
 
 
-def test_cli_api_key_env_unset_is_error(tmp_path):
+def test_cli_preset_missing_api_key_env_is_error(tmp_path):
+  """Preset declares api_key_env=DEEPSEEK_API_KEY but the var is
+  unset → daemon must fail fast rather than spawning the SDK with an
+  empty token."""
   from nemo.__main__ import main
   project = str(tmp_path)
   argv = [
     "nemo", "--chat-id", "oc_1", "--project-dir", project,
-    "--api-key-env", "DEFINITELY_NOT_SET_XYZZY",
+    "--model", "deepseek-v4-pro",
   ]
-  with mock.patch.dict(os.environ, {}, clear=False), \
+  env_no_key = {k: v for k, v in os.environ.items() if k != "DEEPSEEK_API_KEY"}
+  with mock.patch.dict(os.environ, env_no_key, clear=True), \
        mock.patch("sys.argv", argv), \
        mock.patch("nemo.__main__._ensure_provider_runtime"), \
        mock.patch("nemo.config.load_credentials",
                   return_value={"app_id": "a", "app_secret": "s", "email": ""}), \
        mock.patch("nemo.preflight.run_preflight", return_value=[]):
-    # Make sure the env var is genuinely unset.
-    os.environ.pop("DEFINITELY_NOT_SET_XYZZY", None)
     rc = main()
   assert rc == 1
 
 
-def test_cli_api_key_env_rejects_literal_key(tmp_path, capsys):
-  # Common mix-up: user passes the actual secret as --api-key-env's
-  # value. Detect via the shape (env var names don't contain hyphens)
-  # and tell them to use --api-key instead.
+def test_cli_unknown_model_passes_through_unchanged(tmp_path):
+  """A non-preset model id (raw provider slug) must skip preset
+  expansion and reach main_loop verbatim, with an empty endpoint."""
   from nemo.__main__ import main
   project = str(tmp_path)
+  captured: dict[str, object] = {}
   argv = [
     "nemo", "--chat-id", "oc_1", "--project-dir", project,
-    "--api-key-env", "sk-77675d801b984b628a5f199488a08eee",
+    "--provider", "claude", "--model", "claude-opus-4-7",
   ]
   with mock.patch("sys.argv", argv), \
        mock.patch("nemo.__main__._ensure_provider_runtime"), \
        mock.patch("nemo.config.load_credentials",
                   return_value={"app_id": "a", "app_secret": "s", "email": ""}), \
-       mock.patch("nemo.preflight.run_preflight", return_value=[]):
+       mock.patch("nemo.preflight.run_preflight", return_value=[]), \
+       mock.patch("nemo.__main__.asyncio") as mock_asyncio:
+    mock_asyncio.run.side_effect = _fake_asyncio_run_capture(captured)
     rc = main()
-  assert rc == 1
-  err = capsys.readouterr().err
-  assert "NAME of an environment variable" in err
-  assert "--api-key" in err
+  assert rc == 0
+  frame = captured["frame"]
+  assert frame.f_locals["model"] == "claude-opus-4-7"
+  assert frame.f_locals["endpoint"].base_url == ""
+  assert frame.f_locals["endpoint"].api_key == ""
