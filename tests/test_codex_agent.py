@@ -247,6 +247,70 @@ def test_codex_ensure_runtime_checks_sidecar():
         raise AssertionError("expected RuntimeError")
 
 
+def test_codex_sidecar_deps_stale_detection(tmp_path):
+  """When package.json pins a different codex-sdk version than what's
+  installed, _ensure_runtime must wipe node_modules and reinstall — npm
+  install alone won't cross a 0.x minor pin boundary, so a stale
+  sidecar would keep using the old codex CLI even after the wheel
+  upgrade. The most common symptom is the OpenAI API rejecting newer
+  models ("'gpt-5.5' requires a newer version of Codex")."""
+  import json as _json
+
+  side_dir = tmp_path / "codex_sidecar"
+  node_modules = side_dir / "node_modules"
+  pkg_path = side_dir / "package.json"
+  installed_path = node_modules / "@openai" / "codex-sdk" / "package.json"
+  installed_path.parent.mkdir(parents=True)
+  pkg_path.write_text(_json.dumps({
+    "dependencies": {"@openai/codex-sdk": "0.128.0"}
+  }))
+  installed_path.write_text(_json.dumps({"version": "0.118.0"}))
+
+  agent = CodexCodingAgent({}, "oc_1", _DummyDB(), _DummyChannel())
+  with mock.patch("nemo.codex_agent._SIDE_CAR_DIR", side_dir), \
+       mock.patch("nemo.codex_agent._SIDE_CAR_PACKAGE", pkg_path), \
+       mock.patch("nemo.codex_agent._SIDE_CAR_NODE_MODULES", node_modules):
+    assert agent._sidecar_deps_stale() is True
+
+    # Match → no reinstall needed.
+    installed_path.write_text(_json.dumps({"version": "0.128.0"}))
+    assert agent._sidecar_deps_stale() is False
+
+    # Caret prefix in package.json should be stripped before compare.
+    pkg_path.write_text(_json.dumps({
+      "dependencies": {"@openai/codex-sdk": "^0.128.0"}
+    }))
+    assert agent._sidecar_deps_stale() is False
+    installed_path.write_text(_json.dumps({"version": "0.127.5"}))
+    assert agent._sidecar_deps_stale() is True
+
+
+def test_codex_ensure_runtime_reinstalls_when_stale(tmp_path):
+  """_ensure_runtime: stale node_modules → rmtree + _install_sidecar_deps."""
+  side_dir = tmp_path / "codex_sidecar"
+  node_modules = side_dir / "node_modules"
+  script_path = side_dir / "run_turn.mjs"
+  pkg_path = side_dir / "package.json"
+  side_dir.mkdir()
+  script_path.write_text("// stub")
+  pkg_path.write_text('{"dependencies": {"@openai/codex-sdk": "0.128.0"}}')
+  installed = node_modules / "@openai" / "codex-sdk" / "package.json"
+  installed.parent.mkdir(parents=True)
+  installed.write_text('{"version": "0.118.0"}')
+
+  agent = CodexCodingAgent({}, "oc_1", _DummyDB(), _DummyChannel())
+  with mock.patch("nemo.codex_agent._SIDE_CAR_DIR", side_dir), \
+       mock.patch("nemo.codex_agent._SIDE_CAR_SCRIPT", script_path), \
+       mock.patch("nemo.codex_agent._SIDE_CAR_PACKAGE", pkg_path), \
+       mock.patch("nemo.codex_agent._SIDE_CAR_NODE_MODULES", node_modules), \
+       mock.patch("shutil.which", side_effect=lambda name: f"/usr/bin/{name}"), \
+       mock.patch.object(CodexCodingAgent, "_install_sidecar_deps") as mock_install:
+    agent._ensure_runtime()
+    mock_install.assert_called_once()
+    # node_modules removed before reinstall.
+    assert not node_modules.exists()
+
+
 def test_codex_item_summary_variants():
   agent = CodexCodingAgent({}, "oc_1", _DummyDB(), _DummyChannel())
   assert agent._item_summary({"type": "command_execution", "command": "ls -la"}) == "$ ls -la"

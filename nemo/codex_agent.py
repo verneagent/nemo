@@ -274,6 +274,45 @@ class CodexCodingAgent(CodingAgent):
       )
     if not _SIDE_CAR_NODE_MODULES.is_dir():
       self._install_sidecar_deps()
+      return
+    if self._sidecar_deps_stale():
+      log.info("codex sidecar deps stale — reinstalling for new captain-nemo")
+      shutil.rmtree(_SIDE_CAR_NODE_MODULES, ignore_errors=True)
+      self._install_sidecar_deps()
+
+  def _sidecar_deps_stale(self) -> bool:
+    """True if the installed @openai/codex-sdk version doesn't match the
+    pin in package.json. captain-nemo upgrades that bump the codex pin
+    (e.g. for a new model the old codex CLI doesn't recognize) need to
+    reinstall the sidecar's node_modules — npm install on its own won't
+    cross a 0.x minor boundary because the caret semantics in 0.y.z
+    constrain to >=0.y.z <0.(y+1).0 in older configs and we now pin
+    exact versions anyway. Compare installed vs declared and force a
+    fresh install on mismatch."""
+    expected = self._declared_sdk_version()
+    if not expected:
+      return False  # no pin to compare against — keep what's there
+    installed = self._installed_sdk_version()
+    return installed != expected
+
+  def _declared_sdk_version(self) -> str:
+    try:
+      data = json.loads(_SIDE_CAR_PACKAGE.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+      log.warning("codex sidecar package.json unreadable: %s", exc)
+      return ""
+    deps = data.get("dependencies", {}) if isinstance(data, dict) else {}
+    raw = deps.get("@openai/codex-sdk", "") if isinstance(deps, dict) else ""
+    # Accept "0.128.0", "^0.128.0", "~0.128.0" — strip semver prefix.
+    return str(raw).lstrip("^~>=< ").strip() if isinstance(raw, str) else ""
+
+  def _installed_sdk_version(self) -> str:
+    pkg = _SIDE_CAR_NODE_MODULES / "@openai" / "codex-sdk" / "package.json"
+    try:
+      data = json.loads(pkg.read_text())
+    except (OSError, json.JSONDecodeError):
+      return ""
+    return str(data.get("version", "")) if isinstance(data, dict) else ""
 
   def _install_sidecar_deps(self) -> None:
     """Run `npm install` in the sidecar dir on first use.
