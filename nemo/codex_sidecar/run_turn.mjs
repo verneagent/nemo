@@ -2,7 +2,7 @@
 
 import { stdin, stdout, stderr, exit, argv } from "node:process";
 import { Codex } from "@openai/codex-sdk";
-import { startStream } from "./resume.mjs";
+import { streamToStdout } from "./resume.mjs";
 
 const VALID_EFFORTS = new Set(["minimal", "low", "medium", "high", "xhigh"]);
 
@@ -54,11 +54,8 @@ async function main() {
     sandboxMode: "danger-full-access",
     approvalPolicy: "never",
   };
-  const { events } = await startStream(
-    codex, threadOptions, prompt, options.resume, stderr);
-  for await (const event of events) {
-    stdout.write(`${JSON.stringify(event)}\n`);
-  }
+  await streamToStdout(
+    codex, threadOptions, prompt, options.resume, stdout, stderr);
 }
 
 main().catch((error) => {

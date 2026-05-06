@@ -13,6 +13,14 @@
 // In all three cases, the only correct behavior is "fall back to a fresh
 // thread, log loudly, and let nemo's DB pick up the new thread.started
 // id from the next event so future turns resume the right thread."
+//
+// IMPORTANT: the codex SDK throws "no rollout found" *lazily* from inside
+// the events async iterator — `runStreamed()` itself returns
+// successfully, but the first `next()` on `events` rejects. So the
+// fallback has to wrap iteration, not just the call site. We only retry
+// when nothing has been written to stdout yet — falling back mid-stream
+// would splice events from two different codex threads into one nemo
+// turn.
 
 export function isResumeUnrecoverable(error) {
   const message = String(error?.message || error || "");
@@ -23,23 +31,36 @@ export function isResumeUnrecoverable(error) {
   );
 }
 
-export async function startStream(codex, threadOptions, prompt, resumeId, stderr) {
+export async function streamToStdout(codex, threadOptions, prompt, resumeId, stdout, stderr) {
   if (!resumeId) {
-    const thread = codex.startThread(threadOptions);
-    return { thread, events: (await thread.runStreamed(prompt)).events };
+    const { events } = await codex.startThread(threadOptions).runStreamed(prompt);
+    for await (const event of events) {
+      stdout.write(`${JSON.stringify(event)}\n`);
+    }
+    return;
   }
+
+  let emittedFromResume = false;
   try {
-    const thread = codex.resumeThread(resumeId, threadOptions);
-    return { thread, events: (await thread.runStreamed(prompt)).events };
+    const { events } = await codex.resumeThread(resumeId, threadOptions).runStreamed(prompt);
+    for await (const event of events) {
+      emittedFromResume = true;
+      stdout.write(`${JSON.stringify(event)}\n`);
+    }
+    return;
   } catch (error) {
-    if (!isResumeUnrecoverable(error)) {
+    if (emittedFromResume || !isResumeUnrecoverable(error)) {
       throw error;
     }
     const summary = String(error?.message || error || "").split("\n")[0];
     stderr.write(
       `[codex sidecar] resume ${resumeId} unusable (${summary}) — starting fresh thread\n`
     );
-    const thread = codex.startThread(threadOptions);
-    return { thread, events: (await thread.runStreamed(prompt)).events };
+  }
+
+  // Resume failed before yielding any event — safe to fall back.
+  const { events } = await codex.startThread(threadOptions).runStreamed(prompt);
+  for await (const event of events) {
+    stdout.write(`${JSON.stringify(event)}\n`);
   }
 }

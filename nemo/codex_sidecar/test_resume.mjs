@@ -1,9 +1,9 @@
 // Tests for resume.mjs. Run with `node test_resume.mjs` — exits 0 on
-// pass, prints the failing assertion and exits 1 otherwise. The Python
-// pytest harness (tests/test_codex_sidecar_resume.py) shells out to this
-// file so the regression travels with the JS source.
+// pass, prints failing assertions and exits 1 otherwise. The Python
+// pytest harness (tests/test_codex_sidecar_resume.py) shells out to
+// this file so the regression travels with the JS source.
 
-import { isResumeUnrecoverable, startStream } from "./resume.mjs";
+import { isResumeUnrecoverable, streamToStdout } from "./resume.mjs";
 
 let passed = 0;
 const failures = [];
@@ -45,122 +45,194 @@ check(
 );
 
 // ---------------------------------------------------------------------------
-// startStream: with no resume id → goes straight to startThread.
+// streamToStdout test scaffolding.
 // ---------------------------------------------------------------------------
 
-function fakeStreamResult(label) {
-  return { events: [`events-from-${label}`] };
-}
-
-function makeCodex({ onResume, onStart }) {
+// Build an async iterable from a list. Items can be:
+//   - a value: yielded normally
+//   - {throw: errorMessage}: the iterator rejects on next() instead of
+//     yielding (this models the codex SDK's lazy "no rollout" throw).
+function fakeEvents(items) {
+  const queue = items.slice();
   return {
-    resumeThread(id, _opts) {
-      const thread = {
-        runStreamed(_prompt) {
-          if (onResume) return onResume(id);
-          return fakeStreamResult(`resume-${id}`);
-        },
-      };
-      return thread;
-    },
-    startThread(_opts) {
+    [Symbol.asyncIterator]() {
       return {
-        runStreamed(_prompt) {
-          if (onStart) return onStart();
-          return fakeStreamResult("start");
+        async next() {
+          if (queue.length === 0) return { done: true, value: undefined };
+          const next = queue.shift();
+          if (next && typeof next === "object" && "throw" in next) {
+            throw new Error(next.throw);
+          }
+          return { done: false, value: next };
         },
       };
     },
   };
 }
 
-class FakeStderr {
+function makeCodex({ resumeEvents, startEvents, resumeSyncThrow }) {
+  return {
+    resumeThread(_id, _opts) {
+      return {
+        async runStreamed(_prompt) {
+          if (resumeSyncThrow) throw new Error(resumeSyncThrow);
+          return { events: fakeEvents(resumeEvents ?? []) };
+        },
+      };
+    },
+    startThread(_opts) {
+      return {
+        async runStreamed(_prompt) {
+          return { events: fakeEvents(startEvents ?? []) };
+        },
+      };
+    },
+  };
+}
+
+class FakeStream {
   constructor() { this.lines = []; }
   write(line) { this.lines.push(line); return true; }
 }
 
 (async () => {
-  // No resume id → startThread, no fallback log.
+  // No resume id → only startThread is consulted.
   {
-    const stderr = new FakeStderr();
-    const codex = makeCodex({});
-    const { events } = await startStream(codex, {}, "hi", "", stderr);
+    const stdout = new FakeStream();
+    const stderr = new FakeStream();
+    const codex = makeCodex({ startEvents: [{ type: "ok", n: 1 }] });
+    await streamToStdout(codex, {}, "hi", "", stdout, stderr);
     check(
-      "startStream: no resume → startThread",
-      events[0] === "events-from-start",
-      `events=${JSON.stringify(events)}`,
+      "no resume → events from startThread",
+      stdout.lines.length === 1 && stdout.lines[0].includes('"type":"ok"'),
+      `stdout=${JSON.stringify(stdout.lines)}`,
     );
     check(
-      "startStream: no resume → no fallback log",
+      "no resume → no fallback log",
       stderr.lines.length === 0,
-      `stderr=${JSON.stringify(stderr.lines)}`,
     );
   }
 
-  // Resume id, resumeThread succeeds → return events from resume.
+  // Successful resume → events flow, no fallback.
   {
-    const stderr = new FakeStderr();
-    const codex = makeCodex({});
-    const { events } = await startStream(codex, {}, "hi", "abc-123", stderr);
-    check(
-      "startStream: successful resume → resume events",
-      events[0] === "events-from-resume-abc-123",
-      `events=${JSON.stringify(events)}`,
-    );
-    check(
-      "startStream: successful resume → no fallback log",
-      stderr.lines.length === 0,
-      `stderr=${JSON.stringify(stderr.lines)}`,
-    );
-  }
-
-  // Resume id, resumeThread throws "no rollout" → fall back to startThread,
-  // emit a stderr line for operator visibility.
-  {
-    const stderr = new FakeStderr();
+    const stdout = new FakeStream();
+    const stderr = new FakeStream();
     const codex = makeCodex({
-      onResume: () => {
-        throw new Error(
-          "thread/resume: thread/resume failed: no rollout found for thread id abc-123"
-        );
-      },
+      resumeEvents: [{ type: "started" }, { type: "done" }],
+      startEvents: [{ type: "wrong-source" }],
     });
-    const { events } = await startStream(codex, {}, "hi", "abc-123", stderr);
+    await streamToStdout(codex, {}, "hi", "abc-1", stdout, stderr);
     check(
-      "startStream: unrecoverable resume → fall back to startThread",
-      events[0] === "events-from-start",
-      `events=${JSON.stringify(events)}`,
+      "successful resume → only resume events",
+      stdout.lines.length === 2
+      && stdout.lines.every(l => !l.includes("wrong-source")),
+      `stdout=${JSON.stringify(stdout.lines)}`,
     );
     check(
-      "startStream: fallback emits stderr breadcrumb",
+      "successful resume → no fallback log",
+      stderr.lines.length === 0,
+    );
+  }
+
+  // Lazy throw on first iteration → fall back, log, emit fresh-thread events.
+  {
+    const stdout = new FakeStream();
+    const stderr = new FakeStream();
+    const codex = makeCodex({
+      resumeEvents: [
+        { throw: "thread/resume: thread/resume failed: no rollout found for thread id abc-1" },
+      ],
+      startEvents: [{ type: "fresh-1" }, { type: "fresh-2" }],
+    });
+    await streamToStdout(codex, {}, "hi", "abc-1", stdout, stderr);
+    check(
+      "lazy iterator throw before any event → fallback emits fresh events",
+      stdout.lines.length === 2
+      && stdout.lines[0].includes("fresh-1")
+      && stdout.lines[1].includes("fresh-2"),
+      `stdout=${JSON.stringify(stdout.lines)}`,
+    );
+    check(
+      "lazy iterator throw → stderr breadcrumb",
       stderr.lines.length === 1
       && stderr.lines[0].includes("[codex sidecar]")
-      && stderr.lines[0].includes("abc-123")
+      && stderr.lines[0].includes("abc-1")
       && stderr.lines[0].includes("starting fresh thread"),
       `stderr=${JSON.stringify(stderr.lines)}`,
     );
   }
 
-  // Resume id, resumeThread throws something OTHER than the resume-class —
-  // do NOT swallow; let it bubble so genuine bugs surface.
+  // Sync throw from runStreamed itself (older SDK behavior we still want to
+  // recover from) → fall back.
   {
-    const stderr = new FakeStderr();
+    const stdout = new FakeStream();
+    const stderr = new FakeStream();
     const codex = makeCodex({
-      onResume: () => { throw new Error("ECONNREFUSED 127.0.0.1:1234"); },
+      resumeSyncThrow: "no rollout found for thread id abc-1",
+      startEvents: [{ type: "fresh" }],
+    });
+    await streamToStdout(codex, {}, "hi", "abc-1", stdout, stderr);
+    check(
+      "sync throw from resumeThread.runStreamed → fallback",
+      stdout.lines.length === 1 && stdout.lines[0].includes("fresh"),
+      `stdout=${JSON.stringify(stdout.lines)}`,
+    );
+    check(
+      "sync throw → stderr breadcrumb",
+      stderr.lines.length === 1 && stderr.lines[0].includes("starting fresh thread"),
+    );
+  }
+
+  // Unrelated error during iteration → MUST bubble (don't mask real bugs).
+  {
+    const stdout = new FakeStream();
+    const stderr = new FakeStream();
+    const codex = makeCodex({
+      resumeEvents: [{ throw: "ECONNREFUSED 127.0.0.1:6152" }],
+      startEvents: [{ type: "should-not-emit" }],
     });
     let raised = null;
     try {
-      await startStream(codex, {}, "hi", "abc-123", stderr);
+      await streamToStdout(codex, {}, "hi", "abc-1", stdout, stderr);
     } catch (err) { raised = err; }
     check(
-      "startStream: non-resume error bubbles",
+      "non-resume iterator error bubbles",
       raised && /ECONNREFUSED/.test(raised.message),
       `raised=${raised && raised.message}`,
     );
     check(
-      "startStream: non-resume error does NOT log fallback",
-      stderr.lines.length === 0,
-      `stderr=${JSON.stringify(stderr.lines)}`,
+      "non-resume error does NOT fall back to fresh thread",
+      stdout.lines.length === 0,
+      `stdout=${JSON.stringify(stdout.lines)}`,
+    );
+  }
+
+  // Mid-stream resume failure (events yielded, THEN iterator rejects) →
+  // do NOT splice fresh thread events on top; bubble so the host sees one
+  // turn ended badly rather than a frankenstein turn.
+  {
+    const stdout = new FakeStream();
+    const stderr = new FakeStream();
+    const codex = makeCodex({
+      resumeEvents: [
+        { type: "partial-1" },
+        { throw: "no rollout found for thread id abc-1" },
+      ],
+      startEvents: [{ type: "should-not-emit" }],
+    });
+    let raised = null;
+    try {
+      await streamToStdout(codex, {}, "hi", "abc-1", stdout, stderr);
+    } catch (err) { raised = err; }
+    check(
+      "mid-stream resume error bubbles (no splicing)",
+      raised && /no rollout/.test(raised.message),
+      `raised=${raised && raised.message}`,
+    );
+    check(
+      "mid-stream error keeps the partial event but doesn't add fresh",
+      stdout.lines.length === 1 && stdout.lines[0].includes("partial-1"),
+      `stdout=${JSON.stringify(stdout.lines)}`,
     );
   }
 
