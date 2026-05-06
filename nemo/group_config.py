@@ -157,11 +157,32 @@ def load_config(token: str, chat_id: str) -> JsonObject:
 
 def save_config(token: str, chat_id: str, config: JsonObject) -> str:
   """Save config to pinned message. Creates or replaces. Returns message_id."""
+  from .lark import api as lark_api
+
   with _save_lock:
     result = _find_config_pin(token, chat_id)
     if result is not None:
       pin_msg_id, _old = result
-      return _update_config_pin(token, pin_msg_id, config)
+      try:
+        return _update_config_pin(token, pin_msg_id, config)
+      except RuntimeError as e:
+        # Lark text messages have a finite edit window (~24h). Older
+        # config pins return code 230075 ("The message has exceeded the
+        # time that can be edited.") on PUT. Recreate the pin instead
+        # of failing the slash command — long-lived groups should still
+        # be able to /mention, /norm, /guest, etc.
+        if "230075" not in str(e):
+          raise
+        log.info(
+          "Config pin %s past edit window; recreating", pin_msg_id)
+        try:
+          lark_api.delete_pin(token, pin_msg_id)
+        except Exception as exc:
+          log.warning("Failed to unpin stale config %s: %s", pin_msg_id, exc)
+        try:
+          lark_api.delete_message(token, pin_msg_id)
+        except Exception as exc:
+          log.warning("Failed to delete stale config %s: %s", pin_msg_id, exc)
     return _create_config_pin(token, chat_id, config)
 
 

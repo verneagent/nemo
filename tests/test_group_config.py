@@ -173,3 +173,87 @@ def test_save_config_updates_existing_in_place():
   assert "autoapprove: true" in edited_text
 
 
+def test_save_config_recreates_when_edit_window_expired():
+  """When edit_text fails with 230075 (Lark's text-edit window exceeded),
+  save_config must unpin/delete the stale pin and create a fresh one
+  instead of letting the slash command fail."""
+  old_config = {"autoapprove": False, "guests": []}
+  old_msg = _text_msg(_build_config_text(old_config))
+  edit_error = RuntimeError(
+    "Failed to edit text: {'code': 230075, 'msg': "
+    "'The message has exceeded the time that can be edited.'}")
+
+  with mock.patch("nemo.lark.api.list_pins", return_value=[
+    {"message_id": "msg_old"},
+  ]):
+    with mock.patch("nemo.lark.api.get_message", return_value=old_msg), \
+         mock.patch("nemo.lark.api.edit_text", side_effect=edit_error), \
+         mock.patch("nemo.lark.api.delete_pin") as mock_del_pin, \
+         mock.patch("nemo.lark.api.delete_message") as mock_del_msg, \
+         mock.patch("nemo.lark.api.send_text", return_value="msg_new") as mock_send, \
+         mock.patch("nemo.lark.api.create_pin") as mock_pin:
+      new_config = {**old_config, "autoapprove": True}
+      msg_id = save_config("tok", "oc_1", new_config)
+
+  # Returned the freshly-created id, not the stale one.
+  assert msg_id == "msg_new"
+  # Stale pin best-effort cleaned up.
+  mock_del_pin.assert_called_once_with("tok", "msg_old")
+  mock_del_msg.assert_called_once_with("tok", "msg_old")
+  # New pin created with updated content.
+  mock_send.assert_called_once()
+  mock_pin.assert_called_once_with("tok", "msg_new")
+  sent_text = mock_send.call_args[0][2]
+  assert "autoapprove: true" in sent_text
+
+
+def test_save_config_recreate_survives_cleanup_failures():
+  """Cleanup of the stale pin is best-effort: if delete_pin or
+  delete_message fail (Lark recall window also expired, etc.), we still
+  create the new pin so the user's config update lands.  _find_config_pin
+  on the next read will dedupe any orphans."""
+  old_config = {"autoapprove": False, "guests": []}
+  old_msg = _text_msg(_build_config_text(old_config))
+  edit_error = RuntimeError(
+    "Failed to edit text: {'code': 230075, 'msg': '...'}")
+
+  with mock.patch("nemo.lark.api.list_pins", return_value=[
+    {"message_id": "msg_old"},
+  ]):
+    with mock.patch("nemo.lark.api.get_message", return_value=old_msg), \
+         mock.patch("nemo.lark.api.edit_text", side_effect=edit_error), \
+         mock.patch("nemo.lark.api.delete_pin",
+                    side_effect=RuntimeError("delete_pin boom")), \
+         mock.patch("nemo.lark.api.delete_message",
+                    side_effect=RuntimeError("recall expired")), \
+         mock.patch("nemo.lark.api.send_text", return_value="msg_new"), \
+         mock.patch("nemo.lark.api.create_pin"):
+      msg_id = save_config("tok", "oc_1", {**old_config, "autoapprove": True})
+
+  assert msg_id == "msg_new"
+
+
+def test_save_config_propagates_non_230075_errors():
+  """Other edit_text failures (e.g. 401 auth, 5xx) must NOT silently
+  recreate — that would mask real bugs."""
+  old_config = {"autoapprove": False, "guests": []}
+  old_msg = _text_msg(_build_config_text(old_config))
+  edit_error = RuntimeError("Failed to edit text: {'code': 99991663, 'msg': 'rate limited'}")
+
+  with mock.patch("nemo.lark.api.list_pins", return_value=[
+    {"message_id": "msg_old"},
+  ]):
+    with mock.patch("nemo.lark.api.get_message", return_value=old_msg), \
+         mock.patch("nemo.lark.api.edit_text", side_effect=edit_error), \
+         mock.patch("nemo.lark.api.send_text") as mock_send, \
+         mock.patch("nemo.lark.api.create_pin") as mock_pin:
+      try:
+        save_config("tok", "oc_1", old_config)
+      except RuntimeError as e:
+        assert "rate limited" in str(e)
+      else:
+        raise AssertionError("expected RuntimeError to propagate")
+  mock_send.assert_not_called()
+  mock_pin.assert_not_called()
+
+
