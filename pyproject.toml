@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "captain-nemo"
-version = "0.3.81"
+version = "0.3.82"
 description = "Lark-connected coding agent daemon powered by Claude Agent SDK"
 requires-python = ">=3.14"
 license = "MIT"
@@ -37,6 +37,7 @@ nemo = [
   "codex_sidecar/package.json",
   "codex_sidecar/package-lock.json",
   "codex_sidecar/run_turn.mjs",
+  "codex_sidecar/resume.mjs",
   "opencode_sidecar/package.json",
   "opencode_sidecar/list_models.mjs",
   "opencode_sidecar/run_turn.mjs",
