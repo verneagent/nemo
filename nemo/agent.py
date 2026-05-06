@@ -498,14 +498,18 @@ async def main_loop(
 
   channel.parent_lookup = _db_parent_lookup
 
-  # Clean stale sessions (preserve sdk_session_id for resume)
+  # Clean stale sessions (preserve sdk_session_id for resume).
+  # Per-provider lookup so switching providers on a chat doesn't feed a
+  # Claude UUID into Codex (or vice versa) — the right answer is always
+  # to start that provider fresh, while leaving the other providers'
+  # stored ids intact for when the user switches back.
   _resume_sdk_id = ""
   try:
     old_owner = db.get_chat_owner(chat_id)
     if old_owner:
-      _resume_sdk_id = db.get_sdk_session_id(chat_id)
-      log.info("Cleaning stale session %s (sdk=%s)", old_owner,
-               _resume_sdk_id[:8] if _resume_sdk_id else "none")
+      _resume_sdk_id = db.get_sdk_session_id(chat_id, provider)
+      log.info("Cleaning stale session %s (sdk[%s]=%s)", old_owner,
+               provider, _resume_sdk_id[:8] if _resume_sdk_id else "none")
       db.deactivate(old_owner)
   except Exception as e:
     log.warning("Stale cleanup error: %s", e)
@@ -1049,7 +1053,7 @@ async def main_loop(
           _await_channel(_clear_ack())
           if event.session_id:
             _sdk_session_id = event.session_id
-            db.set_sdk_session_id(chat_id, _sdk_session_id)
+            db.set_sdk_session_id(chat_id, _sdk_session_id, provider)
           if _turn_interrupt_phase:
             if _turn_card_id:
               db.clear_working(session_id)

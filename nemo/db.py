@@ -61,13 +61,44 @@ CREATE TABLE IF NOT EXISTS working_state (
 """
 
 
+_PROVIDER_SESSION_COLUMNS: dict[str, str] = {
+  "claude": "claude_session_id",
+  "codex": "codex_session_id",
+  "opencode": "opencode_session_id",
+}
+
+
 def _ensure_tables(conn: sqlite3.Connection) -> None:
   conn.executescript(_SCHEMA)
-  # Migration: add sdk_session_id column if missing
   cols = {row[1] for row in conn.execute("PRAGMA table_info(sessions)")}
+  added: list[str] = []
   if "sdk_session_id" not in cols:
+    # Legacy column from before per-provider session storage. Still
+    # added on brand-new DBs so this loop's heuristic backfill below
+    # has somewhere to look. Old code that wrote here continues to work
+    # for one release, but `set_sdk_session_id` no longer touches it.
     conn.execute("ALTER TABLE sessions ADD COLUMN sdk_session_id TEXT DEFAULT ''")
-    conn.commit()
+  for col in _PROVIDER_SESSION_COLUMNS.values():
+    if col not in cols:
+      conn.execute(f"ALTER TABLE sessions ADD COLUMN {col} TEXT DEFAULT ''")
+      added.append(col)
+  # Backfill heuristic on first upgrade: a pre-0.3.87 DB has the
+  # legacy sdk_session_id populated and the new per-provider columns
+  # empty. The legacy column held whatever the most-recent daemon
+  # wrote regardless of provider, but in practice the historical
+  # default and only common case was claude. Copy into claude_session_id
+  # so a daemon that upgrades mid-session can still resume on the
+  # claude path; codex/opencode users will start a fresh thread on
+  # their first post-upgrade turn (the resume-fallback handles that
+  # path safely).
+  claude_col = _PROVIDER_SESSION_COLUMNS["claude"]
+  if claude_col in added:
+    conn.execute(
+      f"UPDATE sessions SET {claude_col} = sdk_session_id "
+      f"WHERE ({claude_col} = '' OR {claude_col} IS NULL) "
+      f"AND sdk_session_id IS NOT NULL AND sdk_session_id != ''"
+    )
+  conn.commit()
 
 
 class Database:
@@ -99,18 +130,30 @@ class Database:
     need_mention: bool = False,
   ) -> None:
     self._session_id = session_id
-    # Preserve sdk_session_id from previous session for this chat
+    # Preserve resume state from the previous row for this chat — both
+    # the legacy sdk_session_id (still read by old captain-nemo) and the
+    # per-provider columns introduced in 0.3.87. INSERT OR REPLACE
+    # rewrites every column to its DEFAULT, so we have to fish out the
+    # current values and pass them through.
+    provider_cols = list(_PROVIDER_SESSION_COLUMNS.values())
+    old_cols = ["sdk_session_id", *provider_cols]
+    select_cols = ", ".join(old_cols)
     old = self._conn.execute(
-      "SELECT sdk_session_id FROM sessions WHERE chat_id = ?", (chat_id,)
+      f"SELECT {select_cols} FROM sessions WHERE chat_id = ?", (chat_id,)
     ).fetchone()
-    old_sdk_id = (old["sdk_session_id"] or "") if old else ""
+    preserved = {col: ((old[col] or "") if old else "") for col in old_cols}
+
+    insert_cols = [
+      "session_id", "chat_id", "session_model", "activated_at",
+      "operator_open_id", "bot_open_id", "need_mention",
+    ] + old_cols
+    placeholders = ", ".join(["?"] * len(insert_cols))
     self._conn.execute(
-      """INSERT OR REPLACE INTO sessions
-         (session_id, chat_id, session_model, activated_at,
-          operator_open_id, bot_open_id, need_mention, sdk_session_id)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+      f"""INSERT OR REPLACE INTO sessions ({", ".join(insert_cols)})
+          VALUES ({placeholders})""",
       (session_id, chat_id, model, str(int(time.time() * 1000)),
-       operator_open_id, bot_open_id, int(need_mention), old_sdk_id or ""),
+       operator_open_id, bot_open_id, int(need_mention),
+       *(preserved[col] for col in old_cols)),
     )
     self._conn.commit()
 
@@ -152,15 +195,30 @@ class Database:
     ).fetchone()
     return row["session_id"] if row else None
 
-  def get_sdk_session_id(self, chat_id: str) -> str:
-    row = self._conn.execute(
-      "SELECT sdk_session_id FROM sessions WHERE chat_id = ?", (chat_id,)
-    ).fetchone()
-    return row["sdk_session_id"] if row and row["sdk_session_id"] else ""
+  def get_sdk_session_id(self, chat_id: str, provider: str) -> str:
+    """Look up the resume id for ``provider`` on ``chat_id``.
 
-  def set_sdk_session_id(self, chat_id: str, sdk_session_id: str) -> None:
+    Each provider (claude / codex / opencode) keeps its own column so
+    switching providers on a chat doesn't try to feed a Claude UUID into
+    Codex (or vice versa). Returns ``""`` if no resume target.
+    """
+    col = _PROVIDER_SESSION_COLUMNS.get(provider)
+    if col is None:
+      return ""
+    row = self._conn.execute(
+      f"SELECT {col} FROM sessions WHERE chat_id = ?", (chat_id,)
+    ).fetchone()
+    return row[col] if row and row[col] else ""
+
+  def set_sdk_session_id(
+    self, chat_id: str, sdk_session_id: str, provider: str,
+  ) -> None:
+    """Persist the most recent SDK session id for ``provider`` on ``chat_id``."""
+    col = _PROVIDER_SESSION_COLUMNS.get(provider)
+    if col is None:
+      return
     self._conn.execute(
-      "UPDATE sessions SET sdk_session_id = ? WHERE chat_id = ?",
+      f"UPDATE sessions SET {col} = ? WHERE chat_id = ?",
       (sdk_session_id, chat_id),
     )
     self._conn.commit()
