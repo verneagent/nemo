@@ -276,6 +276,78 @@ def test_pacing_hint_prepended_after_timeout(tmp_path):
     assert not later.startswith("[Nemo 系统提示]"), later
 
 
+def test_main_loop_threads_provider_through_db_calls(tmp_path):
+  """Per-provider session storage requires the daemon's --provider to
+  reach both db.get_sdk_session_id (resume lookup at startup) and
+  db.set_sdk_session_id (write back from DoneEvent.session_id). A
+  typo or a missed kwarg silently degrades back to the old
+  provider-blind behavior."""
+  from nemo.channel import IncomingMessage
+
+  recorded_get: list[tuple[str, str]] = []
+  recorded_set: list[tuple[str, str, str]] = []
+
+  class _SpyDB(_FakeDB):
+    def get_chat_owner(self, _chat_id):
+      # Return non-None so main_loop bothers calling get_sdk_session_id —
+      # otherwise the early-out would skip the lookup entirely.
+      return "old_session"
+
+    def get_sdk_session_id(self, chat_id, provider):
+      recorded_get.append((chat_id, provider))
+      return ""
+
+    def set_sdk_session_id(self, chat_id, sdk_session_id, provider):
+      recorded_set.append((chat_id, sdk_session_id, provider))
+
+  class _SessionEmittingAgent(_FakeAgent):
+    async def run_turn(self, _prompt, on_event):
+      def _emit():
+        on_event(AnswerEvent("ok"))
+        # Non-empty session_id is what triggers set_sdk_session_id.
+        on_event(DoneEvent(cost=0.01, usage={"input_tokens": 1},
+                           session_id="codex-thread-xyz"))
+      await asyncio.to_thread(_emit)
+      return 0.01, {"input_tokens": 1}
+
+  agent = _SessionEmittingAgent()
+  queued = _QueuedChannel("oc_test", [
+    IncomingMessage(
+      event_type="im.message.receive_v1",
+      chat_id="oc_test", sender_id="ou_user",
+      message_id="om_msg", msg_type="text",
+      text="hello", create_time="1",
+    ),
+    IncomingMessage(
+      event_type="im.message.receive_v1",
+      chat_id="oc_test", sender_id="ou_user",
+      message_id="om_exit", msg_type="text",
+      text="/exit", create_time="2",
+    ),
+  ])
+
+  with mock.patch("nemo.agent.load_credentials", return_value={
+    "app_id": "app_id", "app_secret": "app_secret", "email": "u@e.com",
+  }), \
+       mock.patch("nemo.agent.Database", _SpyDB), \
+       mock.patch("nemo.agent.LarkChannel", return_value=queued), \
+       mock.patch("nemo.agent.build_coding_agent", return_value=agent), \
+       mock.patch("nemo.agent._send_response", new=mock.AsyncMock()), \
+       mock.patch("nemo.group_config.load_config", return_value={}), \
+       mock.patch("nemo.config.load_relay_config", return_value=("", "")), \
+       mock.patch("signal.signal"):
+    rc = asyncio.run(
+      main_loop("oc_test", str(tmp_path), "gpt-5.5", provider="codex")
+    )
+  assert rc == 0
+
+  # Read path: provider is correctly threaded into get_sdk_session_id.
+  assert recorded_get == [("oc_test", "codex")], recorded_get
+  # Write path: DoneEvent.session_id reaches the codex column, not a
+  # provider-blind one.
+  assert ("oc_test", "codex-thread-xyz", "codex") in recorded_set, recorded_set
+
+
 def test_codex_provider_rejects_claude_model_switch(tmp_path):
   from nemo.channel import IncomingMessage
 

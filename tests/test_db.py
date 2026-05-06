@@ -85,19 +85,21 @@ def test_per_provider_session_ids_isolated(tmp_path):
     db.close()
 
 
-def test_legacy_sdk_session_id_migrates_to_claude(tmp_path):
-  # First-time upgrade path: a pre-0.3.87 DB has the legacy
-  # sdk_session_id populated and the new per-provider columns missing.
-  # On open, the new claude_session_id column should be backfilled with
-  # the legacy id so an in-flight Claude session keeps resuming.
+def test_legacy_sdk_session_id_does_not_backfill(tmp_path):
+  # Pre-0.3.87 DB has sdk_session_id populated and per-provider columns
+  # missing. We deliberately do NOT copy the legacy id into any new
+  # column on first upgrade: the old column was provider-blind, so a
+  # codex thread id could end up in there. Feeding that to claude on
+  # the next daemon spawn would make the SDK subprocess silently exit
+  # 1 (Claude has no lazy-throw resume fallback). Better to lose one
+  # resume than to wedge the daemon.
   import sqlite3
 
   from nemo.db import _db_path
 
   proj = str(tmp_path / "project")
   with mock.patch("nemo.db.DB_BASE", str(tmp_path)):
-    legacy_path = _db_path(proj)  # same hash-derived path Database opens
-  # Hand-build a legacy schema row at that exact path.
+    legacy_path = _db_path(proj)
   conn = sqlite3.connect(legacy_path)
   conn.execute("""
     CREATE TABLE sessions (
@@ -115,19 +117,23 @@ def test_legacy_sdk_session_id_migrates_to_claude(tmp_path):
   """)
   conn.execute(
     "INSERT INTO sessions (session_id, chat_id, sdk_session_id) "
-    "VALUES ('legacy', 'chat-old', 'old-claude-uuid')"
+    "VALUES ('legacy', 'chat-old', 'opaque-id-of-unknown-provider')"
   )
   conn.commit()
   conn.close()
 
   with mock.patch("nemo.db.DB_BASE", str(tmp_path)):
     db = Database(proj)
-    # New per-provider column has been backfilled from legacy.
-    assert db.get_sdk_session_id("chat-old", "claude") == "old-claude-uuid"
-    # Other providers stay empty — we don't know which provider the
-    # legacy id was for, claude is the historical default.
-    assert db.get_sdk_session_id("chat-old", "codex") == ""
-    assert db.get_sdk_session_id("chat-old", "opencode") == ""
+    # All per-provider columns must be empty. The legacy column is
+    # left alone (legacy readers can still see it), but nothing flows
+    # into the new columns.
+    for provider in ("claude", "codex", "opencode"):
+      assert db.get_sdk_session_id("chat-old", provider) == "", provider
+    # Legacy column itself untouched.
+    legacy = db._conn.execute(
+      "SELECT sdk_session_id FROM sessions WHERE chat_id = ?", ("chat-old",)
+    ).fetchone()
+    assert legacy[0] == "opaque-id-of-unknown-provider"
     db.close()
 
 

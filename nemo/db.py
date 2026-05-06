@@ -71,33 +71,22 @@ _PROVIDER_SESSION_COLUMNS: dict[str, str] = {
 def _ensure_tables(conn: sqlite3.Connection) -> None:
   conn.executescript(_SCHEMA)
   cols = {row[1] for row in conn.execute("PRAGMA table_info(sessions)")}
-  added: list[str] = []
   if "sdk_session_id" not in cols:
-    # Legacy column from before per-provider session storage. Still
-    # added on brand-new DBs so this loop's heuristic backfill below
-    # has somewhere to look. Old code that wrote here continues to work
-    # for one release, but `set_sdk_session_id` no longer touches it.
+    # Legacy column from before per-provider session storage. New
+    # captain-nemo no longer writes here, but the column is still added
+    # to brand-new DBs so older captain-nemo can read them.
     conn.execute("ALTER TABLE sessions ADD COLUMN sdk_session_id TEXT DEFAULT ''")
   for col in _PROVIDER_SESSION_COLUMNS.values():
     if col not in cols:
       conn.execute(f"ALTER TABLE sessions ADD COLUMN {col} TEXT DEFAULT ''")
-      added.append(col)
-  # Backfill heuristic on first upgrade: a pre-0.3.87 DB has the
-  # legacy sdk_session_id populated and the new per-provider columns
-  # empty. The legacy column held whatever the most-recent daemon
-  # wrote regardless of provider, but in practice the historical
-  # default and only common case was claude. Copy into claude_session_id
-  # so a daemon that upgrades mid-session can still resume on the
-  # claude path; codex/opencode users will start a fresh thread on
-  # their first post-upgrade turn (the resume-fallback handles that
-  # path safely).
-  claude_col = _PROVIDER_SESSION_COLUMNS["claude"]
-  if claude_col in added:
-    conn.execute(
-      f"UPDATE sessions SET {claude_col} = sdk_session_id "
-      f"WHERE ({claude_col} = '' OR {claude_col} IS NULL) "
-      f"AND sdk_session_id IS NOT NULL AND sdk_session_id != ''"
-    )
+  # Deliberately NO backfill from the legacy column. The historical
+  # `sdk_session_id` held whatever the most-recent daemon wrote
+  # regardless of provider — a codex thread id can sit in there from
+  # a previous codex run, and copying it into claude_session_id would
+  # make the next claude daemon try to resume a codex thread.  The
+  # claude SDK doesn't have the lazy-throw fallback the codex sidecar
+  # does, so that surfaces as a silent subprocess exit-1 loop. Cheap
+  # to lose one resume on upgrade; expensive to debug a wedged daemon.
   conn.commit()
 
 
