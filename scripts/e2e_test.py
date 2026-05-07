@@ -1590,10 +1590,13 @@ def run_switch_tests(pid: int, chat_id: str, result: E2EResult,
 
   # T83: SDK turn on the new provider — verifies the rebuilt adapter
   # actually answers, not just that the log line was emitted.
+  # 60s timeout because gpt-5.5's reasoning typically takes 20-40s for
+  # even a one-word response; 30s racing with that finish line caused
+  # spurious failures in the first run of this phase.
   print("  [T83] turn after provider switch...")
   ts = str(int(time.time() * 1000))
   send_msg("Reply with the single word: pong", chat_id)
-  msg, elapsed = wait_for_response(chat_id, ts, timeout=30)
+  msg, elapsed = wait_for_response(chat_id, ts, timeout=60)
   if msg:
     body_txt = json.dumps(msg.get("body", "")).lower()
     if "pong" in body_txt:
