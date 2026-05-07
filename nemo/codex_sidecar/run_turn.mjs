@@ -46,16 +46,31 @@ async function main() {
   const options = parseArgs(argv.slice(2));
   const prompt = await readPrompt();
   // When OPENAI_BASE_URL is set (preset registry pointed nemo at a
-  // third-party endpoint like DeepSeek's OpenAI-compatible host), the
-  // codex CLI will still pick up the user's ChatGPT OAuth token from
-  // ~/.codex/auth.json *unless* we explicitly hand it an apiKey via
-  // the SDK constructor. With OAuth active, codex's own client-side
-  // model whitelist rejects anything outside the ChatGPT-allowed list
-  // ("The 'deepseek-v4-pro' model is not supported when using Codex
-  // with a ChatGPT account") before the request even leaves the box.
-  // Passing apiKey here forces API-key auth and skips that whitelist.
+  // third-party endpoint like DeepSeek's OpenAI-compatible host) we
+  // need to override two codex CLI defaults that bite us otherwise:
+  //
+  //   1. ChatGPT OAuth precedence. codex picks the user's
+  //      ~/.codex/auth.json token even when OPENAI_API_KEY is set in
+  //      the env, then refuses non-whitelisted models on that auth
+  //      mode ("The 'deepseek-v4-pro' model is not supported when
+  //      using Codex with a ChatGPT account"). Passing apiKey via
+  //      the SDK forces API-key auth and skips the whitelist.
+  //
+  //   2. Wire protocol. codex's built-in "openai" provider talks to
+  //      /v1/responses (OpenAI's Responses API). DeepSeek and most
+  //      third-party "OpenAI-compatible" services only implement
+  //      /v1/chat/completions, so the responses-format request 404s.
+  //      We patch the built-in provider's wire_api → "chat" via the
+  //      SDK's --config passthrough.
   const codexOptions = {};
-  if (env.OPENAI_BASE_URL) codexOptions.baseUrl = env.OPENAI_BASE_URL;
+  if (env.OPENAI_BASE_URL) {
+    codexOptions.baseUrl = env.OPENAI_BASE_URL;
+    codexOptions.config = {
+      model_providers: {
+        openai: { wire_api: "chat" },
+      },
+    };
+  }
   if (env.OPENAI_API_KEY) codexOptions.apiKey = env.OPENAI_API_KEY;
   const codex = new Codex(codexOptions);
   const threadOptions = {
