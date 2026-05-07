@@ -35,6 +35,60 @@ def test_model_typo_rejected():
   assert "sonnet" in resp  # available list included
 
 
+def test_provider_show_lists_options():
+  ctx = _ctx()
+  ctx.provider = "claude"
+  ctx.model = "claude-opus-4-7"
+  handled, resp = try_dispatch("/provider", ctx)
+  assert handled
+  assert resp is not None
+  # Lists all three options + names current.
+  assert "claude" in resp
+  assert "codex" in resp
+  assert "opencode" in resp
+  assert "claude-opus-4-7" in resp
+
+
+def test_provider_switch_emits_action_with_default_model():
+  ctx = _ctx()
+  ctx.provider = "claude"
+  handled, resp = try_dispatch("/provider codex", ctx)
+  assert handled
+  # Action code carries both the new provider and its default model so
+  # the loop doesn't have to look it up again. gpt-5.5 is the codex
+  # default per agent_factory._DEFAULT_MODEL_BY_PROVIDER.
+  assert resp == "__provider__:codex:gpt-5.5"
+
+
+def test_provider_same_as_current_is_noop_message():
+  ctx = _ctx()
+  ctx.provider = "codex"
+  handled, resp = try_dispatch("/provider codex", ctx)
+  assert handled
+  # No action code — just a message; main loop won't tear down the
+  # agent for a no-op switch.
+  assert resp is not None
+  assert not resp.startswith("__")
+  assert "Already" in resp
+
+
+def test_provider_unknown_name_rejected():
+  ctx = _ctx()
+  handled, resp = try_dispatch("/provider gpt-nonexistent", ctx)
+  assert handled
+  assert resp is not None and not resp.startswith("__")
+  assert "Unknown provider" in resp
+  # Help points at the valid set.
+  assert "claude" in resp
+
+
+def test_provider_action_code_marked_needs_sdk():
+  # Provider switch tears down the SDK adapter, so it must be in the
+  # _NEEDS_SDK guard list — otherwise the loop would try to handle it
+  # mid-turn.
+  assert is_inline_safe("__provider__:codex:gpt-5.5") is False
+
+
 def test_model_typo_for_codex():
   ctx = _ctx()
   ctx.provider = "codex"

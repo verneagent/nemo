@@ -2,7 +2,7 @@
 
 Two tabs:
   1. Model tab: shows the model name (e.g. "claude-opus-4-7")
-  2. WS status tab: emoji only (🟢 idle, 🟡 working, 🔴 stopped)
+  2. WS status tab: emoji + provider (e.g. "🟢 claude", "🟡 codex")
 
 Tabs are identified by URL markers (?type=nemo-status, ?type=nemo-model),
 not by parsing the tab name.
@@ -40,22 +40,28 @@ def _find_tab_by_marker(tabs: list[JsonObject], marker: str) -> JsonObject | Non
 
 
 def update_status(token: str, chat_id: str, model: str,
-                  status: str = "idle") -> None:
-  """Create or update both tabs. status: idle, working, stopped."""
+                  status: str = "idle", provider: str = "") -> None:
+  """Create or update both tabs. status: idle, working, stopped.
+
+  ``provider`` is rendered next to the status emoji so the user can see
+  at a glance which adapter the daemon is running. Empty string keeps
+  the legacy emoji-only tab for callers that haven't been migrated.
+  """
   from .lark import api as lark_api
 
   emoji = _STATUS_EMOJI.get(status, "🟢")
+  status_label = f"{emoji} {provider}" if provider else emoji
   try:
     tabs = lark_api.list_chat_tabs(token, chat_id)
 
-    # --- Status tab (emoji only) ---
+    # --- Status tab (emoji + provider) ---
     status_tab = _find_tab_by_marker(tabs, _STATUS_MARKER)
     if status_tab:
       tab_id = status_tab.get("tab_id", "")
-      if status_tab.get("tab_name") != emoji and tab_id:
-        lark_api.update_chat_tab(token, chat_id, tab_id, emoji, TAB_URL)
+      if status_tab.get("tab_name") != status_label and tab_id:
+        lark_api.update_chat_tab(token, chat_id, tab_id, status_label, TAB_URL)
     else:
-      lark_api.create_chat_tab(token, chat_id, emoji, TAB_URL)
+      lark_api.create_chat_tab(token, chat_id, status_label, TAB_URL)
 
     # --- Model tab (model name) ---
     model_tab = _find_tab_by_marker(tabs, _MODEL_MARKER)

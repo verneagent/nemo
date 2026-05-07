@@ -451,9 +451,9 @@ class LarkChannel(Channel):
     release_group(self.token, self.chat_id)
     remove_pid_file(self.chat_id)
 
-  async def update_status(self, model: str, state: str) -> None:
+  async def update_status(self, model: str, state: str, provider: str = "") -> None:
     from . import status_tab
-    status_tab.update_status(self.token, self.chat_id, model, state)
+    status_tab.update_status(self.token, self.chat_id, model, state, provider)
 
   async def send_heartbeat(self, model: str) -> None:
     relay_url, _ = load_relay_config()

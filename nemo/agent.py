@@ -574,8 +574,8 @@ async def main_loop(
     if "230002" in err_msg or "NOT be out of the chat" in err_msg:
       return 1
 
-  # Status tab — green idle
-  await channel.update_status(model, "idle")
+  # Status tab — green idle, with provider name next to the dot.
+  await channel.update_status(model, "idle", provider)
 
   # Periodic heartbeat (relay-based idle detection)
   _heartbeat_task: asyncio.Task | None = None
@@ -792,6 +792,7 @@ async def main_loop(
             model = switched_to
             ctx.model = model
             await _restart_client(resume=_sdk_session_id)
+            await channel.update_status(model, "idle", provider)
             await _send_response(
               channel, chat_id,
               f"Model switched to preset **{preset.name}** "
@@ -815,7 +816,61 @@ async def main_loop(
           ctx.model = model
           log.info("Model switch to %s (resume=%s)", model, _sdk_session_id[:8] if _sdk_session_id else "none")
           await _restart_client(resume=_sdk_session_id)
+          await channel.update_status(model, "idle", provider)
           await _send_response(channel, chat_id, f"Model switched to **{model}**.", db)
+        elif response and response.startswith("__provider__:"):
+          # Format: "__provider__:<name>:<default_model>"
+          _, new_provider, default_model = response.split(":", 2)
+          # Stop the old adapter cleanly so its subprocesses / threads
+          # release before we build the replacement.
+          try:
+            await agent.stop()
+          except Exception as exc:
+            log.warning("Stopping %s agent on /provider switch: %s",
+                        provider, exc)
+          # Reset state to the new provider's defaults. Endpoint goes
+          # back to empty (no preset assumed) and model is the
+          # provider's default — the user can /model afterwards if
+          # they want a non-default. Each provider's resume id lives
+          # in its own DB column (per-provider session storage), so
+          # switching back later resumes that provider's last thread.
+          provider = new_provider  # type: ignore[assignment]
+          model = default_model
+          endpoint = EndpointConfig()
+          ctx.provider = provider
+          ctx.model = model
+          _sdk_session_id = db.get_sdk_session_id(chat_id, provider)
+          agent = build_coding_agent(
+            provider, credentials, chat_id, db, channel,
+            permission_mode=permission_mode,
+            system_prompt=system_prompt,
+            endpoint=endpoint,
+          )
+          if ctx.effort:
+            agent.set_effort(ctx.effort)
+          log.info("Provider switch to %s (model=%s, resume=%s)",
+                   provider, model,
+                   _sdk_session_id[:8] if _sdk_session_id else "none")
+          try:
+            await agent.start(project_dir, model, resume=_sdk_session_id)
+          except Exception as exc:
+            log.error("Failed to start %s agent: %s", provider, exc, exc_info=True)
+            await _send_response(
+              channel, chat_id,
+              f"Provider switch to **{provider}** failed: `{exc}`. "
+              f"Daemon is in a broken state — restart it.",
+              db,
+            )
+            await _clear_ack()
+            continue
+          await channel.update_status(model, "idle", provider)
+          await _send_response(
+            channel, chat_id,
+            f"Switched to provider **{provider}** "
+            f"(default model `{model}`). Use `/model <name>` to pick "
+            f"a different one.",
+            db,
+          )
         elif response and response.startswith("__effort__:"):
           new_effort = response.split(":", 1)[1]
           ctx.effort = new_effort
@@ -1451,7 +1506,7 @@ async def main_loop(
   loop = asyncio.get_event_loop()
   cleanup: list = [agent.stop(), channel.stop()]
   cleanup.append(channel.release_workspace())
-  cleanup.append(channel.update_status(model, "stopped"))
+  cleanup.append(channel.update_status(model, "stopped", provider))
   await asyncio.gather(*cleanup, return_exceptions=True)
   db.deactivate(session_id)
   db.close()

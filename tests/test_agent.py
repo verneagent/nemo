@@ -78,7 +78,7 @@ class _FakeChannel:
   async def send_text(self, _chat_id, _text):
     return "om_text"
 
-  async def update_status(self, _model, _state):
+  async def update_status(self, _model, _state, _provider=""):
     pass
 
   async def receive(self, timeout=300):
@@ -404,6 +404,80 @@ def test_model_switch_to_preset_sets_endpoint_and_remote_name(tmp_path):
   # Reset is called with the protocol-specific remote name (the [1m]
   # variant for the Anthropic side).
   assert "deepseek-v4-pro[1m]" in reset_history, reset_history
+
+
+def test_provider_switch_rebuilds_agent_with_new_default(tmp_path):
+  """`/provider codex` from a Claude daemon must (a) stop the old
+  agent, (b) build a fresh agent for codex, (c) reset model to
+  gpt-5.5 (codex default), (d) load the per-provider session id, (e)
+  call agent.start with the new model + that session id."""
+  from nemo.channel import IncomingMessage
+
+  built_providers: list[str] = []
+  start_calls: list[tuple[str, str]] = []   # (model, resume)
+  stops: list[bool] = []
+
+  class _SwitchAgent(_FakeAgent):
+    async def stop(self):
+      stops.append(True)
+
+    async def start(self, _project_dir, model, resume=""):
+      start_calls.append((model, resume))
+
+  def _factory(provider, *_, **__):
+    built_providers.append(provider)
+    return _SwitchAgent()
+
+  class _SpyDB(_FakeDB):
+    def get_chat_owner(self, _chat_id):
+      return None
+
+    def get_sdk_session_id(self, chat_id, provider):
+      # Simulate a previous codex thread already in the DB. claude has
+      # nothing — fresh start there.
+      return "codex-thread-prev" if provider == "codex" else ""
+
+    def set_sdk_session_id(self, *_args, **_kwargs):
+      pass
+
+  queued = _QueuedChannel("oc_test", [
+    IncomingMessage(
+      event_type="im.message.receive_v1", chat_id="oc_test",
+      sender_id="ou_user", message_id="om_switch", msg_type="text",
+      text="/provider codex", create_time="1",
+    ),
+    IncomingMessage(
+      event_type="im.message.receive_v1", chat_id="oc_test",
+      sender_id="ou_user", message_id="om_exit", msg_type="text",
+      text="/exit", create_time="2",
+    ),
+  ])
+
+  with mock.patch("nemo.agent.load_credentials", return_value={
+    "app_id": "a", "app_secret": "s", "email": "u@e.com",
+  }), \
+       mock.patch("nemo.agent.Database", _SpyDB), \
+       mock.patch("nemo.agent.LarkChannel", return_value=queued), \
+       mock.patch("nemo.agent.build_coding_agent", side_effect=_factory), \
+       mock.patch("nemo.agent._send_response", new=mock.AsyncMock()), \
+       mock.patch("nemo.group_config.load_config", return_value={}), \
+       mock.patch("nemo.config.load_relay_config", return_value=("", "")), \
+       mock.patch("signal.signal"):
+    rc = asyncio.run(
+      main_loop("oc_test", str(tmp_path), "claude-opus-4-7", provider="claude")
+    )
+  assert rc == 0
+  # Two builds: the original claude one at startup, then a fresh codex
+  # one when /provider hit.
+  assert built_providers == ["claude", "codex"], built_providers
+  # stop() fires at least twice — once on the /provider switch (tear
+  # down old claude agent) and once when /exit shuts down the new
+  # codex agent.
+  assert len(stops) >= 2, stops
+  # Two start()s: the original at boot (claude default model) and the
+  # post-switch one (codex default + per-provider resume id).
+  assert start_calls[0] == ("claude-opus-4-7", ""), start_calls
+  assert start_calls[1] == ("gpt-5.5", "codex-thread-prev"), start_calls
 
 
 def test_codex_provider_rejects_claude_model_switch(tmp_path):

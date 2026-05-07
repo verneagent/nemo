@@ -101,6 +101,31 @@ def try_dispatch(text: str, ctx: AgentContext) -> tuple[bool, str | None]:
       f"{listing}\n\nUsage: `/model <name>`"
     )
 
+  # /provider
+  if t.startswith("/provider"):
+    from .agent_factory import default_model_for_provider
+    valid = ("claude", "codex", "opencode")
+    parts = text.strip().split(None, 1)
+    if len(parts) >= 2:
+      arg = parts[1].strip().lower()
+      if arg not in valid:
+        return True, (
+          f"Unknown provider `{arg}`. "
+          f"Use `/provider claude|codex|opencode`."
+        )
+      if arg == ctx.provider:
+        return True, f"Already on provider **{ctx.provider}**."
+      default_model = default_model_for_provider(arg)  # type: ignore[arg-type]
+      return True, f"__provider__:{arg}:{default_model}"
+    return True, (
+      f"Current provider: **{ctx.provider}** (model **{ctx.model}**)\n\n"
+      f"Available: `claude`, `codex`, `opencode`. "
+      f"Switching resets the model to that provider's default and "
+      f"keeps each provider's last session id separately, so flipping "
+      f"back resumes the prior conversation.\n\n"
+      f"Usage: `/provider <name>`"
+    )
+
   # /effort
   if t.startswith("/effort"):
     parts = text.strip().split(None, 1)
@@ -176,6 +201,8 @@ def try_dispatch(text: str, ctx: AgentContext) -> tuple[bool, str | None]:
       "|---|---|\n"
       "| `/model` | Show current model |\n"
       "| `/model <name>` | Switch model |\n"
+      "| `/provider` | Show current provider |\n"
+      "| `/provider <claude\\|codex\\|opencode>` | Switch provider (resets to its default model) |\n"
       "| `/effort` | Show current reasoning effort |\n"
       "| `/effort <low\\|medium\\|high\\|max\\|default>` | Set reasoning effort |\n"
       "| `/clear` | Reset conversation |\n"
@@ -283,7 +310,7 @@ def try_dispatch(text: str, ctx: AgentContext) -> tuple[bool, str | None]:
 
 
 # Commands that require SDK restart — NOT safe during a turn.
-_NEEDS_SDK = ("__clear__", "__esc__", "__model__:", "__cd__:")
+_NEEDS_SDK = ("__clear__", "__esc__", "__model__:", "__cd__:", "__provider__:")
 
 
 def is_inline_safe(response: str | None) -> bool:
