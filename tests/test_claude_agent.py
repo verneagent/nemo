@@ -193,3 +193,175 @@ def test_default_trailing_note_is_empty():
     async def stop(self): pass
 
   assert _Stub().trailing_note("some-session") == ""
+
+
+# ---------------------------------------------------------------------------
+# Resume fallback: bundled claude exit-1 → drop resume + retry once
+# ---------------------------------------------------------------------------
+
+def test_is_resume_unrecoverable_walks_cause_chain():
+  """ProcessError(exit_code=1) wrapped in SDKThread's RuntimeError must
+  still be detected as a resume-class failure."""
+  from nemo.claude_agent import _is_resume_unrecoverable
+
+  class FakeProcessError(Exception):
+    def __init__(self, msg, exit_code):
+      super().__init__(msg)
+      self.exit_code = exit_code
+
+  inner = FakeProcessError("Command failed with exit code 1", 1)
+  inner.__class__.__name__ = "ProcessError"
+  outer = RuntimeError("SDK connect failed after 5 attempts")
+  outer.__cause__ = inner
+  assert _is_resume_unrecoverable(outer) is True
+
+  # exit_code other than 1 → real bug, must propagate.
+  inner_137 = FakeProcessError("killed", 137)
+  inner_137.__class__.__name__ = "ProcessError"
+  outer_137 = RuntimeError("...")
+  outer_137.__cause__ = inner_137
+  assert _is_resume_unrecoverable(outer_137) is False
+
+  # No chain at all → no false positive on plain RuntimeError.
+  assert _is_resume_unrecoverable(RuntimeError("network unreachable")) is False
+
+
+def test_is_resume_unrecoverable_matches_text_fallback():
+  """Older SDK versions surface exit-1 via plain RuntimeError text
+  (no chained ProcessError). Match by message as a backup."""
+  from nemo.claude_agent import _is_resume_unrecoverable
+
+  assert _is_resume_unrecoverable(
+    RuntimeError("CLI exited during connect: rc=1 — Command failed with exit code 1"),
+  ) is True
+  # Unrelated exit code text → False.
+  assert _is_resume_unrecoverable(
+    RuntimeError("Command failed with exit code 137"),
+  ) is False
+
+
+def _bare_claude_agent():
+  """Construct a ClaudeCodingAgent without running __init__.
+
+  __init__ pulls in claude_agent_sdk indirectly through SDKThread
+  start; the resume-fallback tests don't need any of that, they just
+  exercise start()'s try/except. Match the pattern used elsewhere in
+  this file (test_run_turn_seeds_options_factory etc).
+  """
+  from nemo.claude_agent import ClaudeCodingAgent
+  agent = ClaudeCodingAgent.__new__(ClaudeCodingAgent)
+  agent._sdk_started = True
+  agent._stale_tasks = set()
+  agent._project_dir = ""
+  agent._model = ""
+  agent._latest_session_id = ""
+  agent._options = None
+  return agent
+
+
+def test_start_falls_back_when_resume_unrecoverable():
+  """Bundled claude exit-1 on resume → claude_agent rebuilds options
+  with resume="" and retries once. Daemon stays alive."""
+  import asyncio
+  from unittest import mock
+
+  agent = _bare_claude_agent()
+
+  build_calls: list[str] = []
+  create_calls: list[object] = []
+
+  def fake_build(_proj, _model, resume=""):
+    build_calls.append(resume)
+    return f"OPTIONS(resume={resume!r})"
+
+  attempts = {"n": 0}
+
+  async def fake_create(opts):
+    create_calls.append(opts)
+    attempts["n"] += 1
+    if attempts["n"] == 1:
+      class _ProcessError(Exception):
+        def __init__(self):
+          super().__init__("Command failed with exit code 1")
+          self.exit_code = 1
+      _ProcessError.__name__ = "ProcessError"
+      err = RuntimeError("SDK connect failed after 5 attempts")
+      err.__cause__ = _ProcessError()
+      raise err
+    return None
+
+  agent._sdk = mock.MagicMock()
+  agent._sdk.start = lambda: None
+  agent._sdk.create_client = fake_create
+  agent._build_options = fake_build  # type: ignore[assignment]
+
+  asyncio.run(agent.start("/tmp/project", "claude-opus-4-7", resume="stale-uuid"))
+
+  # First build with the stale resume id, second build with empty
+  # (fallback path).
+  assert build_calls == ["stale-uuid", ""], build_calls
+  # create_client called twice — first failed, second succeeded.
+  assert len(create_calls) == 2
+  # _latest_session_id reset to "" after fallback so the rest of the
+  # adapter doesn't keep handing the bad id around.
+  assert agent._latest_session_id == ""
+
+
+def test_start_propagates_non_resume_failures():
+  """Network errors / SDK bugs must NOT trigger the resume fallback —
+  daemon should fail loudly so the operator sees the real cause."""
+  import asyncio
+  from unittest import mock
+
+  agent = _bare_claude_agent()
+
+  async def fake_create(_opts):
+    raise RuntimeError("ECONNREFUSED 127.0.0.1:1234")
+
+  agent._sdk = mock.MagicMock()
+  agent._sdk.start = lambda: None
+  agent._sdk.create_client = fake_create
+  agent._build_options = lambda *_a, **_k: "OPTIONS"  # type: ignore[assignment]
+
+  raised: list[BaseException] = []
+  try:
+    asyncio.run(agent.start("/tmp/project", "claude-opus-4-7", resume="abc"))
+  except BaseException as exc:
+    raised.append(exc)
+  assert raised and "ECONNREFUSED" in str(raised[0])
+
+
+def test_start_does_not_retry_when_no_resume():
+  """If no resume id was set, an exit-1 failure isn't a resume problem
+  — propagate. Otherwise we'd hide every CLI-startup bug."""
+  import asyncio
+  from unittest import mock
+
+  agent = _bare_claude_agent()
+
+  attempts = {"n": 0}
+
+  async def fake_create(_opts):
+    attempts["n"] += 1
+    class _ProcessError(Exception):
+      def __init__(self):
+        super().__init__("Command failed with exit code 1")
+        self.exit_code = 1
+    _ProcessError.__name__ = "ProcessError"
+    err = RuntimeError("SDK connect failed after 5 attempts")
+    err.__cause__ = _ProcessError()
+    raise err
+
+  agent._sdk = mock.MagicMock()
+  agent._sdk.start = lambda: None
+  agent._sdk.create_client = fake_create
+  agent._build_options = lambda *_a, **_k: "OPTIONS"  # type: ignore[assignment]
+
+  raised = False
+  try:
+    asyncio.run(agent.start("/tmp/project", "claude-opus-4-7", resume=""))
+  except RuntimeError:
+    raised = True
+  assert raised
+  # Single attempt, no retry — there's no resume id to drop.
+  assert attempts["n"] == 1

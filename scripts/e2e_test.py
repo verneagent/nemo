@@ -13,6 +13,7 @@ Usage:
     python3 scripts/e2e_test.py --perm           # permission flow only
     python3 scripts/e2e_test.py --dual           # dual-instance only
     python3 scripts/e2e_test.py --media          # media & interaction only
+    python3 scripts/e2e_test.py --switch         # /provider + preset switch only
     python3 scripts/e2e_test.py --verbose        # debug nemo logging
     python3 scripts/e2e_test.py --chat <ID>      # custom chat group
 
@@ -1478,6 +1479,158 @@ def run_topic_tests(pid: int, chat_id: str, result: E2EResult) -> None:
   print()
 
 
+# ---------------------------------------------------------------------------
+# Phase 11: /provider + preset switching
+# ---------------------------------------------------------------------------
+
+def run_switch_tests(pid: int, chat_id: str, result: E2EResult,
+                     provider: str) -> None:
+  """Phase 11: exercise /provider runtime switching and the preset
+  registry's /model expansion.
+
+  The daemon is started on the caller's --provider; we drive it
+  through:
+    1. /model <preset>   — same provider, endpoint flips
+    2. /model <slug>     — same provider, back to the static catalog
+    3. /provider <other> — full adapter rebuild, default model resets
+    4. /provider <orig>  — rebuild back, per-provider session preserved
+
+  Each step is verified by both a card response and a log marker so
+  regressions in either path are caught.
+  """
+  print(f"{Colors.BOLD}Phase 11: /provider + preset switch{Colors.RESET}")
+  log = LogAnalyzer(pid)
+
+  # Pick the "other" provider deliberately — gpt-5.5 vs claude default
+  # avoids any preset/endpoint surprises and lives in the static
+  # catalog for both providers.
+  if provider == "claude":
+    other = "codex"
+    other_default_model = "gpt-5.5"
+    static_back = "claude-opus-4-7"
+  elif provider == "codex":
+    other = "claude"
+    other_default_model = "claude-opus-4-7"
+    static_back = "gpt-5.5"
+  else:
+    result.skip(
+      "T80-T84 switch tests",
+      f"provider={provider} switching not exercised in this phase",
+    )
+    print()
+    return
+
+  # T80: /model deepseek-v4-pro — preset expansion (same provider).
+  # Skipped if the daemon's environment has no DEEPSEEK_API_KEY: the
+  # preset fast-fails on missing key, so the e2e would be testing the
+  # error path rather than the happy path. Surfaced as `skip` so the
+  # phase still exits 0 in CI without the secret.
+  print("  [T80] /model deepseek-v4-pro (preset)...")
+  has_key = bool(os.environ.get("DEEPSEEK_API_KEY"))
+  if not has_key:
+    result.skip("T80 preset switch", "DEEPSEEK_API_KEY not set")
+  else:
+    log_mark = log.mark()
+    ts = str(int(time.time() * 1000))
+    send_msg("/model deepseek-v4-pro", chat_id)
+    msg, elapsed = wait_for_response(chat_id, ts, timeout=20)
+    switched = log.wait_for_since(
+      "Model switch to preset deepseek-v4-pro", log_mark,
+      timeout=15, poll=1,
+    )
+    if msg and switched:
+      result.ok("T80 preset switch", f"{elapsed:.1f}s")
+    else:
+      result.fail(
+        "T80 preset switch",
+        "card and/or log marker missing — preset path didn't fire",
+      )
+      log.dump_tail(15, "T80")
+    wait_for_idle(pid, chat_id, timeout=30)
+
+  # T81: /model <static_slug> — same provider, clears preset endpoint.
+  print(f"  [T81] /model {static_back} (clear preset)...")
+  log_mark = log.mark()
+  ts = str(int(time.time() * 1000))
+  send_msg(f"/model {static_back}", chat_id)
+  msg, elapsed = wait_for_response(chat_id, ts, timeout=20)
+  cleared = log.wait_for_since(
+    f"Model switch to {static_back}", log_mark, timeout=15, poll=1,
+  )
+  if msg and cleared:
+    result.ok("T81 clear preset", f"{elapsed:.1f}s")
+  else:
+    result.fail("T81 clear preset", "switch back to static slug did not fire")
+    log.dump_tail(15, "T81")
+  wait_for_idle(pid, chat_id, timeout=30)
+
+  # T82: /provider <other> — full adapter rebuild.
+  print(f"  [T82] /provider {other} (rebuild)...")
+  log_mark = log.mark()
+  ts = str(int(time.time() * 1000))
+  send_msg(f"/provider {other}", chat_id)
+  msg, elapsed = wait_for_response(chat_id, ts, timeout=30)
+  rebuilt = log.wait_for_since(
+    f"Provider switch to {other}", log_mark, timeout=20, poll=1,
+  )
+  if msg and rebuilt:
+    body_txt = json.dumps(msg.get("body", ""))
+    # Confirmation card mentions the new provider's default model.
+    if other_default_model in body_txt:
+      result.ok("T82 provider switch", f"{elapsed:.1f}s → {other_default_model}")
+    else:
+      result.ok(
+        "T82 provider switch",
+        f"{elapsed:.1f}s (default model not in card body, log ok)",
+      )
+  else:
+    result.fail("T82 provider switch", "rebuild marker missing")
+    log.dump_tail(20, "T82")
+  wait_for_idle(pid, chat_id, timeout=30)
+
+  # T83: SDK turn on the new provider — verifies the rebuilt adapter
+  # actually answers, not just that the log line was emitted.
+  print("  [T83] turn after provider switch...")
+  ts = str(int(time.time() * 1000))
+  send_msg("Reply with the single word: pong", chat_id)
+  msg, elapsed = wait_for_response(chat_id, ts, timeout=30)
+  if msg:
+    body_txt = json.dumps(msg.get("body", "")).lower()
+    if "pong" in body_txt:
+      result.ok("T83 turn on new provider", f"{elapsed:.1f}s")
+    else:
+      result.ok(
+        "T83 turn on new provider",
+        f"{elapsed:.1f}s (response card ok, body doesn't include 'pong')",
+      )
+  else:
+    result.fail("T83 turn on new provider", "no response card")
+    log.dump_tail(15, "T83")
+  wait_for_idle(pid, chat_id, timeout=30)
+
+  # T84: /provider <original> — rebuild back. Confirms the
+  # per-provider session id storage doesn't blow up the round-trip
+  # (a reused chat may have an old session id for the original
+  # provider that needs to be restored or gracefully skipped by the
+  # resume fallback we just shipped).
+  print(f"  [T84] /provider {provider} (round-trip)...")
+  log_mark = log.mark()
+  ts = str(int(time.time() * 1000))
+  send_msg(f"/provider {provider}", chat_id)
+  msg, elapsed = wait_for_response(chat_id, ts, timeout=30)
+  back = log.wait_for_since(
+    f"Provider switch to {provider}", log_mark, timeout=20, poll=1,
+  )
+  if msg and back:
+    result.ok("T84 round-trip switch", f"{elapsed:.1f}s")
+  else:
+    result.fail("T84 round-trip switch", "did not return to original provider")
+    log.dump_tail(20, "T84")
+  wait_for_idle(pid, chat_id, timeout=30)
+
+  print()
+
+
 def main():
   import argparse
   parser = argparse.ArgumentParser(description="Nemo E2E test runner")
@@ -1499,6 +1652,8 @@ def main():
                       help="Run only media & interaction test (Phase 9)")
   parser.add_argument("--topic", action="store_true",
                       help="Run only topic-chat regression test (Phase 10)")
+  parser.add_argument("--switch", action="store_true",
+                      help="Run only /provider + preset switch test (Phase 11)")
   parser.add_argument("--verbose", "-v", action="store_true",
                       help="Verbose nemo logging")
   args = parser.parse_args()
@@ -1506,7 +1661,7 @@ def main():
   chat_id = args.chat_id.strip()
   result = E2EResult()
   single_phase = (args.stress or args.project or args.perm
-                  or args.dual or args.media or args.topic)
+                  or args.dual or args.media or args.topic or args.switch)
   run_all = not single_phase
   created_temp_chat = False
 
@@ -1573,6 +1728,8 @@ def main():
     print(f"  Mode: media & interaction test only")
   elif args.topic:
     print(f"  Mode: topic chat test only")
+  elif args.switch:
+    print(f"  Mode: /provider + preset switch test only")
   print()
 
   # Dual-instance manages its own processes
@@ -1794,6 +1951,8 @@ def main():
           run_media_tests(pid, chat_id, result)
           wait_for_idle(pid, chat_id, timeout=30)
           run_topic_tests(pid, chat_id, result)
+          wait_for_idle(pid, chat_id, timeout=30)
+          run_switch_tests(pid, chat_id, result, args.provider)
         finally:
           send_msg("/exit", chat_id)
           if not wait_for_exit(pid, timeout=35):
@@ -1857,6 +2016,14 @@ def main():
     elif args.topic:
       try:
         run_topic_tests(pid, chat_id, result)
+      finally:
+        send_msg("/exit", chat_id)
+        if not wait_for_exit(pid, timeout=35):
+          kill_nemo(pid)
+
+    elif args.switch:
+      try:
+        run_switch_tests(pid, chat_id, result, args.provider)
       finally:
         send_msg("/exit", chat_id)
         if not wait_for_exit(pid, timeout=35):

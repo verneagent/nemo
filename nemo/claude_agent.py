@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from typing import Awaitable, Callable, cast
 
 from .channel import Channel
@@ -54,6 +55,43 @@ def _session_jsonl_path(project_dir: str, sdk_session_id: str) -> str:
   config_dir = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
   slug = project_dir.replace("/", "-")
   return os.path.join(config_dir, "projects", slug, f"{sdk_session_id}.jsonl")
+
+
+def _short_error(exc: BaseException) -> str:
+  """One-line summary suitable for a log breadcrumb."""
+  return str(exc).split("\n")[0][:200]
+
+
+_EXIT_1_PATTERN = re.compile(r"\bexit code 1\b", re.IGNORECASE)
+_NO_SESSION_PATTERN = re.compile(r"\bno session\b", re.IGNORECASE)
+
+
+def _is_resume_unrecoverable(exc: BaseException) -> bool:
+  """True if the SDK connect failure looks like a stale resume target.
+
+  The bundled claude CLI exits 1 when it can't materialise a session
+  from its local jsonl. The SDK reports that as a chained
+  ProcessError("Command failed with exit code 1") wrapped by SDKThread's
+  RuntimeError. We walk the cause chain looking for the exit code so
+  we don't false-positive on real init bugs (network, CLI missing,
+  etc.). When we can't decide, return False — better to surface a
+  genuine bug than to silently lose conversation context.
+  """
+  cur: BaseException | None = exc
+  while cur is not None:
+    name = type(cur).__name__
+    msg = str(cur)
+    if name == "ProcessError":
+      code = getattr(cur, "exit_code", None)
+      if code == 1:
+        return True
+    # Some SDK versions surface the same failure as a plain
+    # RuntimeError with text only — match exit code 1 (with word
+    # boundary so "exit code 137" doesn't trigger) or "no session".
+    if _EXIT_1_PATTERN.search(msg) or _NO_SESSION_PATTERN.search(msg):
+      return True
+    cur = cur.__cause__ or cur.__context__
+  return False
 
 
 def _format_size_warning(size_bytes: int) -> str:
@@ -121,7 +159,31 @@ class ClaudeCodingAgent(CodingAgent):
     self._model = model
     self._latest_session_id = resume
     self._options = self._build_options(project_dir, model, resume=resume)
-    await self._sdk.create_client(self._options)
+    try:
+      await self._sdk.create_client(self._options)
+    except Exception as exc:
+      # Resume-id can become unusable between daemon runs: the bundled
+      # claude CLI hard-exits 1 if the local session jsonl is missing
+      # (process killed mid-turn last time, jsonl never flushed; the
+      # session was created on a different machine; the user's
+      # `~/.claude/projects/...` got pruned; or some endpoint that
+      # speaks Anthropic protocol returned a session id that the
+      # SDK's local resume path doesn't materialise into a jsonl).
+      # The exit-1 propagates as a ProcessError nested inside the
+      # SDKThread retry RuntimeError — same shape as the codex
+      # sidecar's "no rollout found" failure, just on the Claude side.
+      # Drop the resume id and try once more so the daemon doesn't
+      # die. The next DoneEvent will overwrite the stale id in nemo's
+      # DB on its way out.
+      if not resume or not _is_resume_unrecoverable(exc):
+        raise
+      log.warning(
+        "Claude SDK resume %s unusable (%s) — starting fresh session",
+        resume[:8], _short_error(exc),
+      )
+      self._latest_session_id = ""
+      self._options = self._build_options(project_dir, model, resume="")
+      await self._sdk.create_client(self._options)
 
   async def run_turn(
     self,
