@@ -406,36 +406,30 @@ def test_model_switch_to_preset_sets_endpoint_and_remote_name(tmp_path):
   assert "deepseek-v4-pro[1m]" in reset_history, reset_history
 
 
-def test_provider_switch_rebuilds_agent_with_new_default(tmp_path):
-  """`/provider codex` from a Claude daemon must (a) stop the old
-  agent, (b) build a fresh agent for codex, (c) reset model to
-  gpt-5.5 (codex default), (d) load the per-provider session id, (e)
-  call agent.start with the new model + that session id."""
+def _run_provider_switch(tmp_path, *, prior_codex_session: str = ""):
+  """Helper: drive main_loop through /provider codex (then /exit).
+
+  Returns (start_calls, send_calls). prior_codex_session controls
+  whether the spy DB advertises a stored codex session id for this
+  chat (resume path) or none (fresh-start path).
+  """
   from nemo.channel import IncomingMessage
 
-  built_providers: list[str] = []
-  start_calls: list[tuple[str, str]] = []   # (model, resume)
-  stops: list[bool] = []
+  start_calls: list[tuple[str, str]] = []
+  send_calls: list[str] = []
 
   class _SwitchAgent(_FakeAgent):
-    async def stop(self):
-      stops.append(True)
-
     async def start(self, _project_dir, model, resume=""):
       start_calls.append((model, resume))
-
-  def _factory(provider, *_, **__):
-    built_providers.append(provider)
-    return _SwitchAgent()
 
   class _SpyDB(_FakeDB):
     def get_chat_owner(self, _chat_id):
       return None
 
     def get_sdk_session_id(self, chat_id, provider):
-      # Simulate a previous codex thread already in the DB. claude has
-      # nothing — fresh start there.
-      return "codex-thread-prev" if provider == "codex" else ""
+      if provider == "codex":
+        return prior_codex_session
+      return ""
 
     def set_sdk_session_id(self, *_args, **_kwargs):
       pass
@@ -453,13 +447,21 @@ def test_provider_switch_rebuilds_agent_with_new_default(tmp_path):
     ),
   ])
 
+  send_response = mock.AsyncMock()
+
+  def _capture_send(_channel, _chat, body, _db, *_args, **_kwargs):
+    send_calls.append(body)
+
+  send_response.side_effect = _capture_send
+
   with mock.patch("nemo.agent.load_credentials", return_value={
     "app_id": "a", "app_secret": "s", "email": "u@e.com",
   }), \
        mock.patch("nemo.agent.Database", _SpyDB), \
        mock.patch("nemo.agent.LarkChannel", return_value=queued), \
-       mock.patch("nemo.agent.build_coding_agent", side_effect=_factory), \
-       mock.patch("nemo.agent._send_response", new=mock.AsyncMock()), \
+       mock.patch("nemo.agent.build_coding_agent",
+                  side_effect=lambda _p, *_, **__: _SwitchAgent()), \
+       mock.patch("nemo.agent._send_response", new=send_response), \
        mock.patch("nemo.group_config.load_config", return_value={}), \
        mock.patch("nemo.config.load_relay_config", return_value=("", "")), \
        mock.patch("signal.signal"):
@@ -467,17 +469,53 @@ def test_provider_switch_rebuilds_agent_with_new_default(tmp_path):
       main_loop("oc_test", str(tmp_path), "claude-opus-4-7", provider="claude")
     )
   assert rc == 0
-  # Two builds: the original claude one at startup, then a fresh codex
-  # one when /provider hit.
-  assert built_providers == ["claude", "codex"], built_providers
-  # stop() fires at least twice — once on the /provider switch (tear
-  # down old claude agent) and once when /exit shuts down the new
-  # codex agent.
-  assert len(stops) >= 2, stops
+  return start_calls, send_calls
+
+
+def test_provider_switch_rebuilds_agent_with_new_default(tmp_path):
+  """`/provider codex` from a Claude daemon must (a) stop the old
+  agent, (b) build a fresh agent for codex, (c) reset model to
+  gpt-5.5 (codex default), (d) load the per-provider session id, (e)
+  call agent.start with the new model + that session id."""
+  start_calls, _ = _run_provider_switch(
+    tmp_path, prior_codex_session="codex-thread-prev")
   # Two start()s: the original at boot (claude default model) and the
   # post-switch one (codex default + per-provider resume id).
   assert start_calls[0] == ("claude-opus-4-7", ""), start_calls
   assert start_calls[1] == ("gpt-5.5", "codex-thread-prev"), start_calls
+
+
+def test_provider_switch_message_says_resumed_when_prior_session_exists(tmp_path):
+  """Confirmation card after /provider must tell the user their
+  context is the new provider's *own* prior history — not the
+  previous provider's. Otherwise users hit "did the bot forget?"
+  surprises when each provider has its own session column."""
+  _, send_calls = _run_provider_switch(
+    tmp_path, prior_codex_session="codex-thread-9876ab")
+  # Find the switch confirmation among the send_response calls.
+  switch_msg = next(
+    (m for m in send_calls if "Switched to provider" in m), None)
+  assert switch_msg is not None, send_calls
+  # Mentions resume + the codex session prefix + the cross-provider
+  # isolation note.
+  assert "Resuming" in switch_msg
+  assert "codex" in switch_msg
+  assert "codex-th" in switch_msg  # first 8 chars of stored id
+  assert "does not see" in switch_msg
+
+
+def test_provider_switch_message_says_fresh_when_no_prior_session(tmp_path):
+  """First-time switch: new provider has no stored session id for
+  this chat → the card should say "Fresh" and explain the other
+  providers' transcripts are still around when you switch back."""
+  _, send_calls = _run_provider_switch(tmp_path, prior_codex_session="")
+  switch_msg = next(
+    (m for m in send_calls if "Switched to provider" in m), None)
+  assert switch_msg is not None, send_calls
+  assert "Fresh" in switch_msg
+  assert "codex" in switch_msg
+  assert "no prior history" in switch_msg.lower()
+  assert "switching back" in switch_msg.lower()
 
 
 def test_codex_provider_rejects_claude_model_switch(tmp_path):

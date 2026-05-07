@@ -864,11 +864,30 @@ async def main_loop(
             await _clear_ack()
             continue
           await channel.update_status(model, "idle", provider)
+          # Tell the user explicitly what happened to their context.
+          # Each provider keeps its own session id (per-provider DB
+          # columns from 0.3.87), so the new provider either resumes
+          # its OWN prior history on this chat or starts fresh — it
+          # never sees the previous provider's transcript. Without
+          # this note users hit "the bot forgot what we just talked
+          # about" surprises.
+          if _sdk_session_id:
+            context_note = (
+              f"Resuming **{provider}**'s prior conversation on this "
+              f"chat (session `{_sdk_session_id[:8]}`). It does not "
+              f"see what other providers said here."
+            )
+          else:
+            context_note = (
+              f"Fresh **{provider}** conversation — no prior history "
+              f"on this chat. Other providers' transcripts are kept "
+              f"separately and reachable by switching back."
+            )
           await _send_response(
             channel, chat_id,
             f"Switched to provider **{provider}** "
-            f"(default model `{model}`). Use `/model <name>` to pick "
-            f"a different one.",
+            f"(default model `{model}`). {context_note} "
+            f"Use `/model <name>` to pick a different one.",
             db,
           )
         elif response and response.startswith("__effort__:"):
