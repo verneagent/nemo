@@ -1548,6 +1548,40 @@ def run_switch_tests(pid: int, chat_id: str, result: E2EResult,
       log.dump_tail(15, "T80")
     wait_for_idle(pid, chat_id, timeout=30)
 
+    # T80a: send a turn AFTER the preset switch. The preset switch
+    # itself is local — it only flips env vars on nemo's side and
+    # rebuilds SDK options. None of that touches the remote endpoint
+    # until the user sends the first prompt. Without this turn the
+    # phase wouldn't catch protocol mismatches like "DeepSeek's
+    # OpenAI-compatible host doesn't implement /responses, only
+    # /chat/completions" — which is exactly the wire_api regression
+    # 0.3.94 fixed. Test on whichever provider the daemon was started
+    # on (claude → Anthropic protocol against DeepSeek's /anthropic
+    # endpoint; codex → wire_api=chat against /chat/completions).
+    print("  [T80a] turn after preset switch...")
+    ts = str(int(time.time() * 1000))
+    send_msg("Reply with the single word: pong", chat_id)
+    msg, elapsed = wait_for_response(chat_id, ts, timeout=90)
+    if msg:
+      body_txt = json.dumps(msg.get("body", "")).lower()
+      if "404" in body_txt or "not found" in body_txt:
+        result.fail(
+          "T80a turn on preset",
+          f"backend returned 404 — protocol mismatch ({body_txt[:200]})",
+        )
+        log.dump_tail(20, "T80a")
+      elif "pong" in body_txt:
+        result.ok("T80a turn on preset", f"{elapsed:.1f}s")
+      else:
+        result.ok(
+          "T80a turn on preset",
+          f"{elapsed:.1f}s (card ok, body lacks 'pong')",
+        )
+    else:
+      result.fail("T80a turn on preset", "no response card from preset endpoint")
+      log.dump_tail(20, "T80a")
+    wait_for_idle(pid, chat_id, timeout=30)
+
   # T81: /model <static_slug> — same provider, clears preset endpoint.
   print(f"  [T81] /model {static_back} (clear preset)...")
   log_mark = log.mark()
@@ -1610,6 +1644,54 @@ def run_switch_tests(pid: int, chat_id: str, result: E2EResult,
     result.fail("T83 turn on new provider", "no response card")
     log.dump_tail(15, "T83")
   wait_for_idle(pid, chat_id, timeout=30)
+
+  # T83a: AFTER the provider switch, also flip to the DeepSeek preset
+  # so the next turn exercises the OTHER provider's path through the
+  # same third-party endpoint. T80 / T80a covered <original> +
+  # DeepSeek; this covers <other> + DeepSeek. For codex that means
+  # wire_api=chat against api.deepseek.com — the path that 0.3.94
+  # fixed after a /responses 404 leaked into production.
+  if has_key:
+    print(f"  [T83a] /model deepseek-v4-pro on {other} + turn...")
+    log_mark = log.mark()
+    ts = str(int(time.time() * 1000))
+    send_msg("/model deepseek-v4-pro", chat_id)
+    switched = log.wait_for_since(
+      "Model switch to preset deepseek-v4-pro", log_mark,
+      timeout=15, poll=1,
+    )
+    if not switched:
+      result.fail(
+        f"T83a preset on {other}",
+        "preset switch on new provider didn't fire",
+      )
+      log.dump_tail(20, "T83a")
+    else:
+      wait_for_idle(pid, chat_id, timeout=30)
+      ts = str(int(time.time() * 1000))
+      send_msg("Reply with the single word: pong", chat_id)
+      msg, elapsed = wait_for_response(chat_id, ts, timeout=90)
+      if msg:
+        body_txt = json.dumps(msg.get("body", "")).lower()
+        if "404" in body_txt or "not found" in body_txt:
+          result.fail(
+            f"T83a turn on {other}+preset",
+            f"backend 404 — protocol mismatch ({body_txt[:200]})",
+          )
+          log.dump_tail(20, "T83a")
+        elif "pong" in body_txt:
+          result.ok(f"T83a turn on {other}+preset", f"{elapsed:.1f}s")
+        else:
+          result.ok(
+            f"T83a turn on {other}+preset",
+            f"{elapsed:.1f}s (card ok, body lacks 'pong')",
+          )
+      else:
+        result.fail(f"T83a turn on {other}+preset", "no response card")
+        log.dump_tail(20, "T83a")
+    wait_for_idle(pid, chat_id, timeout=30)
+  else:
+    result.skip(f"T83a turn on {other}+preset", "DEEPSEEK_API_KEY not set")
 
   # T84: /provider <original> — rebuild back. Confirms the
   # per-provider session id storage doesn't blow up the round-trip
