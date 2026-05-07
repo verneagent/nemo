@@ -46,31 +46,26 @@ async function main() {
   const options = parseArgs(argv.slice(2));
   const prompt = await readPrompt();
   // When OPENAI_BASE_URL is set (preset registry pointed nemo at a
-  // third-party endpoint like DeepSeek's OpenAI-compatible host) we
-  // need to override two codex CLI defaults that bite us otherwise:
+  // third-party endpoint) we forward baseUrl + apiKey to the codex
+  // SDK constructor. apiKey is critical: the codex CLI otherwise
+  // reads the user's ~/.codex/auth.json OAuth token first and
+  // rejects non-whitelisted models on ChatGPT-account auth ("The
+  // 'deepseek-v4-pro' model is not supported when using Codex with
+  // a ChatGPT account"). Passing apiKey forces API-key mode.
   //
-  //   1. ChatGPT OAuth precedence. codex picks the user's
-  //      ~/.codex/auth.json token even when OPENAI_API_KEY is set in
-  //      the env, then refuses non-whitelisted models on that auth
-  //      mode ("The 'deepseek-v4-pro' model is not supported when
-  //      using Codex with a ChatGPT account"). Passing apiKey via
-  //      the SDK forces API-key auth and skips the whitelist.
-  //
-  //   2. Wire protocol. codex's built-in "openai" provider talks to
-  //      /v1/responses (OpenAI's Responses API). DeepSeek and most
-  //      third-party "OpenAI-compatible" services only implement
-  //      /v1/chat/completions, so the responses-format request 404s.
-  //      We patch the built-in provider's wire_api → "chat" via the
-  //      SDK's --config passthrough.
+  // We deliberately do NOT touch wire_api here. Codex 0.128+
+  // dropped support for `wire_api = "chat"` entirely
+  // (https://github.com/openai/codex/discussions/7782) — the CLI
+  // hard-rejects the value at config-load time. The default
+  // "responses" protocol is the only option, which means codex
+  // against a third-party endpoint requires that endpoint to
+  // implement /v1/responses. DeepSeek's OpenAI-compatible host
+  // currently only exposes /v1/chat/completions, so codex +
+  // deepseek-v4-pro will 404 until DeepSeek ships a responses
+  // adapter or codex restores wire_api=chat. Use Claude provider
+  // (Anthropic-protocol DeepSeek endpoint) for now.
   const codexOptions = {};
-  if (env.OPENAI_BASE_URL) {
-    codexOptions.baseUrl = env.OPENAI_BASE_URL;
-    codexOptions.config = {
-      model_providers: {
-        openai: { wire_api: "chat" },
-      },
-    };
-  }
+  if (env.OPENAI_BASE_URL) codexOptions.baseUrl = env.OPENAI_BASE_URL;
   if (env.OPENAI_API_KEY) codexOptions.apiKey = env.OPENAI_API_KEY;
   const codex = new Codex(codexOptions);
   const threadOptions = {
