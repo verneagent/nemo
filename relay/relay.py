@@ -555,6 +555,23 @@ async def _handle_webhook(data: dict) -> tuple[int, dict]:
                 }
                 await _push_message(f"chat:{chat_id}", reply)
 
+    elif event_type == "im.message.recalled_v1":
+        # Forward recall events so the daemon's in-turn watcher can drop
+        # the recalled message from its pending queue. The recall webhook
+        # carries chat_id directly, no msgchat: lookup needed.
+        message_id = event.get("message_id", "")
+        chat_id = event.get("chat_id", "")
+        if message_id and chat_id:
+            reply = {
+                "msg_type": "recall",
+                "message_id": message_id,
+                "create_time": event.get(
+                    "notify_time", str(int(time.time() * 1000))),
+            }
+            await _push_message(f"chat:{chat_id}", reply)
+            log.info(
+                "Recall pushed: chat=%s msg=%s", chat_id, message_id[:16])
+
     elif event_type == "card.action.trigger":
         return await _handle_card_action(event)
 

@@ -812,6 +812,40 @@ class RelayTestCase(unittest.TestCase):
     # No crash — silently ignored
 
   # =====================================================
+  #  11b. Recall forwarding — daemon's in-turn watcher needs these
+  # =====================================================
+
+  def test_recall_forwarded_as_msg_type_recall(self):
+    """Lark recall webhook → relay pushes msg_type='recall' to the chat,
+    so the daemon's watcher can drop the recalled message from its
+    pending queue. Pre-fix, the relay swallowed recall webhooks entirely
+    and recall never worked end-to-end on the relay path."""
+    self._webhook({
+      "header": {"token": "tok1", "event_type": "im.message.recalled_v1",
+                 "event_id": "evt_recall_eq"},
+      "event": {
+        "message_id": "om_recalled_eq",
+        "chat_id": "oc_recall_eq",
+        "notify_time": "80000",
+      },
+    })
+    result = self._get("/replies/chat:oc_recall_eq?since=")
+    recalls = [r for r in result["replies"] if r["msg_type"] == "recall"]
+    self.assertEqual(len(recalls), 1)
+    r = recalls[0]
+    self.assertEqual(r["message_id"], "om_recalled_eq")
+    self.assertEqual(r["create_time"], "80000")
+
+  def test_recall_without_chat_id_dropped(self):
+    """Recall webhook missing chat_id has nowhere to route — drop silently."""
+    self._webhook({
+      "header": {"token": "tok1", "event_type": "im.message.recalled_v1",
+                 "event_id": "evt_recall_no_chat"},
+      "event": {"message_id": "om_recalled_no_chat"},
+    })
+    # No crash; no chat to assert against.
+
+  # =====================================================
   #  12. Relay — cross-group messaging
   # =====================================================
 
