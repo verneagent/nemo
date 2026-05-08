@@ -20,6 +20,7 @@ import signal
 import time
 import urllib.error
 import uuid
+from typing import Callable
 
 from . import cards, commands, messages, monitor
 from .agent_factory import AgentProvider, build_coding_agent, is_model_compatible
@@ -172,6 +173,23 @@ def _requeue_pending(
       channel.push_back(msg)
   else:
     channel.push_back(result)
+
+
+def _in_turn_filtered_out(
+  msg: IncomingMessage,
+  bot_open_id: str,
+  is_own_message: Callable[[str], bool],
+) -> bool:
+  """Return True iff a regular in-turn message should be ignored under
+  ``need_mention=True`` because it isn't bot-directed.
+
+  Recall events and card.action.trigger events are system-level signals
+  and must NOT pass through this filter — callers handle those branches
+  before invoking this helper.
+  """
+  kept = messages.filter_bot_interactions(
+    [msg], bot_open_id, is_own_message=is_own_message)
+  return not kept
 
 
 async def _send_response(
@@ -600,6 +618,10 @@ async def main_loop(
     agent.set_effort(effort)
   # Resume previous SDK session if available
   _sdk_session_id: str = _resume_sdk_id
+  # Snapshot saved at each /clear so /undo-clear can restore the
+  # session id that was active just before the user reset. Held in
+  # process memory only — does not survive a daemon restart.
+  _prev_sdk_session_id: str = ""
   if _sdk_session_id:
     log.info("Resuming SDK session %s", _sdk_session_id[:8])
   try:
@@ -640,6 +662,11 @@ async def main_loop(
 
   async def _restart_client(resume: str = ""):
     await agent.reset(project_dir, model, resume=resume)
+
+  def _is_own_message(mid: str) -> bool:
+    """True iff `mid` was sent by this bot (recorded as direction='sent')."""
+    row = db.lookup_parent_message(mid)
+    return bool(row and row.get("direction") == "sent")
 
   # Load guest/coowner roles for authorization
   from .guests import get_member_roles
@@ -696,9 +723,6 @@ async def main_loop(
       # people's messages (quoting a teammate's card while @-ing
       # another teammate) is not considered bot-directed.
       if need_mention and bot_open_id:
-        def _is_own_message(mid: str) -> bool:
-          row = db.lookup_parent_message(mid)
-          return bool(row and row.get("direction") == "sent")
         kept = messages.filter_bot_interactions(
           [reply], bot_open_id, is_own_message=_is_own_message)
         if not kept:
@@ -743,15 +767,42 @@ async def main_loop(
         messages.strip_parent_quote(user_message), ctx)
       if handled:
         if response == "__clear__":
+          # Snapshot the active session id BEFORE clearing so /undo-clear
+          # can restore it. The DB still has the old id at this point —
+          # it gets overwritten on the next turn's first event.
+          _prev_sdk_session_id = _sdk_session_id
           t = datetime.datetime.now().strftime("%H:%M")
           card = cards.build_card("🔄 Session Cleared",
                                   body=f"Context reset at {t}.", color="orange")
           msg_id = await channel.send_card(chat_id, card)
           db.record_sent(msg_id, text="Session Cleared", chat_id=chat_id)
           _register_msg(msg_id, chat_id)
-          log.info("Session cleared card sent: %s", msg_id)
+          log.info("Session cleared card sent: %s (saved prev=%s)",
+                   msg_id,
+                   _prev_sdk_session_id[:8] if _prev_sdk_session_id else "none")
           await _restart_client()
           _pending_pacing_hint = False
+        elif response == "__undo_clear__":
+          if not _prev_sdk_session_id:
+            await _send_response(
+              channel, chat_id,
+              "Nothing to undo — no `/clear` recorded since this daemon started.",
+              db,
+            )
+          else:
+            restored = _prev_sdk_session_id
+            _sdk_session_id = restored
+            db.set_sdk_session_id(chat_id, restored, provider)
+            log.info("Restoring SDK session %s after /undo-clear", restored[:8])
+            await _restart_client(resume=restored)
+            await _send_response(
+              channel, chat_id,
+              f"↩️ Restored session `{restored[:8]}`. "
+              f"The next message continues that conversation.",
+              db,
+            )
+            # Single-shot: clear so a second /undo-clear errors out.
+            _prev_sdk_session_id = ""
         elif response == "__esc__":
           elapsed = time.time() - _turn_start
           await _send_response(channel, chat_id, f"{_cancel_emoji(elapsed)} Operation cancelled.", db)
@@ -1394,6 +1445,14 @@ async def main_loop(
                 msg.operator_id, operator_open_id, _member_roles):
               signal_detected = "stop"
               return
+            continue
+          # Apply @mention filter so non-bot-directed chat doesn't get
+          # pulled into the in-turn pending queue (mirrors the top-level
+          # loop's filter). Recall + card.action.trigger handled above.
+          if need_mention and bot_open_id and _in_turn_filtered_out(
+              msg, bot_open_id, _is_own_message):
+            log.info("Skipping during turn: not bot-directed (event=%s)",
+                     msg.event_type)
             continue
           msg_text = msg.text
           mentions = msg.mentions

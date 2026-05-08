@@ -82,6 +82,12 @@ def try_dispatch(text: str, ctx: AgentContext) -> tuple[bool, str | None]:
   if t in ("/clear", "clear", "清空", "重置"):
     return True, "__clear__"
 
+  # /undo-clear — restore the SDK session id that was active just before
+  # the most recent /clear. Only works while the daemon is alive (the
+  # previous id is held in process memory; not persisted to DB).
+  if t in ("/undo-clear", "/undoclear", "/undo", "撤销清空", "恢复"):
+    return True, "__undo_clear__"
+
   # /model
   if t.startswith("/model"):
     from .agent_factory import is_model_compatible, model_catalog_for_provider
@@ -206,6 +212,7 @@ def try_dispatch(text: str, ctx: AgentContext) -> tuple[bool, str | None]:
       "| `/effort` | Show current reasoning effort |\n"
       "| `/effort <low\\|medium\\|high\\|max\\|default>` | Set reasoning effort |\n"
       "| `/clear` | Reset conversation |\n"
+      "| `/undo-clear` | Restore session from last `/clear` (in-memory only) |\n"
       "| `/cd <dir>` | Change working directory |\n"
       "| `/esc` | Cancel current operation |\n"
       "| `/ping` | Status check |\n"
@@ -310,7 +317,8 @@ def try_dispatch(text: str, ctx: AgentContext) -> tuple[bool, str | None]:
 
 
 # Commands that require SDK restart — NOT safe during a turn.
-_NEEDS_SDK = ("__clear__", "__esc__", "__model__:", "__cd__:", "__provider__:")
+_NEEDS_SDK = ("__clear__", "__undo_clear__", "__esc__",
+              "__model__:", "__cd__:", "__provider__:")
 
 
 def is_inline_safe(response: str | None) -> bool:

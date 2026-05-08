@@ -14,6 +14,20 @@ def test_clear_commands():
     assert resp == "__clear__"
 
 
+def test_undo_clear_commands():
+  for cmd in ("/undo-clear", "/undoclear", "/undo", "撤销清空", "恢复"):
+    handled, resp = try_dispatch(cmd, _ctx())
+    assert handled, f"{cmd!r} should be handled"
+    assert resp == "__undo_clear__", f"{cmd!r} → {resp!r}"
+
+
+def test_undo_clear_not_inline_safe():
+  """/undo-clear must NOT be inline-safe — it triggers _restart_client(resume=…)
+  which can't run mid-turn."""
+  _, resp = try_dispatch("/undo-clear", _ctx())
+  assert not is_inline_safe(resp)
+
+
 def test_model_show():
   handled, resp = try_dispatch("/model", _ctx())
   assert handled

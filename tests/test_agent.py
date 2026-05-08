@@ -6,6 +6,7 @@ from unittest import mock
 
 from nemo.agent import (
   _format_rate_limit_notice,
+  _in_turn_filtered_out,
   _merge_pending,
   _requeue_pending,
   _send_response,
@@ -13,6 +14,7 @@ from nemo.agent import (
   _update_done_card_with_fallback,
   main_loop,
 )
+from nemo.channel import IncomingMessage
 from nemo.turn import AnswerEvent, DoneEvent, RateLimitNoticeEvent
 
 
@@ -892,6 +894,55 @@ def test_merge_pending_all_recalled():
   msgs = [_msg("only", message_id="om_1")]
   msgs[:] = [m for m in msgs if m.message_id != "om_1"]
   assert _merge_pending(msgs) is None
+
+
+# ---------------------------------------------------------------------------
+# _in_turn_filtered_out — bug fix: in-turn watcher must apply mention filter
+# so non-bot-directed chat doesn't get pulled into the pending queue when
+# need_mention is on. Pre-fix, OneSecond reactions were attached to messages
+# that weren't even directed at the bot, and those messages were re-queued
+# back into the channel after the turn (causing nemo to "respond" to chatter
+# between teammates).
+# ---------------------------------------------------------------------------
+
+
+def _never_own(_mid: str) -> bool:
+  return False
+
+
+def test_in_turn_filtered_out_skips_unmentioned_message():
+  msg = IncomingMessage(
+    event_type="message", chat_id="oc_x",
+    text="hey teammate", mentions=[],
+  )
+  assert _in_turn_filtered_out(msg, "ou_bot", _never_own) is True
+
+
+def test_in_turn_filtered_out_keeps_mentioned_message():
+  msg = IncomingMessage(
+    event_type="message", chat_id="oc_x",
+    text="@nemo do thing",
+    mentions=[{"id": "ou_bot", "name": "nemo"}],
+  )
+  assert _in_turn_filtered_out(msg, "ou_bot", _never_own) is False
+
+
+def test_in_turn_filtered_out_keeps_reply_to_own_card():
+  msg = IncomingMessage(
+    event_type="message", chat_id="oc_x",
+    text="follow up", mentions=[], parent_id="om_bot_card",
+  )
+  is_own = lambda mid: mid == "om_bot_card"  # noqa: E731
+  assert _in_turn_filtered_out(msg, "ou_bot", is_own) is False
+
+
+def test_in_turn_filtered_out_skips_reply_to_other_user():
+  msg = IncomingMessage(
+    event_type="message", chat_id="oc_x",
+    text="agreeing with you", mentions=[], parent_id="om_other_user",
+  )
+  is_own = lambda mid: mid == "om_bot_card"  # noqa: E731
+  assert _in_turn_filtered_out(msg, "ou_bot", is_own) is True
 
 
 # ---------------------------------------------------------------------------
