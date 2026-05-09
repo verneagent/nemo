@@ -87,11 +87,35 @@ def _is_pid_alive(pid: int) -> bool:
     return True  # Can't verify — assume alive to be safe
 
 
+def _cmdline_targets_chat(cmd: str, chat_id: str) -> bool:
+  """Return True iff the command line targets exactly ``chat_id``.
+
+  Matches ``--chat-id <chat_id>`` (separate tokens) and the inline form
+  ``--chat-id=<chat_id>``. Critically does NOT use substring containment:
+  a previous bug used ``chat_id in cmd``, which on chat_id="0" matched
+  every nemo cmdline (32-char hex chat IDs almost always contain "0")
+  and caused a stray ``--chat-id 0`` daemon to evict every other nemo
+  process on the host.
+  """
+  import shlex
+  try:
+    tokens = shlex.split(cmd)
+  except ValueError:
+    tokens = cmd.split()
+  inline = f"--chat-id={chat_id}"
+  for i, tok in enumerate(tokens):
+    if tok == inline:
+      return True
+    if tok == "--chat-id" and i + 1 < len(tokens) and tokens[i + 1] == chat_id:
+      return True
+  return False
+
+
 def _find_local_nemo_pids(chat_id: str) -> list[int]:
   """Find local nemo processes targeting the given chat_id.
 
-  Scans the process table for nemo commands containing --chat-id <chat_id>.
-  Returns PIDs excluding the current process.
+  Scans the process table for nemo commands whose argv exactly carries
+  ``--chat-id <chat_id>``. Returns PIDs excluding the current process.
   """
   import subprocess
 
@@ -104,9 +128,7 @@ def _find_local_nemo_pids(chat_id: str) -> list[int]:
     )
     for line in result.stdout.splitlines():
       line = line.strip()
-      if not line:
-        continue
-      if "nemo" not in line or chat_id not in line:
+      if not line or "nemo" not in line:
         continue
       parts = line.split(None, 1)
       if len(parts) < 2:
@@ -118,8 +140,9 @@ def _find_local_nemo_pids(chat_id: str) -> list[int]:
       if pid == my_pid:
         continue
       cmd = parts[1]
-      if "--chat-id" in cmd and chat_id in cmd:
-        pids.append(pid)
+      if not _cmdline_targets_chat(cmd, chat_id):
+        continue
+      pids.append(pid)
   except Exception as e:
     log.debug("Failed to scan for local nemo pids: %s", e)
   return pids

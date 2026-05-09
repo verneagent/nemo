@@ -8,6 +8,7 @@ from nemo.workspace import (
   ensure_workspace_tag, auto_create_chat,
   discover_or_create_chat, claim_group, release_group,
   _is_group_idle, _compute_group_name, _find_local_nemo_pids,
+  _cmdline_targets_chat,
 )
 
 
@@ -500,3 +501,37 @@ def test_evict_existing_pid_file():
                 evict_existing("tok", "oc_1")
   import signal
   mock_kill.assert_called_once_with(12345, signal.SIGTERM)
+
+
+# ---------------------------------------------------------------------------
+# _cmdline_targets_chat — guard against the substring-match misfire that
+# let a stray --chat-id 0 daemon evict every nemo on the host (chat IDs
+# are 32-char hex; substring "0" matched all of them).
+# ---------------------------------------------------------------------------
+
+def test_cmdline_targets_chat_separate_tokens():
+  cmd = "/path/python /path/nemo --chat-id oc_45fcf76e --provider claude"
+  assert _cmdline_targets_chat(cmd, "oc_45fcf76e") is True
+
+
+def test_cmdline_targets_chat_inline_form():
+  cmd = "/path/python /path/nemo --chat-id=oc_45fcf76e --verbose"
+  assert _cmdline_targets_chat(cmd, "oc_45fcf76e") is True
+
+
+def test_cmdline_targets_chat_no_substring_misfire():
+  """Pre-fix: substring match — chat_id='0' matched any chat-id with '0'."""
+  cmd = "/path/python /path/nemo --chat-id oc_45fcf76e0a --provider claude"
+  assert _cmdline_targets_chat(cmd, "0") is False
+  # Even when '0' appears literally elsewhere, only an exact arg match counts
+  assert _cmdline_targets_chat(cmd, "oc_45") is False
+
+
+def test_cmdline_targets_chat_different_chat():
+  cmd = "/path/python /path/nemo --chat-id oc_OTHER --provider claude"
+  assert _cmdline_targets_chat(cmd, "oc_45fcf76e") is False
+
+
+def test_cmdline_targets_chat_no_chat_id_arg():
+  cmd = "/path/python /path/nemo --provider claude"
+  assert _cmdline_targets_chat(cmd, "oc_45fcf76e") is False

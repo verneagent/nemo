@@ -278,13 +278,32 @@ def main():
   if len(sys.argv) >= 2 and sys.argv[1] == "list":
     sys.exit(_cmd_list())
 
+  def _validate_chat_id(value: str) -> str:
+    """Reject obviously-invalid Lark chat IDs at parse time.
+
+    Lark group chat IDs always start with ``oc_`` followed by hex.
+    Without this check, a typo like ``--chat-id 0`` propagates into
+    workspace eviction logic — see _cmdline_targets_chat in workspace.py
+    for the full failure mode (a stray chat_id="0" daemon SIGTERMs
+    every other nemo on the host).
+    """
+    if not value:
+      return value  # empty = auto-discover
+    if not (value.startswith("oc_") and len(value) > 3):
+      raise argparse.ArgumentTypeError(
+        f"Invalid Lark chat_id {value!r}: must start with 'oc_' "
+        f"(e.g. oc_da5004fb44ea33ce72ed90aabe2ab9dfe)"
+      )
+    return value
+
   parser = argparse.ArgumentParser(
     prog="nemo",
     description="Lark-connected coding agent daemon",
   )
   parser.add_argument("--version", "-V", action="version",
                       version=f"nemo {_get_version()}")
-  parser.add_argument("--chat-id", default="", help="Lark chat ID (auto-discovered if omitted)")
+  parser.add_argument("--chat-id", default="", type=_validate_chat_id,
+                      help="Lark chat ID (auto-discovered if omitted)")
   parser.add_argument("--chat-name", default="", help="Find chat by name substring")
   parser.add_argument("--project-dir", default=".", help="Project directory (default: cwd)")
   parser.add_argument("--provider", default="claude", choices=["claude", "codex", "opencode"],

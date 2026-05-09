@@ -40,6 +40,27 @@ def test_invalid_project_dir():
       assert result == 1
 
 
+def test_invalid_chat_id_rejected_at_argparse():
+  """A chat_id that doesn't start with 'oc_' must fail argparse early
+  rather than spawn a daemon that mis-evicts every other nemo on the
+  host (see _cmdline_targets_chat regression history)."""
+  import pytest
+  with mock.patch("sys.argv", ["nemo", "--chat-id", "0",
+                                "--project-dir", "/tmp"]):
+    with pytest.raises(SystemExit) as exc:
+      main()
+    assert exc.value.code == 2  # argparse error exit code
+
+
+def test_empty_chat_id_still_allowed():
+  """Empty --chat-id means auto-discover; must not be rejected."""
+  with mock.patch("sys.argv", ["nemo", "--chat-id", "", "--project-dir", "/tmp"]):
+    with mock.patch("nemo.__main__._ensure_provider_runtime"):
+      with mock.patch("nemo.config.load_credentials", return_value=None):
+        result = main()
+        assert result == 1  # fails later for missing creds, NOT at argparse
+
+
 def test_valid_args_calls_main_loop(tmp_path):
   """Should call main_loop with parsed args."""
   project = str(tmp_path)

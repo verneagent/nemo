@@ -128,13 +128,18 @@ class RelayEventStream:
 
         while self._running:
             try:
-                # proxy=None disables websockets' auto-pickup of HTTP_PROXY /
-                # HTTPS_PROXY / ALL_PROXY env vars (default since websockets
-                # 15.0). On hosts with a local outbound proxy (e.g. ClashX in
-                # China for anthropic.com / openai.com), the proxy can't tunnel
-                # WS upgrades and every connect fails with "did not receive a
-                # valid HTTP response from proxy" — relay traffic must always
-                # go direct.
+                # Workaround for python-websockets 15.x's strict CONNECT-response
+                # parser, which raises ValueError on `HTTP/1.0 200 Connection
+                # established` (RFC 7230 §2.6 says clients MUST accept any
+                # version they understand; many forward proxies — ClashX,
+                # Squid, mitmproxy — emit HTTP/1.0 for CONNECT 200). Since
+                # websockets 15.0 the `connect()` proxy default flipped to
+                # True (auto-detect from HTTP_PROXY / ALL_PROXY env), so on
+                # hosts with a local proxy the relay WS connect now fails
+                # with "did not receive a valid HTTP response from proxy".
+                # `proxy=None` opts back into pre-15 behavior — direct, no
+                # env auto-detect — for relay traffic specifically. Other
+                # outbound code paths can still honor the user's proxy env.
                 with ws_client.connect(self._ws_url(),
                                        additional_headers=headers,
                                        close_timeout=2,
