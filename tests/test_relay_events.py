@@ -274,6 +274,46 @@ def test_stream_permission_active_flag():
     assert stream.permission_active is True
 
 
+def test_ws_loop_passes_proxy_none(monkeypatch):
+    """The WS connect must pass proxy=None so HTTP_PROXY / HTTPS_PROXY /
+    ALL_PROXY env vars (e.g. ClashX in China) don't get auto-applied to
+    relay connections. Pre-fix, websockets >=15.0 default proxy=True
+    auto-pulled the local proxy and every relay WS connect failed with
+    'did not receive a valid HTTP response from proxy'."""
+    captured: dict = {}
+
+    class _FakeWS:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def recv(self, timeout=None):
+            raise StopIteration  # break the inner loop
+
+    def _fake_connect(uri, **kwargs):
+        captured.update(kwargs)
+        captured["uri"] = uri
+        # Stop the outer reconnect loop after one call
+        stream._running = False
+        return _FakeWS()
+
+    import websockets.sync.client as ws_client
+    monkeypatch.setattr(ws_client, "connect", _fake_connect)
+
+    stream = RelayEventStream("http://relay.example.com", "k", "oc_test")
+    stream._running = True
+    import asyncio as _asyncio
+    loop = _asyncio.new_event_loop()
+    try:
+        stream._ws_loop(loop)
+    finally:
+        loop.close()
+
+    assert captured.get("uri") == "ws://relay.example.com/ws/chat:oc_test"
+    assert "proxy" in captured, "proxy kwarg must be set explicitly"
+    assert captured["proxy"] is None, (
+        f"proxy must be None to bypass env-var proxies; got {captured['proxy']!r}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # RelayEventStream + relay server integration
 # ---------------------------------------------------------------------------

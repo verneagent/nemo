@@ -128,9 +128,17 @@ class RelayEventStream:
 
         while self._running:
             try:
+                # proxy=None disables websockets' auto-pickup of HTTP_PROXY /
+                # HTTPS_PROXY / ALL_PROXY env vars (default since websockets
+                # 15.0). On hosts with a local outbound proxy (e.g. ClashX in
+                # China for anthropic.com / openai.com), the proxy can't tunnel
+                # WS upgrades and every connect fails with "did not receive a
+                # valid HTTP response from proxy" — relay traffic must always
+                # go direct.
                 with ws_client.connect(self._ws_url(),
                                        additional_headers=headers,
-                                       close_timeout=2) as ws:
+                                       close_timeout=2,
+                                       proxy=None) as ws:
                     self._ws = ws  # Save for force-close on shutdown
                     log.info("WS connected to relay")
                     # Ping every 30s to keep alive
