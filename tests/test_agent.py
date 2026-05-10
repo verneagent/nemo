@@ -870,6 +870,30 @@ def test_requeue_pending_merges():
   assert "second" in pushed[0].text
 
 
+def test_merge_pending_real_event_type():
+  """Real Lark/relay messages carry event_type='im.message.receive_v1';
+  they must still be recognized as text and merged. Regression for a bug
+  where the filter accepted only 'message'/'' so production messages got
+  re-pushed one-by-one instead of merged."""
+  msgs = [
+    _IM(event_type="im.message.receive_v1", chat_id="oc_test",
+        sender_id="ou_user", msg_type="text", text="第一条",
+        message_id="om_1", create_time="1"),
+    _IM(event_type="im.message.receive_v1", chat_id="oc_test",
+        sender_id="ou_user", msg_type="text", text="第二条",
+        message_id="om_2", create_time="2"),
+    _IM(event_type="im.message.receive_v1", chat_id="oc_test",
+        sender_id="ou_user", msg_type="text", text="第三条",
+        message_id="om_3", create_time="3"),
+  ]
+  result = _merge_pending(msgs)
+  assert isinstance(result, _IM), \
+    f"expected single merged IncomingMessage, got {type(result).__name__}"
+  assert "[用户在上一轮工作期间发送了 3 条消息]" in result.text
+  assert "第一条" in result.text and "第三条" in result.text
+  assert result.message_id == "om_3"
+
+
 def test_merge_pending_after_recall():
   """Recalling a message should leave it out of the merge."""
   msgs = [

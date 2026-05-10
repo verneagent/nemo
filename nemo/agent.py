@@ -117,10 +117,13 @@ def _merge_pending(pending: list[IncomingMessage]) -> IncomingMessage | None:
     return pending[0]
 
   # Separate regular text messages from non-text (commands, card actions, etc.)
+  # Real events from the relay/Lark stream carry event_type
+  # "im.message.receive_v1"; older code paths and tests use "message" or "".
+  _TEXT_EVENT_TYPES = {"", "message", "im.message.receive_v1"}
   text_msgs: list[IncomingMessage] = []
   other_msgs: list[IncomingMessage] = []
   for msg in pending:
-    if msg.event_type in ("", "message") and msg.text.strip():
+    if msg.event_type in _TEXT_EVENT_TYPES and msg.text.strip():
       text_msgs.append(msg)
     else:
       other_msgs.append(msg)
