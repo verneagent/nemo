@@ -49,6 +49,12 @@ class _FakeDB:
   def get_session(self, _session_id):
     return {}
 
+  def get_sdk_session_id(self, _chat_id, _provider, _endpoint_key=""):
+    return ""
+
+  def set_sdk_session_id(self, _chat_id, _sdk_session_id, _provider, _endpoint_key=""):
+    pass
+
 
 class _FakeChannel:
   def __init__(self, _chat_id):
@@ -286,8 +292,8 @@ def test_main_loop_threads_provider_through_db_calls(tmp_path):
   provider-blind behavior."""
   from nemo.channel import IncomingMessage
 
-  recorded_get: list[tuple[str, str]] = []
-  recorded_set: list[tuple[str, str, str]] = []
+  recorded_get: list[tuple[str, str, str]] = []
+  recorded_set: list[tuple[str, str, str, str]] = []
 
   class _SpyDB(_FakeDB):
     def get_chat_owner(self, _chat_id):
@@ -295,12 +301,13 @@ def test_main_loop_threads_provider_through_db_calls(tmp_path):
       # otherwise the early-out would skip the lookup entirely.
       return "old_session"
 
-    def get_sdk_session_id(self, chat_id, provider):
-      recorded_get.append((chat_id, provider))
+    def get_sdk_session_id(self, chat_id, provider, endpoint_key=""):
+      recorded_get.append((chat_id, provider, endpoint_key))
       return ""
 
-    def set_sdk_session_id(self, chat_id, sdk_session_id, provider):
-      recorded_set.append((chat_id, sdk_session_id, provider))
+    def set_sdk_session_id(self, chat_id, sdk_session_id, provider,
+                           endpoint_key=""):
+      recorded_set.append((chat_id, sdk_session_id, provider, endpoint_key))
 
   class _SessionEmittingAgent(_FakeAgent):
     async def run_turn(self, _prompt, on_event):
@@ -344,10 +351,11 @@ def test_main_loop_threads_provider_through_db_calls(tmp_path):
   assert rc == 0
 
   # Read path: provider is correctly threaded into get_sdk_session_id.
-  assert recorded_get == [("oc_test", "codex")], recorded_get
+  # Default endpoint at startup → endpoint_key="".
+  assert recorded_get == [("oc_test", "codex", "")], recorded_get
   # Write path: DoneEvent.session_id reaches the codex column, not a
-  # provider-blind one.
-  assert ("oc_test", "codex-thread-xyz", "codex") in recorded_set, recorded_set
+  # provider-blind one. Default endpoint stays under endpoint_key="".
+  assert ("oc_test", "codex-thread-xyz", "codex", "") in recorded_set, recorded_set
 
 
 def test_model_switch_to_preset_sets_endpoint_and_remote_name(tmp_path):
@@ -408,6 +416,107 @@ def test_model_switch_to_preset_sets_endpoint_and_remote_name(tmp_path):
   assert "deepseek-v4-pro[1m]" in reset_history, reset_history
 
 
+def test_model_switch_isolates_session_per_endpoint(tmp_path):
+  """Regression: `/model deepseek-v4-pro` then `/model claude-opus-4-7`
+  must NOT feed the DeepSeek session id back into real Anthropic.
+
+  The DeepSeek Anthropic-compat gateway emits ``thinking`` blocks whose
+  signatures only verify at DeepSeek; replaying that transcript against
+  api.anthropic.com yields ``400 Invalid signature in thinking block``
+  and wedges the session. Each upstream endpoint must keep its own
+  resume id.
+  """
+  import os as _os
+  from nemo.channel import IncomingMessage
+
+  reset_calls: list[tuple[str, str, str]] = []  # (model, resume, endpoint_url)
+
+  class _SpyAgent(_FakeAgent):
+    def __init__(self):
+      super().__init__()
+      self._endpoint_url = ""
+
+    def set_endpoint(self, endpoint):
+      self._endpoint_url = endpoint.base_url
+
+    async def reset(self, _project_dir, model, resume=""):
+      reset_calls.append((model, resume, self._endpoint_url))
+
+  agent = _SpyAgent()
+
+  class _SpyDB(_FakeDB):
+    """Default endpoint has a stored session from previous turns; the
+    DeepSeek preset slot is empty. After switching to DeepSeek and back,
+    the daemon should restore the default-endpoint session — NOT
+    whatever DeepSeek left behind."""
+
+    def __init__(self, project_dir):
+      super().__init__(project_dir)
+      # Persisted store: {(chat, provider, endpoint_key): sdk_session_id}
+      self._store: dict[tuple[str, str, str], str] = {
+        ("oc_test", "claude", ""): "default-uuid",
+      }
+
+    def get_sdk_session_id(self, chat_id, provider, endpoint_key=""):
+      return self._store.get((chat_id, provider, endpoint_key), "")
+
+    def set_sdk_session_id(self, chat_id, sdk_session_id, provider,
+                           endpoint_key=""):
+      self._store[(chat_id, provider, endpoint_key)] = sdk_session_id
+
+  queued = _QueuedChannel("oc_test", [
+    IncomingMessage(
+      event_type="im.message.receive_v1", chat_id="oc_test",
+      sender_id="ou_user", message_id="om_to_deepseek", msg_type="text",
+      text="/model deepseek-v4-pro", create_time="1",
+    ),
+    IncomingMessage(
+      event_type="im.message.receive_v1", chat_id="oc_test",
+      sender_id="ou_user", message_id="om_back_to_opus", msg_type="text",
+      text="/model claude-opus-4-7", create_time="2",
+    ),
+    IncomingMessage(
+      event_type="im.message.receive_v1", chat_id="oc_test",
+      sender_id="ou_user", message_id="om_exit", msg_type="text",
+      text="/exit", create_time="3",
+    ),
+  ])
+
+  with mock.patch.dict(_os.environ, {"DEEPSEEK_API_KEY": "sk-test"}), \
+       mock.patch("nemo.agent.load_credentials", return_value={
+         "app_id": "a", "app_secret": "s", "email": "u@e.com",
+       }), \
+       mock.patch("nemo.agent.Database", _SpyDB), \
+       mock.patch("nemo.agent.LarkChannel", return_value=queued), \
+       mock.patch("nemo.agent.build_coding_agent", return_value=agent), \
+       mock.patch("nemo.agent._send_response", new=mock.AsyncMock()), \
+       mock.patch("nemo.group_config.load_config", return_value={}), \
+       mock.patch("nemo.config.load_relay_config", return_value=("", "")), \
+       mock.patch("signal.signal"):
+    rc = asyncio.run(
+      main_loop("oc_test", str(tmp_path), "claude-opus-4-7", provider="claude")
+    )
+  assert rc == 0
+
+  # Two reset() calls: one for each /model switch.
+  assert len(reset_calls) == 2, reset_calls
+  # First switch: opus default → DeepSeek preset. DeepSeek slot is empty
+  # in this DB, so the daemon must start a fresh session (resume=""),
+  # not replay the default-endpoint transcript against DeepSeek.
+  model1, resume1, endpoint1 = reset_calls[0]
+  assert model1 == "deepseek-v4-pro[1m]", reset_calls
+  assert resume1 == "", reset_calls
+  assert endpoint1 == "https://api.deepseek.com/anthropic", reset_calls
+  # Second switch: DeepSeek preset → opus default. THIS is the bug
+  # path. Resume MUST come from the default-endpoint slot
+  # ("default-uuid"), not from the DeepSeek session (whatever the
+  # daemon ended up holding while running against the gateway).
+  model2, resume2, endpoint2 = reset_calls[1]
+  assert model2 == "claude-opus-4-7", reset_calls
+  assert resume2 == "default-uuid", reset_calls
+  assert endpoint2 == "", reset_calls
+
+
 def _run_provider_switch(tmp_path, *, prior_codex_session: str = ""):
   """Helper: drive main_loop through /provider codex (then /exit).
 
@@ -428,7 +537,8 @@ def _run_provider_switch(tmp_path, *, prior_codex_session: str = ""):
     def get_chat_owner(self, _chat_id):
       return None
 
-    def get_sdk_session_id(self, chat_id, provider):
+    def get_sdk_session_id(self, chat_id, provider, endpoint_key=""):
+      del chat_id, endpoint_key
       if provider == "codex":
         return prior_codex_session
       return ""

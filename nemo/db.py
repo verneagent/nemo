@@ -58,6 +58,13 @@ CREATE TABLE IF NOT EXISTS working_state (
   message_id TEXT DEFAULT '',
   created_at REAL DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS provider_sessions (
+  chat_id TEXT NOT NULL,
+  provider TEXT NOT NULL,
+  endpoint_key TEXT NOT NULL DEFAULT '',
+  sdk_session_id TEXT NOT NULL DEFAULT '',
+  PRIMARY KEY (chat_id, provider, endpoint_key)
+);
 """
 
 
@@ -184,32 +191,69 @@ class Database:
     ).fetchone()
     return row["session_id"] if row else None
 
-  def get_sdk_session_id(self, chat_id: str, provider: str) -> str:
+  def get_sdk_session_id(
+    self, chat_id: str, provider: str, endpoint_key: str = "",
+  ) -> str:
     """Look up the resume id for ``provider`` on ``chat_id``.
 
-    Each provider (claude / codex / opencode) keeps its own column so
+    Each provider (claude / codex / opencode) keeps its own slot so
     switching providers on a chat doesn't try to feed a Claude UUID into
-    Codex (or vice versa). Returns ``""`` if no resume target.
+    Codex (or vice versa). Within one provider, ``endpoint_key`` further
+    isolates sessions by upstream endpoint — switching e.g. from real
+    Anthropic to DeepSeek's Anthropic-compatible gateway gives the new
+    endpoint its own fresh session rather than replaying a transcript
+    whose ``thinking`` blocks were signed by a different vendor (the
+    Anthropic API rejects those with HTTP 400).
+
+    ``endpoint_key=""`` means the provider's default endpoint; preset
+    endpoints use the preset name (e.g. ``"deepseek-v4-pro"``). Returns
+    ``""`` if no resume target.
     """
-    col = _PROVIDER_SESSION_COLUMNS.get(provider)
-    if col is None:
+    if _PROVIDER_SESSION_COLUMNS.get(provider) is None:
       return ""
+    if endpoint_key == "":
+      # Default endpoint stays in the per-provider column so older
+      # captain-nemo readers (which predate provider_sessions) keep
+      # working — they only ever knew the default endpoint anyway.
+      col = _PROVIDER_SESSION_COLUMNS[provider]
+      row = self._conn.execute(
+        f"SELECT {col} FROM sessions WHERE chat_id = ?", (chat_id,)
+      ).fetchone()
+      return row[col] if row and row[col] else ""
     row = self._conn.execute(
-      f"SELECT {col} FROM sessions WHERE chat_id = ?", (chat_id,)
+      "SELECT sdk_session_id FROM provider_sessions "
+      "WHERE chat_id = ? AND provider = ? AND endpoint_key = ?",
+      (chat_id, provider, endpoint_key),
     ).fetchone()
-    return row[col] if row and row[col] else ""
+    return row["sdk_session_id"] if row and row["sdk_session_id"] else ""
 
   def set_sdk_session_id(
     self, chat_id: str, sdk_session_id: str, provider: str,
+    endpoint_key: str = "",
   ) -> None:
-    """Persist the most recent SDK session id for ``provider`` on ``chat_id``."""
-    col = _PROVIDER_SESSION_COLUMNS.get(provider)
-    if col is None:
+    """Persist the most recent SDK session id for ``provider`` on ``chat_id``.
+
+    ``endpoint_key`` scopes the id to a specific upstream endpoint —
+    see ``get_sdk_session_id`` for why. Unknown providers are a silent
+    no-op (matches pre-existing semantics).
+    """
+    if _PROVIDER_SESSION_COLUMNS.get(provider) is None:
       return
-    self._conn.execute(
-      f"UPDATE sessions SET {col} = ? WHERE chat_id = ?",
-      (sdk_session_id, chat_id),
-    )
+    if endpoint_key == "":
+      col = _PROVIDER_SESSION_COLUMNS[provider]
+      self._conn.execute(
+        f"UPDATE sessions SET {col} = ? WHERE chat_id = ?",
+        (sdk_session_id, chat_id),
+      )
+    else:
+      self._conn.execute(
+        "INSERT INTO provider_sessions "
+        "(chat_id, provider, endpoint_key, sdk_session_id) "
+        "VALUES (?, ?, ?, ?) "
+        "ON CONFLICT(chat_id, provider, endpoint_key) "
+        "DO UPDATE SET sdk_session_id = excluded.sdk_session_id",
+        (chat_id, provider, endpoint_key, sdk_session_id),
+      )
     self._conn.commit()
 
   def set_autoapprove(self, chat_id: str, enabled: bool) -> None:

@@ -85,6 +85,45 @@ def test_per_provider_session_ids_isolated(tmp_path):
     db.close()
 
 
+def test_per_endpoint_sessions_isolated_within_provider(tmp_path):
+  # Within one provider, different upstream endpoints (default Anthropic
+  # vs DeepSeek's Anthropic-compatible gateway) must keep separate
+  # session ids. Otherwise resuming a DeepSeek-produced transcript
+  # against real Anthropic surfaces as
+  # ``400 Invalid signature in thinking block`` — the thinking blocks
+  # were signed by DeepSeek and the Anthropic API rejects them.
+  with mock.patch("nemo.db.DB_BASE", str(tmp_path)):
+    db = Database(str(tmp_path / "project"))
+    db.activate("sess1", "chat1", "claude-opus-4-7")
+    # Default endpoint (real Anthropic).
+    db.set_sdk_session_id("chat1", "anthropic-uuid", "claude")
+    # Preset endpoint (DeepSeek's anthropic-compat gateway).
+    db.set_sdk_session_id(
+      "chat1", "deepseek-uuid", "claude", "deepseek-v4-pro")
+    # Each endpoint's slot is independent. Switching endpoints must
+    # not bleed across.
+    assert db.get_sdk_session_id("chat1", "claude") == "anthropic-uuid"
+    assert db.get_sdk_session_id("chat1", "claude", "") == "anthropic-uuid"
+    assert db.get_sdk_session_id(
+      "chat1", "claude", "deepseek-v4-pro") == "deepseek-uuid"
+    # Unknown endpoint_key for a known provider → empty (start fresh)
+    # rather than falling back to another endpoint's id.
+    assert db.get_sdk_session_id("chat1", "claude", "anything-else") == ""
+    # Survives deactivate + reactivate just like the legacy columns do.
+    db.deactivate("sess1")
+    db.activate("sess2", "chat1", "claude-opus-4-7")
+    assert db.get_sdk_session_id("chat1", "claude") == "anthropic-uuid"
+    assert db.get_sdk_session_id(
+      "chat1", "claude", "deepseek-v4-pro") == "deepseek-uuid"
+    # Overwriting one endpoint leaves the other intact.
+    db.set_sdk_session_id(
+      "chat1", "deepseek-uuid-2", "claude", "deepseek-v4-pro")
+    assert db.get_sdk_session_id(
+      "chat1", "claude", "deepseek-v4-pro") == "deepseek-uuid-2"
+    assert db.get_sdk_session_id("chat1", "claude") == "anthropic-uuid"
+    db.close()
+
+
 def test_legacy_sdk_session_id_does_not_backfill(tmp_path):
   # Pre-0.3.87 DB has sdk_session_id populated and per-provider columns
   # missing. We deliberately do NOT copy the legacy id into any new

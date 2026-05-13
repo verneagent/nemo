@@ -484,6 +484,7 @@ async def main_loop(
   effort: str = "",
   system_prompt: str = "",
   endpoint: EndpointConfig | None = None,
+  endpoint_key: str = "",
 ) -> int:
   """Run the agent main loop."""
   session_id = str(uuid.uuid4())
@@ -520,17 +521,20 @@ async def main_loop(
   channel.parent_lookup = _db_parent_lookup
 
   # Clean stale sessions (preserve sdk_session_id for resume).
-  # Per-provider lookup so switching providers on a chat doesn't feed a
-  # Claude UUID into Codex (or vice versa) — the right answer is always
-  # to start that provider fresh, while leaving the other providers'
-  # stored ids intact for when the user switches back.
+  # Per-(provider, endpoint) lookup so switching providers or endpoints
+  # on a chat doesn't feed a Claude UUID into Codex (or vice versa), and
+  # doesn't replay a transcript whose thinking blocks were signed by a
+  # different upstream — the right answer is always to start that slot
+  # fresh while leaving other slots' stored ids intact for when the user
+  # switches back.
   _resume_sdk_id = ""
   try:
     old_owner = db.get_chat_owner(chat_id)
     if old_owner:
-      _resume_sdk_id = db.get_sdk_session_id(chat_id, provider)
-      log.info("Cleaning stale session %s (sdk[%s]=%s)", old_owner,
-               provider, _resume_sdk_id[:8] if _resume_sdk_id else "none")
+      _resume_sdk_id = db.get_sdk_session_id(chat_id, provider, endpoint_key)
+      log.info("Cleaning stale session %s (sdk[%s/%s]=%s)", old_owner,
+               provider, endpoint_key or "default",
+               _resume_sdk_id[:8] if _resume_sdk_id else "none")
       db.deactivate(old_owner)
   except Exception as e:
     log.warning("Stale cleanup error: %s", e)
@@ -621,6 +625,10 @@ async def main_loop(
     agent.set_effort(effort)
   # Resume previous SDK session if available
   _sdk_session_id: str = _resume_sdk_id
+  # Track which upstream endpoint the running session belongs to so we
+  # never resume a transcript across endpoints — see the comment on
+  # ``db.get_sdk_session_id`` for why.
+  _endpoint_key: str = endpoint_key
   # Snapshot saved at each /clear so /undo-clear can restore the
   # session id that was active just before the user reset. Held in
   # process memory only — does not survive a daemon restart.
@@ -795,7 +803,7 @@ async def main_loop(
           else:
             restored = _prev_sdk_session_id
             _sdk_session_id = restored
-            db.set_sdk_session_id(chat_id, restored, provider)
+            db.set_sdk_session_id(chat_id, restored, provider, _endpoint_key)
             log.info("Restoring SDK session %s after /undo-clear", restored[:8])
             await _restart_client(resume=restored)
             await _send_response(
@@ -840,8 +848,15 @@ async def main_loop(
               continue
             agent.set_endpoint(preset.endpoint_for(provider))
             switched_to = preset.remote_for(provider)
-            log.info("Model switch to preset %s → %s (resume=%s)",
-                     preset.name, switched_to,
+            # Each upstream endpoint (preset vs default) keeps its own
+            # SDK session so we never replay one vendor's signed
+            # ``thinking`` blocks against another vendor's API — see
+            # ``db.get_sdk_session_id``.
+            _endpoint_key = preset.name
+            _sdk_session_id = db.get_sdk_session_id(
+              chat_id, provider, _endpoint_key)
+            log.info("Model switch to preset %s → %s (endpoint=%s resume=%s)",
+                     preset.name, switched_to, _endpoint_key,
                      _sdk_session_id[:8] if _sdk_session_id else "none")
             model = switched_to
             ctx.model = model
@@ -864,11 +879,18 @@ async def main_loop(
             await _clear_ack()
             continue
           # Plain model swap. Clear any preset endpoint that was active
-          # so we go back to the provider's default auth path.
+          # so we go back to the provider's default auth path. The
+          # default endpoint has its own SDK session — fetch it instead
+          # of replaying the preset endpoint's transcript whose
+          # ``thinking`` blocks would 400 against real Anthropic.
           agent.set_endpoint(EndpointConfig())
+          _endpoint_key = ""
+          _sdk_session_id = db.get_sdk_session_id(
+            chat_id, provider, _endpoint_key)
           model = new_model
           ctx.model = model
-          log.info("Model switch to %s (resume=%s)", model, _sdk_session_id[:8] if _sdk_session_id else "none")
+          log.info("Model switch to %s (endpoint=default resume=%s)",
+                   model, _sdk_session_id[:8] if _sdk_session_id else "none")
           await _restart_client(resume=_sdk_session_id)
           await channel.update_status(model, "idle", provider)
           await _send_response(channel, chat_id, f"Model switched to **{model}**.", db)
@@ -891,9 +913,10 @@ async def main_loop(
           provider = new_provider  # type: ignore[assignment]
           model = default_model
           endpoint = EndpointConfig()
+          _endpoint_key = ""
           ctx.provider = provider
           ctx.model = model
-          _sdk_session_id = db.get_sdk_session_id(chat_id, provider)
+          _sdk_session_id = db.get_sdk_session_id(chat_id, provider, _endpoint_key)
           agent = build_coding_agent(
             provider, credentials, chat_id, db, channel,
             permission_mode=permission_mode,
@@ -1226,7 +1249,8 @@ async def main_loop(
           _await_channel(_clear_ack())
           if event.session_id:
             _sdk_session_id = event.session_id
-            db.set_sdk_session_id(chat_id, _sdk_session_id, provider)
+            db.set_sdk_session_id(
+              chat_id, _sdk_session_id, provider, _endpoint_key)
           if _turn_interrupt_phase:
             if _turn_card_id:
               db.clear_working(session_id)

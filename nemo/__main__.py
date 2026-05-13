@@ -462,6 +462,7 @@ def main():
   from .coding_agent import EndpointConfig
   from .presets import resolve_preset
   endpoint = EndpointConfig()
+  endpoint_key = ""
   preset = resolve_preset(model)
   if preset is not None:
     if not preset.supports(args.provider):
@@ -476,6 +477,7 @@ def main():
         f"and re-run.")
     endpoint = preset.endpoint_for(args.provider)
     model = preset.remote_for(args.provider)
+    endpoint_key = preset.name
     log.info("Resolved preset %s → endpoint=%s model=%s",
              preset.name, endpoint.base_url, model)
 
@@ -486,7 +488,8 @@ def main():
                                  permission_mode=args.permission_mode,
                                  effort=args.effort,
                                  system_prompt=system_prompt,
-                                 endpoint=endpoint))
+                                 endpoint=endpoint,
+                                 endpoint_key=endpoint_key))
   except KeyboardInterrupt:
     return 0
   except BaseException as e:
