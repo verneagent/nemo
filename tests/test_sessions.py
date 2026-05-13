@@ -197,35 +197,6 @@ def test_find_session_prefers_exact_over_prefix():
   assert find_session("nope", [a, b]) == []
 
 
-def test_session_digest_keeps_recent_turns_within_char_budget(tmp_path):
-  home = str(tmp_path / "home")
-  project = str(tmp_path / "p")
-  os.makedirs(project, exist_ok=True)
-  events: list[dict] = []
-  for i in range(50):
-    events.append({"type": "user", "message": {
-      "role": "user",
-      "content": f"user msg {i}",
-    }})
-    events.append({"type": "assistant", "message": {
-      "model": "claude-opus-4-7",
-      "content": [{"type": "text", "text": f"assistant reply {i}"}],
-    }})
-  _claude_session(home, project, "deadbeef-0000-0000-0000-000000000000", events)
-  with mock.patch.dict(os.environ, {"HOME": home}):
-    out = sessions.list_claude_sessions(project)
-    info = out[0]
-    digest = sessions.session_digest(info, max_turns=4, max_chars=10000)
-  # max_turns=4 → last 4 entries (user msg 48, assistant 48, user 49, assistant 49)
-  assert "user msg 49" in digest, digest
-  assert "assistant reply 49" in digest, digest
-  assert "user msg 0" not in digest, digest
-  # Char budget kicks in when small.
-  short = sessions.session_digest(info, max_turns=50, max_chars=200)
-  assert short.startswith("...(truncated)..."), short
-  assert len(short) <= 200 + len("...(truncated)...\n\n"), len(short)
-
-
 def test_list_claude_sessions_captures_last_three_user_prompts(tmp_path):
   home = str(tmp_path / "home")
   project = str(tmp_path / "project")

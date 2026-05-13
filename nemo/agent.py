@@ -493,13 +493,17 @@ async def _handle_session_recall(
   project_dir: str,
   target: str,
 ) -> str:
-  """Resolve ``target`` to a session, extract its text digest, queue it
-  as a synthetic user message, and return an ack/error string.
+  """Resolve ``target`` to a past session file and ask the live agent
+  to read it. Returns an ack/error string to send to the user.
 
-  Recall does NOT touch ``_sdk_session_id`` — that's intentional. SDK
-  resume across endpoints replays thinking-block signatures and 400s
-  (see db.py); recall is read-only memory injection that goes through
-  the live SDK session as a normal turn.
+  Recall is deliberately LLM-driven rather than Python-side digest
+  extraction. The agent has Read tool access, so handing it the JSONL
+  path lets it skim/seek/tail at whatever granularity its own context
+  budget allows, and pick out the kind of structured info (tool calls,
+  file paths, decisions) that a one-size-fits-all digest can't.
+
+  This does NOT touch ``_sdk_session_id``. SDK resume across endpoints
+  replays thinking-block signatures and 400s — see db.py.
   """
   from . import sessions as _sessions
   from .channel import IncomingMessage
@@ -515,26 +519,47 @@ async def _handle_session_recall(
     return (f"`{target}` is ambiguous — matches {ambig}. "
             f"Use more characters from the uuid.")
   info = matches[0]
-  digest = _sessions.session_digest(info)
-  if not digest:
-    return (f"Session `{info.uuid[:8]}` has no recoverable user/assistant "
-            f"text — nothing to recall.")
+  try:
+    size = os.path.getsize(info.path)
+  except OSError:
+    size = 0
+  size_kb = max(1, size // 1024)
   import datetime as _dt
   when = _dt.datetime.fromtimestamp(info.mtime).strftime("%Y-%m-%d %H:%M")
+  format_hint = {
+    "claude": (
+      "One JSON event per line. ``type:\"user\"`` carries the user "
+      "prompt at ``message.content`` (string or list of "
+      "``{type:\"text\",text:...}`` blocks). ``type:\"assistant\"`` "
+      "carries the model reply with ``message.model`` and the same "
+      "content shape. Tool uses appear as ``tool_use`` / "
+      "``tool_result`` blocks — skim them, don't quote verbatim."
+    ),
+    "codex": (
+      "One JSON event per line. The first event is ``session_meta`` "
+      "(payload.cwd, payload.model). Real turns are "
+      "``type:\"response_item\"`` with ``payload.role`` of user/"
+      "assistant and ``payload.content[].text`` or ``input_text``. "
+      "The first user message is usually injected AGENTS.md "
+      "boilerplate — skip past it."
+    ),
+  }.get(info.provider, "")
   prompt = (
-    f"[Recall] Below is a digest of a past session in this project "
-    f"(uuid `{info.uuid[:8]}`, provider `{info.provider}`, last activity "
-    f"{when}). Keep it in working memory — the user may refer back to "
-    f"it; do not re-execute any actions described here. Just acknowledge "
-    f"briefly that you've noted it.\n\n"
-    f"--- session {info.uuid[:8]} begin ---\n"
-    f"{digest}\n"
-    f"--- session {info.uuid[:8]} end ---"
+    f"[Nemo recall] The user asked you to recall a past coding session "
+    f"in this project. Its JSONL transcript lives at:\n\n"
+    f"  {info.path}\n\n"
+    f"Session metadata: provider `{info.provider}`, uuid "
+    f"`{info.uuid[:8]}`, model `{info.model or 'unknown'}`, last "
+    f"activity {when}, file size ~{size_kb}KB.\n\n"
+    f"Format: {format_hint}\n\n"
+    f"Use your Read tool to skim it — for large files prefer the "
+    f"tail (most recent turns are usually more relevant than the "
+    f"opening setup). Figure out: what was being worked on, what got "
+    f"decided, and any pending threads. Hold the gist in working "
+    f"memory; the user may refer back to it. Reply with a short "
+    f"summary (a few bullet points) of what you recovered. Do NOT "
+    f"re-execute any actions described in the past session."
   )
-  # Hand the recall to the live SDK as a normal user turn. The channel
-  # queue is the same path real user messages take, so the existing
-  # ack/working-card/done-card pipeline handles it without special
-  # cases.
   recall_msg = IncomingMessage(
     event_type="im.message.receive_v1",
     chat_id=chat_id,
@@ -546,10 +571,9 @@ async def _handle_session_recall(
     is_internal=True,
   )
   channel.push_back(recall_msg)
-  size_hint = f"{len(digest)} chars" if digest else "empty"
   return (
-    f"📖 Recalling session `{info.uuid[:8]}` ({info.provider}, "
-    f"{size_hint}). Replaying through the current agent…"
+    f"📖 Asking the agent to recall session `{info.uuid[:8]}` "
+    f"({info.provider}, ~{size_kb}KB)…"
   )
 
 
@@ -920,14 +944,21 @@ async def main_loop(
         log.debug("Skipping: empty after stripping mentions")
         continue
 
-      # Acknowledge receipt with THINKING reaction
-      ack_msg_id = reply.message_id
-      ack_reaction_id = await channel.add_reaction(ack_msg_id, "THINKING")
-      db.record_received(
-        chat_id=chat_id, text=text,
-        source_message_id=reply.message_id,
-        message_time=reply.create_time,
-      )
+      # Acknowledge receipt with THINKING reaction + persist to
+      # messages table — but only for real user messages. Nemo-
+      # synthesised internal messages (e.g. /session recall) have a
+      # fabricated message_id that Lark would reject if we tried to
+      # react to it, and their text is a system prompt to the agent,
+      # not user-authored content that belongs in chat history.
+      ack_msg_id = "" if reply.is_internal else reply.message_id
+      ack_reaction_id = ""
+      if not reply.is_internal:
+        ack_reaction_id = await channel.add_reaction(ack_msg_id, "THINKING")
+        db.record_received(
+          chat_id=chat_id, text=text,
+          source_message_id=reply.message_id,
+          message_time=reply.create_time,
+        )
 
       async def _clear_ack():
         nonlocal ack_reaction_id
