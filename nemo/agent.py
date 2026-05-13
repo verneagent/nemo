@@ -448,13 +448,11 @@ async def _handle_session_list(
     else:
       when = f"{age // 86400}d ago"
     marker = " ← current" if s.uuid == current_sdk_session_id else ""
-    preview = s.first_user_text.replace("\n", " ").strip()[:80]
-    if not preview:
-      preview = "(no user message)"
     model = f" `{s.model}`" if s.model else ""
+    bullets = _format_session_previews(s)
     lines.append(
       f"- `{s.uuid[:8]}` · **{s.provider}**{model} · {when}{marker}\n"
-      f"   {preview}"
+      f"{bullets}"
     )
   more = ""
   if len(sessions) > 30:
@@ -466,6 +464,27 @@ async def _handle_session_list(
     + "\n\nRecall one with `/session recall <uuid prefix>`."
   )
   await _send_response(channel, chat_id, body, db)
+
+
+def _format_session_previews(s) -> str:
+  """Render the per-session preview lines: first prompt + the last few.
+
+  Deduplicates so a session with ≤4 user prompts doesn't repeat the
+  first one in the "recent" bullets, and tags ages so the operator can
+  tell at a glance whether a session was short or long.
+  """
+  def _flatten(text: str, limit: int = 80) -> str:
+    return text.replace("\n", " ").strip()[:limit] or "(no user message)"
+  parts: list[str] = []
+  first = _flatten(s.first_user_text)
+  parts.append(f"   ▸ {first}")
+  recent = list(getattr(s, "last_user_texts", []) or [])
+  # Drop the first prompt from the "recent" tail if it's already shown.
+  if recent and recent[0].strip() == s.first_user_text.strip():
+    recent = recent[1:]
+  for text in recent:
+    parts.append(f"   · {_flatten(text)}")
+  return "\n".join(parts)
 
 
 async def _handle_session_recall(

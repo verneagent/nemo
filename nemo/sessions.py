@@ -15,7 +15,7 @@ import glob as _glob
 import json
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Iterable
 
 
@@ -26,8 +26,12 @@ class SessionInfo:
   provider: str        # "claude" | "codex"
   path: str            # absolute path to the JSONL
   mtime: float         # last-modified epoch seconds
-  first_user_text: str # cleaned preview of the first user message
-  model: str           # last-seen model id (e.g. "claude-opus-4-7", may be empty)
+  first_user_text: str        # cleaned preview of the first real user prompt
+  model: str                  # last-seen model id (e.g. "claude-opus-4-7", may be empty)
+  last_user_texts: list[str] = field(default_factory=list)
+  # ↑ up to ~3 most recent user prompts, oldest first; default empty
+  # so the SessionInfo constructor remains callable from tests/helpers
+  # that only care about the identity fields.
 
 
 # ---------------------------------------------------------------------------
@@ -88,12 +92,69 @@ def _extract_text_blocks(content: object) -> str:
   return "\n".join(parts)
 
 
+_TAIL_BYTES_DEFAULT = 256 * 1024
+_PREVIEW_LIMIT = 120
+_RECENT_USER_COUNT = 3
+
+
+def _read_tail_lines(path: str, max_bytes: int = _TAIL_BYTES_DEFAULT) -> list[str]:
+  """Return decoded lines from the tail of ``path`` without loading the
+  whole file. Discards the first (possibly partial) line if the file
+  exceeds ``max_bytes`` — the trade-off is missing the very oldest
+  events when scanning a multi-MB session, which is exactly what tail
+  is for.
+  """
+  try:
+    size = os.path.getsize(path)
+  except OSError:
+    return []
+  if size == 0:
+    return []
+  try:
+    with open(path, "rb") as f:
+      if size > max_bytes:
+        f.seek(size - max_bytes)
+        f.readline()  # discard the partial line we landed mid-way through
+      raw = f.read()
+  except OSError:
+    return []
+  return raw.decode("utf-8", errors="replace").splitlines()
+
+
+def _claude_user_text(ev: dict) -> str:
+  """Extract a user prompt from a Claude JSONL event, or ``""``."""
+  if ev.get("type") != "user":
+    return ""
+  msg = ev.get("message")
+  if not isinstance(msg, dict):
+    return ""
+  return _clean_preview(_extract_text_blocks(msg.get("content")))
+
+
+def _codex_user_text(ev: dict) -> str:
+  """Extract a user prompt from a Codex rollout event, or ``""``."""
+  if ev.get("type") != "response_item":
+    return ""
+  p = ev.get("payload")
+  if not isinstance(p, dict):
+    return ""
+  if p.get("type") != "message" or p.get("role") != "user":
+    return ""
+  return _clean_preview(_extract_text_blocks(p.get("content")))
+
+
 # ---------------------------------------------------------------------------
 # Claude
 # ---------------------------------------------------------------------------
 
 def _scan_claude_session(path: str) -> SessionInfo | None:
-  """Read a Claude JSONL just far enough to fill SessionInfo."""
+  """Read a Claude JSONL just far enough to fill SessionInfo.
+
+  Forward pass with early-exit gets the first user prompt + model id
+  (cheap even on multi-MB files). A separate tail read picks up the
+  last few user prompts so the listing shows "what was being discussed
+  recently" without forcing a full scan.
+  """
   try:
     st = os.stat(path)
   except OSError:
@@ -108,12 +169,10 @@ def _scan_claude_session(path: str) -> SessionInfo | None:
           ev = json.loads(line)
         except json.JSONDecodeError:
           continue
-        if not first_user and ev.get("type") == "user":
-          msg = ev.get("message")
-          if isinstance(msg, dict):
-            text = _clean_preview(_extract_text_blocks(msg.get("content")))
-            if text:
-              first_user = text[:120]
+        if not first_user:
+          text = _claude_user_text(ev)
+          if text:
+            first_user = text[:_PREVIEW_LIMIT]
         if ev.get("type") == "assistant":
           msg = ev.get("message")
           if isinstance(msg, dict):
@@ -127,9 +186,23 @@ def _scan_claude_session(path: str) -> SessionInfo | None:
           break
   except OSError:
     return None
+
+  # Tail pass for recent user prompts. Keeps the last N seen, in order.
+  recent: list[str] = []
+  for line in _read_tail_lines(path):
+    try:
+      ev = json.loads(line)
+    except json.JSONDecodeError:
+      continue
+    text = _claude_user_text(ev)
+    if text:
+      recent.append(text[:_PREVIEW_LIMIT])
+      if len(recent) > _RECENT_USER_COUNT:
+        recent.pop(0)
+
   return SessionInfo(
     uuid=uuid, provider="claude", path=path, mtime=st.st_mtime,
-    first_user_text=first_user, model=model,
+    first_user_text=first_user, last_user_texts=recent, model=model,
   )
 
 
@@ -204,22 +277,34 @@ def _scan_codex_session(path: str, want_cwd: str) -> SessionInfo | None:
             m = p.get("model") or p.get("model_name")
             if isinstance(m, str) and m:
               model = m
-        elif etype == "response_item":
-          p = ev.get("payload", {})
-          if isinstance(p, dict) and not first_user:
-            if p.get("type") == "message" and p.get("role") == "user":
-              text = _clean_preview(_extract_text_blocks(p.get("content")))
-              if text and not _looks_like_injected_context(text):
-                first_user = text[:120]
+        elif etype == "response_item" and not first_user:
+          text = _codex_user_text(ev)
+          if text and not _looks_like_injected_context(text):
+            first_user = text[:_PREVIEW_LIMIT]
         if uuid and first_user and (model or cwd):
           break
   except OSError:
     return None
   if cwd != want_cwd or not uuid:
     return None
+
+  # Tail pass for recent user prompts. Skip the AGENTS.md auto-
+  # injection so the recent-prompts column also lands on real prompts.
+  recent: list[str] = []
+  for line in _read_tail_lines(path):
+    try:
+      ev = json.loads(line)
+    except json.JSONDecodeError:
+      continue
+    text = _codex_user_text(ev)
+    if text and not _looks_like_injected_context(text):
+      recent.append(text[:_PREVIEW_LIMIT])
+      if len(recent) > _RECENT_USER_COUNT:
+        recent.pop(0)
+
   return SessionInfo(
     uuid=uuid, provider="codex", path=path, mtime=st.st_mtime,
-    first_user_text=first_user, model=model,
+    first_user_text=first_user, last_user_texts=recent, model=model,
   )
 
 

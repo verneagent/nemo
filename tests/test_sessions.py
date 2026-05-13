@@ -226,6 +226,63 @@ def test_session_digest_keeps_recent_turns_within_char_budget(tmp_path):
   assert len(short) <= 200 + len("...(truncated)...\n\n"), len(short)
 
 
+def test_list_claude_sessions_captures_last_three_user_prompts(tmp_path):
+  home = str(tmp_path / "home")
+  project = str(tmp_path / "project")
+  os.makedirs(project, exist_ok=True)
+  events: list[dict] = []
+  for i in range(6):
+    events.append({"type": "user", "message": {
+      "role": "user", "content": f"prompt {i}",
+    }})
+    events.append({"type": "assistant", "message": {
+      "model": "claude-opus-4-7",
+      "content": [{"type": "text", "text": f"reply {i}"}],
+    }})
+  _claude_session(home, project, "cafef00d-0000-0000-0000-000000000000", events)
+  with mock.patch.dict(os.environ, {"HOME": home}):
+    out = sessions.list_claude_sessions(project)
+  assert len(out) == 1
+  s = out[0]
+  # First-pass preview is the oldest user prompt.
+  assert s.first_user_text == "prompt 0"
+  # Tail-pass collects the last 3 in oldest-first order.
+  assert s.last_user_texts == ["prompt 3", "prompt 4", "prompt 5"]
+
+
+def test_list_codex_sessions_captures_last_three_user_prompts(tmp_path):
+  home = str(tmp_path / "home")
+  project = str(tmp_path / "project")
+  os.makedirs(project, exist_ok=True)
+  events: list[dict] = [
+    {"type": "session_meta", "payload": {
+      "id": "beadbead-1111-2222-3333-444444444444",
+      "cwd": os.path.abspath(project),
+    }},
+    # Injected AGENTS.md (the tail scan must skip this too).
+    {"type": "response_item", "payload": {
+      "type": "message", "role": "user",
+      "content": [{"type": "input_text", "text": "# AGENTS.md\n..."}],
+    }},
+  ]
+  for i in range(5):
+    events.append({"type": "response_item", "payload": {
+      "type": "message", "role": "user",
+      "content": [{"type": "input_text", "text": f"user prompt {i}"}],
+    }})
+    events.append({"type": "response_item", "payload": {
+      "type": "message", "role": "assistant",
+      "content": [{"type": "output_text", "text": f"reply {i}"}],
+    }})
+  _codex_session(home, "2026", "04", "01",
+                 "beadbead-1111-2222-3333-444444444444", events)
+  with mock.patch.dict(os.environ, {"HOME": home}):
+    out = sessions.list_codex_sessions(project)
+  s = out[0]
+  assert s.first_user_text == "user prompt 0"
+  assert s.last_user_texts == ["user prompt 2", "user prompt 3", "user prompt 4"]
+
+
 def test_list_returns_empty_when_project_has_no_sessions(tmp_path):
   home = str(tmp_path / "home")
   project = str(tmp_path / "empty")
