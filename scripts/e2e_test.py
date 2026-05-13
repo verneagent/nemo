@@ -111,9 +111,15 @@ def _refresh_token() -> None:
       json.dump(d, f, indent=2)
     print(f"  Token refreshed (expires_in={d.get('expires_in')}s)")
   except Exception as e:
+    # Raise instead of sys.exit so the caller's `except Exception` can
+    # catch us and downgrade to relay-only injection — the user token is
+    # only needed for the "send via user API" path; --skip-sdk and most
+    # tests inject via relay webhook and don't need it. SystemExit
+    # inherits from BaseException, which `except Exception` does NOT
+    # catch, so sys.exit here would kill the whole script.
     print(f"{Colors.RED}  Token refresh failed: {e}")
     print(f"  Run device flow manually (see CLAUDE.md){Colors.RESET}")
-    sys.exit(1)
+    raise RuntimeError(f"token refresh failed: {e}") from e
 
 
 def _get_bot_token() -> str:
