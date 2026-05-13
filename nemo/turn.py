@@ -196,6 +196,43 @@ class ErrorEvent:
 
 
 @dataclass
+class CompactStartedEvent:
+  """Conversation compaction is about to begin.
+
+  Surfaced from the Claude Agent SDK's ``PreCompact`` hook, which fires
+  before the CLI starts summarising. The compaction itself can take 10–60s
+  during which the SDK emits no other messages — without this event the
+  working card would silently stall. The matching completion signal is
+  ``CompactNoticeEvent``.
+
+  ``trigger`` — "auto" | "manual"; "auto" is what nemo will normally see.
+  """
+  trigger: str
+
+
+@dataclass
+class CompactNoticeEvent:
+  """Conversation-compaction completed.
+
+  The Claude CLI emits a SystemMessage with subtype="compact_boundary"
+  once per compaction, AFTER the summarization has finished (the duration
+  and post-tokens fields are populated only after the LLM call returns).
+  There is no separate "compaction started" event on the stream, so this
+  is the user's only signal that a multi-second silent stall on the
+  working card was actually the CLI compacting context.
+
+  ``trigger``      — "auto" | "manual"; "auto" is what nemo will normally see.
+  ``pre_tokens``   — context-window size before compaction.
+  ``post_tokens``  — context-window size after compaction (0 if absent).
+  ``duration_ms``  — wall-clock cost of the summarization (0 if absent).
+  """
+  trigger: str
+  pre_tokens: int
+  post_tokens: int = 0
+  duration_ms: int = 0
+
+
+@dataclass
 class RateLimitNoticeEvent:
   """Upstream rate-limit status surfaced from the SDK's RateLimitEvent.
 
@@ -219,7 +256,7 @@ class RateLimitNoticeEvent:
 TurnEvent = (
   ProgressEvent | AnswerEvent |
   TaskStartedEvent | TaskDoneEvent | DoneEvent | ErrorEvent |
-  RateLimitNoticeEvent
+  RateLimitNoticeEvent | CompactStartedEvent | CompactNoticeEvent
 )
 
 
@@ -316,6 +353,37 @@ async def _single_turn(
       break
     msg_count += 1
     msg_type = type(message).__name__
+    sys_subtype = getattr(message, "subtype", "") if msg_type == "SystemMessage" else ""
+
+    # Conversation compaction surfaces as SystemMessage(subtype=
+    # "compact_boundary"). It's a real, multi-second piece of work the CLI
+    # just did — count it as progress so back-to-back compactions can't
+    # exhaust PROGRESS_TIMEOUT, and forward to the host as
+    # CompactNoticeEvent so the user gets a card update during what would
+    # otherwise be an unexplained working-card stall. ``microcompact_boundary``
+    # is a smaller in-place compaction the CLI UI itself doesn't render —
+    # we don't surface it either, but still tick the progress clock.
+    if sys_subtype == "compact_boundary":
+      data = getattr(message, "data", None) or {}
+      meta = data.get("compact_metadata") if isinstance(data, dict) else None
+      if not isinstance(meta, dict):
+        meta = {}
+      log.info("turn msg: SystemMessage[compact_boundary] trigger=%s pre=%s post=%s dur=%sms",
+               meta.get("trigger"), meta.get("pre_tokens"),
+               meta.get("post_tokens"), meta.get("duration_ms"))
+      on_event(CompactNoticeEvent(
+        trigger=str(meta.get("trigger") or ""),
+        pre_tokens=int(meta.get("pre_tokens") or 0),
+        post_tokens=int(meta.get("post_tokens") or 0),
+        duration_ms=int(meta.get("duration_ms") or 0),
+      ))
+      last_progress_at = _time.monotonic()
+      continue
+    if sys_subtype == "microcompact_boundary":
+      log.info("turn msg: SystemMessage[microcompact_boundary] (suppressed)")
+      last_progress_at = _time.monotonic()
+      continue
+
     if msg_type in _NON_PROGRESS_MESSAGE_TYPES:
       since_progress = _time.monotonic() - last_progress_at
       log.warning("turn msg: %s (non-progress, idle=%.0fs/%ds)",

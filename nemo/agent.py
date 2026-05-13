@@ -29,7 +29,10 @@ from .channel import IncomingMessage
 from .config import load_credentials
 from .db import Database
 from .lark_channel import LarkChannel
-from .turn import AnswerEvent, DoneEvent, ProgressEvent, RateLimitNoticeEvent
+from .turn import (
+  AnswerEvent, CompactNoticeEvent, CompactStartedEvent, DoneEvent,
+  ProgressEvent, RateLimitNoticeEvent,
+)
 
 log = logging.getLogger(__name__)
 
@@ -632,6 +635,43 @@ def _format_rate_limit_notice(event: RateLimitNoticeEvent) -> str:
           mins = 0
         bits.append(f"resets in {h}h {mins}m" if mins else f"resets in {h}h")
   return " ".join(bits)
+
+
+_COMPACT_TRIGGER_LABEL = {"auto": "自动", "manual": "手动"}
+
+
+def _format_compact_started(event: CompactStartedEvent) -> str:
+  """Render a CompactStartedEvent as a one-line timeline step.
+
+  Fires from the SDK's PreCompact hook just before the CLI begins
+  summarising the conversation. We only know the trigger here — tokens
+  and duration are not known until the matching CompactNoticeEvent.
+  """
+  label = _COMPACT_TRIGGER_LABEL.get(event.trigger, event.trigger or "")
+  if label:
+    return f"🗜 上下文{label}压缩中…"
+  return "🗜 上下文压缩中…"
+
+
+def _format_compact_notice(event: CompactNoticeEvent) -> str:
+  """Render a CompactNoticeEvent as a one-line timeline step.
+
+  Emitted on the matching SystemMessage(subtype="compact_boundary") after
+  the CLI finishes compacting; carries pre/post tokens and duration. The
+  paired CompactStartedEvent step (if present) lives just above this one
+  in the timeline.
+  """
+  label = _COMPACT_TRIGGER_LABEL.get(event.trigger, event.trigger or "")
+  parts: list[str] = []
+  if event.pre_tokens and event.post_tokens:
+    parts.append(f"{event.pre_tokens:,} → {event.post_tokens:,} tokens")
+  elif event.pre_tokens:
+    parts.append(f"{event.pre_tokens:,} tokens")
+  if event.duration_ms:
+    parts.append(f"{event.duration_ms / 1000:.1f}s")
+  detail = " · ".join(parts)
+  head = f"🗜 上下文已{label}压缩" if label else "🗜 上下文已压缩"
+  return f"{head}（{detail}）" if detail else head
 
 
 def _endpoint_change_note(
@@ -1464,6 +1504,21 @@ async def main_loop(
           # Surface upstream rate-limit pressure even when the turn hasn't
           # produced any visible work yet — that silence is exactly what we
           # want to explain.
+          _ensure_card()
+          _update_working()
+
+        elif isinstance(event, CompactStartedEvent):
+          # PreCompact hook fired — compaction may take 10-60s during which
+          # no other SDK messages arrive. Drop a step + PATCH the card so
+          # the user knows what's happening instead of staring at silence.
+          _turn_steps.append(cards.ThinkingStep("compact", _format_compact_started(event)))
+          _ensure_card()
+          _update_working()
+
+        elif isinstance(event, CompactNoticeEvent):
+          # SystemMessage(subtype=compact_boundary) arrived — compaction
+          # finished. Drop a step with the post-fact summary (tokens, duration).
+          _turn_steps.append(cards.ThinkingStep("compact", _format_compact_notice(event)))
           _ensure_card()
           _update_working()
 

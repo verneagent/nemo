@@ -12,7 +12,7 @@ from .coding_agent import CodingAgent, EndpointConfig
 from .db import Database
 from .permissions import build_ask_user_question_handler, build_permission_handler
 from .sdk_thread import SDKThread
-from .turn import TurnEvent
+from .turn import CompactStartedEvent, TurnEvent
 from .types import JsonObject
 
 # Env vars Claude Code / claude-agent-sdk honor for endpoint overrides
@@ -141,6 +141,12 @@ class ClaudeCodingAgent(CodingAgent):
     # adapter. Kept here (not in the abstract CodingAgent interface) because
     # only the Claude SDK exhibits the bug.
     self._stale_tasks: set[str] = set()
+    # Live per-turn on_event sink for hook callbacks. Hooks are session-
+    # scoped (registered once on ClaudeAgentOptions) but events are
+    # per-turn, so the PreCompact hook reads this attribute to find the
+    # current turn's callback. Set at the top of run_turn(), cleared on
+    # exit. None means no turn is active — we drop the hook event.
+    self._current_on_event: Callable[[TurnEvent], None] | None = None
 
   def set_effort(self, effort: str) -> None:
     self._effort = effort if effort in _CLAUDE_EFFORT_LEVELS else ""
@@ -201,11 +207,42 @@ class ClaudeCodingAgent(CodingAgent):
       return self._build_options(
         self._project_dir, self._model, resume=self._latest_session_id)
 
-    return await self._sdk.run_turn_with_reconnect(
-      prompt, _wrapped,
-      stale_tasks=self._stale_tasks,
-      options=self._options,
-      options_factory=_options_factory)
+    self._current_on_event = _wrapped
+    try:
+      return await self._sdk.run_turn_with_reconnect(
+        prompt, _wrapped,
+        stale_tasks=self._stale_tasks,
+        options=self._options,
+        options_factory=_options_factory)
+    finally:
+      self._current_on_event = None
+
+  async def _on_pre_compact(
+    self,
+    hook_input: object,
+    tool_use_id: object,
+    context: object,
+  ) -> dict[str, object]:
+    """SDK PreCompact hook — surface a CompactStartedEvent.
+
+    Fires from the SDK's control channel before the CLI begins compaction.
+    Returns an empty dict so the SDK's default-allow path runs (returning
+    a dict with ``decision: "block"`` would actually block compaction —
+    not what we want).
+    """
+    del tool_use_id, context
+    sink = self._current_on_event
+    if sink is None:
+      log.warning("PreCompact hook fired outside a live turn — dropping")
+      return {}
+    try:
+      trigger = ""
+      if isinstance(hook_input, dict):
+        trigger = str(hook_input.get("trigger") or "")
+      sink(CompactStartedEvent(trigger=trigger))
+    except Exception as exc:  # never block compaction on our notice failure
+      log.warning("PreCompact hook handler error: %s", exc)
+    return {}
 
   async def interrupt(self) -> None:
     self._sdk.cancel()
@@ -267,7 +304,7 @@ class ClaudeCodingAgent(CodingAgent):
     return agent_prompt
 
   def _build_options(self, project_dir: str, model: str, resume: str = "") -> object:
-    from claude_agent_sdk import ClaudeAgentOptions
+    from claude_agent_sdk import ClaudeAgentOptions, HookMatcher
     from claude_agent_sdk.types import PermissionMode
 
     agent_prompt = self._build_agent_prompt()
@@ -367,7 +404,14 @@ class ClaudeCodingAgent(CodingAgent):
       model=model,
       env=env,
       stderr=_stderr_handler,
-      hooks={},
+      # PreCompact fires before the CLI starts summarising context. Without
+      # it, the user sees a silent 10-60s working-card stall mid-turn; with
+      # it we surface CompactStartedEvent and the host can render a banner.
+      # The matching completion arrives on the message stream as
+      # SystemMessage(subtype="compact_boundary"); see turn.py.
+      hooks={
+        "PreCompact": [HookMatcher(hooks=[self._on_pre_compact])],
+      },
       can_use_tool=_can_use_tool,
       # Single stream_json messages can exceed the SDK's 1 MB default when
       # a tool result (large file read, heavy bash output) lands in one chunk.

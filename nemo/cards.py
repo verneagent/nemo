@@ -34,7 +34,7 @@ class ToolRecord:
 @dataclass
 class ThinkingStep:
   """One entry in the unified thinking timeline."""
-  kind: str       # "thinking" | "tool" | "reasoning" | "answer"
+  kind: str       # "thinking" | "tool" | "reasoning" | "answer" | "compact"
   content: str    # text content or tool summary
 
 
@@ -249,8 +249,10 @@ def _collapsible_thinking(steps: list[ThinkingStep]) -> JsonObject:
         t = t[:297] + "..."
       entries.append(("text", _escape_md(t)))
 
-    # Separate thinking/reasoning and tool steps while preserving order
-    thinkings = [s for s in grp_steps if s.kind in ("thinking", "reasoning")]
+    # Separate thinking/reasoning/compact and tool steps while preserving
+    # order. Compact-boundary steps render in the same "text" lane as
+    # thinking — they're brief informational lines, not tool calls.
+    thinkings = [s for s in grp_steps if s.kind in ("thinking", "reasoning", "compact")]
     tools = [s for s in grp_steps if s.kind == "tool"]
 
     # Render thinking blocks (all of them — not counted toward tool limit)

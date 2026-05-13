@@ -9,7 +9,7 @@ import pytest
 from nemo.turn import (
   run_turn, ProgressEvent, AnswerEvent,
   TaskStartedEvent, TaskDoneEvent, DoneEvent, ErrorEvent,
-  RateLimitNoticeEvent, TurnEvent,
+  RateLimitNoticeEvent, CompactNoticeEvent, TurnEvent,
 )
 
 
@@ -732,6 +732,109 @@ def test_rate_limit_event_emits_notice():
   assert n.rate_limit_type == "five_hour"
   assert n.resets_at == 1_700_000_000
   assert abs((n.utilization or 0.0) - 0.97) < 1e-9
+
+
+def test_compact_boundary_emits_notice():
+  """SystemMessage(subtype="compact_boundary") must surface as
+  CompactNoticeEvent with the metadata fields extracted from data."""
+
+  @dataclass
+  class SystemMessage:
+    subtype: str
+    data: dict
+
+  messages = [
+    SystemMessage(
+      subtype="compact_boundary",
+      data={
+        "type": "system",
+        "subtype": "compact_boundary",
+        "compact_metadata": {
+          "trigger": "auto",
+          "pre_tokens": 45_000,
+          "post_tokens": 8_200,
+          "duration_ms": 12_345,
+        },
+      },
+    ),
+    FakeAssistantMessage(content=[FakeTextBlock(text="back to work")]),
+    FakeResultMessage(),
+  ]
+  events: list = []
+  async def _run():
+    with mock.patch.dict("sys.modules", _sdk_modules()):
+      await run_turn(FakeClient(messages), "hi", events.append)
+  asyncio.run(_run())
+
+  notices = [e for e in events if isinstance(e, CompactNoticeEvent)]
+  assert len(notices) == 1
+  n = notices[0]
+  assert n.trigger == "auto"
+  assert n.pre_tokens == 45_000
+  assert n.post_tokens == 8_200
+  assert n.duration_ms == 12_345
+  # Compaction is real work — the downstream AssistantMessage should still
+  # produce its AnswerEvent (i.e. compact_boundary doesn't short-circuit
+  # the rest of the turn).
+  assert any(isinstance(e, AnswerEvent) and e.text == "back to work"
+             for e in events)
+
+
+def test_compact_boundary_with_partial_metadata():
+  """A compact_boundary with only the required fields (no post_tokens / no
+  duration) must still emit a notice — those fields are documented optional
+  in the Claude CLI stream-json schema."""
+
+  @dataclass
+  class SystemMessage:
+    subtype: str
+    data: dict
+
+  messages = [
+    SystemMessage(
+      subtype="compact_boundary",
+      data={
+        "type": "system",
+        "subtype": "compact_boundary",
+        "compact_metadata": {"trigger": "manual", "pre_tokens": 30_000},
+      },
+    ),
+    FakeResultMessage(),
+  ]
+  events: list = []
+  async def _run():
+    with mock.patch.dict("sys.modules", _sdk_modules()):
+      await run_turn(FakeClient(messages), "hi", events.append)
+  asyncio.run(_run())
+
+  notices = [e for e in events if isinstance(e, CompactNoticeEvent)]
+  assert len(notices) == 1
+  assert notices[0].trigger == "manual"
+  assert notices[0].pre_tokens == 30_000
+  assert notices[0].post_tokens == 0
+  assert notices[0].duration_ms == 0
+
+
+def test_microcompact_boundary_is_suppressed():
+  """SystemMessage(subtype="microcompact_boundary") should be silently
+  dropped — the Claude CLI's UI also returns null for it. We still want
+  to consume the message without crashing or surfacing a notice."""
+
+  @dataclass
+  class SystemMessage:
+    subtype: str
+    data: dict
+
+  messages = [
+    SystemMessage(subtype="microcompact_boundary", data={}),
+    FakeResultMessage(),
+  ]
+  events: list = []
+  async def _run():
+    with mock.patch.dict("sys.modules", _sdk_modules()):
+      await run_turn(FakeClient(messages), "hi", events.append)
+  asyncio.run(_run())
+  assert not any(isinstance(e, CompactNoticeEvent) for e in events)
 
 
 def test_rate_limit_event_with_missing_info_is_skipped():
