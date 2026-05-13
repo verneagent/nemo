@@ -477,7 +477,10 @@ def main():
         f"and re-run.")
     endpoint = preset.endpoint_for(args.provider)
     model = preset.remote_for(args.provider)
-    endpoint_key = preset.name
+    # Key by the upstream URL, not the preset name — two presets that
+    # hit the same gateway share signing keys and can safely share an
+    # SDK session, while two presets at different URLs cannot.
+    endpoint_key = endpoint.base_url
     log.info("Resolved preset %s → endpoint=%s model=%s",
              preset.name, endpoint.base_url, model)
 

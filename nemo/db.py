@@ -205,9 +205,12 @@ class Database:
     whose ``thinking`` blocks were signed by a different vendor (the
     Anthropic API rejects those with HTTP 400).
 
-    ``endpoint_key=""`` means the provider's default endpoint; preset
-    endpoints use the preset name (e.g. ``"deepseek-v4-pro"``). Returns
-    ``""`` if no resume target.
+    ``endpoint_key`` is the upstream URL (``EndpointConfig.base_url``);
+    ``""`` means the provider's default endpoint. Two presets pointing
+    at the same gateway (e.g. ``deepseek-v4-pro`` and
+    ``deepseek-v4-flash`` both at ``api.deepseek.com/anthropic``)
+    deliberately share a session — they share signing keys so the
+    history is replayable. Returns ``""`` if no resume target.
     """
     if _PROVIDER_SESSION_COLUMNS.get(provider) is None:
       return ""

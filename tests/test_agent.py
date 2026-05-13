@@ -517,6 +517,85 @@ def test_model_switch_isolates_session_per_endpoint(tmp_path):
   assert endpoint2 == "", reset_calls
 
 
+def test_model_swap_within_same_endpoint_keeps_session(tmp_path):
+  """Swapping between two models that share an upstream (e.g.
+  opus↔sonnet, both on api.anthropic.com) must keep the same SDK
+  session. The bug fix isolates by endpoint URL, not by model name —
+  routine model swaps should NOT segment context."""
+  from nemo.channel import IncomingMessage
+
+  reset_calls: list[tuple[str, str]] = []  # (model, resume)
+
+  class _SpyAgent(_FakeAgent):
+    def set_endpoint(self, _endpoint):
+      pass
+
+    async def reset(self, _project_dir, model, resume=""):
+      reset_calls.append((model, resume))
+
+  agent = _SpyAgent()
+
+  class _SpyDB(_FakeDB):
+    def __init__(self, project_dir):
+      super().__init__(project_dir)
+      self._store: dict[tuple[str, str, str], str] = {
+        ("oc_test", "claude", ""): "default-uuid",
+      }
+
+    def get_sdk_session_id(self, chat_id, provider, endpoint_key=""):
+      return self._store.get((chat_id, provider, endpoint_key), "")
+
+    def set_sdk_session_id(self, chat_id, sdk_session_id, provider,
+                           endpoint_key=""):
+      self._store[(chat_id, provider, endpoint_key)] = sdk_session_id
+
+  queued = _QueuedChannel("oc_test", [
+    # Start on claude-opus-4-7 (default endpoint). Switch to sonnet,
+    # then haiku — both also on default endpoint. Session continuity
+    # is what we're checking.
+    IncomingMessage(
+      event_type="im.message.receive_v1", chat_id="oc_test",
+      sender_id="ou_user", message_id="om_to_sonnet", msg_type="text",
+      text="/model claude-sonnet-4-6", create_time="1",
+    ),
+    IncomingMessage(
+      event_type="im.message.receive_v1", chat_id="oc_test",
+      sender_id="ou_user", message_id="om_to_haiku", msg_type="text",
+      text="/model claude-haiku-4-5", create_time="2",
+    ),
+    IncomingMessage(
+      event_type="im.message.receive_v1", chat_id="oc_test",
+      sender_id="ou_user", message_id="om_exit", msg_type="text",
+      text="/exit", create_time="3",
+    ),
+  ])
+
+  with mock.patch("nemo.agent.load_credentials", return_value={
+         "app_id": "a", "app_secret": "s", "email": "u@e.com",
+       }), \
+       mock.patch("nemo.agent.Database", _SpyDB), \
+       mock.patch("nemo.agent.LarkChannel", return_value=queued), \
+       mock.patch("nemo.agent.build_coding_agent", return_value=agent), \
+       mock.patch("nemo.agent._send_response", new=mock.AsyncMock()), \
+       mock.patch("nemo.group_config.load_config", return_value={}), \
+       mock.patch("nemo.config.load_relay_config", return_value=("", "")), \
+       mock.patch("signal.signal"):
+    rc = asyncio.run(
+      main_loop("oc_test", str(tmp_path), "claude-opus-4-7", provider="claude")
+    )
+  assert rc == 0
+
+  # Both switches stay on the default endpoint and so must resume the
+  # same session id. Losing continuity here would break the user-
+  # facing promise that "swap model = pick a different brain for the
+  # same conversation".
+  assert len(reset_calls) == 2, reset_calls
+  for model, resume in reset_calls:
+    assert resume == "default-uuid", (model, resume, reset_calls)
+  assert reset_calls[0][0] == "claude-sonnet-4-6", reset_calls
+  assert reset_calls[1][0] == "claude-haiku-4-5", reset_calls
+
+
 def _run_provider_switch(tmp_path, *, prior_codex_session: str = ""):
   """Helper: drive main_loop through /provider codex (then /exit).
 

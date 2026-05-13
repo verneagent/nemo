@@ -92,34 +92,34 @@ def test_per_endpoint_sessions_isolated_within_provider(tmp_path):
   # against real Anthropic surfaces as
   # ``400 Invalid signature in thinking block`` — the thinking blocks
   # were signed by DeepSeek and the Anthropic API rejects them.
+  #
+  # endpoint_key is the upstream URL — same URL = same signing
+  # authority = safe to share a session.
+  ds_url = "https://api.deepseek.com/anthropic"
   with mock.patch("nemo.db.DB_BASE", str(tmp_path)):
     db = Database(str(tmp_path / "project"))
     db.activate("sess1", "chat1", "claude-opus-4-7")
     # Default endpoint (real Anthropic).
     db.set_sdk_session_id("chat1", "anthropic-uuid", "claude")
     # Preset endpoint (DeepSeek's anthropic-compat gateway).
-    db.set_sdk_session_id(
-      "chat1", "deepseek-uuid", "claude", "deepseek-v4-pro")
+    db.set_sdk_session_id("chat1", "deepseek-uuid", "claude", ds_url)
     # Each endpoint's slot is independent. Switching endpoints must
     # not bleed across.
     assert db.get_sdk_session_id("chat1", "claude") == "anthropic-uuid"
     assert db.get_sdk_session_id("chat1", "claude", "") == "anthropic-uuid"
-    assert db.get_sdk_session_id(
-      "chat1", "claude", "deepseek-v4-pro") == "deepseek-uuid"
+    assert db.get_sdk_session_id("chat1", "claude", ds_url) == "deepseek-uuid"
     # Unknown endpoint_key for a known provider → empty (start fresh)
     # rather than falling back to another endpoint's id.
-    assert db.get_sdk_session_id("chat1", "claude", "anything-else") == ""
+    assert db.get_sdk_session_id(
+      "chat1", "claude", "https://other-vendor.example/anthropic") == ""
     # Survives deactivate + reactivate just like the legacy columns do.
     db.deactivate("sess1")
     db.activate("sess2", "chat1", "claude-opus-4-7")
     assert db.get_sdk_session_id("chat1", "claude") == "anthropic-uuid"
-    assert db.get_sdk_session_id(
-      "chat1", "claude", "deepseek-v4-pro") == "deepseek-uuid"
+    assert db.get_sdk_session_id("chat1", "claude", ds_url) == "deepseek-uuid"
     # Overwriting one endpoint leaves the other intact.
-    db.set_sdk_session_id(
-      "chat1", "deepseek-uuid-2", "claude", "deepseek-v4-pro")
-    assert db.get_sdk_session_id(
-      "chat1", "claude", "deepseek-v4-pro") == "deepseek-uuid-2"
+    db.set_sdk_session_id("chat1", "deepseek-uuid-2", "claude", ds_url)
+    assert db.get_sdk_session_id("chat1", "claude", ds_url) == "deepseek-uuid-2"
     assert db.get_sdk_session_id("chat1", "claude") == "anthropic-uuid"
     db.close()
 

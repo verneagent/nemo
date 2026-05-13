@@ -471,6 +471,28 @@ def _format_rate_limit_notice(event: RateLimitNoticeEvent) -> str:
   return " ".join(bits)
 
 
+def _endpoint_change_note(
+  old_endpoint_key: str, new_endpoint_key: str, sdk_session_id: str,
+) -> str:
+  """One-line trailing note shown after ``/model`` when the upstream
+  endpoint actually changed.
+
+  Returns ``""`` when the endpoint did not change (e.g. opus↔sonnet on
+  default Anthropic) so a routine model swap stays a one-line confirm.
+  When the endpoint flipped, the per-endpoint session isolation makes
+  the new model blind to the other endpoint's transcript — surface
+  that explicitly so users don't think the bot "forgot" anything.
+  """
+  if old_endpoint_key == new_endpoint_key:
+    return ""
+  if sdk_session_id:
+    return (f" Resuming this endpoint's prior conversation "
+            f"(session `{sdk_session_id[:8]}`); the other endpoint's "
+            f"history is kept separately.")
+  return (" Fresh conversation on this endpoint — the previous "
+          "endpoint's history is preserved, switch back to continue it.")
+
+
 # ---------------------------------------------------------------------------
 # Main loop
 # ---------------------------------------------------------------------------
@@ -846,13 +868,17 @@ async def main_loop(
               )
               await _clear_ack()
               continue
-            agent.set_endpoint(preset.endpoint_for(provider))
+            old_endpoint_key = _endpoint_key
+            new_endpoint = preset.endpoint_for(provider)
+            agent.set_endpoint(new_endpoint)
             switched_to = preset.remote_for(provider)
             # Each upstream endpoint (preset vs default) keeps its own
             # SDK session so we never replay one vendor's signed
-            # ``thinking`` blocks against another vendor's API — see
-            # ``db.get_sdk_session_id``.
-            _endpoint_key = preset.name
+            # ``thinking`` blocks against another vendor's API. Key by
+            # the upstream URL — same URL = same signing authority =
+            # safe to share a session across e.g. opus↔sonnet (both at
+            # api.anthropic.com) or two DeepSeek model variants.
+            _endpoint_key = new_endpoint.base_url
             _sdk_session_id = db.get_sdk_session_id(
               chat_id, provider, _endpoint_key)
             log.info("Model switch to preset %s → %s (endpoint=%s resume=%s)",
@@ -862,10 +888,12 @@ async def main_loop(
             ctx.model = model
             await _restart_client(resume=_sdk_session_id)
             await channel.update_status(model, "idle", provider)
+            note = _endpoint_change_note(
+              old_endpoint_key, _endpoint_key, _sdk_session_id)
             await _send_response(
               channel, chat_id,
               f"Model switched to preset **{preset.name}** "
-              f"(remote: `{switched_to}`).",
+              f"(remote: `{switched_to}`).{note}",
               db,
             )
             continue
@@ -883,6 +911,7 @@ async def main_loop(
           # default endpoint has its own SDK session — fetch it instead
           # of replaying the preset endpoint's transcript whose
           # ``thinking`` blocks would 400 against real Anthropic.
+          old_endpoint_key = _endpoint_key
           agent.set_endpoint(EndpointConfig())
           _endpoint_key = ""
           _sdk_session_id = db.get_sdk_session_id(
@@ -893,7 +922,12 @@ async def main_loop(
                    model, _sdk_session_id[:8] if _sdk_session_id else "none")
           await _restart_client(resume=_sdk_session_id)
           await channel.update_status(model, "idle", provider)
-          await _send_response(channel, chat_id, f"Model switched to **{model}**.", db)
+          note = _endpoint_change_note(
+            old_endpoint_key, _endpoint_key, _sdk_session_id)
+          await _send_response(
+            channel, chat_id,
+            f"Model switched to **{model}**.{note}", db,
+          )
         elif response and response.startswith("__provider__:"):
           # Format: "__provider__:<name>:<default_model>"
           _, new_provider, default_model = response.split(":", 2)
