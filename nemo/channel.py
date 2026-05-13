@@ -39,6 +39,11 @@ class IncomingMessage:
   action_tag: str = ""
   operator_id: str = ""
   raw: JsonObject = field(default_factory=dict)
+  # True for messages synthesised by Nemo itself (e.g. /session recall
+  # injection) rather than received from the channel. The main loop
+  # bypasses the human-sender authorization + need_mention filters for
+  # these so they reach the SDK as a normal turn.
+  is_internal: bool = False
 
 
 class Channel(ABC):

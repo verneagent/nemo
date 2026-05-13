@@ -223,6 +223,8 @@ def try_dispatch(text: str, ctx: AgentContext) -> tuple[bool, str | None]:
       "| `/norm` | Manage group norms |\n"
       "| `/guest` | Manage guests |\n"
       "| `/diag` | Run diagnostics |\n"
+      "| `/session list` | List past sessions in this project |\n"
+      "| `/session recall <uuid>` | Recall a past session's contents into context |\n"
       "| `/exit` | Stop agent, keep group |\n"
       "| `/dissolve` | Stop agent, dissolve group |\n"
       "| `/help` | This help |\n"
@@ -304,6 +306,27 @@ def try_dispatch(text: str, ctx: AgentContext) -> tuple[bool, str | None]:
       name = parts[2].strip()
       return True, f"__guest_remove__:{name}"
     return True, "Usage: `/guest list`, `/guest add <name>`, `/guest remove <name>`"
+
+  # /session list  |  /session recall <id>
+  # Browse and recall past coding-agent sessions stored locally
+  # (claude JSONL / codex rollout). "recall" is read-only — it injects
+  # the session's contents as memory context, never SDK-resumes (that
+  # would cross the per-endpoint isolation boundary).
+  if t.startswith("/session"):
+    parts = text.strip().split(None, 2)
+    if len(parts) >= 2:
+      sub = parts[1].lower()
+      if sub == "list":
+        return True, "__session_list__"
+      if sub == "recall" and len(parts) >= 3:
+        return True, f"__session_recall__:{parts[2].strip()}"
+    return True, (
+      "**Session Commands**\n\n"
+      "| Command | Description |\n"
+      "|---|---|\n"
+      "| `/session list` | List past sessions in this project (Claude + Codex) |\n"
+      "| `/session recall <uuid>` | Read a past session and remember its contents |"
+    )
 
   # /dissolve — stop agent, dissolve group (check before /exit to avoid prefix match)
   if t in ("/dissolve", "dissolve"):

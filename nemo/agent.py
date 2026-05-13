@@ -414,6 +414,126 @@ async def _handle_diag(
     log.error("Failed to send diag card: %s", e)
 
 
+async def _handle_session_list(
+  channel: LarkChannel,
+  chat_id: str,
+  project_dir: str,
+  db: Database,
+  current_sdk_session_id: str,
+) -> None:
+  """Send a markdown card listing all known sessions for ``project_dir``.
+
+  Sessions are pulled from both Claude CLI's storage (`~/.claude/...`)
+  and Codex's (`~/.codex/...`) and merged into one mtime-desc list.
+  Each row shows uuid prefix, provider, model, age, and a short user-
+  prompt preview so the operator can identify which one to recall.
+  """
+  from . import sessions as _sessions
+  sessions = _sessions.list_sessions(project_dir)
+  if not sessions:
+    await _send_response(
+      channel, chat_id,
+      f"No past sessions found in `{project_dir}`.",
+      db,
+    )
+    return
+  now = time.time()
+  lines: list[str] = []
+  for s in sessions[:30]:
+    age = max(0, int(now - s.mtime))
+    if age < 3600:
+      when = f"{age // 60}m ago"
+    elif age < 86400:
+      when = f"{age // 3600}h ago"
+    else:
+      when = f"{age // 86400}d ago"
+    marker = " ← current" if s.uuid == current_sdk_session_id else ""
+    preview = s.first_user_text.replace("\n", " ").strip()[:80]
+    if not preview:
+      preview = "(no user message)"
+    model = f" `{s.model}`" if s.model else ""
+    lines.append(
+      f"- `{s.uuid[:8]}` · **{s.provider}**{model} · {when}{marker}\n"
+      f"   {preview}"
+    )
+  more = ""
+  if len(sessions) > 30:
+    more = f"\n\n(+{len(sessions) - 30} older sessions not shown)"
+  body = (
+    f"📂 `{project_dir}` — {len(sessions)} session(s)\n\n"
+    + "\n".join(lines)
+    + more
+    + "\n\nRecall one with `/session recall <uuid prefix>`."
+  )
+  await _send_response(channel, chat_id, body, db)
+
+
+async def _handle_session_recall(
+  channel: LarkChannel,
+  chat_id: str,
+  project_dir: str,
+  target: str,
+) -> str:
+  """Resolve ``target`` to a session, extract its text digest, queue it
+  as a synthetic user message, and return an ack/error string.
+
+  Recall does NOT touch ``_sdk_session_id`` — that's intentional. SDK
+  resume across endpoints replays thinking-block signatures and 400s
+  (see db.py); recall is read-only memory injection that goes through
+  the live SDK session as a normal turn.
+  """
+  from . import sessions as _sessions
+  from .channel import IncomingMessage
+  if not target.strip():
+    return "Usage: `/session recall <uuid prefix>`"
+  all_sessions = _sessions.list_sessions(project_dir)
+  matches = _sessions.find_session(target, all_sessions)
+  if not matches:
+    return (f"No session matches `{target}` in this project. "
+            f"Run `/session list` to see what's available.")
+  if len(matches) > 1:
+    ambig = ", ".join(f"`{m.uuid[:8]}`" for m in matches[:5])
+    return (f"`{target}` is ambiguous — matches {ambig}. "
+            f"Use more characters from the uuid.")
+  info = matches[0]
+  digest = _sessions.session_digest(info)
+  if not digest:
+    return (f"Session `{info.uuid[:8]}` has no recoverable user/assistant "
+            f"text — nothing to recall.")
+  import datetime as _dt
+  when = _dt.datetime.fromtimestamp(info.mtime).strftime("%Y-%m-%d %H:%M")
+  prompt = (
+    f"[Recall] Below is a digest of a past session in this project "
+    f"(uuid `{info.uuid[:8]}`, provider `{info.provider}`, last activity "
+    f"{when}). Keep it in working memory — the user may refer back to "
+    f"it; do not re-execute any actions described here. Just acknowledge "
+    f"briefly that you've noted it.\n\n"
+    f"--- session {info.uuid[:8]} begin ---\n"
+    f"{digest}\n"
+    f"--- session {info.uuid[:8]} end ---"
+  )
+  # Hand the recall to the live SDK as a normal user turn. The channel
+  # queue is the same path real user messages take, so the existing
+  # ack/working-card/done-card pipeline handles it without special
+  # cases.
+  recall_msg = IncomingMessage(
+    event_type="im.message.receive_v1",
+    chat_id=chat_id,
+    sender_id="",  # synthetic — not from a real user
+    message_id=f"recall_{info.uuid[:8]}_{int(time.time())}",
+    msg_type="text",
+    text=prompt,
+    create_time=str(int(time.time() * 1000)),
+    is_internal=True,
+  )
+  channel.push_back(recall_msg)
+  size_hint = f"{len(digest)} chars" if digest else "empty"
+  return (
+    f"📖 Recalling session `{info.uuid[:8]}` ({info.provider}, "
+    f"{size_hint}). Replaying through the current agent…"
+  )
+
+
 # When an SDK turn times out the underlying CLI/agent is usually choking on a
 # heavy context that's been asked to do too much at once. The next user turn
 # gets this preamble so the agent paces itself instead of repeating the
@@ -744,18 +864,22 @@ async def main_loop(
       if bot_open_id and sender == bot_open_id:
         log.debug("Skipping: own message from bot %s", sender)
         continue  # Skip own messages
-      from .guests import is_authorized_sender
-      if operator_open_id and not is_authorized_sender(
-          sender, operator_open_id, _member_roles):
-        log.info("Skipping: unauthorized sender %s (operator=%s)", sender, operator_open_id)
-        continue
+      # Internal messages (e.g. /session recall injection) bypass the
+      # human-auth checks — Nemo synthesised them on behalf of an
+      # already-authorized command invocation.
+      if not reply.is_internal:
+        from .guests import is_authorized_sender
+        if operator_open_id and not is_authorized_sender(
+            sender, operator_open_id, _member_roles):
+          log.info("Skipping: unauthorized sender %s (operator=%s)", sender, operator_open_id)
+          continue
 
       # need_mention mode: only respond to @mentions and interactions
       # directed at nemo's own messages (text reply or emoji reaction).
       # Slash commands must also be @-directed. Replying to *other*
       # people's messages (quoting a teammate's card while @-ing
       # another teammate) is not considered bot-directed.
-      if need_mention and bot_open_id:
+      if need_mention and bot_open_id and not reply.is_internal:
         kept = messages.filter_bot_interactions(
           [reply], bot_open_id, is_own_message=_is_own_message)
         if not kept:
@@ -1158,6 +1282,20 @@ async def main_loop(
             await _send_response(channel, chat_id, f"Rename failed: {e}", db)
         elif response == "__diag__":
           await _handle_diag(channel, chat_id, project_dir, db)
+        elif response == "__session_list__":
+          await _handle_session_list(
+            channel, chat_id, project_dir, db, _sdk_session_id)
+        elif response and response.startswith("__session_recall__:"):
+          target = response.split(":", 1)[1]
+          # Recall injects the session's text contents as a synthetic
+          # user message that the running agent processes on the next
+          # turn — no SDK resume (would 400 across endpoints, see the
+          # per-endpoint isolation comment in db.py). Returns the
+          # confirmation/error text to show.
+          ack = await _handle_session_recall(
+            channel, chat_id, project_dir, target)
+          if ack:
+            await _send_response(channel, chat_id, ack, db)
         elif response == "__exit__":
           end_card = cards.build_card("Nemo — Stopped", body="Agent stopped.", color="blue")
           await channel.send_card(chat_id, end_card)
