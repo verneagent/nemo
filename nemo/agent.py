@@ -1463,8 +1463,18 @@ async def main_loop(
         def _update_working(**kwargs):
           """Update the working card with current state."""
           nonlocal _turn_card_id
-          if not _turn_card_id or _turn_interrupt_phase:
+          if _turn_interrupt_phase:
             return
+          if not _turn_card_id:
+            # The card-create call on the first progress event failed
+            # (transient Lark connection drop, rate-limit blip, etc).
+            # Retry now instead of staying silent for the rest of the
+            # turn — if the second attempt also fails, _ensure_card
+            # logs and leaves _turn_card_id None and we exit silently
+            # below, same as before.
+            _ensure_card()
+            if not _turn_card_id:
+              return
           elapsed = int(time.time() - _turn_start)
           card = cards.build_turn_card(
             "working",

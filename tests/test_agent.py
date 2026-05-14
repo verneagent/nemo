@@ -15,7 +15,7 @@ from nemo.agent import (
   main_loop,
 )
 from nemo.channel import IncomingMessage
-from nemo.turn import AnswerEvent, DoneEvent, RateLimitNoticeEvent
+from nemo.turn import AnswerEvent, DoneEvent, ProgressEvent, RateLimitNoticeEvent
 
 
 class _FakeDB:
@@ -1210,3 +1210,113 @@ def test_format_rate_limit_notice_past_reset_omits_eta():
   )
   out = _format_rate_limit_notice(ev)
   assert "resets in" not in out
+
+
+def test_working_card_retries_on_first_create_failure(tmp_path):
+  """Regression: 0.4.8 and earlier — when the first send_card for a
+  turn's working card fails (transient `Remote end closed connection
+  without response` from Lark), _ensure_card logged the error and left
+  _turn_card_id None. Every subsequent progress event silently no-op'd
+  the update, so the user saw no working indicator for the rest of the
+  turn — sometimes minutes of dead air before the final answer card.
+
+  Fix: _update_working retries _ensure_card when the card is still
+  missing. This test drives a turn with multiple ProgressEvents and a
+  send_card that fails once then succeeds, and asserts the second
+  progress event causes a retry that actually produces a card.
+  """
+  from nemo.channel import IncomingMessage
+
+  send_card_calls: list[object] = []
+  update_card_calls: list[object] = []
+  # Distinguish the start card (always sent first by main_loop) from
+  # the working card created on the first ProgressEvent.
+  _state = {"working_create_attempts": 0}
+
+  class _FlakyChannel(_FakeChannel):
+    async def send_card(self, _chat_id, card):
+      send_card_calls.append(card)
+      # First send_card is the daemon's start card — let it succeed so
+      # we're testing the working-card failure path specifically.
+      if len(send_card_calls) == 1:
+        return "om_start"
+      _state["working_create_attempts"] += 1
+      # The 2nd send_card is _ensure_card on the first ProgressEvent.
+      # Fail it the way Lark did at 15:04:36 — the connection drops
+      # before a response comes back. Later attempts (retry on
+      # subsequent _update_working calls) succeed.
+      if _state["working_create_attempts"] == 1:
+        raise ConnectionError("Remote end closed connection without response")
+      return "om_working"
+
+    async def update_card(self, card_id, card):
+      update_card_calls.append((card_id, card))
+      return card_id
+
+  class _MultiProgressAgent(_FakeAgent):
+    async def run_turn(self, _prompt, on_event):
+      def _emit():
+        # `first=True` triggers _ensure_card — the failure we're
+        # regressing against. Subsequent first=False events drive
+        # _update_working, which is where the retry must happen.
+        on_event(ProgressEvent(kind="tool", summary="Read", first=True))
+        on_event(ProgressEvent(kind="tool", summary="Grep", first=False))
+        on_event(ProgressEvent(kind="tool", summary="Edit", first=False))
+        on_event(AnswerEvent("done"))
+        on_event(DoneEvent(cost=0.0, usage={"input_tokens": 1}))
+      await asyncio.to_thread(_emit)
+      return 0.0, {"input_tokens": 1}
+
+  channel = _FlakyChannel("oc_test")
+  channel._messages = [
+    IncomingMessage(
+      event_type="im.message.receive_v1",
+      chat_id="oc_test", sender_id="ou_user",
+      message_id="om_msg", msg_type="text",
+      text="hi", create_time="1",
+    ),
+    IncomingMessage(
+      event_type="im.message.receive_v1",
+      chat_id="oc_test", sender_id="ou_user",
+      message_id="om_exit", msg_type="text",
+      text="/exit", create_time="2",
+    ),
+  ]
+  async def _recv(timeout=300):
+    del timeout
+    if channel._messages:
+      return channel._messages.pop(0)
+    return None
+  channel.receive = _recv
+
+  with mock.patch("nemo.agent.load_credentials", return_value={
+    "app_id": "app_id", "app_secret": "app_secret", "email": "u@e.com",
+  }), \
+       mock.patch("nemo.agent.Database", _FakeDB), \
+       mock.patch("nemo.agent.LarkChannel", return_value=channel), \
+       mock.patch("nemo.agent.build_coding_agent", return_value=_MultiProgressAgent()), \
+       mock.patch("nemo.agent._send_response", new=mock.AsyncMock()), \
+       mock.patch("nemo.group_config.load_config", return_value={}), \
+       mock.patch("nemo.config.load_relay_config", return_value=("", "")), \
+       mock.patch("signal.signal"):
+    rc = asyncio.run(main_loop("oc_test", str(tmp_path), "claude-opus-4-6"))
+
+  assert rc == 0
+  # Before the fix: _ensure_card failed once on the first ProgressEvent
+  # and _turn_card_id stayed None, so every subsequent _update_working
+  # short-circuited at `if not _turn_card_id: return`. update_card was
+  # never called for the rest of the turn.
+  #
+  # After the fix: the very next _update_working in the same first
+  # event retries _ensure_card, the second send_card succeeds, and
+  # later progress events PATCH that card via update_card.
+  #
+  # update_card is the right oracle here — send_card alone is noisy
+  # because main_loop's `else` branch in the DoneEvent handler also
+  # calls send_card (via _send_response) when the working card never
+  # materialised, masking the bug if you only count send_card.
+  assert len(update_card_calls) >= 1, (
+    f"working card never recovered: 0 update_card calls "
+    f"(send_card attempts={len(send_card_calls)}, "
+    f"working_creates={_state['working_create_attempts']})"
+  )
