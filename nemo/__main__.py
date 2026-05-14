@@ -71,17 +71,17 @@ def _ensure_opencode_cli() -> None:
   sys.exit(1)
 
 
-def _ensure_provider_runtime(provider: str) -> None:
-  if provider == "claude":
+def _ensure_agent_runtime(agent: str) -> None:
+  if agent == "claude":
     _ensure_claude_sdk()
     return
-  if provider == "codex":
+  if agent == "codex":
     _ensure_codex_cli()
     return
-  if provider == "opencode":
+  if agent == "opencode":
     _ensure_opencode_cli()
     return
-  print(f"Error: unsupported provider '{provider}'", file=sys.stderr)
+  print(f"Error: unsupported agent '{agent}'", file=sys.stderr)
   sys.exit(1)
 
 
@@ -306,11 +306,11 @@ def main():
                       help="Lark chat ID (auto-discovered if omitted)")
   parser.add_argument("--chat-name", default="", help="Find chat by name substring")
   parser.add_argument("--project-dir", default=".", help="Project directory (default: cwd)")
-  parser.add_argument("--provider", default="claude", choices=["claude", "codex", "opencode"],
-                      help="Coding agent provider (default: claude)")
-  parser.add_argument("--model", default="", help="Model to use (provider default if omitted)")
+  parser.add_argument("--agent", default="claude", choices=["claude", "codex", "opencode"],
+                      help="Coding agent runtime (default: claude)")
+  parser.add_argument("--model", default="", help="Model to use (agent default if omitted)")
   parser.add_argument("--effort", default="", choices=["", "low", "medium", "high", "max"],
-                      help="Reasoning effort for the coding agent (default: provider default)")
+                      help="Reasoning effort for the coding agent (default: agent default)")
   parser.add_argument("--profile", default="default", help="Config profile name (default: default)")
   parser.add_argument("--permission-mode", default="bypassPermissions",
                       choices=["default", "acceptEdits", "plan", "bypassPermissions"],
@@ -337,7 +337,7 @@ def main():
       print(f"Error: --system-prompt-file is empty: {sp_path}", file=sys.stderr)
       return 1
 
-  _ensure_provider_runtime(args.provider)
+  _ensure_agent_runtime(args.agent)
 
   # Set active profile before any config loading
   from .config import set_profile, profile_path
@@ -395,8 +395,8 @@ def main():
 
   try:
     project_dir = os.path.abspath(args.project_dir)
-    from .agent_factory import default_model_for_provider
-    model = args.model or default_model_for_provider(args.provider)
+    from .agent_factory import default_model_for_agent
+    model = args.model or default_model_for_agent(args.agent)
     if not os.path.isdir(project_dir):
       return _startup_fail(f"Error: {project_dir} is not a directory")
 
@@ -457,7 +457,7 @@ def main():
   # to (endpoint, remote_model) so downstream code sees both the
   # routing config and the wire-format model id without the user having
   # to thread three flags. Unknown models pass through unchanged — they
-  # might be a raw provider slug like "claude-opus-4-7" or a custom
+  # might be a raw model slug like "claude-opus-4-7" or a custom
   # model the user added to ~/.nemo/models.json.
   from .coding_agent import EndpointConfig
   from .presets import resolve_preset
@@ -465,18 +465,18 @@ def main():
   endpoint_key = ""
   preset = resolve_preset(model)
   if preset is not None:
-    if not preset.supports(args.provider):
+    if not preset.supports(args.agent):
       return _startup_fail(
-        f"Error: preset {model!r} has no endpoint configured for "
-        f"--provider {args.provider}. Add anthropic_url/openai_url to "
-        f"~/.nemo/models.json or pick a different provider.")
+        f"Error: model {model!r} has no endpoint configured for "
+        f"--agent {args.agent}. Add the protocol block to its provider "
+        f"in ~/.nemo/models.json or pick a different agent.")
     if preset.api_key_env and not os.environ.get(preset.api_key_env):
       return _startup_fail(
-        f"Error: preset {model!r} requires ${preset.api_key_env}, "
+        f"Error: model {model!r} requires ${preset.api_key_env}, "
         f"which is unset. Export it (e.g. `export {preset.api_key_env}=...`) "
         f"and re-run.")
-    endpoint = preset.endpoint_for(args.provider)
-    model = preset.remote_for(args.provider)
+    endpoint = preset.endpoint_for(args.agent)
+    model = preset.remote_for(args.agent)
     # Key by the upstream URL, not the preset name — two presets that
     # hit the same gateway share signing keys and can safely share an
     # SDK session, while two presets at different URLs cannot.
@@ -487,7 +487,7 @@ def main():
   from .agent import main_loop
   try:
     return asyncio.run(main_loop(chat_id, project_dir, model,
-                                 provider=args.provider,
+                                 agent=args.agent,
                                  permission_mode=args.permission_mode,
                                  effort=args.effort,
                                  system_prompt=system_prompt,

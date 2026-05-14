@@ -1,4 +1,4 @@
-"""Tests for nemo.presets — preset registry + per-provider expansion."""
+"""Tests for nemo.presets — provider-grouped JSON registry."""
 
 from __future__ import annotations
 
@@ -7,13 +7,13 @@ import os
 from unittest import mock
 
 from nemo.presets import (
-  BUILTIN_PRESETS, Preset, _preset_from_dict,
+  Preset, _flatten_providers, _parse_api_key_env,
   load_presets, resolve_preset,
 )
 
 
 # ---------------------------------------------------------------------------
-# Preset.supports / .remote_for / .endpoint_for
+# Preset.supports / .remote_for / .endpoint_for — internal flat record
 # ---------------------------------------------------------------------------
 
 def test_supports_only_when_protocol_url_is_set():
@@ -21,7 +21,7 @@ def test_supports_only_when_protocol_url_is_set():
   assert p.supports("claude") is True
   assert p.supports("codex") is False
   # opencode is OK if either protocol is set — the SDK picks based on
-  # the model slug prefix, not the daemon's --provider flag.
+  # the model slug prefix, not the daemon's --agent flag.
   assert p.supports("opencode") is True
 
   p_neither = Preset(name="x")
@@ -30,17 +30,15 @@ def test_supports_only_when_protocol_url_is_set():
   assert p_neither.supports("opencode") is False
 
 
-def test_remote_for_falls_back_through_chain():
-  # Most specific to least specific: protocol-specific override →
-  # generic remote_name → preset name itself.
+def test_remote_for_falls_back_to_model_name():
+  # Per-protocol override → preset name itself.
   p = Preset(
     name="alias",
-    remote_name="generic",
-    anthropic_remote="anthropic-only",
-    openai_url="https://x", openai_remote="",
+    anthropic_url="https://a", anthropic_remote="anthropic-only",
+    openai_url="https://x",  # no openai_remote override
   )
   assert p.remote_for("claude") == "anthropic-only"
-  assert p.remote_for("codex") == "generic"  # falls through to remote_name
+  assert p.remote_for("codex") == "alias"  # falls through to name
 
   p2 = Preset(name="alias")  # no overrides anywhere
   assert p2.remote_for("claude") == "alias"
@@ -72,89 +70,177 @@ def test_endpoint_for_with_unset_env_returns_empty_key():
 
 
 # ---------------------------------------------------------------------------
-# _preset_from_dict
+# {env:VARNAME} apiKey parsing — secrets-in-config defence
 # ---------------------------------------------------------------------------
 
-def test_from_dict_happy_path():
-  p = _preset_from_dict("foo", {
-    "api_key_env": "K",
-    "remote_name": "foo-1",
-    "anthropic_url": "https://a",
-    "openai_url": "https://o",
-  })
-  assert p is not None
-  assert p.name == "foo"
-  assert p.api_key_env == "K"
-  assert p.remote_name == "foo-1"
+def test_parse_api_key_env_accepts_env_syntax():
+  assert _parse_api_key_env("{env:DEEPSEEK_API_KEY}", where="t") == "DEEPSEEK_API_KEY"
+  # Whitespace around the syntax is fine — JSON-paste-from-docs path.
+  assert _parse_api_key_env("  {env:FOO}  ", where="t") == "FOO"
 
 
-def test_from_dict_rejects_non_object():
-  assert _preset_from_dict("foo", "not-a-dict") is None
-  assert _preset_from_dict("foo", None) is None
-
-
-def test_from_dict_ignores_unknown_fields(caplog):
+def test_parse_api_key_env_rejects_plain_string(caplog):
   import logging
   with caplog.at_level(logging.WARNING, logger="nemo.presets"):
-    p = _preset_from_dict("foo", {
-      "anthropic_url": "https://a",
-      "weird_field": "ignored",
-      "another": 42,
-    })
-  assert p is not None
-  assert any("unknown fields" in r.getMessage() for r in caplog.records)
+    out = _parse_api_key_env("sk-secret-literal", where="provider.kimi.anthropic.apiKey")
+  # Plain literals are rejected so keys can't accidentally land in
+  # the JSON file (and from there dotfile backups, git, etc).
+  assert out == ""
+  assert any("{env:VARNAME}" in r.getMessage() for r in caplog.records)
 
 
-def test_from_dict_coerces_bad_field_types():
-  # Non-string field gets logged + reset to "" rather than crashing.
-  p = _preset_from_dict("foo", {
-    "anthropic_url": 123,  # not a string
-    "openai_url": "https://ok",
-  })
-  assert p is not None
-  assert p.anthropic_url == ""
-  assert p.openai_url == "https://ok"
+def test_parse_api_key_env_blank_or_missing_is_empty():
+  assert _parse_api_key_env("", where="t") == ""
+  assert _parse_api_key_env(None, where="t") == ""
 
 
 # ---------------------------------------------------------------------------
-# load_presets / resolve_preset / user overrides
+# Flattening: provider-grouped JSON → flat {name: Preset}
 # ---------------------------------------------------------------------------
 
-def test_builtin_includes_deepseek_v4_pro():
-  assert "deepseek-v4-pro" in BUILTIN_PRESETS
-  p = BUILTIN_PRESETS["deepseek-v4-pro"]
-  # DeepSeek's Anthropic endpoint advertises [1m]; OpenAI side does not.
-  assert p.anthropic_remote == "deepseek-v4-pro[1m]"
-  assert p.openai_remote == "deepseek-v4-pro"
-  assert p.api_key_env == "DEEPSEEK_API_KEY"
-
-
-def test_user_overrides_extend_and_replace_builtins(tmp_path):
-  override_path = tmp_path / "models.json"
-  override_path.write_text(json.dumps({
-    # New preset.
-    "router-claude": {
-      "api_key_env": "OPENROUTER_KEY",
-      "anthropic_url": "https://openrouter.ai/anthropic",
-      "remote_name": "anthropic/claude-sonnet-4-6",
+def test_flatten_kimi_anthropic_only():
+  presets = _flatten_providers({
+    "kimi": {
+      "anthropic": {
+        "baseURL": "https://api.kimi.com/coding",
+        "apiKey": "{env:KIMI_API_KEY}",
+      },
+      "models": {"kimi-for-coding": {}},
     },
-    # Overrides the builtin deepseek-v4-pro with a different api_key_env.
-    "deepseek-v4-pro": {
-      "api_key_env": "MY_DEEPSEEK_KEY",
-      "anthropic_url": "https://api.deepseek.com/anthropic",
-      "anthropic_remote": "deepseek-v4-pro[1m]",
-      "openai_url": "https://api.deepseek.com",
-      "openai_remote": "deepseek-v4-pro",
+  })
+  assert "kimi-for-coding" in presets
+  p = presets["kimi-for-coding"]
+  # OpenAI endpoint missing → /agent codex must not advertise it.
+  assert p.supports("claude") is True
+  assert p.supports("codex") is False
+  assert p.anthropic_url == "https://api.kimi.com/coding"
+  assert p.anthropic_remote == "kimi-for-coding"  # falls back to model name
+  assert p.api_key_env == "KIMI_API_KEY"
+
+
+def test_flatten_deepseek_dual_protocol_with_remote_override():
+  presets = _flatten_providers({
+    "deepseek": {
+      "anthropic": {
+        "baseURL": "https://api.deepseek.com/anthropic",
+        "apiKey": "{env:DEEPSEEK_API_KEY}",
+      },
+      "openai": {
+        "baseURL": "https://api.deepseek.com",
+        "apiKey": "{env:DEEPSEEK_API_KEY}",
+      },
+      "models": {
+        # Anthropic endpoint advertises [1m] context variant; OpenAI doesn't.
+        "deepseek-v4-pro": {"anthropic": {"remote": "deepseek-v4-pro[1m]"}},
+        # No override → both protocols send the bare model name.
+        "deepseek-v4-flash": {},
+      },
+    },
+  })
+  pro = presets["deepseek-v4-pro"]
+  assert pro.remote_for("claude") == "deepseek-v4-pro[1m]"
+  assert pro.remote_for("codex") == "deepseek-v4-pro"
+  flash = presets["deepseek-v4-flash"]
+  assert flash.remote_for("claude") == "deepseek-v4-flash"
+  assert flash.remote_for("codex") == "deepseek-v4-flash"
+
+
+def test_flatten_skips_provider_with_non_object_value(caplog):
+  import logging
+  with caplog.at_level(logging.WARNING, logger="nemo.presets"):
+    out = _flatten_providers({"weird": "not-an-object"})
+  assert out == {}
+  assert any("expected object" in r.getMessage() for r in caplog.records)
+
+
+def test_flatten_warns_and_skips_orphan_provider(caplog):
+  # User wrote ``models: { ... }`` but forgot the anthropic/openai
+  # block. Without a guard, flattening would produce Presets with
+  # empty URLs that vanish from /model — silently uncallable. Warn so
+  # the misconfig surfaces, and don't pretend the model exists.
+  import logging
+  with caplog.at_level(logging.WARNING, logger="nemo.presets"):
+    out = _flatten_providers({
+      "broken": {
+        "models": {"my-cool-model": {}},
+      },
+    })
+  assert "my-cool-model" not in out
+  assert any(
+    "no anthropic/openai block" in r.getMessage() and "broken" in r.getMessage()
+    for r in caplog.records
+  )
+
+
+# ---------------------------------------------------------------------------
+# load_presets / resolve_preset — file-based plumbing + user overrides
+# ---------------------------------------------------------------------------
+
+def test_load_presets_uses_package_builtin():
+  # Package ships kimi + deepseek out of the box; no user file needed.
+  os.environ.pop("DEEPSEEK_API_KEY", None)  # not required to *load* the catalog
+  presets = load_presets(user_path="/nonexistent/path")
+  assert "kimi-for-coding" in presets
+  assert "deepseek-v4-pro" in presets
+  assert "deepseek-v4-flash" in presets
+  # Verify the [1m] override survived JSON round-trip.
+  assert presets["deepseek-v4-pro"].anthropic_remote == "deepseek-v4-pro[1m]"
+  assert presets["deepseek-v4-pro"].openai_remote == "deepseek-v4-pro"
+
+
+def test_user_override_adds_new_provider(tmp_path):
+  user = tmp_path / "models.json"
+  user.write_text(json.dumps({
+    "providers": {
+      "router": {
+        "anthropic": {
+          "baseURL": "https://openrouter.ai/anthropic",
+          "apiKey": "{env:OPENROUTER_KEY}",
+        },
+        "models": {"anthropic/claude-sonnet-4-6": {}},
+      },
     },
   }))
-  presets = load_presets(path=str(override_path))
-  assert "router-claude" in presets
-  # Override: api_key_env replaced, builtin's value gone.
-  assert presets["deepseek-v4-pro"].api_key_env == "MY_DEEPSEEK_KEY"
+  presets = load_presets(user_path=str(user))
+  # Package builtins still there.
+  assert "kimi-for-coding" in presets
+  # New entry from user file.
+  assert "anthropic/claude-sonnet-4-6" in presets
+  assert presets["anthropic/claude-sonnet-4-6"].api_key_env == "OPENROUTER_KEY"
+
+
+def test_user_override_replaces_existing_provider(tmp_path):
+  # Provider-level replacement: redefining "deepseek" in the user file
+  # wipes the builtin's model list for that provider so the user fully
+  # owns it. Provider entries the user doesn't touch pass through.
+  user = tmp_path / "models.json"
+  user.write_text(json.dumps({
+    "providers": {
+      "deepseek": {
+        "anthropic": {
+          "baseURL": "https://api.deepseek.com/anthropic",
+          "apiKey": "{env:MY_OWN_KEY}",
+        },
+        "models": {"deepseek-v4-pro": {}},  # only one model now, no [1m]
+      },
+    },
+  }))
+  presets = load_presets(user_path=str(user))
+  # kimi untouched.
+  assert "kimi-for-coding" in presets
+  # deepseek-v4-flash no longer present (user provider entry replaced builtin).
+  assert "deepseek-v4-flash" not in presets
+  # User's deepseek-v4-pro replaces the builtin (different api_key_env, no [1m]).
+  pro = presets["deepseek-v4-pro"]
+  assert pro.api_key_env == "MY_OWN_KEY"
+  assert pro.anthropic_remote == "deepseek-v4-pro"  # no override now
 
 
 def test_resolve_preset_returns_none_for_unknown(tmp_path):
-  assert resolve_preset("definitely-not-a-real-model", path=str(tmp_path / "missing.json")) is None
+  assert resolve_preset(
+    "definitely-not-a-real-model",
+    user_path=str(tmp_path / "missing.json"),
+  ) is None
 
 
 def test_load_presets_handles_malformed_user_file(tmp_path, caplog):
@@ -162,10 +248,10 @@ def test_load_presets_handles_malformed_user_file(tmp_path, caplog):
   bad.write_text("{not valid json")
   import logging
   with caplog.at_level(logging.WARNING, logger="nemo.presets"):
-    out = load_presets(path=str(bad))
-  # Falls back to builtins only; log line surfaces the error.
+    out = load_presets(user_path=str(bad))
+  # Falls back to package builtins; log line surfaces the error.
   assert "deepseek-v4-pro" in out
-  assert "router-claude" not in out  # nothing user-defined survives
+  assert "kimi-for-coding" in out
   assert any("failed to read" in r.getMessage() for r in caplog.records)
 
 
@@ -174,6 +260,17 @@ def test_load_presets_user_file_top_level_must_be_object(tmp_path, caplog):
   bad.write_text(json.dumps(["not", "an", "object"]))
   import logging
   with caplog.at_level(logging.WARNING, logger="nemo.presets"):
-    out = load_presets(path=str(bad))
-  assert out == BUILTIN_PRESETS  # untouched
+    out = load_presets(user_path=str(bad))
+  # Builtins untouched.
+  assert "deepseek-v4-pro" in out
   assert any("expected an object" in r.getMessage() for r in caplog.records)
+
+
+def test_kimi_anthropic_only_visible_in_codex_picker():
+  # Regression: Kimi For Coding gates its OpenAI endpoint
+  # (access_terminated_error for this tier). Make sure /agent codex
+  # never advertises it.
+  p = resolve_preset("kimi-for-coding")
+  assert p is not None
+  assert p.supports("claude") is True
+  assert p.supports("codex") is False

@@ -49,10 +49,10 @@ class _FakeDB:
   def get_session(self, _session_id):
     return {}
 
-  def get_sdk_session_id(self, _chat_id, _provider, _endpoint_key=""):
+  def get_sdk_session_id(self, _chat_id, _agent, _endpoint_key=""):
     return ""
 
-  def set_sdk_session_id(self, _chat_id, _sdk_session_id, _provider, _endpoint_key=""):
+  def set_sdk_session_id(self, _chat_id, _sdk_session_id, _agent, _endpoint_key=""):
     pass
 
 
@@ -86,7 +86,7 @@ class _FakeChannel:
   async def send_text(self, _chat_id, _text):
     return "om_text"
 
-  async def update_status(self, _model, _state, _provider=""):
+  async def update_status(self, _model, _state, _agent=""):
     pass
 
   async def receive(self, timeout=300):
@@ -284,12 +284,12 @@ def test_pacing_hint_prepended_after_timeout(tmp_path):
     assert not later.startswith("[Nemo 系统提示]"), later
 
 
-def test_main_loop_threads_provider_through_db_calls(tmp_path):
-  """Per-provider session storage requires the daemon's --provider to
+def test_main_loop_threads_agent_through_db_calls(tmp_path):
+  """Per-agent session storage requires the daemon's --agent to
   reach both db.get_sdk_session_id (resume lookup at startup) and
   db.set_sdk_session_id (write back from DoneEvent.session_id). A
   typo or a missed kwarg silently degrades back to the old
-  provider-blind behavior."""
+  agent-blind behavior."""
   from nemo.channel import IncomingMessage
 
   recorded_get: list[tuple[str, str, str]] = []
@@ -301,13 +301,13 @@ def test_main_loop_threads_provider_through_db_calls(tmp_path):
       # otherwise the early-out would skip the lookup entirely.
       return "old_session"
 
-    def get_sdk_session_id(self, chat_id, provider, endpoint_key=""):
-      recorded_get.append((chat_id, provider, endpoint_key))
+    def get_sdk_session_id(self, chat_id, agent, endpoint_key=""):
+      recorded_get.append((chat_id, agent, endpoint_key))
       return ""
 
-    def set_sdk_session_id(self, chat_id, sdk_session_id, provider,
+    def set_sdk_session_id(self, chat_id, sdk_session_id, agent,
                            endpoint_key=""):
-      recorded_set.append((chat_id, sdk_session_id, provider, endpoint_key))
+      recorded_set.append((chat_id, sdk_session_id, agent, endpoint_key))
 
   class _SessionEmittingAgent(_FakeAgent):
     async def run_turn(self, _prompt, on_event):
@@ -346,15 +346,15 @@ def test_main_loop_threads_provider_through_db_calls(tmp_path):
        mock.patch("nemo.config.load_relay_config", return_value=("", "")), \
        mock.patch("signal.signal"):
     rc = asyncio.run(
-      main_loop("oc_test", str(tmp_path), "gpt-5.5", provider="codex")
+      main_loop("oc_test", str(tmp_path), "gpt-5.5", agent="codex")
     )
   assert rc == 0
 
-  # Read path: provider is correctly threaded into get_sdk_session_id.
+  # Read path: agent is correctly threaded into get_sdk_session_id.
   # Default endpoint at startup → endpoint_key="".
   assert recorded_get == [("oc_test", "codex", "")], recorded_get
   # Write path: DoneEvent.session_id reaches the codex column, not a
-  # provider-blind one. Default endpoint stays under endpoint_key="".
+  # agent-blind one. Default endpoint stays under endpoint_key="".
   assert ("oc_test", "codex-thread-xyz", "codex", "") in recorded_set, recorded_set
 
 
@@ -403,7 +403,7 @@ def test_model_switch_to_preset_sets_endpoint_and_remote_name(tmp_path):
        mock.patch("nemo.config.load_relay_config", return_value=("", "")), \
        mock.patch("signal.signal"):
     rc = asyncio.run(
-      main_loop("oc_test", str(tmp_path), "claude-opus-4-7", provider="claude")
+      main_loop("oc_test", str(tmp_path), "claude-opus-4-7", agent="claude")
     )
   assert rc == 0
   # Endpoint gets flipped exactly once with the DeepSeek anthropic URL
@@ -452,17 +452,17 @@ def test_model_switch_isolates_session_per_endpoint(tmp_path):
 
     def __init__(self, project_dir):
       super().__init__(project_dir)
-      # Persisted store: {(chat, provider, endpoint_key): sdk_session_id}
+      # Persisted store: {(chat, agent, endpoint_key): sdk_session_id}
       self._store: dict[tuple[str, str, str], str] = {
         ("oc_test", "claude", ""): "default-uuid",
       }
 
-    def get_sdk_session_id(self, chat_id, provider, endpoint_key=""):
-      return self._store.get((chat_id, provider, endpoint_key), "")
+    def get_sdk_session_id(self, chat_id, agent, endpoint_key=""):
+      return self._store.get((chat_id, agent, endpoint_key), "")
 
-    def set_sdk_session_id(self, chat_id, sdk_session_id, provider,
+    def set_sdk_session_id(self, chat_id, sdk_session_id, agent,
                            endpoint_key=""):
-      self._store[(chat_id, provider, endpoint_key)] = sdk_session_id
+      self._store[(chat_id, agent, endpoint_key)] = sdk_session_id
 
   queued = _QueuedChannel("oc_test", [
     IncomingMessage(
@@ -494,7 +494,7 @@ def test_model_switch_isolates_session_per_endpoint(tmp_path):
        mock.patch("nemo.config.load_relay_config", return_value=("", "")), \
        mock.patch("signal.signal"):
     rc = asyncio.run(
-      main_loop("oc_test", str(tmp_path), "claude-opus-4-7", provider="claude")
+      main_loop("oc_test", str(tmp_path), "claude-opus-4-7", agent="claude")
     )
   assert rc == 0
 
@@ -542,12 +542,12 @@ def test_model_swap_within_same_endpoint_keeps_session(tmp_path):
         ("oc_test", "claude", ""): "default-uuid",
       }
 
-    def get_sdk_session_id(self, chat_id, provider, endpoint_key=""):
-      return self._store.get((chat_id, provider, endpoint_key), "")
+    def get_sdk_session_id(self, chat_id, agent, endpoint_key=""):
+      return self._store.get((chat_id, agent, endpoint_key), "")
 
-    def set_sdk_session_id(self, chat_id, sdk_session_id, provider,
+    def set_sdk_session_id(self, chat_id, sdk_session_id, agent,
                            endpoint_key=""):
-      self._store[(chat_id, provider, endpoint_key)] = sdk_session_id
+      self._store[(chat_id, agent, endpoint_key)] = sdk_session_id
 
   queued = _QueuedChannel("oc_test", [
     # Start on claude-opus-4-7 (default endpoint). Switch to sonnet,
@@ -581,7 +581,7 @@ def test_model_swap_within_same_endpoint_keeps_session(tmp_path):
        mock.patch("nemo.config.load_relay_config", return_value=("", "")), \
        mock.patch("signal.signal"):
     rc = asyncio.run(
-      main_loop("oc_test", str(tmp_path), "claude-opus-4-7", provider="claude")
+      main_loop("oc_test", str(tmp_path), "claude-opus-4-7", agent="claude")
     )
   assert rc == 0
 
@@ -596,8 +596,8 @@ def test_model_swap_within_same_endpoint_keeps_session(tmp_path):
   assert reset_calls[1][0] == "claude-haiku-4-5", reset_calls
 
 
-def _run_provider_switch(tmp_path, *, prior_codex_session: str = ""):
-  """Helper: drive main_loop through /provider codex (then /exit).
+def _run_agent_switch(tmp_path, *, prior_codex_session: str = ""):
+  """Helper: drive main_loop through /agent codex (then /exit).
 
   Returns (start_calls, send_calls). prior_codex_session controls
   whether the spy DB advertises a stored codex session id for this
@@ -616,9 +616,9 @@ def _run_provider_switch(tmp_path, *, prior_codex_session: str = ""):
     def get_chat_owner(self, _chat_id):
       return None
 
-    def get_sdk_session_id(self, chat_id, provider, endpoint_key=""):
+    def get_sdk_session_id(self, chat_id, agent, endpoint_key=""):
       del chat_id, endpoint_key
-      if provider == "codex":
+      if agent == "codex":
         return prior_codex_session
       return ""
 
@@ -629,7 +629,7 @@ def _run_provider_switch(tmp_path, *, prior_codex_session: str = ""):
     IncomingMessage(
       event_type="im.message.receive_v1", chat_id="oc_test",
       sender_id="ou_user", message_id="om_switch", msg_type="text",
-      text="/provider codex", create_time="1",
+      text="/agent codex", create_time="1",
     ),
     IncomingMessage(
       event_type="im.message.receive_v1", chat_id="oc_test",
@@ -657,37 +657,37 @@ def _run_provider_switch(tmp_path, *, prior_codex_session: str = ""):
        mock.patch("nemo.config.load_relay_config", return_value=("", "")), \
        mock.patch("signal.signal"):
     rc = asyncio.run(
-      main_loop("oc_test", str(tmp_path), "claude-opus-4-7", provider="claude")
+      main_loop("oc_test", str(tmp_path), "claude-opus-4-7", agent="claude")
     )
   assert rc == 0
   return start_calls, send_calls
 
 
-def test_provider_switch_rebuilds_agent_with_new_default(tmp_path):
-  """`/provider codex` from a Claude daemon must (a) stop the old
+def test_agent_switch_rebuilds_agent_with_new_default(tmp_path):
+  """`/agent codex` from a Claude daemon must (a) stop the old
   agent, (b) build a fresh agent for codex, (c) reset model to
-  gpt-5.5 (codex default), (d) load the per-provider session id, (e)
+  gpt-5.5 (codex default), (d) load the per-agent session id, (e)
   call agent.start with the new model + that session id."""
-  start_calls, _ = _run_provider_switch(
+  start_calls, _ = _run_agent_switch(
     tmp_path, prior_codex_session="codex-thread-prev")
   # Two start()s: the original at boot (claude default model) and the
-  # post-switch one (codex default + per-provider resume id).
+  # post-switch one (codex default + per-agent resume id).
   assert start_calls[0] == ("claude-opus-4-7", ""), start_calls
   assert start_calls[1] == ("gpt-5.5", "codex-thread-prev"), start_calls
 
 
-def test_provider_switch_message_says_resumed_when_prior_session_exists(tmp_path):
-  """Confirmation card after /provider must tell the user their
-  context is the new provider's *own* prior history — not the
-  previous provider's. Otherwise users hit "did the bot forget?"
-  surprises when each provider has its own session column."""
-  _, send_calls = _run_provider_switch(
+def test_agent_switch_message_says_resumed_when_prior_session_exists(tmp_path):
+  """Confirmation card after /agent must tell the user their
+  context is the new agent's *own* prior history — not the
+  previous agent's. Otherwise users hit "did the bot forget?"
+  surprises when each agent has its own session column."""
+  _, send_calls = _run_agent_switch(
     tmp_path, prior_codex_session="codex-thread-9876ab")
   # Find the switch confirmation among the send_response calls.
   switch_msg = next(
-    (m for m in send_calls if "Switched to provider" in m), None)
+    (m for m in send_calls if "Switched to agent" in m), None)
   assert switch_msg is not None, send_calls
-  # Mentions resume + the codex session prefix + the cross-provider
+  # Mentions resume + the codex session prefix + the cross-agent
   # isolation note.
   assert "Resuming" in switch_msg
   assert "codex" in switch_msg
@@ -695,13 +695,13 @@ def test_provider_switch_message_says_resumed_when_prior_session_exists(tmp_path
   assert "does not see" in switch_msg
 
 
-def test_provider_switch_message_says_fresh_when_no_prior_session(tmp_path):
-  """First-time switch: new provider has no stored session id for
+def test_agent_switch_message_says_fresh_when_no_prior_session(tmp_path):
+  """First-time switch: new agent has no stored session id for
   this chat → the card should say "Fresh" and explain the other
-  providers' transcripts are still around when you switch back."""
-  _, send_calls = _run_provider_switch(tmp_path, prior_codex_session="")
+  agents' transcripts are still around when you switch back."""
+  _, send_calls = _run_agent_switch(tmp_path, prior_codex_session="")
   switch_msg = next(
-    (m for m in send_calls if "Switched to provider" in m), None)
+    (m for m in send_calls if "Switched to agent" in m), None)
   assert switch_msg is not None, send_calls
   assert "Fresh" in switch_msg
   assert "codex" in switch_msg
@@ -709,7 +709,7 @@ def test_provider_switch_message_says_fresh_when_no_prior_session(tmp_path):
   assert "switching back" in switch_msg.lower()
 
 
-def test_codex_provider_rejects_claude_model_switch(tmp_path):
+def test_codex_agent_rejects_claude_model_switch(tmp_path):
   from nemo.channel import IncomingMessage
 
   class _TrackResetAgent(_FakeAgent):
@@ -751,7 +751,7 @@ def test_codex_provider_rejects_claude_model_switch(tmp_path):
        mock.patch("nemo.config.load_relay_config", return_value=("", "")), \
        mock.patch("signal.signal"):
     result = asyncio.run(
-      main_loop("oc_test", str(tmp_path), "gpt-5.5", provider="codex")
+      main_loop("oc_test", str(tmp_path), "gpt-5.5", agent="codex")
     )
 
   assert result == 0

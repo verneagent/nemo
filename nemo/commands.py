@@ -29,7 +29,7 @@ def _format_model_catalog(catalog) -> str:
     lines.append("Note: " + catalog.note)
   return "\n".join(lines) if lines else "(no models configured)"
 
-# What each effort level actually does per provider.
+# What each effort level actually does per agent kind.
 _EFFORT_DETAIL: dict[str, dict[str, str]] = {
   "claude": {
     "": "high (SDK default)",
@@ -59,14 +59,14 @@ class AgentContext:
   """Minimal context for command handlers."""
 
   def __init__(self, model: str, project_dir: str, start_time: float):
-    from .agent_factory import AgentProvider
+    from .agent_factory import AgentKind
     self.model = model
     self.project_dir = project_dir
     self.start_time = start_time
     self.msg_count = 0
     self.total_cost = 0.0
     self.effort = ""
-    self.provider: AgentProvider = "claude"
+    self.agent: AgentKind = "claude"
 
 
 # Each handler returns (handled: bool, response_text: str | None).
@@ -90,46 +90,46 @@ def try_dispatch(text: str, ctx: AgentContext) -> tuple[bool, str | None]:
 
   # /model
   if t.startswith("/model"):
-    from .agent_factory import is_model_compatible, model_catalog_for_provider
-    catalog = model_catalog_for_provider(ctx.provider, ctx.project_dir)
+    from .agent_factory import is_model_compatible, model_catalog_for_agent
+    catalog = model_catalog_for_agent(ctx.agent, ctx.project_dir)
     listing = _format_model_catalog(catalog)
     parts = text.strip().split(None, 1)
     if len(parts) >= 2:
       new_model = parts[1].strip()
-      if not is_model_compatible(ctx.provider, new_model, ctx.project_dir):
+      if not is_model_compatible(ctx.agent, new_model, ctx.project_dir):
         return True, (
-          f"Unknown model `{new_model}` for provider **{ctx.provider}**.\n\n"
+          f"Unknown model `{new_model}` for agent **{ctx.agent}**.\n\n"
           f"{listing}"
         )
       return True, f"__model__:{new_model}"
     return True, (
-      f"Current model: **{ctx.model}** (provider **{ctx.provider}**)\n\n"
+      f"Current model: **{ctx.model}** (agent **{ctx.agent}**)\n\n"
       f"{listing}\n\nUsage: `/model <name>`"
     )
 
-  # /provider
-  if t.startswith("/provider"):
-    from .agent_factory import default_model_for_provider
+  # /agent
+  if t.startswith("/agent"):
+    from .agent_factory import default_model_for_agent
     valid = ("claude", "codex", "opencode")
     parts = text.strip().split(None, 1)
     if len(parts) >= 2:
       arg = parts[1].strip().lower()
       if arg not in valid:
         return True, (
-          f"Unknown provider `{arg}`. "
-          f"Use `/provider claude|codex|opencode`."
+          f"Unknown agent `{arg}`. "
+          f"Use `/agent claude|codex|opencode`."
         )
-      if arg == ctx.provider:
-        return True, f"Already on provider **{ctx.provider}**."
-      default_model = default_model_for_provider(arg)  # type: ignore[arg-type]
-      return True, f"__provider__:{arg}:{default_model}"
+      if arg == ctx.agent:
+        return True, f"Already on agent **{ctx.agent}**."
+      default_model = default_model_for_agent(arg)  # type: ignore[arg-type]
+      return True, f"__agent__:{arg}:{default_model}"
     return True, (
-      f"Current provider: **{ctx.provider}** (model **{ctx.model}**)\n\n"
+      f"Current agent: **{ctx.agent}** (model **{ctx.model}**)\n\n"
       f"Available: `claude`, `codex`, `opencode`. "
-      f"Switching resets the model to that provider's default and "
-      f"keeps each provider's last session id separately, so flipping "
+      f"Switching resets the model to that agent's default and "
+      f"keeps each agent's last session id separately, so flipping "
       f"back resumes the prior conversation.\n\n"
-      f"Usage: `/provider <name>`"
+      f"Usage: `/agent <name>`"
     )
 
   # /effort
@@ -146,7 +146,7 @@ def try_dispatch(text: str, ctx: AgentContext) -> tuple[bool, str | None]:
         f"Use `/effort low|medium|high|max|default`."
       )
     current = ctx.effort or "default"
-    detail_map = _EFFORT_DETAIL.get(ctx.provider, {})
+    detail_map = _EFFORT_DETAIL.get(ctx.agent, {})
     detail = detail_map.get(ctx.effort, "")
     hint = f" — {detail}" if detail else ""
     return True, (
@@ -193,11 +193,11 @@ def try_dispatch(text: str, ctx: AgentContext) -> tuple[bool, str | None]:
 
   # /usage
   if t in ("/usage", "usage"):
-    if ctx.provider == "claude":
+    if ctx.agent == "claude":
       return True, "Plan usage: [claude.ai/settings/usage](https://claude.ai/settings/usage)"
-    if ctx.provider == "opencode":
-      return True, "Usage is provider-specific under OpenCode. Run `opencode stats` locally for totals."
-    return True, "Usage is provider-specific for this agent. Check the local CLI/account UI for totals."
+    if ctx.agent == "opencode":
+      return True, "Usage is agent-specific under OpenCode. Run `opencode stats` locally for totals."
+    return True, "Usage is agent-specific. Check the local CLI/account UI for totals."
 
   # /help
   if t in ("/help", "help", "帮助"):
@@ -207,8 +207,8 @@ def try_dispatch(text: str, ctx: AgentContext) -> tuple[bool, str | None]:
       "|---|---|\n"
       "| `/model` | Show current model |\n"
       "| `/model <name>` | Switch model |\n"
-      "| `/provider` | Show current provider |\n"
-      "| `/provider <claude\\|codex\\|opencode>` | Switch provider (resets to its default model) |\n"
+      "| `/agent` | Show current agent |\n"
+      "| `/agent <claude\\|codex\\|opencode>` | Switch coding agent (resets to its default model) |\n"
       "| `/effort` | Show current reasoning effort |\n"
       "| `/effort <low\\|medium\\|high\\|max\\|default>` | Set reasoning effort |\n"
       "| `/clear` | Reset conversation |\n"
@@ -341,7 +341,7 @@ def try_dispatch(text: str, ctx: AgentContext) -> tuple[bool, str | None]:
 
 # Commands that require SDK restart — NOT safe during a turn.
 _NEEDS_SDK = ("__clear__", "__undo_clear__", "__esc__",
-              "__model__:", "__cd__:", "__provider__:")
+              "__model__:", "__cd__:", "__agent__:")
 
 
 def is_inline_safe(response: str | None) -> bool:

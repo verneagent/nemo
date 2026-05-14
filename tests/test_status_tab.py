@@ -47,7 +47,7 @@ def test_update_creates_both_tabs():
     with mock.patch("nemo.lark.api.create_chat_tab") as mock_create:
       update_status("tok", "oc_1", "opus", "idle")
   assert mock_create.call_count == 2
-  # First call: status tab (emoji only — no provider passed)
+  # First call: status tab (emoji only — no agent passed)
   assert mock_create.call_args_list[0][0][2] == "🟢"
   assert _STATUS_MARKER in mock_create.call_args_list[0][0][3]
   # Second call: model tab
@@ -55,13 +55,13 @@ def test_update_creates_both_tabs():
   assert _MODEL_MARKER in mock_create.call_args_list[1][0][3]
 
 
-def test_update_creates_status_tab_with_provider_label():
-  """When the caller passes a provider, the status tab name is
-  ``<emoji> <provider>`` so the user can see the active adapter
+def test_update_creates_status_tab_with_agent_label():
+  """When the caller passes a agent, the status tab name is
+  ``<emoji> <agent>`` so the user can see the active adapter
   alongside the WS health dot."""
   with mock.patch("nemo.lark.api.list_chat_tabs", return_value=[]):
     with mock.patch("nemo.lark.api.create_chat_tab") as mock_create:
-      update_status("tok", "oc_1", "gpt-5.5", "idle", provider="codex")
+      update_status("tok", "oc_1", "gpt-5.5", "idle", agent="codex")
   # Status tab created with "🟢 codex".
   assert mock_create.call_args_list[0][0][2] == "🟢 codex"
 
@@ -74,14 +74,14 @@ def test_update_status_emoji():
     with mock.patch("nemo.lark.api.update_chat_tab") as mock_update:
       with mock.patch("nemo.lark.api.create_chat_tab") as mock_create:
         update_status("tok", "oc_1", "opus", "working")
-  # Status tab updated to 🟡 (no provider passed).
+  # Status tab updated to 🟡 (no agent passed).
   mock_update.assert_called_once()
   assert mock_update.call_args[0][3] == "🟡"
   mock_create.assert_not_called()
 
 
-def test_update_status_changes_provider_label():
-  """Switching provider while status is unchanged still rewrites the
+def test_update_status_changes_agent_label():
+  """Switching agent while status is unchanged still rewrites the
   tab — `🟢 claude` → `🟢 codex` differs even though the emoji
   doesn't."""
   tabs = [
@@ -90,7 +90,7 @@ def test_update_status_changes_provider_label():
   ]
   with mock.patch("nemo.lark.api.list_chat_tabs", return_value=tabs):
     with mock.patch("nemo.lark.api.update_chat_tab") as mock_update:
-      update_status("tok", "oc_1", "opus", "idle", provider="codex")
+      update_status("tok", "oc_1", "opus", "idle", agent="codex")
   mock_update.assert_called_once()
   assert mock_update.call_args[0][3] == "🟢 codex"
 
@@ -106,13 +106,13 @@ def test_update_status_skips_same_emoji():
 
 
 def test_update_status_skips_when_label_unchanged():
-  """If the existing tab already shows the same emoji + provider, no
+  """If the existing tab already shows the same emoji + agent, no
   PATCH fires — avoids spurious Lark API churn on every turn."""
   tabs = [_make_tab("t1", "🟢 claude", TAB_URL),
           _make_tab("t2", "opus", MODEL_TAB_URL)]
   with mock.patch("nemo.lark.api.list_chat_tabs", return_value=tabs):
     with mock.patch("nemo.lark.api.update_chat_tab") as mock_update:
-      update_status("tok", "oc_1", "opus", "idle", provider="claude")
+      update_status("tok", "oc_1", "opus", "idle", agent="claude")
   mock_update.assert_not_called()
 
 

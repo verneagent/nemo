@@ -6,7 +6,7 @@ import asyncio
 from pathlib import Path
 from unittest import mock
 
-from nemo.agent_factory import build_coding_agent, default_model_for_provider, is_model_compatible
+from nemo.agent_factory import build_coding_agent, default_model_for_agent, is_model_compatible
 from nemo.claude_agent import ClaudeCodingAgent
 from nemo.codex_agent import CodexCodingAgent, _SIDE_CAR_SCRIPT
 from nemo.turn import AnswerEvent, DoneEvent, ProgressEvent
@@ -68,11 +68,11 @@ class _FakeProc:
     self.returncode = -9
 
 
-def test_default_model_for_provider():
-  assert default_model_for_provider("claude") == "claude-opus-4-7"
+def test_default_model_for_agent():
+  assert default_model_for_agent("claude") == "claude-opus-4-7"
   # Codex default must work for both ChatGPT subscribers and API users —
   # the codex-specialized (-codex) slugs are API-only.
-  assert default_model_for_provider("codex") == "gpt-5.5"
+  assert default_model_for_agent("codex") == "gpt-5.5"
 
 
 def test_is_model_compatible():

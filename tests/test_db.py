@@ -28,7 +28,7 @@ def test_get_session_nonexistent(tmp_path):
 
 
 def test_deactivate_keeps_row_for_resume(tmp_path):
-  # deactivate must preserve the sessions row so the per-provider resume
+  # deactivate must preserve the sessions row so the per-agent resume
   # ids survive clean shutdown and the next boot can resume the
   # coding-agent thread. Ownership fields get overwritten by the next
   # activate().
@@ -47,7 +47,7 @@ def test_deactivate_keeps_row_for_resume(tmp_path):
 def test_activate_after_deactivate_preserves_sdk_session_id(tmp_path):
   # Simulates the real restart flow: old daemon deactivates, new daemon
   # activates with a fresh session_id. The INSERT OR REPLACE on the
-  # chat_id UNIQUE conflict must carry the per-provider resume ids over.
+  # chat_id UNIQUE conflict must carry the per-agent resume ids over.
   with mock.patch("nemo.db.DB_BASE", str(tmp_path)):
     db = Database(str(tmp_path / "project"))
     db.activate("sess1", "chat1", "opus")
@@ -59,8 +59,8 @@ def test_activate_after_deactivate_preserves_sdk_session_id(tmp_path):
     db.close()
 
 
-def test_per_provider_session_ids_isolated(tmp_path):
-  # Switching provider must NOT cross-pollute resume targets — Codex
+def test_per_agent_session_ids_isolated(tmp_path):
+  # Switching agent must NOT cross-pollute resume targets — Codex
   # rejects Claude UUIDs and vice versa, the resume-fallback would mask
   # the failure but waste a turn.
   with mock.patch("nemo.db.DB_BASE", str(tmp_path)):
@@ -72,21 +72,21 @@ def test_per_provider_session_ids_isolated(tmp_path):
     assert db.get_sdk_session_id("chat1", "claude") == "claude-uuid"
     assert db.get_sdk_session_id("chat1", "codex") == "codex-thread"
     assert db.get_sdk_session_id("chat1", "opencode") == "opencode-sess"
-    # Each provider's slot survives a deactivate + reactivate.
+    # Each agent's slot survives a deactivate + reactivate.
     db.deactivate("sess1")
     db.activate("sess2", "chat1", "opus")
     assert db.get_sdk_session_id("chat1", "claude") == "claude-uuid"
     assert db.get_sdk_session_id("chat1", "codex") == "codex-thread"
     assert db.get_sdk_session_id("chat1", "opencode") == "opencode-sess"
-    # Unknown provider is a no-op rather than a crash.
+    # Unknown agent is a no-op rather than a crash.
     assert db.get_sdk_session_id("chat1", "bogus") == ""
     db.set_sdk_session_id("chat1", "ignored", "bogus")  # silent
     assert db.get_sdk_session_id("chat1", "claude") == "claude-uuid"  # unchanged
     db.close()
 
 
-def test_per_endpoint_sessions_isolated_within_provider(tmp_path):
-  # Within one provider, different upstream endpoints (default Anthropic
+def test_per_endpoint_sessions_isolated_within_agent(tmp_path):
+  # Within one agent, different upstream endpoints (default Anthropic
   # vs DeepSeek's Anthropic-compatible gateway) must keep separate
   # session ids. Otherwise resuming a DeepSeek-produced transcript
   # against real Anthropic surfaces as
@@ -108,7 +108,7 @@ def test_per_endpoint_sessions_isolated_within_provider(tmp_path):
     assert db.get_sdk_session_id("chat1", "claude") == "anthropic-uuid"
     assert db.get_sdk_session_id("chat1", "claude", "") == "anthropic-uuid"
     assert db.get_sdk_session_id("chat1", "claude", ds_url) == "deepseek-uuid"
-    # Unknown endpoint_key for a known provider → empty (start fresh)
+    # Unknown endpoint_key for a known agent → empty (start fresh)
     # rather than falling back to another endpoint's id.
     assert db.get_sdk_session_id(
       "chat1", "claude", "https://other-vendor.example/anthropic") == ""
@@ -125,9 +125,9 @@ def test_per_endpoint_sessions_isolated_within_provider(tmp_path):
 
 
 def test_legacy_sdk_session_id_does_not_backfill(tmp_path):
-  # Pre-0.3.87 DB has sdk_session_id populated and per-provider columns
+  # Pre-0.3.87 DB has sdk_session_id populated and per-agent columns
   # missing. We deliberately do NOT copy the legacy id into any new
-  # column on first upgrade: the old column was provider-blind, so a
+  # column on first upgrade: the old column was agent-blind, so a
   # codex thread id could end up in there. Feeding that to claude on
   # the next daemon spawn would make the SDK subprocess silently exit
   # 1 (Claude has no lazy-throw resume fallback). Better to lose one
@@ -156,23 +156,151 @@ def test_legacy_sdk_session_id_does_not_backfill(tmp_path):
   """)
   conn.execute(
     "INSERT INTO sessions (session_id, chat_id, sdk_session_id) "
-    "VALUES ('legacy', 'chat-old', 'opaque-id-of-unknown-provider')"
+    "VALUES ('legacy', 'chat-old', 'opaque-id-of-unknown-agent')"
   )
   conn.commit()
   conn.close()
 
   with mock.patch("nemo.db.DB_BASE", str(tmp_path)):
     db = Database(proj)
-    # All per-provider columns must be empty. The legacy column is
+    # All per-agent columns must be empty. The legacy column is
     # left alone (legacy readers can still see it), but nothing flows
     # into the new columns.
-    for provider in ("claude", "codex", "opencode"):
-      assert db.get_sdk_session_id("chat-old", provider) == "", provider
+    for agent in ("claude", "codex", "opencode"):
+      assert db.get_sdk_session_id("chat-old", agent) == "", agent
     # Legacy column itself untouched.
     legacy = db._conn.execute(
       "SELECT sdk_session_id FROM sessions WHERE chat_id = ?", ("chat-old",)
     ).fetchone()
-    assert legacy[0] == "opaque-id-of-unknown-provider"
+    assert legacy[0] == "opaque-id-of-unknown-agent"
+    db.close()
+
+
+def test_migrates_legacy_provider_sessions_table(tmp_path):
+  # Existing user DBs from before the agent rename have a
+  # provider_sessions table with a `provider` column. _ensure_tables
+  # must rename both in place so resume data isn't lost on upgrade.
+  # Schema strings here are the literal LEGACY shape — do not "fix"
+  # them to the new names, that's the whole point.
+  import sqlite3
+
+  from nemo.db import _db_path
+
+  proj = str(tmp_path / "project")
+  with mock.patch("nemo.db.DB_BASE", str(tmp_path)):
+    legacy_path = _db_path(proj)
+  conn = sqlite3.connect(legacy_path)
+  conn.execute("""
+    CREATE TABLE provider_sessions (
+      chat_id TEXT NOT NULL,
+      provider TEXT NOT NULL,
+      endpoint_key TEXT NOT NULL DEFAULT '',
+      sdk_session_id TEXT NOT NULL DEFAULT '',
+      PRIMARY KEY (chat_id, provider, endpoint_key)
+    )
+  """)
+  conn.execute(
+    "INSERT INTO provider_sessions (chat_id, provider, endpoint_key, sdk_session_id) "
+    "VALUES ('chat1', 'claude', 'https://api.deepseek.com/anthropic', 'preserved-uuid')"
+  )
+  conn.commit()
+  conn.close()
+
+  with mock.patch("nemo.db.DB_BASE", str(tmp_path)):
+    db = Database(proj)
+    # Old table gone, new table exists with the data.
+    tables = {
+      row[0] for row in db._conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'"
+      )
+    }
+    assert "provider_sessions" not in tables
+    assert "agent_sessions" in tables
+    # Column was also renamed.
+    cols = {row[1] for row in db._conn.execute("PRAGMA table_info(agent_sessions)")}
+    assert "agent" in cols
+    assert "provider" not in cols
+    # Resume id survived.
+    assert db.get_sdk_session_id(
+      "chat1", "claude", "https://api.deepseek.com/anthropic"
+    ) == "preserved-uuid"
+    db.close()
+
+
+def test_migration_is_idempotent(tmp_path):
+  # _ensure_tables runs every connect(). On a DB that already migrated,
+  # the migration must be a no-op — otherwise repeated daemon restarts
+  # would crash with "table agent_sessions already exists" or worse.
+  with mock.patch("nemo.db.DB_BASE", str(tmp_path)):
+    db = Database(str(tmp_path / "project"))
+    db.activate("sess1", "chat1", "opus")
+    db.set_sdk_session_id("chat1", "uuid-1", "claude",
+                          "https://api.deepseek.com/anthropic")
+    db.close()
+    # Second open re-runs _ensure_tables on a DB that has agent_sessions
+    # already. Nothing should break and the data should persist.
+    db2 = Database(str(tmp_path / "project"))
+    assert db2.get_sdk_session_id(
+      "chat1", "claude", "https://api.deepseek.com/anthropic"
+    ) == "uuid-1"
+    db2.close()
+
+
+def test_migration_recovers_from_partial_state(tmp_path):
+  # Pathological state: an interrupted previous migration left both
+  # tables — provider_sessions has real data, agent_sessions exists but
+  # is empty (e.g. created by CREATE TABLE IF NOT EXISTS before the
+  # RENAME ran). _migrate_provider_to_agent must drop the empty new
+  # table and let the rename complete, not bail out silently.
+  import sqlite3
+
+  from nemo.db import _db_path
+
+  proj = str(tmp_path / "project")
+  with mock.patch("nemo.db.DB_BASE", str(tmp_path)):
+    legacy_path = _db_path(proj)
+  conn = sqlite3.connect(legacy_path)
+  # Legacy table with data.
+  conn.execute("""
+    CREATE TABLE provider_sessions (
+      chat_id TEXT NOT NULL,
+      provider TEXT NOT NULL,
+      endpoint_key TEXT NOT NULL DEFAULT '',
+      sdk_session_id TEXT NOT NULL DEFAULT '',
+      PRIMARY KEY (chat_id, provider, endpoint_key)
+    )
+  """)
+  conn.execute(
+    "INSERT INTO provider_sessions (chat_id, provider, endpoint_key, sdk_session_id) "
+    "VALUES ('chat1', 'claude', 'https://example.com', 'survived')"
+  )
+  # New table from a half-completed prior migration (empty, with the
+  # final schema shape — what CREATE TABLE IF NOT EXISTS would produce).
+  conn.execute("""
+    CREATE TABLE agent_sessions (
+      chat_id TEXT NOT NULL,
+      agent TEXT NOT NULL,
+      endpoint_key TEXT NOT NULL DEFAULT '',
+      sdk_session_id TEXT NOT NULL DEFAULT '',
+      PRIMARY KEY (chat_id, agent, endpoint_key)
+    )
+  """)
+  conn.commit()
+  conn.close()
+
+  with mock.patch("nemo.db.DB_BASE", str(tmp_path)):
+    db = Database(proj)
+    # Real data from provider_sessions made it across.
+    assert db.get_sdk_session_id(
+      "chat1", "claude", "https://example.com"
+    ) == "survived"
+    tables = {
+      row[0] for row in db._conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'"
+      )
+    }
+    assert "provider_sessions" not in tables
+    assert "agent_sessions" in tables
     db.close()
 
 

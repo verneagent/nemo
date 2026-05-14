@@ -1,4 +1,11 @@
-"""Provider-based CodingAgent factory."""
+"""Coding-agent factory.
+
+"Agent" here means the coding-agent runtime / harness — Claude Agent SDK,
+Codex CLI, or OpenCode — selected by the daemon's ``--agent`` flag and
+runtime ``/agent`` command. (This is intentionally distinct from "model
+provider" in nemo/models.json, where ``provider`` groups models that
+share the same upstream gateway like DeepSeek or Kimi.)
+"""
 
 from __future__ import annotations
 
@@ -12,22 +19,22 @@ from .codex_agent import CodexCodingAgent
 from .db import Database
 from .opencode_agent import OpenCodeCodingAgent
 
-type AgentProvider = Literal["claude", "codex", "opencode"]
+type AgentKind = Literal["claude", "codex", "opencode"]
 
-DEFAULT_PROVIDER: AgentProvider = "claude"
+DEFAULT_AGENT: AgentKind = "claude"
 
 __all__ = [
-  "AgentProvider",
-  "DEFAULT_PROVIDER",
+  "AgentKind",
+  "DEFAULT_AGENT",
   "EndpointConfig",
   "ModelCatalog",
   "build_coding_agent",
-  "default_model_for_provider",
+  "default_model_for_agent",
   "is_model_compatible",
-  "model_catalog_for_provider",
+  "model_catalog_for_agent",
 ]
 
-_DEFAULT_MODEL_BY_PROVIDER: dict[AgentProvider, str] = {
+_DEFAULT_MODEL_BY_AGENT: dict[AgentKind, str] = {
   "claude": "claude-opus-4-7",
   # gpt-5.5 is the current top-priority codex model — works for both
   # ChatGPT subscribers and API users. The codex-specialized slugs
@@ -41,7 +48,7 @@ _DEFAULT_MODEL_BY_PROVIDER: dict[AgentProvider, str] = {
 
 @dataclass(frozen=True)
 class ModelCatalog:
-  """Model catalog for a provider.
+  """Model catalog for an agent kind.
 
   - ``visible``: full slugs shown in the picker.
   - ``api_only``: full slugs that require API auth (ChatGPT subscribers
@@ -66,7 +73,7 @@ class ModelCatalog:
 # Claude aliases mirror the Claude CLI's /model picker.
 # Codex slugs come from github.com/openai/codex `models-manager/models.json`.
 # Older bundled `codex` binaries may reject newer slugs at turn time.
-_CATALOG_BY_PROVIDER: dict[AgentProvider, ModelCatalog] = {
+_CATALOG_BY_AGENT: dict[AgentKind, ModelCatalog] = {
   "claude": ModelCatalog(
     visible=(
       "claude-opus-4-7",
@@ -120,30 +127,30 @@ _CATALOG_BY_PROVIDER: dict[AgentProvider, ModelCatalog] = {
 }
 
 
-def default_model_for_provider(provider: AgentProvider) -> str:
-  return _DEFAULT_MODEL_BY_PROVIDER[provider]
+def default_model_for_agent(agent: AgentKind) -> str:
+  return _DEFAULT_MODEL_BY_AGENT[agent]
 
 
-def _preset_names_for_provider(provider: AgentProvider) -> tuple[str, ...]:
-  """Names of presets whose endpoints are populated for ``provider``."""
+def _preset_names_for_agent(agent: AgentKind) -> tuple[str, ...]:
+  """Names of model presets whose endpoints are populated for ``agent``."""
   from .presets import load_presets
   return tuple(
-    name for name, p in load_presets().items() if p.supports(provider)
+    name for name, p in load_presets().items() if p.supports(agent)
   )
 
 
-def model_catalog_for_provider(
-  provider: AgentProvider,
+def model_catalog_for_agent(
+  agent: AgentKind,
   project_dir: str = "",
 ) -> ModelCatalog:
-  if provider == "opencode":
+  if agent == "opencode":
     from .opencode_agent import query_opencode_model_catalog_data
     models, note = query_opencode_model_catalog_data(project_dir)
-    presets = _preset_names_for_provider(provider)
+    presets = _preset_names_for_agent(agent)
     visible = tuple(dict.fromkeys((*models, *presets)))
     return ModelCatalog(visible=visible, note=note)
-  base = _CATALOG_BY_PROVIDER.get(provider, ModelCatalog())
-  presets = _preset_names_for_provider(provider)
+  base = _CATALOG_BY_AGENT.get(agent, ModelCatalog())
+  presets = _preset_names_for_agent(agent)
   if not presets:
     return base
   # Drop any preset name that already lives in the static catalog so
@@ -160,36 +167,36 @@ def model_catalog_for_provider(
 
 
 def is_model_compatible(
-  provider: AgentProvider,
+  agent: AgentKind,
   model: str,
   project_dir: str = "",
 ) -> bool:
   candidate = model.strip().lower()
-  # Preset names expand to provider-specific endpoints, so they're
-  # compatible iff the preset itself supports this provider — short-
+  # Preset names expand to agent-specific endpoints, so they're
+  # compatible iff the preset itself supports this agent kind — short-
   # circuit before falling back to the static catalog.
   from .presets import resolve_preset
   preset = resolve_preset(candidate)
   if preset is not None:
-    return preset.supports(provider)
-  if provider == "opencode":
+    return preset.supports(agent)
+  if agent == "opencode":
     if candidate == "default":
       return True
-    catalog = model_catalog_for_provider(provider, project_dir)
+    catalog = model_catalog_for_agent(agent, project_dir)
     if candidate in catalog.all_names():
       return True
     # OpenCode resolves the actual provider at the SDK layer, and the
     # live catalog isn't always reachable (pytest, fresh installs).
     # Accept any ``provider/model`` slug as a compatibility fallback.
     return "/" in candidate
-  return candidate in model_catalog_for_provider(
-    provider,
+  return candidate in model_catalog_for_agent(
+    agent,
     project_dir,
   ).all_names()
 
 
 def build_coding_agent(
-  provider: AgentProvider,
+  agent: AgentKind,
   credentials: dict[str, str],
   chat_id: str,
   db: Database,
@@ -200,25 +207,25 @@ def build_coding_agent(
   endpoint: EndpointConfig | None = None,
 ) -> CodingAgent:
   endpoint = endpoint or EndpointConfig()
-  if provider == "claude":
+  if agent == "claude":
     return ClaudeCodingAgent(
       credentials, chat_id, db, channel,
       permission_mode=permission_mode,
       system_prompt=system_prompt,
       endpoint=endpoint,
     )
-  if provider == "codex":
+  if agent == "codex":
     return CodexCodingAgent(
       credentials, chat_id, db, channel,
       permission_mode=permission_mode,
       system_prompt=system_prompt,
       endpoint=endpoint,
     )
-  if provider == "opencode":
+  if agent == "opencode":
     return OpenCodeCodingAgent(
       credentials, chat_id, db, channel,
       permission_mode=permission_mode,
       system_prompt=system_prompt,
       endpoint=endpoint,
     )
-  raise ValueError(f"Unsupported provider: {provider}")
+  raise ValueError(f"Unsupported agent: {agent}")

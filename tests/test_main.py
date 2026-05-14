@@ -13,7 +13,7 @@ def _fake_asyncio_run(coro):
 def test_no_chat_id_no_credentials():
   """Without --chat-id and no credentials, should return 1."""
   with mock.patch("sys.argv", ["nemo", "--project-dir", "/tmp"]):
-    with mock.patch("nemo.__main__._ensure_provider_runtime"):
+    with mock.patch("nemo.__main__._ensure_agent_runtime"):
       with mock.patch("nemo.config.load_credentials", return_value=None):
         result = main()
         assert result == 1
@@ -22,7 +22,7 @@ def test_no_chat_id_no_credentials():
 def test_no_chat_id_no_matching_group(tmp_path):
   """Without --chat-id and no matching group, should return 1."""
   with mock.patch("sys.argv", ["nemo", "--project-dir", str(tmp_path)]):
-    with mock.patch("nemo.__main__._ensure_provider_runtime"):
+    with mock.patch("nemo.__main__._ensure_agent_runtime"):
       with mock.patch("nemo.config.load_credentials",
                       return_value={"app_id": "a", "app_secret": "s", "email": ""}):
         with mock.patch("nemo.lark.auth.get_token", return_value="tok"):
@@ -35,7 +35,7 @@ def test_invalid_project_dir():
   """Should return 1 for non-existent directory."""
   with mock.patch("sys.argv", ["nemo", "--chat-id", "oc_1",
                                 "--project-dir", "/nonexistent/path"]):
-    with mock.patch("nemo.__main__._ensure_provider_runtime"):
+    with mock.patch("nemo.__main__._ensure_agent_runtime"):
       result = main()
       assert result == 1
 
@@ -55,7 +55,7 @@ def test_invalid_chat_id_rejected_at_argparse():
 def test_empty_chat_id_still_allowed():
   """Empty --chat-id means auto-discover; must not be rejected."""
   with mock.patch("sys.argv", ["nemo", "--chat-id", "", "--project-dir", "/tmp"]):
-    with mock.patch("nemo.__main__._ensure_provider_runtime"):
+    with mock.patch("nemo.__main__._ensure_agent_runtime"):
       with mock.patch("nemo.config.load_credentials", return_value=None):
         result = main()
         assert result == 1  # fails later for missing creds, NOT at argparse
@@ -67,7 +67,7 @@ def test_valid_args_calls_main_loop(tmp_path):
   with mock.patch("sys.argv", ["nemo", "--chat-id", "oc_test",
                                 "--project-dir", project,
                                 "--model", "claude-sonnet-4-6"]):
-    with mock.patch("nemo.__main__._ensure_provider_runtime"):
+    with mock.patch("nemo.__main__._ensure_agent_runtime"):
       with mock.patch("nemo.config.load_credentials",
                       return_value={"app_id": "a", "app_secret": "s", "email": ""}):
         with mock.patch("nemo.preflight.run_preflight", return_value=[]):
@@ -83,7 +83,7 @@ def test_default_model(tmp_path):
   project = str(tmp_path)
   with mock.patch("sys.argv", ["nemo", "--chat-id", "oc_1",
                                 "--project-dir", project]):
-    with mock.patch("nemo.__main__._ensure_provider_runtime"):
+    with mock.patch("nemo.__main__._ensure_agent_runtime"):
       with mock.patch("nemo.config.load_credentials",
                       return_value={"app_id": "a", "app_secret": "s", "email": ""}):
         with mock.patch("nemo.preflight.run_preflight", return_value=[]):
@@ -98,7 +98,7 @@ def test_verbose_flag(tmp_path):
   project = str(tmp_path)
   with mock.patch("sys.argv", ["nemo", "--chat-id", "oc_1",
                                 "--project-dir", project, "-v"]):
-    with mock.patch("nemo.__main__._ensure_provider_runtime"):
+    with mock.patch("nemo.__main__._ensure_agent_runtime"):
       with mock.patch("nemo.config.load_credentials",
                       return_value={"app_id": "a", "app_secret": "s", "email": ""}):
         with mock.patch("nemo.preflight.run_preflight", return_value=[]):
@@ -124,7 +124,7 @@ def test_system_prompt_file_is_read_and_passed(tmp_path):
   with mock.patch("sys.argv", ["nemo", "--chat-id", "oc_1",
                                 "--project-dir", project,
                                 "--system-prompt-file", str(sp_file)]):
-    with mock.patch("nemo.__main__._ensure_provider_runtime"):
+    with mock.patch("nemo.__main__._ensure_agent_runtime"):
       with mock.patch("nemo.config.load_credentials",
                       return_value={"app_id": "a", "app_secret": "s", "email": ""}):
         with mock.patch("nemo.preflight.run_preflight", return_value=[]):
@@ -143,14 +143,14 @@ def test_system_prompt_file_missing_returns_error(tmp_path):
   with mock.patch("sys.argv", ["nemo", "--chat-id", "oc_1",
                                 "--project-dir", project,
                                 "--system-prompt-file", missing]):
-    with mock.patch("nemo.__main__._ensure_provider_runtime"):
+    with mock.patch("nemo.__main__._ensure_agent_runtime"):
       with mock.patch("nemo.config.load_credentials",
                       return_value={"app_id": "a", "app_secret": "s", "email": ""}):
         result = main()
         assert result == 1
 
 
-def test_codex_provider_uses_provider_default_model(tmp_path):
+def test_codex_agent_uses_agent_default_model(tmp_path):
   project = str(tmp_path)
   captured = {}
 
@@ -161,8 +161,8 @@ def test_codex_provider_uses_provider_default_model(tmp_path):
 
   with mock.patch("sys.argv", ["nemo", "--chat-id", "oc_1",
                                 "--project-dir", project,
-                                "--provider", "codex"]):
-    with mock.patch("nemo.__main__._ensure_provider_runtime"):
+                                "--agent", "codex"]):
+    with mock.patch("nemo.__main__._ensure_agent_runtime"):
       with mock.patch("nemo.config.load_credentials",
                       return_value={"app_id": "a", "app_secret": "s", "email": ""}):
         with mock.patch("nemo.preflight.run_preflight", return_value=[]):
@@ -173,10 +173,10 @@ def test_codex_provider_uses_provider_default_model(tmp_path):
             frame = captured["frame"]
             assert frame is not None
             assert frame.f_locals["model"] == "gpt-5.5"
-            assert frame.f_locals["provider"] == "codex"
+            assert frame.f_locals["agent"] == "codex"
 
 
-def test_opencode_provider_uses_provider_default_model(tmp_path):
+def test_opencode_agent_uses_agent_default_model(tmp_path):
   project = str(tmp_path)
   captured = {}
 
@@ -187,8 +187,8 @@ def test_opencode_provider_uses_provider_default_model(tmp_path):
 
   with mock.patch("sys.argv", ["nemo", "--chat-id", "oc_1",
                                 "--project-dir", project,
-                                "--provider", "opencode"]):
-    with mock.patch("nemo.__main__._ensure_provider_runtime"):
+                                "--agent", "opencode"]):
+    with mock.patch("nemo.__main__._ensure_agent_runtime"):
       with mock.patch("nemo.config.load_credentials",
                       return_value={"app_id": "a", "app_secret": "s", "email": ""}):
         with mock.patch("nemo.preflight.run_preflight", return_value=[]):
@@ -199,7 +199,7 @@ def test_opencode_provider_uses_provider_default_model(tmp_path):
             frame = captured["frame"]
             assert frame is not None
             assert frame.f_locals["model"] == "default"
-            assert frame.f_locals["provider"] == "opencode"
+            assert frame.f_locals["agent"] == "opencode"
 
 
 def test_init_exception_logged_and_returns_1(tmp_path, caplog):
@@ -213,7 +213,7 @@ def test_init_exception_logged_and_returns_1(tmp_path, caplog):
 
   project = str(tmp_path)
   with mock.patch("sys.argv", ["nemo", "--project-dir", project]):
-    with mock.patch("nemo.__main__._ensure_provider_runtime"):
+    with mock.patch("nemo.__main__._ensure_agent_runtime"):
       with mock.patch("nemo.config.load_credentials",
                       return_value={"app_id": "a", "app_secret": "s", "email": ""}):
         # Simulate the production failure: get_token raises during workspace
@@ -251,7 +251,7 @@ def test_preflight_failure_logged_and_returns_1(tmp_path, caplog):
   project = str(tmp_path)
   with mock.patch("sys.argv",
                   ["nemo", "--chat-id", "oc_x", "--project-dir", project]):
-    with mock.patch("nemo.__main__._ensure_provider_runtime"):
+    with mock.patch("nemo.__main__._ensure_agent_runtime"):
       with mock.patch("nemo.config.load_credentials",
                       return_value={"app_id": "a", "app_secret": "s", "email": ""}):
         # Preflight returns errors (Lark API hiccup) — main should log
@@ -283,7 +283,7 @@ def test_invalid_project_dir_logged(tmp_path, caplog):
   with mock.patch("sys.argv",
                   ["nemo", "--chat-id", "oc_x",
                    "--project-dir", "/definitely/does/not/exist/anywhere"]):
-    with mock.patch("nemo.__main__._ensure_provider_runtime"):
+    with mock.patch("nemo.__main__._ensure_agent_runtime"):
       with caplog.at_level(logging.ERROR, logger="nemo"):
         result = main()
   assert result == 1

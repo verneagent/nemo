@@ -302,11 +302,11 @@ def test_cli_preset_expands_to_endpoint_and_remote_model(tmp_path):
   captured: dict[str, object] = {}
   argv = [
     "nemo", "--chat-id", "oc_1", "--project-dir", project,
-    "--provider", "claude", "--model", "deepseek-v4-pro",
+    "--agent", "claude", "--model", "deepseek-v4-pro",
   ]
   with mock.patch.dict(os.environ, {"DEEPSEEK_API_KEY": "sk-test"}), \
        mock.patch("sys.argv", argv), \
-       mock.patch("nemo.__main__._ensure_provider_runtime"), \
+       mock.patch("nemo.__main__._ensure_agent_runtime"), \
        mock.patch("nemo.config.load_credentials",
                   return_value={"app_id": "a", "app_secret": "s", "email": ""}), \
        mock.patch("nemo.preflight.run_preflight", return_value=[]), \
@@ -329,11 +329,11 @@ def test_cli_preset_picks_protocol_for_provider(tmp_path):
   captured: dict[str, object] = {}
   argv = [
     "nemo", "--chat-id", "oc_1", "--project-dir", project,
-    "--provider", "codex", "--model", "deepseek-v4-pro",
+    "--agent", "codex", "--model", "deepseek-v4-pro",
   ]
   with mock.patch.dict(os.environ, {"DEEPSEEK_API_KEY": "sk-test"}), \
        mock.patch("sys.argv", argv), \
-       mock.patch("nemo.__main__._ensure_provider_runtime"), \
+       mock.patch("nemo.__main__._ensure_agent_runtime"), \
        mock.patch("nemo.config.load_credentials",
                   return_value={"app_id": "a", "app_secret": "s", "email": ""}), \
        mock.patch("nemo.preflight.run_preflight", return_value=[]), \
@@ -345,6 +345,35 @@ def test_cli_preset_picks_protocol_for_provider(tmp_path):
   endpoint = frame.f_locals["endpoint"]
   assert endpoint.base_url == "https://api.deepseek.com"  # no /anthropic
   assert frame.f_locals["model"] == "deepseek-v4-pro"     # no [1m] suffix
+
+
+def test_cli_kimi_under_codex_agent_fails_fast(tmp_path):
+  """`--agent codex --model kimi-for-coding` must fail at startup, not
+  launch and 4xx on the first turn. The Kimi For Coding gateway gates
+  its OpenAI endpoint to coding-agent clients only (returns
+  access_terminated_error), so the preset declares no openai block —
+  resolve_preset → supports("codex") False → _startup_fail.
+
+  This is the asymmetric-provider regression risk the new schema
+  introduces: nothing else in the catalog has one protocol but not
+  the other, so without this test a future schema refactor could
+  silently flip Kimi to allow codex and we wouldn't notice until
+  someone tried it in prod.
+  """
+  from nemo.__main__ import main
+  project = str(tmp_path)
+  argv = [
+    "nemo", "--chat-id", "oc_1", "--project-dir", project,
+    "--agent", "codex", "--model", "kimi-for-coding",
+  ]
+  with mock.patch.dict(os.environ, {"KIMI_API_KEY": "sk-fake"}), \
+       mock.patch("sys.argv", argv), \
+       mock.patch("nemo.__main__._ensure_agent_runtime"), \
+       mock.patch("nemo.config.load_credentials",
+                  return_value={"app_id": "a", "app_secret": "s", "email": ""}), \
+       mock.patch("nemo.preflight.run_preflight", return_value=[]):
+    rc = main()
+  assert rc == 1
 
 
 def test_cli_preset_missing_api_key_env_is_error(tmp_path):
@@ -360,7 +389,7 @@ def test_cli_preset_missing_api_key_env_is_error(tmp_path):
   env_no_key = {k: v for k, v in os.environ.items() if k != "DEEPSEEK_API_KEY"}
   with mock.patch.dict(os.environ, env_no_key, clear=True), \
        mock.patch("sys.argv", argv), \
-       mock.patch("nemo.__main__._ensure_provider_runtime"), \
+       mock.patch("nemo.__main__._ensure_agent_runtime"), \
        mock.patch("nemo.config.load_credentials",
                   return_value={"app_id": "a", "app_secret": "s", "email": ""}), \
        mock.patch("nemo.preflight.run_preflight", return_value=[]):
@@ -376,10 +405,10 @@ def test_cli_unknown_model_passes_through_unchanged(tmp_path):
   captured: dict[str, object] = {}
   argv = [
     "nemo", "--chat-id", "oc_1", "--project-dir", project,
-    "--provider", "claude", "--model", "claude-opus-4-7",
+    "--agent", "claude", "--model", "claude-opus-4-7",
   ]
   with mock.patch("sys.argv", argv), \
-       mock.patch("nemo.__main__._ensure_provider_runtime"), \
+       mock.patch("nemo.__main__._ensure_agent_runtime"), \
        mock.patch("nemo.config.load_credentials",
                   return_value={"app_id": "a", "app_secret": "s", "email": ""}), \
        mock.patch("nemo.preflight.run_preflight", return_value=[]), \

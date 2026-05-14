@@ -23,7 +23,7 @@ import uuid
 from typing import Callable
 
 from . import cards, commands, messages, monitor
-from .agent_factory import AgentProvider, build_coding_agent, is_model_compatible
+from .agent_factory import AgentKind, build_coding_agent, is_model_compatible
 from .coding_agent import EndpointConfig
 from .channel import IncomingMessage
 from .config import load_credentials
@@ -428,7 +428,7 @@ async def _handle_session_list(
 
   Sessions are pulled from both Claude CLI's storage (`~/.claude/...`)
   and Codex's (`~/.codex/...`) and merged into one mtime-desc list.
-  Each row shows uuid prefix, provider, model, age, and a short user-
+  Each row shows uuid prefix, agent, model, age, and a short user-
   prompt preview so the operator can identify which one to recall.
   """
   from . import sessions as _sessions
@@ -454,7 +454,7 @@ async def _handle_session_list(
     model = f" `{s.model}`" if s.model else ""
     bullets = _format_session_previews(s)
     lines.append(
-      f"- `{s.uuid[:8]}` · **{s.provider}**{model} · {when}{marker}\n"
+      f"- `{s.uuid[:8]}` · **{s.agent}**{model} · {when}{marker}\n"
       f"{bullets}"
     )
   more = ""
@@ -546,12 +546,12 @@ async def _handle_session_recall(
       "The first user message is usually injected AGENTS.md "
       "boilerplate — skip past it."
     ),
-  }.get(info.provider, "")
+  }.get(info.agent, "")
   prompt = (
     f"[Nemo recall] The user asked you to recall a past coding session "
     f"in this project. Its JSONL transcript lives at:\n\n"
     f"  {info.path}\n\n"
-    f"Session metadata: provider `{info.provider}`, uuid "
+    f"Session metadata: agent `{info.agent}`, uuid "
     f"`{info.uuid[:8]}`, model `{info.model or 'unknown'}`, last "
     f"activity {when}, file size ~{size_kb}KB.\n\n"
     f"Format: {format_hint}\n\n"
@@ -576,7 +576,7 @@ async def _handle_session_recall(
   channel.push_back(recall_msg)
   return (
     f"📖 Asking the agent to recall session `{info.uuid[:8]}` "
-    f"({info.provider}, ~{size_kb}KB)…"
+    f"({info.agent}, ~{size_kb}KB)…"
   )
 
 
@@ -704,7 +704,7 @@ async def main_loop(
   chat_id: str,
   project_dir: str,
   model: str,
-  provider: AgentProvider = "claude",
+  agent: AgentKind = "claude",
   permission_mode: str = "bypassPermissions",
   effort: str = "",
   system_prompt: str = "",
@@ -746,7 +746,7 @@ async def main_loop(
   channel.parent_lookup = _db_parent_lookup
 
   # Clean stale sessions (preserve sdk_session_id for resume).
-  # Per-(provider, endpoint) lookup so switching providers or endpoints
+  # Per-(agent, endpoint) lookup so switching agents or endpoints
   # on a chat doesn't feed a Claude UUID into Codex (or vice versa), and
   # doesn't replay a transcript whose thinking blocks were signed by a
   # different upstream — the right answer is always to start that slot
@@ -756,9 +756,9 @@ async def main_loop(
   try:
     old_owner = db.get_chat_owner(chat_id)
     if old_owner:
-      _resume_sdk_id = db.get_sdk_session_id(chat_id, provider, endpoint_key)
+      _resume_sdk_id = db.get_sdk_session_id(chat_id, agent, endpoint_key)
       log.info("Cleaning stale session %s (sdk[%s/%s]=%s)", old_owner,
-               provider, endpoint_key or "default",
+               agent, endpoint_key or "default",
                _resume_sdk_id[:8] if _resume_sdk_id else "none")
       db.deactivate(old_owner)
   except Exception as e:
@@ -810,7 +810,7 @@ async def main_loop(
     start_lines.append(f"Session `{_resume_sdk_id[:8]}` resumed")
   start_note = project_dir
   start_card = cards.build_card(
-    f"Nemo v{__version__} ({provider} · {model})",
+    f"Nemo v{__version__} ({agent} · {model})",
     body="\n".join(start_lines),
     color="blue",
     note=start_note,
@@ -824,8 +824,8 @@ async def main_loop(
     if "230002" in err_msg or "NOT be out of the chat" in err_msg:
       return 1
 
-  # Status tab — green idle, with provider name next to the dot.
-  await channel.update_status(model, "idle", provider)
+  # Status tab — green idle, with agent name next to the dot.
+  await channel.update_status(model, "idle", agent)
 
   # Periodic heartbeat (relay-based idle detection)
   _heartbeat_task: asyncio.Task | None = None
@@ -839,15 +839,15 @@ async def main_loop(
 
     _heartbeat_task = asyncio.create_task(_heartbeat_loop())
 
-  agent = build_coding_agent(
-    provider,
+  coding_agent = build_coding_agent(
+    agent,
     credentials, chat_id, db, channel,
     permission_mode=permission_mode,
     system_prompt=system_prompt,
     endpoint=endpoint,
   )
   if effort:
-    agent.set_effort(effort)
+    coding_agent.set_effort(effort)
   # Resume previous SDK session if available
   _sdk_session_id: str = _resume_sdk_id
   # Track which upstream endpoint the running session belongs to so we
@@ -861,7 +861,7 @@ async def main_loop(
   if _sdk_session_id:
     log.info("Resuming SDK session %s", _sdk_session_id[:8])
   try:
-    await agent.start(project_dir, model, resume=_sdk_session_id)
+    await coding_agent.start(project_dir, model, resume=_sdk_session_id)
   except Exception as e:
     log.error("SDK startup failed: %s", e)
     err_card = cards.build_card(
@@ -879,7 +879,7 @@ async def main_loop(
 
   # Context
   ctx = commands.AgentContext(model, project_dir, time.time())
-  ctx.provider = provider
+  ctx.agent = agent
   ctx.effort = effort
   main_loop_ref = asyncio.get_running_loop()
   running = True
@@ -897,7 +897,7 @@ async def main_loop(
   signal.signal(signal.SIGTERM, handle_sig)
 
   async def _restart_client(resume: str = ""):
-    await agent.reset(project_dir, model, resume=resume)
+    await coding_agent.reset(project_dir, model, resume=resume)
 
   def _is_own_message(mid: str) -> bool:
     """True iff `mid` was sent by this bot (recorded as direction='sent')."""
@@ -1039,7 +1039,7 @@ async def main_loop(
           else:
             restored = _prev_sdk_session_id
             _sdk_session_id = restored
-            db.set_sdk_session_id(chat_id, restored, provider, _endpoint_key)
+            db.set_sdk_session_id(chat_id, restored, agent, _endpoint_key)
             log.info("Restoring SDK session %s after /undo-clear", restored[:8])
             await _restart_client(resume=restored)
             await _send_response(
@@ -1064,11 +1064,11 @@ async def main_loop(
           from .presets import resolve_preset
           preset = resolve_preset(new_model)
           if preset is not None:
-            if not preset.supports(provider):
+            if not preset.supports(agent):
               await _send_response(
                 channel, chat_id,
-                f"Preset **{new_model}** has no endpoint for "
-                f"provider **{provider}**.",
+                f"Model **{new_model}** has no endpoint for "
+                f"agent **{agent}**.",
                 db,
               )
               await _clear_ack()
@@ -1083,9 +1083,9 @@ async def main_loop(
               await _clear_ack()
               continue
             old_endpoint_key = _endpoint_key
-            new_endpoint = preset.endpoint_for(provider)
-            agent.set_endpoint(new_endpoint)
-            switched_to = preset.remote_for(provider)
+            new_endpoint = preset.endpoint_for(agent)
+            coding_agent.set_endpoint(new_endpoint)
+            switched_to = preset.remote_for(agent)
             # Each upstream endpoint (preset vs default) keeps its own
             # SDK session so we never replay one vendor's signed
             # ``thinking`` blocks against another vendor's API. Key by
@@ -1094,14 +1094,14 @@ async def main_loop(
             # api.anthropic.com) or two DeepSeek model variants.
             _endpoint_key = new_endpoint.base_url
             _sdk_session_id = db.get_sdk_session_id(
-              chat_id, provider, _endpoint_key)
+              chat_id, agent, _endpoint_key)
             log.info("Model switch to preset %s → %s (endpoint=%s resume=%s)",
                      preset.name, switched_to, _endpoint_key,
                      _sdk_session_id[:8] if _sdk_session_id else "none")
             model = switched_to
             ctx.model = model
             await _restart_client(resume=_sdk_session_id)
-            await channel.update_status(model, "idle", provider)
+            await channel.update_status(model, "idle", agent)
             note = _endpoint_change_note(
               old_endpoint_key, _endpoint_key, _sdk_session_id)
             await _send_response(
@@ -1111,106 +1111,105 @@ async def main_loop(
               db,
             )
             continue
-          if not is_model_compatible(provider, new_model):
+          if not is_model_compatible(agent, new_model):
             await _send_response(
               channel,
               chat_id,
-              f"Model **{new_model}** is not supported by provider **{provider}**.",
+              f"Model **{new_model}** is not supported by agent **{agent}**.",
               db,
             )
             await _clear_ack()
             continue
           # Plain model swap. Clear any preset endpoint that was active
-          # so we go back to the provider's default auth path. The
+          # so we go back to the agent's default auth path. The
           # default endpoint has its own SDK session — fetch it instead
           # of replaying the preset endpoint's transcript whose
           # ``thinking`` blocks would 400 against real Anthropic.
           old_endpoint_key = _endpoint_key
-          agent.set_endpoint(EndpointConfig())
+          coding_agent.set_endpoint(EndpointConfig())
           _endpoint_key = ""
           _sdk_session_id = db.get_sdk_session_id(
-            chat_id, provider, _endpoint_key)
+            chat_id, agent, _endpoint_key)
           model = new_model
           ctx.model = model
           log.info("Model switch to %s (endpoint=default resume=%s)",
                    model, _sdk_session_id[:8] if _sdk_session_id else "none")
           await _restart_client(resume=_sdk_session_id)
-          await channel.update_status(model, "idle", provider)
+          await channel.update_status(model, "idle", agent)
           note = _endpoint_change_note(
             old_endpoint_key, _endpoint_key, _sdk_session_id)
           await _send_response(
             channel, chat_id,
             f"Model switched to **{model}**.{note}", db,
           )
-        elif response and response.startswith("__provider__:"):
-          # Format: "__provider__:<name>:<default_model>"
-          _, new_provider, default_model = response.split(":", 2)
+        elif response and response.startswith("__agent__:"):
+          # Format: "__agent__:<name>:<default_model>"
+          _, new_agent, default_model = response.split(":", 2)
           # Stop the old adapter cleanly so its subprocesses / threads
           # release before we build the replacement.
           try:
-            await agent.stop()
+            await coding_agent.stop()
           except Exception as exc:
-            log.warning("Stopping %s agent on /provider switch: %s",
-                        provider, exc)
-          # Reset state to the new provider's defaults. Endpoint goes
-          # back to empty (no preset assumed) and model is the
-          # provider's default — the user can /model afterwards if
-          # they want a non-default. Each provider's resume id lives
-          # in its own DB column (per-provider session storage), so
-          # switching back later resumes that provider's last thread.
-          provider = new_provider  # type: ignore[assignment]
+            log.warning("Stopping %s agent on /agent switch: %s",
+                        agent, exc)
+          # Reset state to the new agent's defaults. Endpoint goes
+          # back to empty (no preset assumed) and model is the new
+          # agent's default — the user can /model afterwards if they
+          # want a non-default. Each agent's resume id lives in its
+          # own DB column (per-agent session storage), so switching
+          # back later resumes that agent's last thread.
+          agent = new_agent  # type: ignore[assignment]
           model = default_model
           endpoint = EndpointConfig()
           _endpoint_key = ""
-          ctx.provider = provider
+          ctx.agent = agent
           ctx.model = model
-          _sdk_session_id = db.get_sdk_session_id(chat_id, provider, _endpoint_key)
-          agent = build_coding_agent(
-            provider, credentials, chat_id, db, channel,
+          _sdk_session_id = db.get_sdk_session_id(chat_id, agent, _endpoint_key)
+          coding_agent = build_coding_agent(
+            agent, credentials, chat_id, db, channel,
             permission_mode=permission_mode,
             system_prompt=system_prompt,
             endpoint=endpoint,
           )
           if ctx.effort:
-            agent.set_effort(ctx.effort)
-          log.info("Provider switch to %s (model=%s, resume=%s)",
-                   provider, model,
+            coding_agent.set_effort(ctx.effort)
+          log.info("Agent switch to %s (model=%s, resume=%s)",
+                   agent, model,
                    _sdk_session_id[:8] if _sdk_session_id else "none")
           try:
-            await agent.start(project_dir, model, resume=_sdk_session_id)
+            await coding_agent.start(project_dir, model, resume=_sdk_session_id)
           except Exception as exc:
-            log.error("Failed to start %s agent: %s", provider, exc, exc_info=True)
+            log.error("Failed to start %s agent: %s", agent, exc, exc_info=True)
             await _send_response(
               channel, chat_id,
-              f"Provider switch to **{provider}** failed: `{exc}`. "
+              f"Agent switch to **{agent}** failed: `{exc}`. "
               f"Daemon is in a broken state — restart it.",
               db,
             )
             await _clear_ack()
             continue
-          await channel.update_status(model, "idle", provider)
+          await channel.update_status(model, "idle", agent)
           # Tell the user explicitly what happened to their context.
-          # Each provider keeps its own session id (per-provider DB
-          # columns from 0.3.87), so the new provider either resumes
-          # its OWN prior history on this chat or starts fresh — it
-          # never sees the previous provider's transcript. Without
-          # this note users hit "the bot forgot what we just talked
-          # about" surprises.
+          # Each agent keeps its own session id (per-agent DB columns),
+          # so the new agent either resumes its OWN prior history on
+          # this chat or starts fresh — it never sees the previous
+          # agent's transcript. Without this note users hit "the bot
+          # forgot what we just talked about" surprises.
           if _sdk_session_id:
             context_note = (
-              f"Resuming **{provider}**'s prior conversation on this "
+              f"Resuming **{agent}**'s prior conversation on this "
               f"chat (session `{_sdk_session_id[:8]}`). It does not "
-              f"see what other providers said here."
+              f"see what other agents said here."
             )
           else:
             context_note = (
-              f"Fresh **{provider}** conversation — no prior history "
-              f"on this chat. Other providers' transcripts are kept "
+              f"Fresh **{agent}** conversation — no prior history "
+              f"on this chat. Other agents' transcripts are kept "
               f"separately and reachable by switching back."
             )
           await _send_response(
             channel, chat_id,
-            f"Switched to provider **{provider}** "
+            f"Switched to agent **{agent}** "
             f"(default model `{model}`). {context_note} "
             f"Use `/model <name>` to pick a different one.",
             db,
@@ -1218,9 +1217,9 @@ async def main_loop(
         elif response and response.startswith("__effort__:"):
           new_effort = response.split(":", 1)[1]
           ctx.effort = new_effort
-          agent.set_effort(new_effort)
+          coding_agent.set_effort(new_effort)
           label = new_effort if new_effort else "default"
-          detail_map = commands._EFFORT_DETAIL.get(provider, {})
+          detail_map = commands._EFFORT_DETAIL.get(agent, {})
           detail = detail_map.get(new_effort, "")
           hint = f" — {detail}" if detail else ""
           log.info("Reasoning effort set to %s — restarting client (resume=%s)",
@@ -1527,7 +1526,7 @@ async def main_loop(
           if event.session_id:
             _sdk_session_id = event.session_id
             db.set_sdk_session_id(
-              chat_id, _sdk_session_id, provider, _endpoint_key)
+              chat_id, _sdk_session_id, agent, _endpoint_key)
           if _turn_interrupt_phase:
             if _turn_card_id:
               db.clear_working(session_id)
@@ -1536,11 +1535,11 @@ async def main_loop(
           # Final response = last answer step (if any)
           answer_steps = [s for s in _turn_steps if s.kind == "answer"]
           final_text = answer_steps[-1].content if answer_steps else ""
-          # Ask the active coding agent for any provider-specific note to tack
+          # Ask the active coding agent for any agent-specific note to tack
           # onto the response (e.g. Claude warns when the session jsonl is
           # getting large so the user remembers to /clear).
           if final_text:
-            trailing = agent.trailing_note(_sdk_session_id)
+            trailing = coding_agent.trailing_note(_sdk_session_id)
             if trailing:
               final_text = final_text + trailing
           # Thinking timeline = all non-answer steps
@@ -1574,7 +1573,7 @@ async def main_loop(
       else:
         prompt_for_agent = user_message
       sdk_task = asyncio.create_task(
-        agent.run_turn(prompt_for_agent, _on_event)
+        coding_agent.run_turn(prompt_for_agent, _on_event)
       )
 
       # Concurrent signal watcher: read events during SDK execution
@@ -1657,9 +1656,9 @@ async def main_loop(
           elif response and response.startswith("__effort__:"):
             new_effort = response.split(":", 1)[1]
             ctx.effort = new_effort
-            agent.set_effort(new_effort)
+            coding_agent.set_effort(new_effort)
             label = new_effort if new_effort else "default"
-            detail_map = commands._EFFORT_DETAIL.get(provider, {})
+            detail_map = commands._EFFORT_DETAIL.get(agent, {})
             detail = detail_map.get(new_effort, "")
             hint = f" — {detail}" if detail else ""
             await _restart_client(resume=_sdk_session_id)
@@ -1799,7 +1798,7 @@ async def main_loop(
           await _clear_ack()
           await _update_interrupt_card("stopping")
           try:
-            await agent.interrupt()
+            await coding_agent.interrupt()
             await asyncio.wait_for(sdk_task, timeout=10)
             log.info("SDK turn interrupted cleanly")
           except Exception as exc:
@@ -1812,7 +1811,7 @@ async def main_loop(
         elif signal_detected in ("exit", "dissolve"):
           await _clear_ack()
           try:
-            await agent.interrupt()
+            await coding_agent.interrupt()
             await asyncio.wait_for(sdk_task, timeout=10)
           except Exception:
             sdk_task.cancel()
@@ -1886,9 +1885,9 @@ async def main_loop(
       pass  # expected on shutdown cancel
   # Close SDK, event stream, and Lark API calls all concurrently
   loop = asyncio.get_event_loop()
-  cleanup: list = [agent.stop(), channel.stop()]
+  cleanup: list = [coding_agent.stop(), channel.stop()]
   cleanup.append(channel.release_workspace())
-  cleanup.append(channel.update_status(model, "stopped", provider))
+  cleanup.append(channel.update_status(model, "stopped", agent))
   await asyncio.gather(*cleanup, return_exceptions=True)
   db.deactivate(session_id)
   db.close()

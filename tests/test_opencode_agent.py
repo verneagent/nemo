@@ -6,7 +6,7 @@ import asyncio
 from pathlib import Path
 from unittest import mock
 
-from nemo.agent_factory import build_coding_agent, default_model_for_provider, is_model_compatible
+from nemo.agent_factory import build_coding_agent, default_model_for_agent, is_model_compatible
 from nemo.opencode_agent import (
   OpenCodeCodingAgent,
   _SIDE_CAR_SCRIPT,
@@ -72,8 +72,8 @@ class _FakeProc:
     self.returncode = -9
 
 
-def test_default_model_for_provider():
-  assert default_model_for_provider("opencode") == "default"
+def test_default_model_for_agent():
+  assert default_model_for_agent("opencode") == "default"
 
 
 def test_is_model_compatible():

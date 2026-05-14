@@ -510,7 +510,7 @@ def test_evict_existing_pid_file():
 # ---------------------------------------------------------------------------
 
 def test_cmdline_targets_chat_separate_tokens():
-  cmd = "/path/python /path/nemo --chat-id oc_45fcf76e --provider claude"
+  cmd = "/path/python /path/nemo --chat-id oc_45fcf76e --agent claude"
   assert _cmdline_targets_chat(cmd, "oc_45fcf76e") is True
 
 
@@ -521,17 +521,17 @@ def test_cmdline_targets_chat_inline_form():
 
 def test_cmdline_targets_chat_no_substring_misfire():
   """Pre-fix: substring match — chat_id='0' matched any chat-id with '0'."""
-  cmd = "/path/python /path/nemo --chat-id oc_45fcf76e0a --provider claude"
+  cmd = "/path/python /path/nemo --chat-id oc_45fcf76e0a --agent claude"
   assert _cmdline_targets_chat(cmd, "0") is False
   # Even when '0' appears literally elsewhere, only an exact arg match counts
   assert _cmdline_targets_chat(cmd, "oc_45") is False
 
 
 def test_cmdline_targets_chat_different_chat():
-  cmd = "/path/python /path/nemo --chat-id oc_OTHER --provider claude"
+  cmd = "/path/python /path/nemo --chat-id oc_OTHER --agent claude"
   assert _cmdline_targets_chat(cmd, "oc_45fcf76e") is False
 
 
 def test_cmdline_targets_chat_no_chat_id_arg():
-  cmd = "/path/python /path/nemo --provider claude"
+  cmd = "/path/python /path/nemo --agent claude"
   assert _cmdline_targets_chat(cmd, "oc_45fcf76e") is False

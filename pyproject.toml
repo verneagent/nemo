@@ -34,6 +34,7 @@ include = ["nemo*"]
 [tool.setuptools.package-data]
 nemo = [
   "assets/*.png",
+  "models.json",
   "codex_sidecar/package.json",
   "codex_sidecar/package-lock.json",
   "codex_sidecar/run_turn.mjs",

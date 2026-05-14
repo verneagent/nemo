@@ -49,11 +49,11 @@ def test_model_typo_rejected():
   assert "sonnet" in resp  # available list included
 
 
-def test_provider_show_lists_options():
+def test_agent_show_lists_options():
   ctx = _ctx()
-  ctx.provider = "claude"
+  ctx.agent = "claude"
   ctx.model = "claude-opus-4-7"
-  handled, resp = try_dispatch("/provider", ctx)
+  handled, resp = try_dispatch("/agent", ctx)
   assert handled
   assert resp is not None
   # Lists all three options + names current.
@@ -63,21 +63,21 @@ def test_provider_show_lists_options():
   assert "claude-opus-4-7" in resp
 
 
-def test_provider_switch_emits_action_with_default_model():
+def test_agent_switch_emits_action_with_default_model():
   ctx = _ctx()
-  ctx.provider = "claude"
-  handled, resp = try_dispatch("/provider codex", ctx)
+  ctx.agent = "claude"
+  handled, resp = try_dispatch("/agent codex", ctx)
   assert handled
-  # Action code carries both the new provider and its default model so
+  # Action code carries both the new agent and its default model so
   # the loop doesn't have to look it up again. gpt-5.5 is the codex
   # default per agent_factory._DEFAULT_MODEL_BY_PROVIDER.
-  assert resp == "__provider__:codex:gpt-5.5"
+  assert resp == "__agent__:codex:gpt-5.5"
 
 
-def test_provider_same_as_current_is_noop_message():
+def test_agent_same_as_current_is_noop_message():
   ctx = _ctx()
-  ctx.provider = "codex"
-  handled, resp = try_dispatch("/provider codex", ctx)
+  ctx.agent = "codex"
+  handled, resp = try_dispatch("/agent codex", ctx)
   assert handled
   # No action code — just a message; main loop won't tear down the
   # agent for a no-op switch.
@@ -86,26 +86,26 @@ def test_provider_same_as_current_is_noop_message():
   assert "Already" in resp
 
 
-def test_provider_unknown_name_rejected():
+def test_agent_unknown_name_rejected():
   ctx = _ctx()
-  handled, resp = try_dispatch("/provider gpt-nonexistent", ctx)
+  handled, resp = try_dispatch("/agent gpt-nonexistent", ctx)
   assert handled
   assert resp is not None and not resp.startswith("__")
-  assert "Unknown provider" in resp
+  assert "Unknown agent" in resp
   # Help points at the valid set.
   assert "claude" in resp
 
 
-def test_provider_action_code_marked_needs_sdk():
-  # Provider switch tears down the SDK adapter, so it must be in the
+def test_agent_action_code_marked_needs_sdk():
+  # Agent switch tears down the SDK adapter, so it must be in the
   # _NEEDS_SDK guard list — otherwise the loop would try to handle it
   # mid-turn.
-  assert is_inline_safe("__provider__:codex:gpt-5.5") is False
+  assert is_inline_safe("__agent__:codex:gpt-5.5") is False
 
 
 def test_model_typo_for_codex():
   ctx = _ctx()
-  ctx.provider = "codex"
+  ctx.agent = "codex"
   handled, resp = try_dispatch("/model claude-sonnet-4-6", ctx)
   assert handled
   assert resp is not None and not resp.startswith("__model__:")
@@ -115,7 +115,7 @@ def test_model_typo_for_codex():
 def test_model_list_separates_chatgpt_from_api_only_codex():
   """Codex /model listing must warn that -codex slugs need API auth."""
   ctx = _ctx()
-  ctx.provider = "codex"
+  ctx.agent = "codex"
   handled, resp = try_dispatch("/model", ctx)
   assert handled
   assert resp is not None
@@ -133,7 +133,7 @@ def test_model_list_separates_chatgpt_from_api_only_codex():
 
 def test_model_list_for_opencode_shows_dynamic_note():
   ctx = _ctx()
-  ctx.provider = "opencode"
+  ctx.agent = "opencode"
   with __import__("unittest").mock.patch(
       "nemo.opencode_agent.query_opencode_model_catalog_data",
       return_value=(("anthropic/claude-sonnet-4-5",), "Config default: `anthropic/claude-sonnet-4-5`."),
@@ -145,9 +145,9 @@ def test_model_list_for_opencode_shows_dynamic_note():
     assert "Config default" in resp
 
 
-def test_model_switch_for_opencode_accepts_provider_model():
+def test_model_switch_for_opencode_accepts_provider_slug_model():
   ctx = _ctx()
-  ctx.provider = "opencode"
+  ctx.agent = "opencode"
   with __import__("unittest").mock.patch(
       "nemo.opencode_agent.query_opencode_model_catalog_data",
       return_value=(("anthropic/claude-sonnet-4-5",), "note"),
@@ -202,7 +202,7 @@ def test_usage():
 
 def test_usage_for_opencode():
   ctx = _ctx()
-  ctx.provider = "opencode"
+  ctx.agent = "opencode"
   handled, resp = try_dispatch("/usage", ctx)
   assert handled
   assert "opencode stats" in resp

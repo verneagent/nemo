@@ -58,37 +58,61 @@ CREATE TABLE IF NOT EXISTS working_state (
   message_id TEXT DEFAULT '',
   created_at REAL DEFAULT 0
 );
-CREATE TABLE IF NOT EXISTS provider_sessions (
+CREATE TABLE IF NOT EXISTS agent_sessions (
   chat_id TEXT NOT NULL,
-  provider TEXT NOT NULL,
+  agent TEXT NOT NULL,
   endpoint_key TEXT NOT NULL DEFAULT '',
   sdk_session_id TEXT NOT NULL DEFAULT '',
-  PRIMARY KEY (chat_id, provider, endpoint_key)
+  PRIMARY KEY (chat_id, agent, endpoint_key)
 );
 """
 
 
-_PROVIDER_SESSION_COLUMNS: dict[str, str] = {
+_AGENT_SESSION_COLUMNS: dict[str, str] = {
   "claude": "claude_session_id",
   "codex": "codex_session_id",
   "opencode": "opencode_session_id",
 }
 
 
+def _migrate_provider_to_agent(conn: sqlite3.Connection) -> None:
+  """Rename the legacy ``provider_sessions`` table (and its ``provider``
+  column) to the agent terminology. Idempotent: only runs when the old
+  table is present and the new one isn't.
+  """
+  has_old = conn.execute(
+    "SELECT name FROM sqlite_master WHERE type='table' AND name='provider_sessions'"
+  ).fetchone() is not None
+  has_new = conn.execute(
+    "SELECT name FROM sqlite_master WHERE type='table' AND name='agent_sessions'"
+  ).fetchone() is not None
+  if not has_old:
+    return
+  if has_new:
+    # Both present is a pathological state from an interrupted migration;
+    # drop the freshly-created empty new table and let the rename retry.
+    conn.execute("DROP TABLE agent_sessions")
+  conn.execute("ALTER TABLE provider_sessions RENAME TO agent_sessions")
+  conn.execute("ALTER TABLE agent_sessions RENAME COLUMN provider TO agent")
+
+
 def _ensure_tables(conn: sqlite3.Connection) -> None:
+  # Migration runs before CREATE TABLE IF NOT EXISTS so the new table
+  # isn't accidentally created empty while the old one still holds data.
+  _migrate_provider_to_agent(conn)
   conn.executescript(_SCHEMA)
   cols = {row[1] for row in conn.execute("PRAGMA table_info(sessions)")}
   if "sdk_session_id" not in cols:
-    # Legacy column from before per-provider session storage. New
+    # Legacy column from before per-agent session storage. New
     # captain-nemo no longer writes here, but the column is still added
     # to brand-new DBs so older captain-nemo can read them.
     conn.execute("ALTER TABLE sessions ADD COLUMN sdk_session_id TEXT DEFAULT ''")
-  for col in _PROVIDER_SESSION_COLUMNS.values():
+  for col in _AGENT_SESSION_COLUMNS.values():
     if col not in cols:
       conn.execute(f"ALTER TABLE sessions ADD COLUMN {col} TEXT DEFAULT ''")
   # Deliberately NO backfill from the legacy column. The historical
   # `sdk_session_id` held whatever the most-recent daemon wrote
-  # regardless of provider — a codex thread id can sit in there from
+  # regardless of agent — a codex thread id can sit in there from
   # a previous codex run, and copying it into claude_session_id would
   # make the next claude daemon try to resume a codex thread.  The
   # claude SDK doesn't have the lazy-throw fallback the codex sidecar
@@ -128,11 +152,11 @@ class Database:
     self._session_id = session_id
     # Preserve resume state from the previous row for this chat — both
     # the legacy sdk_session_id (still read by old captain-nemo) and the
-    # per-provider columns introduced in 0.3.87. INSERT OR REPLACE
+    # per-agent columns introduced in 0.3.87. INSERT OR REPLACE
     # rewrites every column to its DEFAULT, so we have to fish out the
     # current values and pass them through.
-    provider_cols = list(_PROVIDER_SESSION_COLUMNS.values())
-    old_cols = ["sdk_session_id", *provider_cols]
+    agent_cols = list(_AGENT_SESSION_COLUMNS.values())
+    old_cols = ["sdk_session_id", *agent_cols]
     select_cols = ", ".join(old_cols)
     old = self._conn.execute(
       f"SELECT {select_cols} FROM sessions WHERE chat_id = ?", (chat_id,)
@@ -192,13 +216,13 @@ class Database:
     return row["session_id"] if row else None
 
   def get_sdk_session_id(
-    self, chat_id: str, provider: str, endpoint_key: str = "",
+    self, chat_id: str, agent: str, endpoint_key: str = "",
   ) -> str:
-    """Look up the resume id for ``provider`` on ``chat_id``.
+    """Look up the resume id for ``agent`` on ``chat_id``.
 
-    Each provider (claude / codex / opencode) keeps its own slot so
-    switching providers on a chat doesn't try to feed a Claude UUID into
-    Codex (or vice versa). Within one provider, ``endpoint_key`` further
+    Each agent kind (claude / codex / opencode) keeps its own slot so
+    switching agents on a chat doesn't try to feed a Claude UUID into
+    Codex (or vice versa). Within one agent, ``endpoint_key`` further
     isolates sessions by upstream endpoint — switching e.g. from real
     Anthropic to DeepSeek's Anthropic-compatible gateway gives the new
     endpoint its own fresh session rather than replaying a transcript
@@ -206,56 +230,56 @@ class Database:
     Anthropic API rejects those with HTTP 400).
 
     ``endpoint_key`` is the upstream URL (``EndpointConfig.base_url``);
-    ``""`` means the provider's default endpoint. Two presets pointing
+    ``""`` means the agent's default endpoint. Two presets pointing
     at the same gateway (e.g. ``deepseek-v4-pro`` and
     ``deepseek-v4-flash`` both at ``api.deepseek.com/anthropic``)
     deliberately share a session — they share signing keys so the
     history is replayable. Returns ``""`` if no resume target.
     """
-    if _PROVIDER_SESSION_COLUMNS.get(provider) is None:
+    if _AGENT_SESSION_COLUMNS.get(agent) is None:
       return ""
     if endpoint_key == "":
-      # Default endpoint stays in the per-provider column so older
-      # captain-nemo readers (which predate provider_sessions) keep
+      # Default endpoint stays in the per-agent column so older
+      # captain-nemo readers (which predate agent_sessions) keep
       # working — they only ever knew the default endpoint anyway.
-      col = _PROVIDER_SESSION_COLUMNS[provider]
+      col = _AGENT_SESSION_COLUMNS[agent]
       row = self._conn.execute(
         f"SELECT {col} FROM sessions WHERE chat_id = ?", (chat_id,)
       ).fetchone()
       return row[col] if row and row[col] else ""
     row = self._conn.execute(
-      "SELECT sdk_session_id FROM provider_sessions "
-      "WHERE chat_id = ? AND provider = ? AND endpoint_key = ?",
-      (chat_id, provider, endpoint_key),
+      "SELECT sdk_session_id FROM agent_sessions "
+      "WHERE chat_id = ? AND agent = ? AND endpoint_key = ?",
+      (chat_id, agent, endpoint_key),
     ).fetchone()
     return row["sdk_session_id"] if row and row["sdk_session_id"] else ""
 
   def set_sdk_session_id(
-    self, chat_id: str, sdk_session_id: str, provider: str,
+    self, chat_id: str, sdk_session_id: str, agent: str,
     endpoint_key: str = "",
   ) -> None:
-    """Persist the most recent SDK session id for ``provider`` on ``chat_id``.
+    """Persist the most recent SDK session id for ``agent`` on ``chat_id``.
 
     ``endpoint_key`` scopes the id to a specific upstream endpoint —
-    see ``get_sdk_session_id`` for why. Unknown providers are a silent
+    see ``get_sdk_session_id`` for why. Unknown agent kinds are a silent
     no-op (matches pre-existing semantics).
     """
-    if _PROVIDER_SESSION_COLUMNS.get(provider) is None:
+    if _AGENT_SESSION_COLUMNS.get(agent) is None:
       return
     if endpoint_key == "":
-      col = _PROVIDER_SESSION_COLUMNS[provider]
+      col = _AGENT_SESSION_COLUMNS[agent]
       self._conn.execute(
         f"UPDATE sessions SET {col} = ? WHERE chat_id = ?",
         (sdk_session_id, chat_id),
       )
     else:
       self._conn.execute(
-        "INSERT INTO provider_sessions "
-        "(chat_id, provider, endpoint_key, sdk_session_id) "
+        "INSERT INTO agent_sessions "
+        "(chat_id, agent, endpoint_key, sdk_session_id) "
         "VALUES (?, ?, ?, ?) "
-        "ON CONFLICT(chat_id, provider, endpoint_key) "
+        "ON CONFLICT(chat_id, agent, endpoint_key) "
         "DO UPDATE SET sdk_session_id = excluded.sdk_session_id",
-        (chat_id, provider, endpoint_key, sdk_session_id),
+        (chat_id, agent, endpoint_key, sdk_session_id),
       )
     self._conn.commit()
 

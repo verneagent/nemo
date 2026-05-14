@@ -4,7 +4,7 @@ Both Claude (``~/.claude/projects/<encoded-cwd>/<uuid>.jsonl``) and Codex
 (``~/.codex/sessions/<yyyy>/<mm>/<dd>/rollout-<ts>-<uuid>.jsonl``) keep
 the per-turn transcript locally as JSONL. ``/session list`` and
 ``/session recall`` walk those files so the user can browse what's been
-discussed in this project across providers/endpoints and pull a past
+discussed in this project across agents/endpoints and pull a past
 session's contents back into the current conversation as memory (no
 real SDK resume — see the per-endpoint isolation note in db.py).
 """
@@ -23,7 +23,7 @@ from typing import Iterable
 class SessionInfo:
   """One past session discovered on disk."""
   uuid: str            # bare uuid (no rollout- prefix etc.)
-  provider: str        # "claude" | "codex"
+  agent: str           # "claude" | "codex"
   path: str            # absolute path to the JSONL
   mtime: float         # last-modified epoch seconds
   first_user_text: str        # cleaned preview of the first real user prompt
@@ -201,7 +201,7 @@ def _scan_claude_session(path: str) -> SessionInfo | None:
         recent.pop(0)
 
   return SessionInfo(
-    uuid=uuid, provider="claude", path=path, mtime=st.st_mtime,
+    uuid=uuid, agent="claude", path=path, mtime=st.st_mtime,
     first_user_text=first_user, last_user_texts=recent, model=model,
   )
 
@@ -303,7 +303,7 @@ def _scan_codex_session(path: str, want_cwd: str) -> SessionInfo | None:
         recent.pop(0)
 
   return SessionInfo(
-    uuid=uuid, provider="codex", path=path, mtime=st.st_mtime,
+    uuid=uuid, agent="codex", path=path, mtime=st.st_mtime,
     first_user_text=first_user, last_user_texts=recent, model=model,
   )
 
@@ -330,7 +330,7 @@ def list_codex_sessions(project_dir: str) -> list[SessionInfo]:
 # ---------------------------------------------------------------------------
 
 def list_sessions(project_dir: str) -> list[SessionInfo]:
-  """All sessions for ``project_dir`` across providers, newest first."""
+  """All sessions for ``project_dir`` across agents, newest first."""
   sessions = list_claude_sessions(project_dir) + list_codex_sessions(project_dir)
   sessions.sort(key=lambda s: s.mtime, reverse=True)
   return sessions

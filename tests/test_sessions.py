@@ -59,7 +59,7 @@ def test_list_claude_sessions_extracts_uuid_model_and_preview(tmp_path):
   assert len(out) == 1, out
   s = out[0]
   assert s.uuid == "01fe69c7-5793-4ad7-9ba6-7d1aa1e01f90"
-  assert s.provider == "claude"
+  assert s.agent == "claude"
   assert s.model == "claude-opus-4-7"
   # Noise tag (<command-name>) gets stripped; the real first user
   # prompt comes through as the preview.
@@ -148,7 +148,7 @@ def test_list_codex_sessions_scopes_to_project_cwd(tmp_path):
   assert len(out) == 1, [s.uuid for s in out]
   s = out[0]
   assert s.uuid == "019c3fec-3890-78f0-988c-cdb3802197b8"
-  assert s.provider == "codex"
+  assert s.agent == "codex"
   assert s.model == "gpt-5.5"
   assert s.first_user_text == "Run the tests please"
 
@@ -177,14 +177,14 @@ def test_list_sessions_merges_claude_and_codex_newest_first(tmp_path):
   os.utime(x_path, (time.time() - 10, time.time() - 10))
   with mock.patch.dict(os.environ, {"HOME": home}):
     out = sessions.list_sessions(project)
-  assert [s.provider for s in out] == ["codex", "claude"], out
+  assert [s.agent for s in out] == ["codex", "claude"], out
 
 
 def test_find_session_prefers_exact_over_prefix():
   from nemo.sessions import SessionInfo, find_session
-  a = SessionInfo(uuid="abc123", provider="claude", path="", mtime=0,
+  a = SessionInfo(uuid="abc123", agent="claude", path="", mtime=0,
                   first_user_text="", model="")
-  b = SessionInfo(uuid="abc1234567", provider="claude", path="", mtime=0,
+  b = SessionInfo(uuid="abc1234567", agent="claude", path="", mtime=0,
                   first_user_text="", model="")
   # Exact wins.
   matches = find_session("abc123", [a, b])
