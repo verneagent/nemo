@@ -1320,3 +1320,100 @@ def test_working_card_retries_on_first_create_failure(tmp_path):
     f"(send_card attempts={len(send_card_calls)}, "
     f"working_creates={_state['working_create_attempts']})"
   )
+
+
+def test_working_card_retry_also_triggered_by_answer_event(tmp_path):
+  """Companion to test_working_card_retries_on_first_create_failure:
+  the retry path lives in `_update_working`, which is called from the
+  ProgressEvent handler *and* from the AnswerEvent handler (and from
+  RateLimit / Compact handlers). A turn whose only events are
+  (first=True ProgressEvent that fails to create the card) + an
+  AnswerEvent must still produce a working card via the AnswerEvent's
+  retry — otherwise text-only turns (no follow-up tool calls) would
+  stay silent after one transient blip.
+
+  Without the fix: 0 successful card creates, 0 update_card calls.
+  With the fix: AnswerEvent's _update_working calls _ensure_card again,
+  the second send_card succeeds, and the AnswerEvent's update_card
+  fires.
+  """
+  from nemo.channel import IncomingMessage
+
+  send_card_calls: list[object] = []
+  update_card_calls: list[object] = []
+  _state = {"working_create_attempts": 0}
+
+  class _FlakyChannel(_FakeChannel):
+    async def send_card(self, _chat_id, card):
+      send_card_calls.append(card)
+      if len(send_card_calls) == 1:
+        return "om_start"  # start card unrelated to the working card
+      _state["working_create_attempts"] += 1
+      if _state["working_create_attempts"] == 1:
+        raise ConnectionError("Remote end closed connection without response")
+      return "om_working"
+
+    async def update_card(self, card_id, card):
+      update_card_calls.append((card_id, card))
+      return card_id
+
+  class _OneToolThenAnswerAgent(_FakeAgent):
+    async def run_turn(self, _prompt, on_event):
+      def _emit():
+        # Only ONE ProgressEvent — its _ensure_card fails. If the retry
+        # only lived in subsequent ProgressEvents, this turn would
+        # never recover. AnswerEvent's _update_working must pick it up.
+        on_event(ProgressEvent(kind="tool", summary="Read", first=True))
+        on_event(AnswerEvent("here is the answer"))
+        on_event(DoneEvent(cost=0.0, usage={"input_tokens": 1}))
+      await asyncio.to_thread(_emit)
+      return 0.0, {"input_tokens": 1}
+
+  channel = _FlakyChannel("oc_test")
+  channel._messages = [
+    IncomingMessage(
+      event_type="im.message.receive_v1",
+      chat_id="oc_test", sender_id="ou_user",
+      message_id="om_msg", msg_type="text",
+      text="hi", create_time="1",
+    ),
+    IncomingMessage(
+      event_type="im.message.receive_v1",
+      chat_id="oc_test", sender_id="ou_user",
+      message_id="om_exit", msg_type="text",
+      text="/exit", create_time="2",
+    ),
+  ]
+  async def _recv(timeout=300):
+    del timeout
+    if channel._messages:
+      return channel._messages.pop(0)
+    return None
+  channel.receive = _recv
+
+  with mock.patch("nemo.agent.load_credentials", return_value={
+    "app_id": "app_id", "app_secret": "app_secret", "email": "u@e.com",
+  }), \
+       mock.patch("nemo.agent.Database", _FakeDB), \
+       mock.patch("nemo.agent.LarkChannel", return_value=channel), \
+       mock.patch("nemo.agent.build_coding_agent", return_value=_OneToolThenAnswerAgent()), \
+       mock.patch("nemo.agent._send_response", new=mock.AsyncMock()), \
+       mock.patch("nemo.group_config.load_config", return_value={}), \
+       mock.patch("nemo.config.load_relay_config", return_value=("", "")), \
+       mock.patch("signal.signal"):
+    rc = asyncio.run(main_loop("oc_test", str(tmp_path), "claude-opus-4-6"))
+
+  assert rc == 0
+  # Either the ProgressEvent's in-line retry or the AnswerEvent's
+  # retry must have produced an update_card call. Before the fix the
+  # ProgressEvent has nothing to retry off of (first=True triggers
+  # _ensure_card directly, which fails and never gets a second
+  # chance) and the AnswerEvent's `if not _turn_card_id: return`
+  # short-circuit kills the AnswerEvent path too — so update_card
+  # stays at zero.
+  assert len(update_card_calls) >= 1, (
+    f"AnswerEvent didn't recover the working card after _ensure_card "
+    f"failure: send_card attempts={len(send_card_calls)}, "
+    f"working_creates={_state['working_create_attempts']}, "
+    f"update_card={len(update_card_calls)}"
+  )
