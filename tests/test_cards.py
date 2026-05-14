@@ -328,6 +328,71 @@ def test_working_card_no_rate_limit_notice_by_default():
   assert "Rate limit" not in elements[0]["content"]
 
 
+def test_working_card_renders_compact_notice_above_thinking():
+  """Compact-notice banner sits at the top of the working card body —
+  ABOVE the collapsible thinking panel — so a 10–60s silent compaction
+  is explained as it happens instead of buried in the thinking timeline
+  the user has to expand to see.
+
+  Regression: pre-refactor compaction surfaced as a ThinkingStep
+  ("compact", "🗜 上下文压缩中…") that got grouped into the
+  ``collapsible_thinking`` panel. The pause was invisible until the
+  user expanded thinking — exactly the silence we were trying to fix.
+  """
+  steps = [ThinkingStep("tool", "Read: a.py")]
+  card = build_turn_card(
+    "working",
+    steps=steps,
+    compact_notice="🗜 上下文压缩中…",
+    elapsed=12,
+    chat_id="oc_x",
+  )
+  elements = card["body"]["elements"]
+  # First element is the grey compact-notice banner (outside the
+  # collapsible thinking panel).
+  assert elements[0]["tag"] == "markdown"
+  assert "压缩中" in elements[0]["content"]
+  assert "<font color='grey'>" in elements[0]["content"]
+  # No element after the banner should be a collapsible_panel that
+  # contains a "压缩" step — the notice must NOT be duplicated inside
+  # the thinking timeline.
+  for el in elements:
+    if el.get("tag") == "collapsible_panel":
+      assert "压缩" not in repr(el), (
+        "compact notice leaked into collapsible thinking — banner only"
+      )
+
+
+def test_working_card_renders_both_notices_distinct_colors():
+  """Rate-limit (orange) and compact (grey) can coexist as two banners
+  at the top of the working card. They share the same slot but stack
+  in declaration order so the user sees both."""
+  card = build_turn_card(
+    "working",
+    current_tool="Read: a.py",
+    rate_limit_notice="⛔ Rate limit hit",
+    compact_notice="🗜 上下文压缩中…",
+    elapsed=5,
+    chat_id="oc_x",
+  )
+  elements = card["body"]["elements"]
+  assert elements[0]["tag"] == "markdown"
+  assert "Rate limit" in elements[0]["content"]
+  assert "<font color='orange'>" in elements[0]["content"]
+  assert elements[1]["tag"] == "markdown"
+  assert "压缩中" in elements[1]["content"]
+  assert "<font color='grey'>" in elements[1]["content"]
+
+
+def test_working_card_no_compact_notice_by_default():
+  """Without an explicit notice nothing changes."""
+  card = build_turn_card("working", current_tool="Read: a.py", chat_id="oc_x")
+  elements = card["body"]["elements"]
+  for el in elements:
+    if el.get("tag") == "markdown":
+      assert "压缩" not in el["content"]
+
+
 def test_stopping_card_preserves_working_content():
   steps = [ThinkingStep("tool", "Read: a.py"), ThinkingStep("answer", "Checking")]
   card = build_turn_card("stopping", current_tool="Read: a.py", steps=steps)

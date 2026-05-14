@@ -15,7 +15,10 @@ from nemo.agent import (
   main_loop,
 )
 from nemo.channel import IncomingMessage
-from nemo.turn import AnswerEvent, DoneEvent, ProgressEvent, RateLimitNoticeEvent
+from nemo.turn import (
+  AnswerEvent, CompactNoticeEvent, CompactStartedEvent, DoneEvent,
+  ProgressEvent, RateLimitNoticeEvent,
+)
 
 
 class _FakeDB:
@@ -1417,3 +1420,119 @@ def test_working_card_retry_also_triggered_by_answer_event(tmp_path):
     f"working_creates={_state['working_create_attempts']}, "
     f"update_card={len(update_card_calls)}"
   )
+
+
+def test_compact_events_set_banner_not_thinking_steps(tmp_path):
+  """CompactStartedEvent / CompactNoticeEvent surface as a banner on the
+  working card, not as ThinkingSteps inside the collapsible thinking
+  timeline.
+
+  Before the refactor: compaction was appended to ``_turn_steps`` as
+  ``ThinkingStep("compact", …)`` and got grouped into the collapsible
+  thinking panel — so a 10–60s silent compaction was invisible until
+  the user expanded thinking. After: the latest compact message lives
+  in a banner above the thinking panel (same slot as rate-limit) and
+  ``_turn_steps`` carries no "compact" entries.
+
+  Oracle: every update_card payload emitted during the turn must
+  contain the compact-notice banner (grey markdown above the
+  collapsible) and no ThinkingStep with the compact glyph inside the
+  thinking panel.
+  """
+  from nemo.channel import IncomingMessage
+
+  update_card_payloads: list[object] = []
+
+  class _CapturingChannel(_FakeChannel):
+    async def send_card(self, _chat_id, _card):
+      return "om_working"
+
+    async def update_card(self, card_id, card):
+      update_card_payloads.append(card)
+      return card_id
+
+  class _CompactingAgent(_FakeAgent):
+    async def run_turn(self, _prompt, on_event):
+      def _emit():
+        # first=True so the working card exists before the compact events
+        # arrive — _update_working updates the existing card rather than
+        # creating one mid-event.
+        on_event(ProgressEvent(kind="tool", summary="Read", first=True))
+        on_event(CompactStartedEvent(trigger="auto"))
+        on_event(CompactNoticeEvent(
+          trigger="auto", pre_tokens=180_000, post_tokens=60_000,
+          duration_ms=15_000,
+        ))
+        on_event(AnswerEvent("after compact"))
+        on_event(DoneEvent(cost=0.0, usage={"input_tokens": 1}))
+      await asyncio.to_thread(_emit)
+      return 0.0, {"input_tokens": 1}
+
+  channel = _CapturingChannel("oc_test")
+  channel._messages = [
+    IncomingMessage(
+      event_type="im.message.receive_v1",
+      chat_id="oc_test", sender_id="ou_user",
+      message_id="om_msg", msg_type="text",
+      text="hi", create_time="1",
+    ),
+    IncomingMessage(
+      event_type="im.message.receive_v1",
+      chat_id="oc_test", sender_id="ou_user",
+      message_id="om_exit", msg_type="text",
+      text="/exit", create_time="2",
+    ),
+  ]
+  async def _recv(timeout=300):
+    del timeout
+    if channel._messages:
+      return channel._messages.pop(0)
+    return None
+  channel.receive = _recv
+
+  with mock.patch("nemo.agent.load_credentials", return_value={
+    "app_id": "app_id", "app_secret": "app_secret", "email": "u@e.com",
+  }), \
+       mock.patch("nemo.agent.Database", _FakeDB), \
+       mock.patch("nemo.agent.LarkChannel", return_value=channel), \
+       mock.patch("nemo.agent.build_coding_agent", return_value=_CompactingAgent()), \
+       mock.patch("nemo.agent._send_response", new=mock.AsyncMock()), \
+       mock.patch("nemo.group_config.load_config", return_value={}), \
+       mock.patch("nemo.config.load_relay_config", return_value=("", "")), \
+       mock.patch("signal.signal"):
+    rc = asyncio.run(main_loop("oc_test", str(tmp_path), "claude-opus-4-6"))
+
+  assert rc == 0
+  # At least one update_card after CompactStartedEvent must carry the
+  # grey banner. After CompactNoticeEvent it gets replaced with the
+  # post-fact summary that mentions tokens or duration. The very last
+  # working-phase update should carry the summary banner.
+  working_updates = [
+    c for c in update_card_payloads
+    if c.get("header", {}).get("title", {}).get("content", "").startswith(
+      ("Working", "Stopping", "Stopped"))
+  ]
+  assert working_updates, "no working-phase update_card calls"
+  banners_seen = []
+  for card in working_updates:
+    for el in card["body"]["elements"]:
+      if el.get("tag") == "markdown" and "<font color='grey'>" in el.get("content", ""):
+        banners_seen.append(el["content"])
+  assert banners_seen, (
+    f"no grey compact-notice banner in any of {len(working_updates)} "
+    f"working_updates"
+  )
+  # Last banner is the post-fact summary — it must include either a
+  # token count or a duration that came from CompactNoticeEvent.
+  last_banner = banners_seen[-1]
+  assert ("180" in last_banner or "60" in last_banner or "15" in last_banner), (
+    f"last compact banner missing post-fact metadata: {last_banner!r}"
+  )
+  # No collapsible_thinking panel anywhere may contain the compaction
+  # glyph — the banner must NOT also leak into the thinking timeline.
+  for card in update_card_payloads:
+    for el in card["body"]["elements"]:
+      if el.get("tag") == "collapsible_panel":
+        assert "🗜" not in repr(el), (
+          f"compact glyph leaked into collapsible thinking: {el!r}"
+        )

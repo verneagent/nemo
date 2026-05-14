@@ -1414,6 +1414,13 @@ async def main_loop(
       # Latest rendered rate-limit notice for this turn. Persists on the
       # working card and is appended to the timeout error if the turn dies.
       _turn_rate_limit_notice = ""
+      # Latest rendered compact-notice banner for this turn. Set when the
+      # SDK fires PreCompact (CompactStartedEvent) and replaced with the
+      # post-fact summary on CompactNoticeEvent. Lives outside the
+      # collapsible thinking panel so a 10–60s silent compaction is
+      # explained as it happens rather than buried after the user expands
+      # thinking.
+      _turn_compact_notice = ""
 
       async def _update_interrupt_card(phase: str) -> None:
         nonlocal _turn_card_id, _turn_interrupt_phase
@@ -1427,6 +1434,7 @@ async def main_loop(
             current_tool=_turn_current_tool,
             elapsed=int(time.time() - _turn_start),
             rate_limit_notice=_turn_rate_limit_notice,
+            compact_notice=_turn_compact_notice,
           )
           prev_id = _turn_card_id
           _turn_card_id = await channel.update_card(_turn_card_id, card)
@@ -1444,7 +1452,7 @@ async def main_loop(
         # asyncio.wait({sdk_task, ...}) completes, which guarantees all
         # _on_event calls have finished. No lock needed.
         nonlocal _turn_card_id, _sdk_session_id, _turn_current_tool
-        nonlocal _turn_rate_limit_notice
+        nonlocal _turn_rate_limit_notice, _turn_compact_notice
 
         def _ensure_card():
           """Create working card if it doesn't exist yet."""
@@ -1482,6 +1490,7 @@ async def main_loop(
             elapsed=elapsed,
             chat_id=chat_id,
             rate_limit_notice=_turn_rate_limit_notice,
+            compact_notice=_turn_compact_notice,
             **kwargs,
           )
           try:
@@ -1518,16 +1527,20 @@ async def main_loop(
 
         elif isinstance(event, CompactStartedEvent):
           # PreCompact hook fired — compaction may take 10-60s during which
-          # no other SDK messages arrive. Drop a step + PATCH the card so
-          # the user knows what's happening instead of staring at silence.
-          _turn_steps.append(cards.ThinkingStep("compact", _format_compact_started(event)))
+          # no other SDK messages arrive. Surface a banner above the
+          # working state so the silence is explained as it happens.
+          # CompactNoticeEvent below replaces this with the post-fact
+          # summary (tokens, duration) once compaction finishes.
+          _turn_compact_notice = _format_compact_started(event)
           _ensure_card()
           _update_working()
 
         elif isinstance(event, CompactNoticeEvent):
           # SystemMessage(subtype=compact_boundary) arrived — compaction
-          # finished. Drop a step with the post-fact summary (tokens, duration).
-          _turn_steps.append(cards.ThinkingStep("compact", _format_compact_notice(event)))
+          # finished. Swap the "compressing…" banner for a summary
+          # banner with tokens + duration so the user can see at a
+          # glance what happened during the silent stretch above.
+          _turn_compact_notice = _format_compact_notice(event)
           _ensure_card()
           _update_working()
 

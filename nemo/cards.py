@@ -34,7 +34,7 @@ class ToolRecord:
 @dataclass
 class ThinkingStep:
   """One entry in the unified thinking timeline."""
-  kind: str       # "thinking" | "tool" | "reasoning" | "answer" | "compact"
+  kind: str       # "thinking" | "tool" | "reasoning" | "answer"
   content: str    # text content or tool summary
 
 
@@ -252,7 +252,7 @@ def _collapsible_thinking(steps: list[ThinkingStep]) -> JsonObject:
     # Separate thinking/reasoning/compact and tool steps while preserving
     # order. Compact-boundary steps render in the same "text" lane as
     # thinking — they're brief informational lines, not tool calls.
-    thinkings = [s for s in grp_steps if s.kind in ("thinking", "reasoning", "compact")]
+    thinkings = [s for s in grp_steps if s.kind in ("thinking", "reasoning")]
     tools = [s for s in grp_steps if s.kind == "tool"]
 
     # Render thinking blocks (all of them — not counted toward tool limit)
@@ -355,6 +355,7 @@ def _working_elements(
   include_stop_button: bool,
   chat_id: str = "",
   rate_limit_notice: str = "",
+  compact_notice: str = "",
 ) -> list[JsonObject]:
   """Build the shared body for working/stopping/stopped phases."""
   elements: list[JsonObject] = []
@@ -362,6 +363,14 @@ def _working_elements(
     elements.append({
       "tag": "markdown",
       "content": f"<font color='orange'>{rate_limit_notice}</font>",
+    })
+  if compact_notice:
+    # Same banner slot as rate_limit, different colour so they're
+    # distinguishable when both fire in the same turn. Grey reads as
+    # "informational status" vs rate-limit's orange "watch out".
+    elements.append({
+      "tag": "markdown",
+      "content": f"<font color='grey'>{compact_notice}</font>",
     })
   if current_tool:
     elements.append({"tag": "markdown", "content": f"`{current_tool}`"})
@@ -383,6 +392,7 @@ def build_turn_card(
   chat_id: str = "",
   session_id: str = "",
   rate_limit_notice: str = "",
+  compact_notice: str = "",
 ) -> JsonObject:
   """Build a unified turn card for any phase.
 
@@ -391,6 +401,10 @@ def build_turn_card(
   steps: unified thinking timeline (text + tool entries in order)
   rate_limit_notice: short banner shown above the working state to flag
     upstream rate-limit pressure (only rendered in working/stopping/stopped).
+  compact_notice: short banner explaining a context-compaction pause —
+    rendered in the same banner slot as rate_limit_notice. Lives outside
+    the collapsible thinking panel so a 10–60s silent compaction doesn't
+    look like the daemon has stalled.
   """
   steps = steps or []
   elements: list[JsonObject] = []
@@ -400,6 +414,7 @@ def build_turn_card(
       steps=steps, current_tool=current_tool,
       include_stop_button=True, chat_id=chat_id,
       rate_limit_notice=rate_limit_notice,
+      compact_notice=compact_notice,
     )
     title = _elapsed_title(elapsed)
     header: JsonObject | None = {
@@ -412,6 +427,7 @@ def build_turn_card(
       steps=steps, current_tool=current_tool,
       include_stop_button=False,
       rate_limit_notice=rate_limit_notice,
+      compact_notice=compact_notice,
     )
     header = {
       "title": {"tag": "plain_text", "content": "Stopping..."},
@@ -423,6 +439,7 @@ def build_turn_card(
       steps=steps, current_tool=current_tool,
       include_stop_button=False,
       rate_limit_notice=rate_limit_notice,
+      compact_notice=compact_notice,
     )
     header = {
       "title": {"tag": "plain_text", "content": "Stopped"},
