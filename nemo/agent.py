@@ -12,6 +12,7 @@ Wires together:
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import datetime
 import logging
 import os
@@ -1054,9 +1055,16 @@ async def main_loop(
             )
             # Single-shot: clear so a second /undo-clear errors out.
             _prev_sdk_session_id = ""
-        elif response == "__esc__":
+        elif response == "__esc__" or (response and response.startswith("__esc__:")):
           elapsed = time.time() - _turn_start
           await _send_response(channel, chat_id, f"{_cancel_emoji(elapsed)} Operation cancelled.", db)
+          # `/esc <text>`: between turns there's nothing to cancel, but
+          # the user expects `<text>` to run next — push it back as a
+          # fresh message so the loop picks it up on the next iteration.
+          if response.startswith("__esc__:"):
+            follow_up = response.split(":", 1)[1]
+            follow_msg = dataclasses.replace(reply, text=follow_up)
+            channel.push_back(follow_msg)
         elif response and response.startswith("__model__:"):
           new_model = response.split(":", 1)[1]
           # Resolve against the preset registry first. A preset name
@@ -1818,7 +1826,14 @@ async def main_loop(
             continue
           msg_text = msg.text
           mentions = msg.mentions
-          if monitor.is_esc(msg_text, mentions):
+          esc_follow_up = monitor.parse_esc(msg_text, mentions)
+          if esc_follow_up is not None:
+            if esc_follow_up:
+              # `/esc <text>`: queue `<text>` as the next turn's input so
+              # the requeue at the end of the esc handler picks it up.
+              follow_msg = dataclasses.replace(msg, text=esc_follow_up)
+              _pending_msgs.append(follow_msg)
+              await _ack_pending(follow_msg)
             signal_detected = "esc"
             return
           if monitor.is_dissolve(msg_text, mentions):

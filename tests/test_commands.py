@@ -164,6 +164,26 @@ def test_esc():
     assert resp == "__esc__"
 
 
+def test_esc_with_follow_up_text():
+  handled, resp = try_dispatch("/esc fix the bug", _ctx())
+  assert handled
+  assert resp == "__esc__:fix the bug"
+
+
+def test_esc_with_follow_up_preserves_case():
+  handled, resp = try_dispatch("/esc Use TypeScript", _ctx())
+  assert handled
+  assert resp == "__esc__:Use TypeScript"
+
+
+def test_esc_with_follow_up_not_inline_safe():
+  # /esc <text> must NOT run as an inline command — it needs SDK restart
+  # (cancel current turn then re-queue the follow-up text).
+  from nemo.commands import is_inline_safe
+  _, resp = try_dispatch("/esc do something", _ctx())
+  assert not is_inline_safe(resp)
+
+
 def test_cd_valid(tmp_path):
   handled, resp = try_dispatch(f"/cd {tmp_path}", _ctx())
   assert handled

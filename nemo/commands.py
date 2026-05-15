@@ -154,8 +154,17 @@ def try_dispatch(text: str, ctx: AgentContext) -> tuple[bool, str | None]:
       f"Usage: `/effort low|medium|high|max|default`"
     )
 
-  # /esc
-  if t in ("/esc", "esc", "cancel", "取消"):
+  # /esc — bare cancels the current turn; with trailing text, cancel then
+  # send the text as a new message (case preserved from the original input).
+  esc_m = re.match(
+    r"^(?:/esc|esc|cancel|取消)(?:\s+(.+))?$",
+    text.strip(),
+    re.IGNORECASE | re.DOTALL,
+  )
+  if esc_m:
+    follow_up = (esc_m.group(1) or "").strip()
+    if follow_up:
+      return True, f"__esc__:{follow_up}"
     return True, "__esc__"
 
   # /cd
@@ -215,6 +224,7 @@ def try_dispatch(text: str, ctx: AgentContext) -> tuple[bool, str | None]:
       "| `/undo-clear` | Restore session from last `/clear` (in-memory only) |\n"
       "| `/cd <dir>` | Change working directory |\n"
       "| `/esc` | Cancel current operation |\n"
+      "| `/esc <text>` | Cancel and send `<text>` as the next message |\n"
       "| `/ping` | Status check |\n"
       "| `/cost` | Session API cost |\n"
       "| `/usage` | Plan usage limits |\n"
