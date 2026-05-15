@@ -218,6 +218,141 @@ def test_text_only_turn_clears_thinking_reaction(tmp_path):
   remove_reaction.assert_awaited_once_with("om_src", "r_thinking")
 
 
+def test_idle_esc_is_silent(tmp_path):
+  from nemo.channel import IncomingMessage
+
+  channel = _QueuedChannel("oc_test", [
+    IncomingMessage(
+      event_type="im.message.receive_v1",
+      chat_id="oc_test",
+      sender_id="ou_user",
+      message_id="om_esc",
+      msg_type="text",
+      text="/esc",
+      create_time="1",
+    ),
+    IncomingMessage(
+      event_type="im.message.receive_v1",
+      chat_id="oc_test",
+      sender_id="ou_user",
+      message_id="om_exit",
+      msg_type="text",
+      text="/exit",
+      create_time="2",
+    ),
+  ])
+  send_response = mock.AsyncMock()
+
+  with mock.patch("nemo.agent.load_credentials", return_value={
+    "app_id": "app_id",
+    "app_secret": "app_secret",
+    "email": "user@example.com",
+  }), \
+       mock.patch("nemo.agent.Database", _FakeDB), \
+       mock.patch("nemo.agent.LarkChannel", return_value=channel), \
+       mock.patch("nemo.agent.build_coding_agent", return_value=_FakeAgent()), \
+       mock.patch("nemo.agent._send_response", new=send_response), \
+       mock.patch("nemo.group_config.load_config", return_value={}), \
+       mock.patch("nemo.config.load_relay_config", return_value=("", "")), \
+       mock.patch("signal.signal"):
+    result = asyncio.run(main_loop("oc_test", str(tmp_path), "claude-opus-4-6"))
+
+  assert result == 0
+  send_response.assert_not_awaited()
+
+
+def test_active_esc_updates_card_without_cancel_message(tmp_path):
+  from nemo.channel import IncomingMessage
+
+  class _InterruptChannel(_QueuedChannel):
+    def __init__(self):
+      super().__init__("oc_test", [
+        IncomingMessage(
+          event_type="im.message.receive_v1",
+          chat_id="oc_test",
+          sender_id="ou_user",
+          message_id="om_work",
+          msg_type="text",
+          text="work",
+          create_time="1",
+        ),
+        IncomingMessage(
+          event_type="im.message.receive_v1",
+          chat_id="oc_test",
+          sender_id="ou_user",
+          message_id="om_esc",
+          msg_type="text",
+          text="/esc",
+          create_time="2",
+        ),
+        IncomingMessage(
+          event_type="im.message.receive_v1",
+          chat_id="oc_test",
+          sender_id="ou_user",
+          message_id="om_exit",
+          msg_type="text",
+          text="/exit",
+          create_time="3",
+        ),
+      ])
+      self._receive_count = 0
+      self.updated_cards: list[object] = []
+
+    async def receive(self, timeout=300):
+      self._receive_count += 1
+      if self._receive_count == 2:
+        await asyncio.sleep(0.05)
+      return await super().receive(timeout)
+
+    async def send_card(self, _chat_id, _card):
+      return f"om_card_{self._receive_count}"
+
+    async def update_card(self, card_id, card):
+      self.updated_cards.append(card)
+      return card_id
+
+  class _InterruptibleAgent(_FakeAgent):
+    def __init__(self):
+      self._interrupted = asyncio.Event()
+
+    async def interrupt(self):
+      self._interrupted.set()
+
+    async def run_turn(self, _prompt, on_event):
+      await asyncio.to_thread(
+        lambda: on_event(ProgressEvent(kind="tool", summary="Read", first=True))
+      )
+      await self._interrupted.wait()
+      await asyncio.to_thread(
+        lambda: on_event(DoneEvent(cost=0.0, usage={"input_tokens": 1}))
+      )
+      return 0.0, {"input_tokens": 1}
+
+  channel = _InterruptChannel()
+  send_response = mock.AsyncMock()
+
+  with mock.patch("nemo.agent.load_credentials", return_value={
+    "app_id": "app_id",
+    "app_secret": "app_secret",
+    "email": "user@example.com",
+  }), \
+       mock.patch("nemo.agent.Database", _FakeDB), \
+       mock.patch("nemo.agent.LarkChannel", return_value=channel), \
+       mock.patch("nemo.agent.build_coding_agent", return_value=_InterruptibleAgent()), \
+       mock.patch("nemo.agent._send_response", new=send_response), \
+       mock.patch("nemo.group_config.load_config", return_value={}), \
+       mock.patch("nemo.config.load_relay_config", return_value=("", "")), \
+       mock.patch("signal.signal"):
+    result = asyncio.run(main_loop("oc_test", str(tmp_path), "claude-opus-4-6"))
+
+  assert result == 0
+  send_response.assert_not_awaited()
+  assert any(
+    card.get("header", {}).get("title", {}).get("content") == "Stopped"
+    for card in channel.updated_cards
+  )
+
+
 def test_pacing_hint_prepended_after_timeout(tmp_path):
   """After a TimeoutError the next turn's prompt is prefixed with a pacing hint;
   the hint is not applied to subsequent turns."""
