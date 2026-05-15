@@ -1127,8 +1127,6 @@ async def main_loop(
             # Single-shot: clear so a second /undo-clear errors out.
             _prev_sdk_session_id = ""
         elif response == "__esc__" or (response and response.startswith("__esc__:")):
-          elapsed = time.time() - _turn_start
-          await _send_response(channel, chat_id, f"{_cancel_emoji(elapsed)} Operation cancelled.", db)
           # `/esc <text>`: between turns there's nothing to cancel, but
           # the user expects `<text>` to run next — push it back as a
           # fresh message so the loop picks it up on the next iteration.
@@ -1965,12 +1963,6 @@ async def main_loop(
           except Exception as exc:
             log.warning("SDK interrupt failed (%s), cancelling task", exc)
             sdk_task.cancel()
-          elapsed = time.time() - _turn_start
-          if signal_detected == "autoesc":
-            notice = f"{_cancel_emoji(elapsed)} Auto-cancelled — picking up new message."
-          else:
-            notice = f"{_cancel_emoji(elapsed)} Operation cancelled."
-          await _send_response(channel, chat_id, notice, db)
           await _update_interrupt_card("stopped")
 
         elif signal_detected in ("exit", "dissolve"):
