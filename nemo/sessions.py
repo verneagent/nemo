@@ -41,11 +41,12 @@ class SessionInfo:
 def _claude_project_dir(project_dir: str) -> str:
   """Map a project_dir to the Claude CLI's storage folder.
 
-  Claude CLI's heuristic: replace every ``/`` in the absolute cwd with
-  ``-``, which for absolute paths starts the result with ``-``.
+  Claude CLI's heuristic: replace every path separator and ``.`` in the
+  absolute cwd with ``-``, which for absolute paths starts the result
+  with ``-``.
   """
   abs_dir = os.path.abspath(project_dir)
-  encoded = abs_dir.replace("/", "-")
+  encoded = abs_dir.replace("/", "-").replace(".", "-")
   return os.path.expanduser(f"~/.claude/projects/{encoded}")
 
 
@@ -277,6 +278,12 @@ def _scan_codex_session(path: str, want_cwd: str) -> SessionInfo | None:
             m = p.get("model") or p.get("model_name")
             if isinstance(m, str) and m:
               model = m
+        elif etype == "turn_context" and not model:
+          p = ev.get("payload", {})
+          if isinstance(p, dict):
+            m = p.get("model")
+            if isinstance(m, str) and m:
+              model = m
         elif etype == "response_item" and not first_user:
           text = _codex_user_text(ev)
           if text and not _looks_like_injected_context(text):
@@ -357,5 +364,3 @@ def find_session(
     elif u.startswith(needle):
       matches.append(s)
   return exact or matches
-
-

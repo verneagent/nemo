@@ -19,7 +19,7 @@ def _write_jsonl(path: str, events: list[dict]) -> None:
 
 def _claude_session(home: str, project_dir: str, uuid: str,
                     events: list[dict]) -> str:
-  encoded = os.path.abspath(project_dir).replace("/", "-")
+  encoded = os.path.abspath(project_dir).replace("/", "-").replace(".", "-")
   path = os.path.join(home, ".claude", "projects", encoded, f"{uuid}.jsonl")
   _write_jsonl(path, events)
   return path
@@ -64,6 +64,23 @@ def test_list_claude_sessions_extracts_uuid_model_and_preview(tmp_path):
   # Noise tag (<command-name>) gets stripped; the real first user
   # prompt comes through as the preview.
   assert s.first_user_text == "Help me debug this bug"
+
+
+def test_list_claude_sessions_handles_hidden_path_segments(tmp_path):
+  home = str(tmp_path / "home")
+  project = str(tmp_path / ".prowl" / "repos" / "fived" / "stt-stuck")
+  os.makedirs(project, exist_ok=True)
+  _claude_session(home, project, "d65dfbbf-7c71-49cd-9761-06844d0a189f", [
+    {"type": "user", "message": {
+      "role": "user",
+      "content": "Look at this bug",
+    }},
+  ])
+  with mock.patch.dict(os.environ, {"HOME": home}):
+    out = sessions.list_claude_sessions(project)
+  assert len(out) == 1
+  assert out[0].uuid == "d65dfbbf-7c71-49cd-9761-06844d0a189f"
+  assert out[0].first_user_text == "Look at this bug"
 
 
 def test_list_claude_sessions_handles_block_content(tmp_path):
@@ -151,6 +168,33 @@ def test_list_codex_sessions_scopes_to_project_cwd(tmp_path):
   assert s.agent == "codex"
   assert s.model == "gpt-5.5"
   assert s.first_user_text == "Run the tests please"
+
+
+def test_list_codex_sessions_extracts_model_from_turn_context(tmp_path):
+  home = str(tmp_path / "home")
+  project = str(tmp_path / "p")
+  os.makedirs(project, exist_ok=True)
+  _codex_session(home, "2026", "05", "15",
+                 "019e2b0a-2519-7f81-ad04-fa2f22e450e7", [
+    {"type": "session_meta", "payload": {
+      "id": "019e2b0a-2519-7f81-ad04-fa2f22e450e7",
+      "cwd": os.path.abspath(project),
+    }},
+    {"type": "response_item", "payload": {
+      "type": "message", "role": "user",
+      "content": [{"type": "input_text", "text": "# AGENTS.md\n..."}],
+    }},
+    {"type": "turn_context", "payload": {"model": "gpt-5.5"}},
+    {"type": "response_item", "payload": {
+      "type": "message", "role": "user",
+      "content": [{"type": "input_text", "text": "Actual prompt"}],
+    }},
+  ])
+  with mock.patch.dict(os.environ, {"HOME": home}):
+    out = sessions.list_codex_sessions(project)
+  assert len(out) == 1
+  assert out[0].model == "gpt-5.5"
+  assert out[0].first_user_text == "Actual prompt"
 
 
 def test_list_sessions_merges_claude_and_codex_newest_first(tmp_path):
