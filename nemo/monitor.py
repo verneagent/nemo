@@ -15,9 +15,42 @@ import re
 
 
 def is_esc(text: str, mentions: list[dict[str, str]] | None = None) -> bool:
-  """Check if a message is an /esc command."""
-  t = _strip_mentions(text, mentions)
-  return t in ("/esc", "esc", "cancel", "取消")
+  """Check if a message is an /esc command (with or without follow-up text)."""
+  return parse_esc(text, mentions) is not None
+
+
+def parse_esc(
+  text: str, mentions: list[dict[str, str]] | None = None,
+) -> str | None:
+  """Parse `/esc` or `/esc <text>`.
+
+  Returns:
+    - None  : not an esc command
+    - ""    : bare `/esc` (or `esc`, `cancel`, `取消`)
+    - "<x>" : `/esc <x>` — original case preserved
+  """
+  stripped = _strip_mentions_preserving_case(text, mentions)
+  m = _ESC_PATTERN.match(stripped)
+  if not m:
+    return None
+  return (m.group(1) or "").strip()
+
+
+_ESC_PATTERN = re.compile(
+  r"^(?:/esc|esc|cancel|取消)(?:\s+(.+))?$",
+  re.IGNORECASE | re.DOTALL,
+)
+
+
+def _strip_mentions_preserving_case(
+  text: str, mentions: list[dict[str, str]] | None = None,
+) -> str:
+  t = text.strip()
+  for m in (mentions or []):
+    key = m.get("key", "")
+    if key:
+      t = re.sub(re.escape(key), "", t, flags=re.IGNORECASE)
+  return re.sub(r"\s+", " ", t).strip()
 
 
 def is_exit(text: str, mentions: list[dict[str, str]] | None = None) -> bool:

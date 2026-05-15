@@ -1,6 +1,8 @@
 """Tests for nemo.monitor — signal detection."""
 
-from nemo.monitor import is_esc, is_exit, is_dissolve, is_permission_reply, is_privileged
+from nemo.monitor import (
+  is_esc, is_exit, is_dissolve, is_permission_reply, is_privileged, parse_esc,
+)
 
 
 def test_is_esc():
@@ -15,6 +17,41 @@ def test_is_esc():
 def test_is_esc_with_mentions():
   assert is_esc("@bot /esc", [{"key": "@bot"}])
   assert is_esc("@bot esc", [{"key": "@bot"}])
+
+
+def test_parse_esc_bare():
+  assert parse_esc("/esc") == ""
+  assert parse_esc("esc") == ""
+  assert parse_esc("cancel") == ""
+  assert parse_esc("取消") == ""
+
+
+def test_parse_esc_not_esc():
+  assert parse_esc("hello") is None
+  assert parse_esc("escape") is None
+  assert parse_esc("") is None
+
+
+def test_parse_esc_with_follow_up():
+  assert parse_esc("/esc fix the bug") == "fix the bug"
+  assert parse_esc("/esc Use TypeScript") == "Use TypeScript"
+  # Preserves multi-line / multi-space content
+  assert parse_esc("/esc do A\nthen B") == "do A then B"
+
+
+def test_parse_esc_with_mentions_and_text():
+  assert parse_esc(
+    "@bot /esc continue", [{"key": "@bot"}]
+  ) == "continue"
+  # Mention key in the middle should be stripped without losing case
+  assert parse_esc(
+    "@bot /esc Use API", [{"key": "@bot"}]
+  ) == "Use API"
+
+
+def test_parse_esc_is_case_insensitive_prefix():
+  assert parse_esc("/ESC continue") == "continue"
+  assert parse_esc("Cancel keep going") == "keep going"
 
 
 def test_is_exit():
