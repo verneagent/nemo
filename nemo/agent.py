@@ -21,7 +21,7 @@ import signal
 import time
 import urllib.error
 import uuid
-from typing import Callable
+from typing import TYPE_CHECKING, Callable
 
 from . import cards, commands, messages, monitor
 from .agent_factory import AgentKind, build_coding_agent, is_model_compatible
@@ -36,6 +36,9 @@ from .turn import (
 )
 
 log = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+  from .sessions import SessionDeleteResult
 
 
 # ---------------------------------------------------------------------------
@@ -579,6 +582,74 @@ async def _handle_session_recall(
     f"📖 Asking the agent to recall session `{info.uuid[:8]}` "
     f"({info.agent}, ~{size_kb}KB)…"
   )
+
+
+def _format_session_delete_result(
+  action: str, result: SessionDeleteResult,
+) -> str:
+  if result.not_found:
+    return (
+      f"No session matches `{result.not_found}` in this project. "
+      f"Run `/session list` to see what's available."
+    )
+  if result.ambiguous:
+    ambig = ", ".join(f"`{m.uuid[:8]}`" for m in result.ambiguous[:5])
+    return (
+      f"`{action}` target is ambiguous — matches {ambig}. "
+      f"Use more characters from the uuid."
+    )
+
+  parts: list[str] = []
+  if result.deleted:
+    by_agent: dict[str, int] = {}
+    for s in result.deleted:
+      by_agent[s.agent] = by_agent.get(s.agent, 0) + 1
+    detail = ", ".join(f"{count} {agent}" for agent, count in sorted(by_agent.items()))
+    parts.append(f"Removed {len(result.deleted)} session(s) ({detail}).")
+  else:
+    parts.append("No sessions matched the purge criteria.")
+
+  if result.failures:
+    failures = ", ".join(
+      f"`{f.session.uuid[:8]}`: {f.error}" for f in result.failures[:3]
+    )
+    more = "" if len(result.failures) <= 3 else f" (+{len(result.failures) - 3} more)"
+    parts.append(f"Failed to remove {len(result.failures)} session(s): {failures}{more}")
+
+  return " ".join(parts)
+
+
+async def _handle_session_rm(
+  channel: LarkChannel,
+  chat_id: str,
+  project_dir: str,
+  target: str,
+  db: Database,
+) -> None:
+  from . import sessions as _sessions
+  if not target.strip():
+    await _send_response(channel, chat_id, "Usage: `/session rm <uuid prefix>`", db)
+    return
+  result = _sessions.remove_session(project_dir, target)
+  await _send_response(channel, chat_id, _format_session_delete_result("rm", result), db)
+
+
+async def _handle_session_purge(
+  channel: LarkChannel,
+  chat_id: str,
+  project_dir: str,
+  target: str,
+  current_sdk_session_id: str,
+  db: Database,
+) -> None:
+  from . import sessions as _sessions
+  result = _sessions.purge_sessions(
+    project_dir,
+    older_than_uuid_or_prefix=target,
+    current_uuid=current_sdk_session_id,
+  )
+  await _send_response(
+    channel, chat_id, _format_session_delete_result("purge", result), db)
 
 
 # When an SDK turn times out the underlying CLI/agent is usually choking on a
@@ -1413,6 +1484,13 @@ async def main_loop(
             channel, chat_id, project_dir, target)
           if ack:
             await _send_response(channel, chat_id, ack, db)
+        elif response and response.startswith("__session_rm__:"):
+          target = response.split(":", 1)[1]
+          await _handle_session_rm(channel, chat_id, project_dir, target, db)
+        elif response and response.startswith("__session_purge__:"):
+          target = response.split(":", 1)[1]
+          await _handle_session_purge(
+            channel, chat_id, project_dir, target, _sdk_session_id, db)
         elif response == "__exit__":
           end_card = cards.build_card("Nemo — Stopped", body="Agent stopped.", color="blue")
           await channel.send_card(chat_id, end_card)

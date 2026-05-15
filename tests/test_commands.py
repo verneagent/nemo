@@ -28,6 +28,22 @@ def test_undo_clear_not_inline_safe():
   assert not is_inline_safe(resp)
 
 
+def test_session_rm_command():
+  handled, resp = try_dispatch("/session rm abc123", _ctx())
+  assert handled
+  assert resp == "__session_rm__:abc123"
+
+
+def test_session_purge_command_with_and_without_target():
+  handled, resp = try_dispatch("/session purge abc123", _ctx())
+  assert handled
+  assert resp == "__session_purge__:abc123"
+
+  handled, resp = try_dispatch("/session purge", _ctx())
+  assert handled
+  assert resp == "__session_purge__:"
+
+
 def test_model_show():
   handled, resp = try_dispatch("/model", _ctx())
   assert handled

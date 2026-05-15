@@ -34,6 +34,22 @@ class SessionInfo:
   # that only care about the identity fields.
 
 
+@dataclass
+class SessionDeleteFailure:
+  """A session file that could not be removed."""
+  session: SessionInfo
+  error: str
+
+
+@dataclass
+class SessionDeleteResult:
+  """Outcome for a session deletion request."""
+  deleted: list[SessionInfo] = field(default_factory=list)
+  failures: list[SessionDeleteFailure] = field(default_factory=list)
+  ambiguous: list[SessionInfo] = field(default_factory=list)
+  not_found: str = ""
+
+
 # ---------------------------------------------------------------------------
 # Path encoding
 # ---------------------------------------------------------------------------
@@ -364,3 +380,60 @@ def find_session(
     elif u.startswith(needle):
       matches.append(s)
   return exact or matches
+
+
+def _delete_session_files(candidates: Iterable[SessionInfo]) -> SessionDeleteResult:
+  result = SessionDeleteResult()
+  for session in candidates:
+    try:
+      os.remove(session.path)
+    except OSError as e:
+      result.failures.append(SessionDeleteFailure(session=session, error=str(e)))
+    else:
+      result.deleted.append(session)
+  return result
+
+
+def remove_session(project_dir: str, uuid_or_prefix: str) -> SessionDeleteResult:
+  """Remove one session matching ``uuid_or_prefix`` for ``project_dir``."""
+  needle = uuid_or_prefix.strip()
+  if not needle:
+    return SessionDeleteResult(not_found=uuid_or_prefix)
+  all_sessions = list_sessions(project_dir)
+  matches = find_session(needle, all_sessions)
+  if not matches:
+    return SessionDeleteResult(not_found=needle)
+  if len(matches) > 1:
+    return SessionDeleteResult(ambiguous=matches)
+  return _delete_session_files(matches)
+
+
+def purge_sessions(
+  project_dir: str,
+  older_than_uuid_or_prefix: str = "",
+  current_uuid: str = "",
+) -> SessionDeleteResult:
+  """Remove old sessions for ``project_dir``.
+
+  With ``older_than_uuid_or_prefix``, removes sessions whose mtime is older
+  than the matched session, excluding the matched session itself. Without it,
+  removes every session except ``current_uuid``.
+  """
+  all_sessions = list_sessions(project_dir)
+  target = older_than_uuid_or_prefix.strip()
+  if target:
+    matches = find_session(target, all_sessions)
+    if not matches:
+      return SessionDeleteResult(not_found=target)
+    if len(matches) > 1:
+      return SessionDeleteResult(ambiguous=matches)
+    pivot = matches[0]
+    candidates = [
+      s for s in all_sessions
+      if s.uuid != pivot.uuid and s.mtime < pivot.mtime
+    ]
+    return _delete_session_files(candidates)
+
+  current = current_uuid.strip()
+  candidates = [s for s in all_sessions if not current or s.uuid != current]
+  return _delete_session_files(candidates)

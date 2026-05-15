@@ -304,3 +304,104 @@ def test_list_returns_empty_when_project_has_no_sessions(tmp_path):
   os.makedirs(project, exist_ok=True)
   with mock.patch.dict(os.environ, {"HOME": home}):
     assert sessions.list_sessions(project) == []
+
+
+def test_remove_session_deletes_matching_file(tmp_path):
+  home = str(tmp_path / "home")
+  project = str(tmp_path / "project")
+  os.makedirs(project, exist_ok=True)
+  path = _claude_session(home, project, "abc12345-0000-0000-0000-000000000000", [
+    {"type": "user", "message": {"role": "user", "content": "delete me"}},
+  ])
+
+  with mock.patch.dict(os.environ, {"HOME": home}):
+    result = sessions.remove_session(project, "abc12345")
+
+  assert [s.uuid for s in result.deleted] == [
+    "abc12345-0000-0000-0000-000000000000"
+  ]
+  assert result.failures == []
+  assert not os.path.exists(path)
+
+
+def test_remove_session_reports_ambiguous_prefix(tmp_path):
+  home = str(tmp_path / "home")
+  project = str(tmp_path / "project")
+  os.makedirs(project, exist_ok=True)
+  path_a = _claude_session(home, project, "abc11111-0000-0000-0000-000000000000", [
+    {"type": "user", "message": {"role": "user", "content": "one"}},
+  ])
+  path_b = _claude_session(home, project, "abc22222-0000-0000-0000-000000000000", [
+    {"type": "user", "message": {"role": "user", "content": "two"}},
+  ])
+
+  with mock.patch.dict(os.environ, {"HOME": home}):
+    result = sessions.remove_session(project, "abc")
+
+  assert {s.uuid for s in result.ambiguous} == {
+    "abc11111-0000-0000-0000-000000000000",
+    "abc22222-0000-0000-0000-000000000000",
+  }
+  assert result.deleted == []
+  assert os.path.exists(path_a)
+  assert os.path.exists(path_b)
+
+
+def test_purge_sessions_removes_older_than_target_excluding_target(tmp_path):
+  home = str(tmp_path / "home")
+  project = str(tmp_path / "project")
+  os.makedirs(project, exist_ok=True)
+  old_path = _claude_session(home, project, "11111111-0000-0000-0000-000000000000", [
+    {"type": "user", "message": {"role": "user", "content": "old"}},
+  ])
+  pivot_path = _claude_session(home, project, "22222222-0000-0000-0000-000000000000", [
+    {"type": "user", "message": {"role": "user", "content": "pivot"}},
+  ])
+  new_path = _claude_session(home, project, "33333333-0000-0000-0000-000000000000", [
+    {"type": "user", "message": {"role": "user", "content": "new"}},
+  ])
+  now = time.time()
+  os.utime(old_path, (now - 300, now - 300))
+  os.utime(pivot_path, (now - 200, now - 200))
+  os.utime(new_path, (now - 100, now - 100))
+
+  with mock.patch.dict(os.environ, {"HOME": home}):
+    result = sessions.purge_sessions(project, "22222222")
+
+  assert [s.uuid for s in result.deleted] == [
+    "11111111-0000-0000-0000-000000000000"
+  ]
+  assert not os.path.exists(old_path)
+  assert os.path.exists(pivot_path)
+  assert os.path.exists(new_path)
+
+
+def test_purge_sessions_without_target_keeps_current(tmp_path):
+  home = str(tmp_path / "home")
+  project = str(tmp_path / "project")
+  os.makedirs(project, exist_ok=True)
+  current_path = _claude_session(
+    home, project, "aaaaaaaa-0000-0000-0000-000000000000", [
+      {"type": "user", "message": {"role": "user", "content": "current"}},
+    ])
+  old_path = _codex_session(home, "2026", "05", "15",
+                            "bbbbbbbb-0000-0000-0000-000000000000", [
+    {"type": "session_meta", "payload": {
+      "id": "bbbbbbbb-0000-0000-0000-000000000000",
+      "cwd": os.path.abspath(project),
+    }},
+    {"type": "response_item", "payload": {
+      "type": "message", "role": "user",
+      "content": [{"type": "input_text", "text": "old"}],
+    }},
+  ])
+
+  with mock.patch.dict(os.environ, {"HOME": home}):
+    result = sessions.purge_sessions(
+      project, current_uuid="aaaaaaaa-0000-0000-0000-000000000000")
+
+  assert [s.uuid for s in result.deleted] == [
+    "bbbbbbbb-0000-0000-0000-000000000000"
+  ]
+  assert os.path.exists(current_path)
+  assert not os.path.exists(old_path)

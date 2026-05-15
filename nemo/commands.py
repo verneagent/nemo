@@ -235,6 +235,8 @@ def try_dispatch(text: str, ctx: AgentContext) -> tuple[bool, str | None]:
       "| `/diag` | Run diagnostics |\n"
       "| `/session list` | List past sessions in this project |\n"
       "| `/session recall <uuid>` | Recall a past session's contents into context |\n"
+      "| `/session rm <uuid>` | Remove one past session |\n"
+      "| `/session purge [uuid]` | Remove sessions older than uuid, or all except current |\n"
       "| `/exit` | Stop agent, keep group |\n"
       "| `/dissolve` | Stop agent, dissolve group |\n"
       "| `/help` | This help |\n"
@@ -326,7 +328,8 @@ def try_dispatch(text: str, ctx: AgentContext) -> tuple[bool, str | None]:
       return True, f"__guest_remove__:{name}"
     return True, "Usage: `/guest list`, `/guest add <name>`, `/guest remove <name>`"
 
-  # /session list  |  /session recall <id>
+  # /session list  |  /session recall <id>  |  /session rm <id>
+  # /session purge [id]
   # Browse and recall past coding-agent sessions stored locally
   # (claude JSONL / codex rollout). "recall" is read-only — it injects
   # the session's contents as memory context, never SDK-resumes (that
@@ -339,12 +342,19 @@ def try_dispatch(text: str, ctx: AgentContext) -> tuple[bool, str | None]:
         return True, "__session_list__"
       if sub == "recall" and len(parts) >= 3:
         return True, f"__session_recall__:{parts[2].strip()}"
+      if sub == "rm" and len(parts) >= 3:
+        return True, f"__session_rm__:{parts[2].strip()}"
+      if sub == "purge":
+        target = parts[2].strip() if len(parts) >= 3 else ""
+        return True, f"__session_purge__:{target}"
     return True, (
       "**Session Commands**\n\n"
       "| Command | Description |\n"
       "|---|---|\n"
       "| `/session list` | List past sessions in this project (Claude + Codex) |\n"
-      "| `/session recall <uuid>` | Read a past session and remember its contents |"
+      "| `/session recall <uuid>` | Read a past session and remember its contents |\n"
+      "| `/session rm <uuid>` | Remove one past session |\n"
+      "| `/session purge [uuid]` | Remove sessions older than uuid, or all except current |"
     )
 
   # /dissolve — stop agent, dissolve group (check before /exit to avoid prefix match)
