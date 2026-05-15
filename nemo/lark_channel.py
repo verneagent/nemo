@@ -117,6 +117,7 @@ def _to_incoming(
     action_tag=event.action_tag,
     operator_id=event.operator_id,
     raw=dict(event.raw),
+    is_internal=event.is_internal,
   )
 
 
@@ -329,6 +330,7 @@ class LarkChannel(Channel):
       action_tag=message.action_tag,
       operator_id=message.operator_id,
       raw=dict(message.raw),
+      is_internal=message.is_internal,
     )
     self._events.push_back(event)
 

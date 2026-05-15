@@ -74,6 +74,10 @@ class LarkEvent:
   action_tag: str = ""
   operator_id: str = ""
   raw: JsonObject = field(default_factory=dict)
+  # Nemo-synthesised event re-injected via Channel.push_back (e.g. the
+  # message that /session recall pushes back). Bypasses auth/mention
+  # filters when reconstituted into an IncomingMessage.
+  is_internal: bool = False
 
 
 def _parse_message_event(payload: JsonObject) -> LarkEvent:

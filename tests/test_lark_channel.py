@@ -5,7 +5,8 @@ import json
 import urllib.error
 from unittest import mock
 
-from nemo.lark.events import LarkEvent
+from nemo.channel import IncomingMessage
+from nemo.lark.events import LarkEvent, LarkEventStream
 from nemo.lark_channel import LarkChannel, _to_incoming, _extract_message_text
 
 
@@ -221,6 +222,47 @@ def test_plain_text_no_enrichment():
   assert msg.text == "just a message"
   assert msg.chat_id == "oc_123"
   assert msg.sender_id == "ou_user1"
+
+
+# ---------------------------------------------------------------------------
+# is_internal round trip — /session recall injects a synthetic message with
+# is_internal=True so the main loop skips its auth/mention filters. The flag
+# must survive push_back -> next_event -> _to_incoming or the injected recall
+# message gets dropped and the user never gets a summary.
+# ---------------------------------------------------------------------------
+
+def test_to_incoming_preserves_is_internal():
+  ev = _make_event(text="recall me", is_internal=True)
+  msg = _to_incoming(ev, token="")
+  assert msg.is_internal is True
+
+
+def test_push_back_round_trip_preserves_is_internal():
+  ch = LarkChannel.__new__(LarkChannel)
+  ch.chat_id = "oc_recall"
+  ch.credentials = {"app_id": "cli_x", "app_secret": "s"}
+  ch.parent_lookup = None
+  ch._chat_mode = ""
+  ch._reply_anchor = ""
+  ch._events = LarkEventStream("cli_x", "s")  # queue is ready without start()
+  injected = IncomingMessage(
+    event_type="im.message.receive_v1",
+    chat_id="oc_recall",
+    sender_id="",  # synthetic — no real user
+    message_id="recall_abc",
+    msg_type="text",
+    text="[Nemo recall] summarize this transcript",
+    create_time="1",
+    is_internal=True,
+  )
+  ch.push_back(injected)
+  with mock.patch(
+      "nemo.lark_channel.lark_auth.get_token", return_value="t-fake"):
+    received = asyncio.run(ch.receive(timeout=1))
+  assert received is not None
+  assert received.is_internal is True
+  assert received.text == "[Nemo recall] summarize this transcript"
+  assert received.message_id == "recall_abc"
 
 
 # ---------------------------------------------------------------------------
