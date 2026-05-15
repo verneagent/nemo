@@ -228,7 +228,8 @@ def try_dispatch(text: str, ctx: AgentContext) -> tuple[bool, str | None]:
       "| `/exit` | Stop agent, keep group |\n"
       "| `/dissolve` | Stop agent, dissolve group |\n"
       "| `/help` | This help |\n"
-      "| `/autoapprove` | Toggle auto-approve |"
+      "| `/autoapprove` | Toggle auto-approve |\n"
+      "| `/autoesc` | Toggle auto-cancel current turn on new message |"
     )
 
   # /norm
@@ -277,6 +278,14 @@ def try_dispatch(text: str, ctx: AgentContext) -> tuple[bool, str | None]:
   if re.match(r"/?(?:auto[\s\-]*approve|autoapprove)\s+(on|off)", t):
     enabled = "on" in t.split()[-1]
     return True, f"__autoapprove__:{'on' if enabled else 'off'}"
+
+  # /autoesc — when on, a new user message during an in-flight turn
+  # automatically cancels (esc) the running turn and starts a new one.
+  if t in ("/autoesc", "autoesc"):
+    return True, "__autoesc_toggle__"
+  if re.match(r"/?(?:auto[\s\-]*esc|autoesc)\s+(on|off)", t):
+    enabled = "on" in t.split()[-1]
+    return True, f"__autoesc__:{'on' if enabled else 'off'}"
 
   # /guest
   if t.startswith("/guest"):

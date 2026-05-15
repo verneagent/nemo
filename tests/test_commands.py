@@ -238,6 +238,30 @@ def test_autoapprove_toggle():
   assert resp == "__autoapprove_toggle__"
 
 
+def test_autoesc_on():
+  handled, resp = try_dispatch("autoesc on", _ctx())
+  assert handled
+  assert resp == "__autoesc__:on"
+
+
+def test_autoesc_slash_on():
+  handled, resp = try_dispatch("/autoesc on", _ctx())
+  assert handled
+  assert resp == "__autoesc__:on"
+
+
+def test_autoesc_off():
+  handled, resp = try_dispatch("autoesc off", _ctx())
+  assert handled
+  assert resp == "__autoesc__:off"
+
+
+def test_autoesc_toggle():
+  handled, resp = try_dispatch("/autoesc", _ctx())
+  assert handled
+  assert resp == "__autoesc_toggle__"
+
+
 def test_exit():
   handled, resp = try_dispatch("/exit", _ctx())
   assert handled
@@ -422,6 +446,11 @@ def test_inline_safe_mention():
 
 def test_inline_safe_autoapprove():
   _, resp = try_dispatch("/autoapprove on", _ctx())
+  assert is_inline_safe(resp)
+
+
+def test_inline_safe_autoesc():
+  _, resp = try_dispatch("/autoesc on", _ctx())
   assert is_inline_safe(resp)
 
 

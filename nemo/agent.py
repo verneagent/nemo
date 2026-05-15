@@ -801,6 +801,10 @@ async def main_loop(
            session_id, chat_id, bot_open_id[:16] if bot_open_id else "?",
            operator_open_id[:16] if operator_open_id else "?", need_mention)
 
+  # autoesc: when True, a new user message arriving during an in-flight
+  # turn auto-cancels the running turn before being processed.
+  autoesc = bool((db.get_session(session_id) or {}).get("autoesc"))
+
   # Send start card
   log.info("Sending start card to %s", chat_id)
   from nemo import __version__
@@ -1249,6 +1253,22 @@ async def main_loop(
           await _send_response(
             channel, chat_id,
             f"Auto-approve **{'enabled' if enabled else 'disabled'}**.", db)
+        elif response == "__autoesc_toggle__":
+          autoesc = not autoesc
+          db.set_autoesc(chat_id, autoesc)
+          await _send_response(
+            channel, chat_id,
+            f"Auto-esc **{'on' if autoesc else 'off'}** "
+            f"— new messages {'will' if autoesc else 'will not'} "
+            f"cancel the running turn.", db)
+        elif response and response.startswith("__autoesc__:"):
+          autoesc = response.endswith(":on")
+          db.set_autoesc(chat_id, autoesc)
+          await _send_response(
+            channel, chat_id,
+            f"Auto-esc **{'on' if autoesc else 'off'}** "
+            f"— new messages {'will' if autoesc else 'will not'} "
+            f"cancel the running turn.", db)
         elif response == "__mention_toggle__":
           need_mention = not need_mention
           _gc = gcfg.load_config(channel.token, chat_id)
@@ -1608,7 +1628,7 @@ async def main_loop(
 
       async def _dispatch_inline(response: str | None, msg: IncomingMessage) -> None:
         """Handle an inline-safe command during an active turn."""
-        nonlocal need_mention
+        nonlocal need_mention, autoesc
         try:
           # Remove THINKING reaction from the command message
           if msg.message_id:
@@ -1627,6 +1647,22 @@ async def main_loop(
             await _send_response(
               channel, chat_id,
               f"Auto-approve **{'enabled' if enabled else 'disabled'}**.", db)
+          elif response == "__autoesc_toggle__":
+            autoesc = not autoesc
+            db.set_autoesc(chat_id, autoesc)
+            await _send_response(
+              channel, chat_id,
+              f"Auto-esc **{'on' if autoesc else 'off'}** "
+              f"— new messages {'will' if autoesc else 'will not'} "
+              f"cancel the running turn.", db)
+          elif response and response.startswith("__autoesc__:"):
+            autoesc = response.endswith(":on")
+            db.set_autoesc(chat_id, autoesc)
+            await _send_response(
+              channel, chat_id,
+              f"Auto-esc **{'on' if autoesc else 'off'}** "
+              f"— new messages {'will' if autoesc else 'will not'} "
+              f"cancel the running turn.", db)
           elif response == "__mention_toggle__":
             need_mention = not need_mention
             _gc = gcfg.load_config(channel.token, chat_id)
@@ -1803,10 +1839,16 @@ async def main_loop(
               # Needs SDK restart — re-queue for after turn
               _pending_msgs.append(msg)
               await _ack_pending(msg)
+              if autoesc:
+                signal_detected = "autoesc"
+                return
               continue
           # Re-queue non-signal messages so they aren't lost
           _pending_msgs.append(msg)
           await _ack_pending(msg)
+          if autoesc:
+            signal_detected = "autoesc"
+            return
 
       watcher = asyncio.create_task(_watch_signals())
 
@@ -1816,8 +1858,11 @@ async def main_loop(
       )
 
       if watcher in done_tasks and signal_detected:
-        if signal_detected in ("esc", "stop"):
-          log.info("Stop signal received — interrupting SDK")
+        if signal_detected in ("esc", "stop", "autoesc"):
+          if signal_detected == "autoesc":
+            log.info("Auto-esc — interrupting SDK for new incoming message")
+          else:
+            log.info("Stop signal received — interrupting SDK")
           await _clear_ack()
           await _update_interrupt_card("stopping")
           try:
@@ -1828,7 +1873,11 @@ async def main_loop(
             log.warning("SDK interrupt failed (%s), cancelling task", exc)
             sdk_task.cancel()
           elapsed = time.time() - _turn_start
-          await _send_response(channel, chat_id, f"{_cancel_emoji(elapsed)} Operation cancelled.", db)
+          if signal_detected == "autoesc":
+            notice = f"{_cancel_emoji(elapsed)} Auto-cancelled — picking up new message."
+          else:
+            notice = f"{_cancel_emoji(elapsed)} Operation cancelled."
+          await _send_response(channel, chat_id, notice, db)
           await _update_interrupt_card("stopped")
 
         elif signal_detected in ("exit", "dissolve"):

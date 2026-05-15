@@ -333,6 +333,21 @@ def test_set_autoapprove(tmp_path):
     db.close()
 
 
+def test_set_autoesc(tmp_path):
+  with mock.patch("nemo.db.DB_BASE", str(tmp_path)):
+    db = Database(str(tmp_path / "project"))
+    db.activate("sess1", "chat1", "opus")
+    s = db.get_session("sess1")
+    assert s["autoesc"] is False
+    db.set_autoesc("chat1", True)
+    s = db.get_session("sess1")
+    assert s["autoesc"] is True
+    db.set_autoesc("chat1", False)
+    s = db.get_session("sess1")
+    assert s["autoesc"] is False
+    db.close()
+
+
 def test_record_and_lookup_messages(tmp_path):
   with mock.patch("nemo.db.DB_BASE", str(tmp_path)):
     db = Database(str(tmp_path / "project"))

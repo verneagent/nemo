@@ -41,7 +41,8 @@ CREATE TABLE IF NOT EXISTS sessions (
   operator_open_id TEXT DEFAULT '',
   bot_open_id TEXT DEFAULT '',
   need_mention INTEGER DEFAULT 0,
-  autoapprove INTEGER DEFAULT 0
+  autoapprove INTEGER DEFAULT 0,
+  autoesc INTEGER DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS messages (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -110,6 +111,8 @@ def _ensure_tables(conn: sqlite3.Connection) -> None:
   for col in _AGENT_SESSION_COLUMNS.values():
     if col not in cols:
       conn.execute(f"ALTER TABLE sessions ADD COLUMN {col} TEXT DEFAULT ''")
+  if "autoesc" not in cols:
+    conn.execute("ALTER TABLE sessions ADD COLUMN autoesc INTEGER DEFAULT 0")
   # Deliberately NO backfill from the legacy column. The historical
   # `sdk_session_id` held whatever the most-recent daemon wrote
   # regardless of agent — a codex thread id can sit in there from
@@ -202,6 +205,7 @@ class Database:
     d = dict(row)
     d["need_mention"] = bool(d.get("need_mention"))
     d["autoapprove"] = bool(d.get("autoapprove"))
+    d["autoesc"] = bool(d.get("autoesc"))
     return d
 
   def get_current_session(self) -> dict[str, object] | None:
@@ -286,6 +290,13 @@ class Database:
   def set_autoapprove(self, chat_id: str, enabled: bool) -> None:
     self._conn.execute(
       "UPDATE sessions SET autoapprove = ? WHERE chat_id = ?",
+      (int(enabled), chat_id),
+    )
+    self._conn.commit()
+
+  def set_autoesc(self, chat_id: str, enabled: bool) -> None:
+    self._conn.execute(
+      "UPDATE sessions SET autoesc = ? WHERE chat_id = ?",
       (int(enabled), chat_id),
     )
     self._conn.commit()
