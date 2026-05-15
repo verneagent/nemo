@@ -453,6 +453,18 @@ def test_done_card_with_steps():
   assert "Thinking (2)" in elements[1]["header"]["title"]["content"]
 
 
+def test_done_card_preserves_compact_notice():
+  card = build_turn_card(
+    "done",
+    body="Done.",
+    compact_notice="🗜 Context compacted: 12k → 4k tokens",
+  )
+  elements = card["body"]["elements"]
+  assert elements[0]["tag"] == "markdown"
+  assert "Context compacted" in elements[0]["content"]
+  assert elements[1]["content"] == "Done."
+
+
 # ---------------------------------------------------------------------------
 # build_turn_card — error phase
 # ---------------------------------------------------------------------------

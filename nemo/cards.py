@@ -447,6 +447,11 @@ def build_turn_card(
     }
 
   elif phase == "done":
+    if compact_notice:
+      elements.append({
+        "tag": "markdown",
+        "content": f"<font color='grey'>{compact_notice}</font>",
+      })
     # Final response (inline)
     if body:
       elements.append({"tag": "markdown", "content": body})

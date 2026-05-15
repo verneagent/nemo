@@ -265,6 +265,7 @@ def _update_done_card_with_fallback(
   session_id: str,
   await_channel,
   register_msg,
+  compact_notice: str = "",
 ) -> str:
   """Update the done card with tiered fallback; return the resulting id.
 
@@ -277,6 +278,7 @@ def _update_done_card_with_fallback(
   full_card = cards.build_turn_card(
     "done", body=final_text, steps=thinking,
     elapsed=elapsed, usage=usage, session_id=session_id,
+    compact_notice=compact_notice,
   )
   try:
     prev_id = turn_card_id
@@ -299,6 +301,7 @@ def _update_done_card_with_fallback(
   preview_card = cards.build_turn_card(
     "done", body=preview_body, steps=thinking,
     elapsed=elapsed, usage=usage, session_id=session_id,
+    compact_notice=compact_notice,
   )
   try:
     prev_id = turn_card_id
@@ -327,6 +330,7 @@ def _update_done_card_with_fallback(
     fallback_card = cards.build_turn_card(
       "done", body=preview, steps=thinking,
       elapsed=elapsed, usage=usage, session_id=session_id,
+      compact_notice=compact_notice,
     )
     prev_id = turn_card_id
     turn_card_id = await_channel(
@@ -1681,6 +1685,7 @@ async def main_loop(
               elapsed=elapsed,
               usage=event.usage,
               session_id=_sdk_session_id,
+              compact_notice=_turn_compact_notice,
               await_channel=_await_channel,
               register_msg=_register_msg,
             )

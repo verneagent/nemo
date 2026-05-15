@@ -927,7 +927,7 @@ class _FakeUpdateChannel:
     return outcome
 
 
-def _run_fallback(channel, final_text="answer body"):
+def _run_fallback(channel, final_text="answer body", compact_notice=""):
   """Drive _update_done_card_with_fallback with identity await_channel."""
   register_calls = []
   return _update_done_card_with_fallback(
@@ -941,6 +941,7 @@ def _run_fallback(channel, final_text="answer body"):
     session_id="sess_x",
     await_channel=lambda x: x,
     register_msg=lambda msg_id, chat_id: register_calls.append((msg_id, chat_id)),
+    compact_notice=compact_notice,
   )
 
 
@@ -949,6 +950,19 @@ def test_done_card_full_body_success_single_update():
   result = _run_fallback(channel)
   assert result == "om_card1"
   assert len(channel.calls) == 1
+
+
+def test_done_card_fallback_preserves_compact_notice():
+  channel = _FakeUpdateChannel(outcomes=["om_card1"])
+  result = _run_fallback(
+    channel,
+    compact_notice="Context compacted: 12k -> 4k tokens",
+  )
+  assert result == "om_card1"
+  _, card = channel.calls[0]
+  elements = card["body"]["elements"]
+  assert "Context compacted" in elements[0]["content"]
+  assert elements[1]["content"] == "answer body"
 
 
 def test_done_card_transport_error_recovers_via_preview_retry():
