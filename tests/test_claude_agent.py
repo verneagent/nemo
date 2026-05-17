@@ -490,3 +490,39 @@ def test_side_question_survives_sdk_error(monkeypatch):
   agent = _btw_claude_agent()
   answer = asyncio.run(agent.side_question("q", "sess"))
   assert answer.startswith("⚠️ btw failed:")
+
+
+def test_side_question_closes_generator_in_task(monkeypatch):
+  """Regression: a daemon crash came from the SDK query generator being
+  finalised across tasks on the host loop (anyio "exit cancel scope in a
+  different task"). side_question must drive + explicitly aclose() the
+  generator itself (on its own worker loop), never leaking it to GC."""
+  import asyncio
+  import claude_agent_sdk as sdk
+
+  closed = {"v": False}
+
+  class _Gen:
+    def __aiter__(self):
+      return self
+
+    async def __anext__(self):
+      yielded = getattr(self, "_done", False)
+      if yielded:
+        raise StopAsyncIteration
+      self._done = True
+      return sdk.ResultMessage(
+        subtype="success", duration_ms=1, duration_api_ms=1,
+        is_error=False, num_turns=1, session_id="s")
+
+    async def aclose(self):
+      closed["v"] = True
+
+  def fake_query(*, prompt, options=None, transport=None):
+    return _Gen()
+
+  monkeypatch.setattr(sdk, "query", fake_query)
+  agent = _btw_claude_agent()
+  answer = asyncio.run(agent.side_question("q", "sess"))
+  assert closed["v"] is True, "generator was not explicitly aclose()d"
+  assert "btw failed" not in answer

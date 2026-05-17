@@ -1528,9 +1528,15 @@ async def main_loop(
         elif response == "__diag__":
           await _handle_diag(channel, chat_id, project_dir, db)
         elif response and response.startswith("__btw__:"):
-          await _handle_btw(
-            channel, chat_id, coding_agent,
-            _sdk_session_id, response.split(":", 1)[1])
+          # Fire-and-forget: a side question must never block the main
+          # loop (it can take many seconds) and its failures must never
+          # reach main_loop. _handle_btw self-contains all errors.
+          _idle_btw = asyncio.create_task(
+            _handle_btw(
+              channel, chat_id, coding_agent,
+              _sdk_session_id, response.split(":", 1)[1]))
+          _btw_tasks.add(_idle_btw)
+          _idle_btw.add_done_callback(_btw_tasks.discard)
         elif response == "__session_list__":
           await _handle_session_list(
             channel, chat_id, project_dir, db, _sdk_session_id)

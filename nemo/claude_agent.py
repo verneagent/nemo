@@ -286,10 +286,20 @@ class ClaudeCodingAgent(CodingAgent):
     from a fresh ephemeral session (no prior context to draw on, but
     /btw must work as the very first message too — Claude Code's does).
     No tools and ``max_turns=1`` keep it strictly read-only and
-    single-response. It spawns its own CLI subprocess (top-level
-    ``query()``), entirely independent of ``SDKThread`` — so a turn
-    running concurrently on the main client is neither blocked nor
-    interrupted.
+    single-response.
+
+    Isolation: ``claude_agent_sdk.query()`` drives an internal anyio
+    task group whose cancel scopes MUST be entered and exited on the
+    same task/loop. Running it on the host's main loop and letting the
+    async generator be finalised (timeout-cancel or GC) crashed the
+    daemon with "Attempted to exit cancel scope in a different task"
+    (anyio), taking the whole chat down. So — exactly like ``SDKThread``
+    does for the main client — we run the entire query lifecycle on a
+    dedicated worker thread with its own ``asyncio.run`` loop, and
+    explicitly ``aclose()`` the generator in-task there. The host only
+    ``await``s the worker via ``to_thread``; nothing from the SDK's
+    cancel scopes can ever cross back into the main loop, and a
+    concurrent main turn is neither blocked nor interrupted.
     """
     if not self._project_dir:
       return ""
@@ -338,26 +348,56 @@ class ClaudeCodingAgent(CodingAgent):
       opts_kwargs["fork_session"] = True
     opts = ClaudeAgentOptions(**opts_kwargs)
 
-    async def _collect() -> str:
+    async def _amain() -> str:
+      # Enforce the timeout INSIDE this loop with a monotonic deadline
+      # instead of cancelling from outside: cancelling the SDK generator
+      # across tasks is precisely what corrupts the anyio scope. We close
+      # the generator explicitly, in this task, in the finally.
+      loop = asyncio.get_running_loop()
+      deadline = loop.time() + _BTW_TIMEOUT
       parts: list[str] = []
-      async for msg in query(prompt=question, options=opts):
-        if isinstance(msg, AssistantMessage):
-          for block in msg.content:
-            if isinstance(block, TextBlock) and block.text:
-              parts.append(block.text)
-        elif isinstance(msg, ResultMessage):
-          break
-      return "".join(parts).strip()
+      timed_out = False
+      gen = query(prompt=question, options=opts)
+      try:
+        async for msg in gen:
+          if isinstance(msg, AssistantMessage):
+            for block in msg.content:
+              if isinstance(block, TextBlock) and block.text:
+                parts.append(block.text)
+          elif isinstance(msg, ResultMessage):
+            break
+          if loop.time() >= deadline:
+            timed_out = True
+            break
+      finally:
+        aclose = getattr(gen, "aclose", None)
+        if aclose is not None:
+          try:
+            await aclose()
+          except (Exception, asyncio.CancelledError) as exc:
+            # Closing within this task is the safe path; if the SDK still
+            # trips, swallow it here so it can't escape the worker loop.
+            log.warning("side_question generator close: %s",
+                        _short_error(exc))
+      text = "".join(parts).strip()
+      if timed_out and not text:
+        return "⚠️ btw timed out before an answer came back."
+      return text or "⚠️ btw returned no answer."
+
+    def _run() -> str:
+      # Fresh loop, own thread — the SDK's anyio scopes live and die
+      # entirely here, never touching the host loop.
+      try:
+        return asyncio.run(_amain())
+      except BaseException as exc:  # nothing may propagate to the host
+        log.warning("side_question worker failed: %s", _short_error(exc))
+        return f"⚠️ btw failed: {_short_error(exc)}"
 
     try:
-      answer = await asyncio.wait_for(_collect(), timeout=_BTW_TIMEOUT)
-    except asyncio.TimeoutError:
-      log.warning("side_question timed out after %ds", _BTW_TIMEOUT)
-      return "⚠️ btw timed out before an answer came back."
+      return await asyncio.to_thread(_run)
     except Exception as exc:
-      log.warning("side_question failed: %s", _short_error(exc))
+      log.warning("side_question dispatch failed: %s", _short_error(exc))
       return f"⚠️ btw failed: {_short_error(exc)}"
-    return answer or "⚠️ btw returned no answer."
 
   def trailing_note(self, sdk_session_id: str) -> str:
     if not sdk_session_id or not self._project_dir:
