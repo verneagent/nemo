@@ -1,5 +1,7 @@
 """Tests for nemo.commands — built-in agent commands."""
 
+from unittest.mock import patch
+
 from nemo.commands import try_dispatch, is_inline_safe, AgentContext
 
 
@@ -178,7 +180,7 @@ def test_model_list_separates_chatgpt_from_api_only_codex():
 def test_model_list_for_opencode_shows_dynamic_note():
   ctx = _ctx()
   ctx.agent = "opencode"
-  with __import__("unittest").mock.patch(
+  with patch(
       "nemo.opencode_agent.query_opencode_model_catalog_data",
       return_value=(("anthropic/claude-sonnet-4-5",), "Config default: `anthropic/claude-sonnet-4-5`."),
   ):
@@ -192,7 +194,7 @@ def test_model_list_for_opencode_shows_dynamic_note():
 def test_model_switch_for_opencode_accepts_provider_slug_model():
   ctx = _ctx()
   ctx.agent = "opencode"
-  with __import__("unittest").mock.patch(
+  with patch(
       "nemo.opencode_agent.query_opencode_model_catalog_data",
       return_value=(("anthropic/claude-sonnet-4-5",), "note"),
   ):
@@ -272,10 +274,83 @@ def test_usage_for_opencode():
   assert "opencode stats" in resp
 
 
+def test_context_unknown_before_first_snapshot():
+  handled, resp = try_dispatch("/context", _ctx())
+  assert handled
+  assert resp is not None
+  assert "unknown" in resp.lower()
+  assert "Run one turn first" in resp
+  assert is_inline_safe(resp)
+
+
+def test_context_reports_last_usage_snapshot():
+  ctx = _ctx()
+  ctx.record_context_usage({
+    "input_tokens": 12345,
+    "output_tokens": 678,
+    "cached_input_tokens": 1000,
+    "context_window": 200000,
+  }, updated_at=0)
+
+  handled, resp = try_dispatch("/context", ctx)
+
+  assert handled
+  assert resp is not None
+  assert "12,345 tokens" in resp
+  assert "200,000 tokens (6.2%)" in resp
+  assert "Last output: 678" in resp
+  assert "Cached input: 1,000" in resp
+  assert "last completed turn" in resp
+  assert is_inline_safe(resp)
+
+
+def test_context_prefers_total_tokens_when_present():
+  ctx = _ctx()
+  ctx.record_context_usage({
+    "input_tokens": 1000,
+    "total_tokens": 2345,
+    "context_window": 10000,
+  }, updated_at=0)
+
+  handled, resp = try_dispatch("context", ctx)
+
+  assert handled
+  assert resp is not None
+  assert "2,345 tokens" in resp
+  assert "10,000 tokens (23.4%)" in resp
+
+
+def test_context_reports_last_compact_snapshot():
+  ctx = _ctx()
+  ctx.record_compact(180000, 42000, updated_at=0)
+
+  handled, resp = try_dispatch("/context", ctx)
+
+  assert handled
+  assert resp is not None
+  assert "Last compact: 180,000" in resp
+  assert "42,000" in resp
+
+
+def test_context_clear_resets_snapshots():
+  ctx = _ctx()
+  ctx.record_context_usage({"input_tokens": 100}, updated_at=0)
+  ctx.record_compact(200, 50, updated_at=0)
+
+  ctx.clear_context_usage()
+  handled, resp = try_dispatch("/context", ctx)
+
+  assert handled
+  assert resp is not None
+  assert "unknown" in resp.lower()
+  assert "Last compact" not in resp
+
+
 def test_help():
   handled, resp = try_dispatch("/help", _ctx())
   assert handled
   assert "Commands" in resp
+  assert "/context" in resp
 
 
 def test_autoapprove_on():

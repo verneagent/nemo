@@ -1162,6 +1162,7 @@ async def main_loop(
           log.info("Session cleared card sent: %s (saved prev=%s)",
                    msg_id,
                    _prev_sdk_session_id[:8] if _prev_sdk_session_id else "none")
+          ctx.clear_context_usage()
           await _restart_client()
           _pending_pacing_hint = False
         elif response == "__undo_clear__":
@@ -1728,6 +1729,7 @@ async def main_loop(
           # banner with tokens + duration so the user can see at a
           # glance what happened during the silent stretch above.
           _turn_compact_notice = _format_compact_notice(event)
+          ctx.record_compact(event.pre_tokens, event.post_tokens)
           _ensure_card()
           _update_working()
 
@@ -1776,6 +1778,7 @@ async def main_loop(
             if final_text:
               _await_channel(_send_response(channel, chat_id, final_text, db))
           ctx.total_cost += event.cost
+          ctx.record_context_usage(event.usage)
 
       if _pending_pacing_hint:
         log.info("Prepending pacing hint after prior timeout")

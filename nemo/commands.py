@@ -6,6 +6,8 @@ import os
 import re
 import time
 
+from .types import JsonObject
+
 
 _EFFORT_LEVELS = ("low", "medium", "high", "max")
 
@@ -67,6 +69,104 @@ class AgentContext:
     self.total_cost = 0.0
     self.effort = ""
     self.agent: AgentKind = "claude"
+    self.context_usage: JsonObject = {}
+    self.context_updated_at = 0.0
+    self.context_source = ""
+    self.compact_pre_tokens = 0
+    self.compact_post_tokens = 0
+    self.compact_updated_at = 0.0
+
+  def record_context_usage(
+    self,
+    usage: JsonObject,
+    *,
+    source: str = "last completed turn",
+    updated_at: float | None = None,
+  ) -> None:
+    self.context_usage = dict(usage)
+    self.context_source = source
+    self.context_updated_at = updated_at if updated_at is not None else time.time()
+
+  def record_compact(
+    self,
+    pre_tokens: int,
+    post_tokens: int,
+    *,
+    updated_at: float | None = None,
+  ) -> None:
+    self.compact_pre_tokens = pre_tokens
+    self.compact_post_tokens = post_tokens
+    self.compact_updated_at = updated_at if updated_at is not None else time.time()
+
+  def clear_context_usage(self) -> None:
+    self.context_usage = {}
+    self.context_updated_at = 0.0
+    self.context_source = ""
+    self.compact_pre_tokens = 0
+    self.compact_post_tokens = 0
+    self.compact_updated_at = 0.0
+
+
+def _int_value(value: object) -> int:
+  if isinstance(value, bool):
+    return 0
+  if isinstance(value, int):
+    return value
+  if isinstance(value, float):
+    return int(value)
+  if isinstance(value, str):
+    try:
+      return int(value)
+    except ValueError:
+      return 0
+  return 0
+
+
+def _format_token_count(value: int) -> str:
+  return f"{value:,}" if value > 0 else "unknown"
+
+
+def _format_context_snapshot(ctx: AgentContext) -> str:
+  if not ctx.context_usage and not ctx.compact_pre_tokens:
+    return (
+      "Context: **unknown**\n\n"
+      "No token snapshot has been reported yet. Run one turn first; "
+      "Nemo will show the last usage snapshot after the SDK reports it."
+    )
+
+  input_tokens = _int_value(ctx.context_usage.get("input_tokens"))
+  output_tokens = _int_value(ctx.context_usage.get("output_tokens"))
+  cached_tokens = _int_value(ctx.context_usage.get("cached_input_tokens"))
+  total_tokens = _int_value(ctx.context_usage.get("total_tokens"))
+  current_tokens = total_tokens or input_tokens
+  context_window = _int_value(ctx.context_usage.get("context_window"))
+
+  lines = ["**Context**"]
+  lines.append(f"- Current: **{_format_token_count(current_tokens)} tokens**")
+  if context_window:
+    pct = current_tokens / context_window * 100 if current_tokens else 0
+    lines.append(f"- Window: {context_window:,} tokens ({pct:.1f}%)")
+  else:
+    lines.append("- Window: unknown")
+  if input_tokens:
+    lines.append(f"- Last input: {input_tokens:,}")
+  if output_tokens:
+    lines.append(f"- Last output: {output_tokens:,}")
+  if cached_tokens:
+    lines.append(f"- Cached input: {cached_tokens:,}")
+  if ctx.context_source:
+    lines.append(f"- Source: {ctx.context_source}")
+  if ctx.context_updated_at:
+    lines.append(f"- Updated: {time.strftime('%H:%M:%S', time.localtime(ctx.context_updated_at))}")
+  if ctx.compact_pre_tokens:
+    if ctx.compact_post_tokens:
+      lines.append(
+        f"- Last compact: {ctx.compact_pre_tokens:,} → "
+        f"{ctx.compact_post_tokens:,}"
+      )
+    else:
+      lines.append(f"- Last compact: {ctx.compact_pre_tokens:,}")
+  return "\n".join(lines)
 
 
 # Each handler returns (handled: bool, response_text: str | None).
@@ -229,6 +329,10 @@ def try_dispatch(text: str, ctx: AgentContext) -> tuple[bool, str | None]:
       return True, "Usage is agent-specific under OpenCode. Run `opencode stats` locally for totals."
     return True, "Usage is agent-specific. Check the local CLI/account UI for totals."
 
+  # /context
+  if t in ("/context", "context"):
+    return True, _format_context_snapshot(ctx)
+
   # /help
   if t in ("/help", "help", "帮助"):
     return True, (
@@ -250,6 +354,7 @@ def try_dispatch(text: str, ctx: AgentContext) -> tuple[bool, str | None]:
       "| `/ping` | Status check |\n"
       "| `/cost` | Session API cost |\n"
       "| `/usage` | Plan usage limits |\n"
+      "| `/context` | Last known context token snapshot |\n"
       "| `/mention` | Toggle @mention requirement |\n"
       "| `/name <name>` | Rename this group |\n"
       "| `/norm` | Manage group norms |\n"
