@@ -1759,3 +1759,71 @@ def test_stale_leak_notice_leaves_visible_breadcrumb(tmp_path):
   ), "stale-leak breadcrumb (SDK #788 + task id) not visible in any card"
   # Sanity: the StaleLeakNoticeEvent type itself is part of TurnEvent.
   assert StaleLeakNoticeEvent(task_id="x").task_id == "x"
+
+
+# ---------------------------------------------------------------------------
+# /btw — ephemeral side question delivery
+# ---------------------------------------------------------------------------
+
+
+class _FakeBtwChannel:
+  def __init__(self):
+    self.token = "tok"
+    self.cards = []
+
+  async def send_card(self, chat_id, card):
+    self.cards.append((chat_id, card))
+    return "msg-id"
+
+
+class _FakeBtwAgent:
+  def __init__(self, answer="", exc=None):
+    self._answer = answer
+    self._exc = exc
+    self.calls = []
+
+  async def side_question(self, question, sdk_session_id):
+    self.calls.append((question, sdk_session_id))
+    if self._exc is not None:
+      raise self._exc
+    return self._answer
+
+
+def test_handle_btw_posts_ephemeral_card_without_db_record():
+  """The answer card must NOT be persisted (no db arg is even threaded
+  in) so it can never re-enter the agent-readable chat history."""
+  from nemo.agent import _handle_btw
+
+  ch = _FakeBtwChannel()
+  ag = _FakeBtwAgent(answer="It was config.toml.")
+  asyncio.run(_handle_btw(ch, "chat-1", ag, "live-sess", "which file?"))
+
+  assert ag.calls == [("which file?", "live-sess")]
+  assert len(ch.cards) == 1
+  _chat, card = ch.cards[0]
+  blob = repr(card)
+  assert "It was config.toml." in blob
+  assert "Ephemeral" in blob
+  assert "btw" in blob
+
+
+def test_handle_btw_unsupported_falls_back_to_note():
+  from nemo.agent import _handle_btw
+
+  ch = _FakeBtwChannel()
+  ag = _FakeBtwAgent(answer="")  # adapter doesn't support side questions
+  asyncio.run(_handle_btw(ch, "c", ag, "", "q"))
+
+  assert len(ch.cards) == 1
+  assert "unavailable" in repr(ch.cards[0][1])
+
+
+def test_handle_btw_swallows_adapter_exception():
+  from nemo.agent import _handle_btw
+
+  ch = _FakeBtwChannel()
+  ag = _FakeBtwAgent(exc=RuntimeError("kaboom"))
+  asyncio.run(_handle_btw(ch, "c", ag, "s", "q"))
+
+  assert len(ch.cards) == 1
+  assert "btw failed" in repr(ch.cards[0][1])

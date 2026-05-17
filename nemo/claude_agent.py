@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import re
@@ -48,6 +49,20 @@ _CLAUDE_EFFORT_LEVELS = frozenset({"low", "medium", "high", "max"})
 # user to /clear well before that cliff. Sizes are in bytes.
 _SESSION_SIZE_NUDGE = 30 * 1024 * 1024
 _SESSION_SIZE_STRONG = 60 * 1024 * 1024
+
+
+# Appended after the main system prompt for `/btw` side questions.
+_BTW_DIRECTIVE = (
+  "SIDE QUESTION MODE: The user asked a quick out-of-band question with "
+  "`/btw`. Answer ONLY from the conversation context you already have. "
+  "You have NO tools — do not attempt to read files, run commands, or "
+  "search. Give one short, direct answer (a few sentences at most). Do "
+  "not resume or comment on the main task; this exchange is ephemeral "
+  "and will not be part of the conversation."
+)
+
+# Hard ceiling so a wedged side query can't hang the chat indefinitely.
+_BTW_TIMEOUT = 120
 
 
 def _session_jsonl_path(project_dir: str, sdk_session_id: str) -> str:
@@ -259,6 +274,82 @@ class ClaudeCodingAgent(CodingAgent):
     self._options = self._build_options(project_dir, model, resume=resume)
     await self._sdk.reconnect(self._options)
 
+  async def side_question(self, question: str, sdk_session_id: str) -> str:
+    """Read-only ephemeral side question — see CodingAgent.side_question.
+
+    Implementation: a one-shot ``query()`` that ``resume``s the live
+    session for full context + parent prompt-cache reuse, but with
+    ``fork_session=True`` so every message it generates lands in a
+    throwaway forked transcript — the real session is never touched, so
+    the answer can never re-enter conversation history. No tools and
+    ``max_turns=1`` keep it strictly read-only and single-response. It
+    spawns its own CLI subprocess (top-level ``query()``), entirely
+    independent of ``SDKThread`` — so a turn running concurrently on the
+    main client is neither blocked nor interrupted.
+    """
+    if not sdk_session_id or not self._project_dir:
+      return ""
+
+    from claude_agent_sdk import (
+      AssistantMessage,
+      ClaudeAgentOptions,
+      ResultMessage,
+      TextBlock,
+      query,
+    )
+
+    # Reuse the main turn's system prompt verbatim so the forked query
+    # hits the parent's cached prefix; the btw directive is a short
+    # suffix appended after it.
+    agent_prompt = (
+      f"{self._build_agent_prompt()}\n\n{_BTW_DIRECTIVE}"
+    )
+    opts = ClaudeAgentOptions(
+      resume=sdk_session_id,
+      fork_session=True,
+      allowed_tools=[],
+      # Belt-and-suspenders: even with an empty allow-list, name every
+      # mutating/IO tool so a preset system prompt can't coax one in.
+      disallowed_tools=[
+        "Agent", "Skill", "Read", "Write", "Edit", "NotebookEdit",
+        "Bash", "BashOutput", "KillShell",
+        "Glob", "Grep", "WebSearch", "WebFetch", "TodoWrite",
+        "AskUserQuestion", "mcp__*",
+      ],
+      max_turns=1,
+      permission_mode="bypassPermissions",
+      cwd=self._project_dir,
+      model=self._model,
+      env=self._build_env(self._project_dir, self._model),
+      system_prompt={
+        "type": "preset",
+        "preset": "claude_code",
+        "append": agent_prompt,
+      },
+      max_buffer_size=16 * 1024 * 1024,
+    )
+
+    async def _collect() -> str:
+      parts: list[str] = []
+      async for msg in query(prompt=question, options=opts):
+        if isinstance(msg, AssistantMessage):
+          for block in msg.content:
+            if isinstance(block, TextBlock) and block.text:
+              parts.append(block.text)
+        elif isinstance(msg, ResultMessage):
+          break
+      return "".join(parts).strip()
+
+    try:
+      answer = await asyncio.wait_for(_collect(), timeout=_BTW_TIMEOUT)
+    except asyncio.TimeoutError:
+      log.warning("side_question timed out after %ds", _BTW_TIMEOUT)
+      return "⚠️ btw timed out before an answer came back."
+    except Exception as exc:
+      log.warning("side_question failed: %s", _short_error(exc))
+      return f"⚠️ btw failed: {_short_error(exc)}"
+    return answer or "⚠️ btw returned no answer."
+
   def trailing_note(self, sdk_session_id: str) -> str:
     if not sdk_session_id or not self._project_dir:
       return ""
@@ -303,12 +394,10 @@ class ClaudeCodingAgent(CodingAgent):
       agent_prompt = f"{agent_prompt}\n\n{self._system_prompt}"
     return agent_prompt
 
-  def _build_options(self, project_dir: str, model: str, resume: str = "") -> object:
-    from claude_agent_sdk import ClaudeAgentOptions, HookMatcher
-    from claude_agent_sdk.types import PermissionMode
-
-    agent_prompt = self._build_agent_prompt()
-
+  def _build_env(self, project_dir: str, model: str) -> dict[str, str]:
+    """Build the SDK subprocess env. Shared by main turns and side
+    questions so a forked side-question subprocess sees the same
+    endpoint/model routing (→ parent prompt-cache reuse)."""
     from .db import _db_path
     db_path = _db_path(project_dir)
 
@@ -353,6 +442,15 @@ class ClaudeCodingAgent(CodingAgent):
       env.setdefault("ANTHROPIC_DEFAULT_SONNET_MODEL", model)
       env.setdefault("ANTHROPIC_DEFAULT_HAIKU_MODEL", model)
       env.setdefault("CLAUDE_CODE_SUBAGENT_MODEL", model)
+    return env
+
+  def _build_options(self, project_dir: str, model: str, resume: str = "") -> object:
+    from claude_agent_sdk import ClaudeAgentOptions, HookMatcher
+    from claude_agent_sdk.types import PermissionMode
+
+    agent_prompt = self._build_agent_prompt()
+
+    env = self._build_env(project_dir, model)
 
     from claude_agent_sdk import PermissionResultAllow
 

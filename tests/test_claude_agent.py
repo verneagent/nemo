@@ -365,3 +365,97 @@ def test_start_does_not_retry_when_no_resume():
   assert raised
   # Single attempt, no retry — there's no resume id to drop.
   assert attempts["n"] == 1
+
+
+# ---------------------------------------------------------------------------
+# /btw side questions
+# ---------------------------------------------------------------------------
+
+
+def test_default_side_question_is_empty():
+  """Non-Claude adapters inherit the no-op: side questions unsupported."""
+  import asyncio
+  from nemo.coding_agent import CodingAgent
+
+  class _Stub(CodingAgent):
+    async def run_turn(self, prompt, on_event):
+      return 0.0, {}
+    async def interrupt(self): pass
+    async def start(self, project_dir, model, resume=""): pass
+    async def reset(self, project_dir, model, resume=""): pass
+    async def stop(self): pass
+
+  assert asyncio.run(_Stub().side_question("hi", "sess")) == ""
+
+
+def _btw_claude_agent():
+  """Bare ClaudeCodingAgent with just the attrs side_question reads.
+
+  Distinct from _bare_claude_agent above (which targets start()'s
+  resume-fallback path) — do NOT merge the two; that earlier collision
+  silently shadowed the start() helper and broke its tests.
+  """
+  from nemo.claude_agent import ClaudeCodingAgent
+  from nemo.coding_agent import EndpointConfig
+
+  agent = ClaudeCodingAgent.__new__(ClaudeCodingAgent)
+  agent._project_dir = "/proj"
+  agent._model = "claude-opus-4-7"
+  agent._chat_id = "chat-1"
+  agent._system_prompt = ""
+  agent._endpoint = EndpointConfig()
+  return agent
+
+
+def test_side_question_requires_session_id():
+  """No live session → nothing to read context from → unsupported ('')."""
+  import asyncio
+  agent = _btw_claude_agent()
+  assert asyncio.run(agent.side_question("q", "")) == ""
+
+
+def test_side_question_forks_resumes_and_is_readonly(monkeypatch):
+  """The side query must resume the live session for context but fork it
+  (so the answer never enters real history), with no tools and a single
+  turn. Asserts the options Nemo hands the SDK enforce exactly that."""
+  import asyncio
+  import claude_agent_sdk as sdk
+
+  captured: dict[str, object] = {}
+
+  async def fake_query(*, prompt, options=None, transport=None):
+    captured["prompt"] = prompt
+    captured["options"] = options
+    yield sdk.AssistantMessage(
+      content=[sdk.TextBlock(text="It was config.toml.")], model="m")
+    yield sdk.ResultMessage(
+      subtype="success", duration_ms=1, duration_api_ms=1,
+      is_error=False, num_turns=1, session_id="forked-throwaway")
+
+  monkeypatch.setattr(sdk, "query", fake_query)
+
+  agent = _btw_claude_agent()
+  answer = asyncio.run(agent.side_question("which file?", "live-session"))
+
+  assert answer == "It was config.toml."
+  assert captured["prompt"] == "which file?"
+  opts = captured["options"]
+  assert opts.resume == "live-session"
+  assert opts.fork_session is True
+  assert opts.allowed_tools == []
+  assert opts.max_turns == 1
+  assert "Bash" in opts.disallowed_tools and "Write" in opts.disallowed_tools
+
+
+def test_side_question_survives_sdk_error(monkeypatch):
+  import asyncio
+  import claude_agent_sdk as sdk
+
+  async def boom(*, prompt, options=None, transport=None):
+    raise RuntimeError("connect failed")
+    yield  # pragma: no cover — make this an async generator
+
+  monkeypatch.setattr(sdk, "query", boom)
+  agent = _btw_claude_agent()
+  answer = asyncio.run(agent.side_question("q", "sess"))
+  assert answer.startswith("⚠️ btw failed:")

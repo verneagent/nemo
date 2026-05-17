@@ -1,9 +1,29 @@
 """Tests for nemo.permissions — auto-approve, formatting, button cards, reactions."""
 
+import sys as _sys
+
+import pytest as _pytest
+
 from nemo.permissions import (
   is_auto_approve, format_tool, _classify_action, _classify_reaction,
   _parse_askq_action,
 )
+
+
+@_pytest.fixture(autouse=True)
+def _restore_claude_agent_sdk():
+  """Several helpers here swap a stub into ``sys.modules['claude_agent_sdk']``
+  and never restore it. That leaks the stub into any later test file that
+  imports the real SDK (e.g. test_claude_agent's /btw side_question tests
+  saw ``module has no attribute 'query'``). Snapshot + restore around every
+  test in this module so the pollution can't escape, regardless of order.
+  """
+  saved = _sys.modules.get("claude_agent_sdk")
+  yield
+  if saved is None:
+    _sys.modules.pop("claude_agent_sdk", None)
+  else:
+    _sys.modules["claude_agent_sdk"] = saved
 
 
 def test_auto_approve_empty_patterns():

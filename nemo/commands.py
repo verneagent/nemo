@@ -154,6 +154,27 @@ def try_dispatch(text: str, ctx: AgentContext) -> tuple[bool, str | None]:
       f"Usage: `/effort low|medium|high|max|default`"
     )
 
+  # /btw <question> — side question. Read-only, single response, runs in a
+  # forked copy of the session so it NEVER enters conversation history, and
+  # does NOT interrupt a running turn. Mirrors Claude Code's `/btw`.
+  # Require the leading slash: bare "btw" is far too common in casual
+  # follow-ups ("btw, also fix X") to safely hijack as a command.
+  btw_m = re.match(
+    r"^/btw(?:\s+(.+))?$",
+    text.strip(),
+    re.IGNORECASE | re.DOTALL,
+  )
+  if btw_m:
+    question = (btw_m.group(1) or "").strip()
+    if not question:
+      return True, (
+        "Usage: `/btw <question>` — ask a quick, read-only question about "
+        "the current work. The answer is ephemeral (never enters "
+        "conversation history) and does not interrupt a running turn. "
+        "Claude agent only."
+      )
+    return True, f"__btw__:{question}"
+
   # /esc — bare cancels the current turn; with trailing text, cancel then
   # send the text as a new message (case preserved from the original input).
   esc_m = re.match(
@@ -225,6 +246,7 @@ def try_dispatch(text: str, ctx: AgentContext) -> tuple[bool, str | None]:
       "| `/cd <dir>` | Change working directory |\n"
       "| `/esc` | Cancel current operation |\n"
       "| `/esc <text>` | Cancel and send `<text>` as the next message |\n"
+      "| `/btw <question>` | Read-only side question; ephemeral, never enters history, doesn't interrupt the turn (Claude only) |\n"
       "| `/ping` | Status check |\n"
       "| `/cost` | Session API cost |\n"
       "| `/usage` | Plan usage limits |\n"

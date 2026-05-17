@@ -91,6 +91,23 @@ class CodingAgent(ABC):
     """
     del endpoint
 
+  async def side_question(self, question: str, sdk_session_id: str) -> str:
+    """Answer a read-only, ephemeral side question ("by the way…").
+
+    Semantics mirror Claude Code's ``/btw``: the answer is produced
+    against the *current* conversation context but MUST NOT mutate it —
+    no tools, a single response, never written back to the session
+    transcript — and it MUST run independently of any turn that may be
+    executing concurrently (the caller does not interrupt the turn).
+
+    `sdk_session_id` is the live session to read context from. Returns
+    the answer text, or "" if this adapter does not support side
+    questions (the caller surfaces a "not supported" note). Default is
+    unsupported, so Codex / OpenCode inherit the no-op.
+    """
+    del question, sdk_session_id
+    return ""
+
   def trailing_note(self, sdk_session_id: str) -> str:
     """Return an optional markdown note to append to the final turn response.
 

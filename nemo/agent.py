@@ -25,7 +25,7 @@ from typing import TYPE_CHECKING, Callable
 
 from . import cards, commands, messages, monitor
 from .agent_factory import AgentKind, build_coding_agent, is_model_compatible
-from .coding_agent import EndpointConfig
+from .coding_agent import CodingAgent, EndpointConfig
 from .channel import IncomingMessage
 from .config import load_credentials
 from .db import Database
@@ -588,6 +588,47 @@ async def _handle_session_recall(
   )
 
 
+async def _handle_btw(
+  channel: LarkChannel,
+  chat_id: str,
+  coding_agent: CodingAgent,
+  sdk_session_id: str,
+  question: str,
+) -> None:
+  """Answer a `/btw` side question and post it as an ephemeral card.
+
+  Ephemerality is enforced on Nemo's side here: the answer card is sent
+  WITHOUT ``db.record_sent`` / ``_register_msg``, so it never lands in
+  the SQLite ``messages`` table the agent reads back as chat history.
+  Combined with the adapter forking the SDK session, the answer can
+  never re-enter the agent's context. (The inbound ``/btw`` line itself
+  is still recorded like any other command — only the answer and any
+  reasoning are kept out of history.)
+  """
+  answer = ""
+  try:
+    answer = await coding_agent.side_question(question, sdk_session_id)
+  except Exception as exc:  # never let a side question crash the loop
+    log.warning("side_question raised: %s", exc)
+    answer = f"⚠️ btw failed: {exc}"
+  if not answer:
+    answer = (
+      "btw is unavailable here — it needs an active Claude session "
+      "with context (the current agent may not support side "
+      "questions, or no turn has run yet)."
+    )
+  body = (
+    f"{answer}\n\n"
+    f"<font color='grey'>Ephemeral — this side answer is not saved to "
+    f"the conversation.</font>"
+  )
+  card = cards.build_markdown_card(body, title="💬 btw", color="indigo")
+  try:
+    await channel.send_card(chat_id, card)
+  except Exception as exc:
+    log.warning("Failed to send btw card: %s", exc)
+
+
 def _format_session_delete_result(
   action: str, result: SessionDeleteResult,
 ) -> str:
@@ -964,6 +1005,10 @@ async def main_loop(
   main_loop_ref = asyncio.get_running_loop()
   running = True
   _dissolve_on_exit = False
+  # In-flight `/btw` side questions spawned during a running turn. Kept
+  # daemon-scoped (not turn-scoped) so an answer started in turn N can
+  # still arrive after turn N ends without its task being GC'd.
+  _btw_tasks: set[asyncio.Task[None]] = set()
   # One-shot flag: prepend a pacing hint to the next user prompt after an
   # SDK timeout. Cleared after use or on /clear.
   _pending_pacing_hint = False
@@ -1472,6 +1517,10 @@ async def main_loop(
             await _send_response(channel, chat_id, f"Rename failed: {e}", db)
         elif response == "__diag__":
           await _handle_diag(channel, chat_id, project_dir, db)
+        elif response and response.startswith("__btw__:"):
+          await _handle_btw(
+            channel, chat_id, coding_agent,
+            _sdk_session_id, response.split(":", 1)[1])
         elif response == "__session_list__":
           await _handle_session_list(
             channel, chat_id, project_dir, db, _sdk_session_id)
@@ -1815,6 +1864,16 @@ async def main_loop(
               await _send_response(channel, chat_id, f"Rename failed: {e}", db)
           elif response == "__diag__":
             await _handle_diag(channel, chat_id, project_dir, db)
+          elif response and response.startswith("__btw__:"):
+            # During a running turn, run the side question in the
+            # background so the signal watcher keeps reacting to
+            # esc/stop and the main turn is never blocked or touched.
+            btw_q = response.split(":", 1)[1]
+            btw_task = asyncio.create_task(
+              _handle_btw(
+                channel, chat_id, coding_agent, _sdk_session_id, btw_q))
+            _btw_tasks.add(btw_task)
+            btw_task.add_done_callback(_btw_tasks.discard)
           elif response and response.startswith("__effort__:"):
             new_effort = response.split(":", 1)[1]
             ctx.effort = new_effort

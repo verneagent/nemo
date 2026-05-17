@@ -44,6 +44,34 @@ def test_session_purge_command_with_and_without_target():
   assert resp == "__session_purge__:"
 
 
+def test_btw_with_question():
+  handled, resp = try_dispatch("/btw what was that config file", _ctx())
+  assert handled
+  assert resp == "__btw__:what was that config file"
+  # Side questions don't restart the SDK → must be inline-safe so they
+  # can run during a turn without being deferred.
+  assert is_inline_safe(resp)
+
+
+def test_btw_multiline_question():
+  handled, resp = try_dispatch("/btw line one\nline two", _ctx())
+  assert handled
+  assert resp == "__btw__:line one\nline two"
+
+
+def test_btw_no_arg_shows_usage():
+  handled, resp = try_dispatch("/btw", _ctx())
+  assert handled
+  assert resp is not None and not resp.startswith("__btw__:")
+  assert "Usage:" in resp
+
+
+def test_bare_btw_is_not_a_command():
+  """Bare 'btw' (no slash) is too common in casual follow-ups to hijack."""
+  handled, _ = try_dispatch("btw, also fix the typo above", _ctx())
+  assert not handled
+
+
 def test_model_show():
   handled, resp = try_dispatch("/model", _ctx())
   assert handled
