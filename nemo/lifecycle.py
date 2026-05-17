@@ -1,0 +1,218 @@
+"""Self-restart and upgrade helpers for the Nemo host process."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+import time
+from dataclasses import dataclass
+from importlib.metadata import PackageNotFoundError, distribution
+
+
+PACKAGE_NAME = "captain-nemo"
+
+
+@dataclass(frozen=True)
+class RestartSpec:
+  """Arguments needed to launch a replacement Nemo process."""
+
+  chat_id: str
+  project_dir: str
+  agent: str
+  model: str
+  permission_mode: str
+  effort: str = ""
+
+
+@dataclass(frozen=True)
+class CommandResult:
+  """Small subprocess result safe to show in chat/logs."""
+
+  returncode: int
+  output: str
+
+
+def is_editable_install(package: str = PACKAGE_NAME) -> bool:
+  """Return True when ``package`` was installed with pip editable mode."""
+  try:
+    dist = distribution(package)
+  except PackageNotFoundError:
+    return False
+  direct_url = dist.read_text("direct_url.json")
+  if not direct_url:
+    return False
+  try:
+    parsed = json.loads(direct_url)
+  except json.JSONDecodeError:
+    return False
+  if not isinstance(parsed, dict):
+    return False
+  dir_info = parsed.get("dir_info")
+  if not isinstance(dir_info, dict):
+    return False
+  return dir_info.get("editable") is True
+
+
+def build_restart_args(spec: RestartSpec, original_args: list[str] | None = None) -> list[str]:
+  """Build ``python -m nemo`` args for a replacement process.
+
+  Preserve process-level options such as ``--profile``, ``--verbose``, and
+  ``--system-prompt-file`` from the original invocation, while forcing the
+  resolved chat/project/agent/model values so restarts never auto-discover a
+  different chat.
+  """
+  args = list(original_args if original_args is not None else sys.argv[1:])
+  skip_value_for = {
+    "--chat-id",
+    "--chat-name",
+    "--project-dir",
+    "--agent",
+    "--model",
+    "--effort",
+    "--permission-mode",
+  }
+  out: list[str] = []
+  i = 0
+  while i < len(args):
+    arg = args[i]
+    if arg in skip_value_for:
+      i += 2
+      continue
+    if any(arg.startswith(f"{flag}=") for flag in skip_value_for):
+      i += 1
+      continue
+    out.append(arg)
+    i += 1
+
+  out.extend([
+    "--chat-id", spec.chat_id,
+    "--project-dir", spec.project_dir,
+    "--agent", spec.agent,
+    "--model", spec.model,
+    "--permission-mode", spec.permission_mode,
+  ])
+  if spec.effort:
+    out.extend(["--effort", spec.effort])
+  return out
+
+
+def helper_log_path(parent_pid: int) -> str:
+  from .config import CONFIG_DIR
+
+  log_dir = os.path.join(CONFIG_DIR, "logs")
+  os.makedirs(log_dir, exist_ok=True)
+  return os.path.join(log_dir, f"nemo-lifecycle-{parent_pid}.log")
+
+
+def spawn_lifecycle_helper(
+  spec: RestartSpec,
+  *,
+  upgrade: bool = False,
+  original_args: list[str] | None = None,
+) -> str:
+  """Start a detached helper that optionally upgrades, then restarts Nemo."""
+  parent_pid = os.getpid()
+  restart_args = build_restart_args(spec, original_args)
+  log_path = helper_log_path(parent_pid)
+  helper_args = [
+    sys.executable,
+    "-m",
+    "nemo.lifecycle",
+    "--parent-pid",
+    str(parent_pid),
+    "--log-path",
+    log_path,
+  ]
+  if upgrade:
+    helper_args.append("--upgrade")
+  helper_args.append("--")
+  helper_args.extend(restart_args)
+  with open(log_path, "ab", buffering=0) as log_file:
+    subprocess.Popen(
+      helper_args,
+      stdin=subprocess.DEVNULL,
+      stdout=log_file,
+      stderr=log_file,
+      start_new_session=True,
+      close_fds=True,
+    )
+  return log_path
+
+
+def run_pipx_upgrade(timeout_s: float = 300.0) -> CommandResult:
+  """Run ``pipx upgrade captain-nemo`` and capture combined output."""
+  try:
+    result = subprocess.run(
+      ["pipx", "upgrade", PACKAGE_NAME],
+      text=True,
+      stdout=subprocess.PIPE,
+      stderr=subprocess.STDOUT,
+      timeout=timeout_s,
+    )
+  except FileNotFoundError:
+    return CommandResult(127, "`pipx` not found in PATH.")
+  except subprocess.TimeoutExpired as exc:
+    output = exc.stdout if isinstance(exc.stdout, str) else ""
+    return CommandResult(124, output + "\nTimed out running `pipx upgrade captain-nemo`.")
+  return CommandResult(result.returncode, result.stdout)
+
+
+def _pid_alive(pid: int) -> bool:
+  try:
+    os.kill(pid, 0)
+  except OSError:
+    return False
+  return True
+
+
+def _wait_for_parent_exit(pid: int, timeout_s: float = 30.0) -> None:
+  deadline = time.time() + timeout_s
+  while time.time() < deadline:
+    if not _pid_alive(pid):
+      return
+    time.sleep(0.25)
+
+
+def _run_helper(parent_pid: int, log_path: str, restart_args: list[str], upgrade: bool) -> int:
+  print(f"lifecycle helper started parent={parent_pid} upgrade={upgrade}", flush=True)
+  if upgrade:
+    print("running: pipx upgrade captain-nemo", flush=True)
+    result = run_pipx_upgrade()
+    print(result.output, end="", flush=True)
+    if result.returncode != 0:
+      print(f"upgrade failed with exit code {result.returncode}", flush=True)
+      return result.returncode
+
+  _wait_for_parent_exit(parent_pid)
+  cmd = [sys.executable, "-m", "nemo", *restart_args]
+  print(f"restarting: {cmd!r}", flush=True)
+  with open(log_path, "ab", buffering=0) as log_file:
+    subprocess.Popen(
+      cmd,
+      stdin=subprocess.DEVNULL,
+      stdout=log_file,
+      stderr=log_file,
+      start_new_session=True,
+      close_fds=True,
+    )
+  return 0
+
+
+def main() -> int:
+  parser = argparse.ArgumentParser(prog="python -m nemo.lifecycle")
+  parser.add_argument("--parent-pid", type=int, required=True)
+  parser.add_argument("--log-path", required=True)
+  parser.add_argument("--upgrade", action="store_true")
+  parser.add_argument("restart_args", nargs=argparse.REMAINDER)
+  args = parser.parse_args()
+  restart_args = list(args.restart_args)
+  if restart_args and restart_args[0] == "--":
+    restart_args = restart_args[1:]
+  return _run_helper(args.parent_pid, args.log_path, restart_args, args.upgrade)
+
+
+if __name__ == "__main__":
+  raise SystemExit(main())

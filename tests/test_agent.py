@@ -166,6 +166,9 @@ class _FakeAgent:
     del resume
     pass
 
+  def set_effort(self, _effort):
+    pass
+
   async def interrupt(self):
     pass
 
@@ -260,6 +263,185 @@ def test_idle_esc_is_silent(tmp_path):
 
   assert result == 0
   send_response.assert_not_awaited()
+
+
+def test_restart_command_spawns_lifecycle_helper_and_exits(tmp_path):
+  channel = _QueuedChannel("oc_test", [
+    IncomingMessage(
+      event_type="im.message.receive_v1",
+      chat_id="oc_test",
+      sender_id="ou_user",
+      message_id="om_restart",
+      msg_type="text",
+      text="/restart",
+      create_time="1",
+    ),
+  ])
+  send_response = mock.AsyncMock()
+
+  with mock.patch("nemo.agent.load_credentials", return_value={
+    "app_id": "app_id",
+    "app_secret": "app_secret",
+    "email": "user@example.com",
+  }), \
+       mock.patch("nemo.agent.Database", _FakeDB), \
+       mock.patch("nemo.agent.LarkChannel", return_value=channel), \
+       mock.patch("nemo.agent.build_coding_agent", return_value=_FakeAgent()), \
+       mock.patch("nemo.agent._send_response", new=send_response), \
+       mock.patch("nemo.lifecycle.spawn_lifecycle_helper", return_value="/tmp/life.log") as spawn, \
+       mock.patch("nemo.group_config.load_config", return_value={}), \
+       mock.patch("nemo.config.load_relay_config", return_value=("", "")), \
+       mock.patch("signal.signal"):
+    result = asyncio.run(main_loop(
+      "oc_test", str(tmp_path), "claude-opus-4-6",
+      agent="claude", permission_mode="acceptEdits", effort="high",
+    ))
+
+  assert result == 0
+  spawn.assert_called_once()
+  spec = spawn.call_args.args[0]
+  assert spec.chat_id == "oc_test"
+  assert spec.project_dir == str(tmp_path)
+  assert spec.agent == "claude"
+  assert spec.model == "claude-opus-4-6"
+  assert spec.permission_mode == "acceptEdits"
+  assert spec.effort == "high"
+  assert "Restarting Nemo" in send_response.await_args.args[2]
+
+
+def test_upgrade_editable_does_not_restart(tmp_path):
+  channel = _QueuedChannel("oc_test", [
+    IncomingMessage(
+      event_type="im.message.receive_v1",
+      chat_id="oc_test",
+      sender_id="ou_user",
+      message_id="om_upgrade",
+      msg_type="text",
+      text="/upgrade",
+      create_time="1",
+    ),
+    IncomingMessage(
+      event_type="im.message.receive_v1",
+      chat_id="oc_test",
+      sender_id="ou_user",
+      message_id="om_exit",
+      msg_type="text",
+      text="/exit",
+      create_time="2",
+    ),
+  ])
+  send_response = mock.AsyncMock()
+
+  with mock.patch("nemo.agent.load_credentials", return_value={
+    "app_id": "app_id",
+    "app_secret": "app_secret",
+    "email": "user@example.com",
+  }), \
+       mock.patch("nemo.agent.Database", _FakeDB), \
+       mock.patch("nemo.agent.LarkChannel", return_value=channel), \
+       mock.patch("nemo.agent.build_coding_agent", return_value=_FakeAgent()), \
+       mock.patch("nemo.agent._send_response", new=send_response), \
+       mock.patch("nemo.lifecycle.is_editable_install", return_value=True), \
+       mock.patch("nemo.lifecycle.spawn_lifecycle_helper") as spawn, \
+       mock.patch("nemo.group_config.load_config", return_value={}), \
+       mock.patch("nemo.config.load_relay_config", return_value=("", "")), \
+       mock.patch("signal.signal"):
+    result = asyncio.run(main_loop("oc_test", str(tmp_path), "claude-opus-4-6"))
+
+  assert result == 0
+  spawn.assert_not_called()
+  assert "editable" in send_response.await_args_list[0].args[2]
+
+
+def test_upgrade_failure_keeps_daemon_running(tmp_path):
+  from nemo.lifecycle import CommandResult
+
+  channel = _QueuedChannel("oc_test", [
+    IncomingMessage(
+      event_type="im.message.receive_v1",
+      chat_id="oc_test",
+      sender_id="ou_user",
+      message_id="om_upgrade",
+      msg_type="text",
+      text="/upgrade",
+      create_time="1",
+    ),
+    IncomingMessage(
+      event_type="im.message.receive_v1",
+      chat_id="oc_test",
+      sender_id="ou_user",
+      message_id="om_exit",
+      msg_type="text",
+      text="/exit",
+      create_time="2",
+    ),
+  ])
+  send_response = mock.AsyncMock()
+
+  with mock.patch("nemo.agent.load_credentials", return_value={
+    "app_id": "app_id",
+    "app_secret": "app_secret",
+    "email": "user@example.com",
+  }), \
+       mock.patch("nemo.agent.Database", _FakeDB), \
+       mock.patch("nemo.agent.LarkChannel", return_value=channel), \
+       mock.patch("nemo.agent.build_coding_agent", return_value=_FakeAgent()), \
+       mock.patch("nemo.agent._send_response", new=send_response), \
+       mock.patch("nemo.lifecycle.is_editable_install", return_value=False), \
+       mock.patch("nemo.lifecycle.run_pipx_upgrade", return_value=CommandResult(1, "bad")), \
+       mock.patch("nemo.lifecycle.spawn_lifecycle_helper") as spawn, \
+       mock.patch("nemo.group_config.load_config", return_value={}), \
+       mock.patch("nemo.config.load_relay_config", return_value=("", "")), \
+       mock.patch("signal.signal"):
+    result = asyncio.run(main_loop("oc_test", str(tmp_path), "claude-opus-4-6"))
+
+  assert result == 0
+  spawn.assert_not_called()
+  assert any(
+    "Upgrade failed" in call.args[2]
+    for call in send_response.await_args_list
+  )
+
+
+def test_upgrade_success_spawns_restart_helper_and_exits(tmp_path):
+  from nemo.lifecycle import CommandResult
+
+  channel = _QueuedChannel("oc_test", [
+    IncomingMessage(
+      event_type="im.message.receive_v1",
+      chat_id="oc_test",
+      sender_id="ou_user",
+      message_id="om_upgrade",
+      msg_type="text",
+      text="/upgrade",
+      create_time="1",
+    ),
+  ])
+  send_response = mock.AsyncMock()
+
+  with mock.patch("nemo.agent.load_credentials", return_value={
+    "app_id": "app_id",
+    "app_secret": "app_secret",
+    "email": "user@example.com",
+  }), \
+       mock.patch("nemo.agent.Database", _FakeDB), \
+       mock.patch("nemo.agent.LarkChannel", return_value=channel), \
+       mock.patch("nemo.agent.build_coding_agent", return_value=_FakeAgent()), \
+       mock.patch("nemo.agent._send_response", new=send_response), \
+       mock.patch("nemo.lifecycle.is_editable_install", return_value=False), \
+       mock.patch("nemo.lifecycle.run_pipx_upgrade", return_value=CommandResult(0, "ok")), \
+       mock.patch("nemo.lifecycle.spawn_lifecycle_helper", return_value="/tmp/life.log") as spawn, \
+       mock.patch("nemo.group_config.load_config", return_value={}), \
+       mock.patch("nemo.config.load_relay_config", return_value=("", "")), \
+       mock.patch("signal.signal"):
+    result = asyncio.run(main_loop("oc_test", str(tmp_path), "claude-opus-4-6"))
+
+  assert result == 0
+  spawn.assert_called_once()
+  assert any(
+    "Upgrade succeeded" in call.args[2]
+    for call in send_response.await_args_list
+  )
 
 
 def test_active_esc_updates_card_without_cancel_message(tmp_path):

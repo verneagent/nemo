@@ -32,6 +32,20 @@ def test_undo_clear_not_inline_safe():
   assert not is_inline_safe(resp)
 
 
+def test_restart_command_not_inline_safe():
+  handled, resp = try_dispatch("/restart", _ctx())
+  assert handled
+  assert resp == "__restart__"
+  assert not is_inline_safe(resp)
+
+
+def test_upgrade_command_not_inline_safe():
+  handled, resp = try_dispatch("/upgrade", _ctx())
+  assert handled
+  assert resp == "__upgrade__"
+  assert not is_inline_safe(resp)
+
+
 def test_session_rm_command():
   handled, resp = try_dispatch("/session rm abc123", _ctx())
   assert handled

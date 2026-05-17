@@ -1609,6 +1609,96 @@ async def main_loop(
             await _send_response(channel, chat_id, f"Rename failed: {e}", db)
         elif response == "__diag__":
           await _handle_diag(channel, chat_id, project_dir, db)
+        elif response == "__restart__":
+          from .lifecycle import RestartSpec, spawn_lifecycle_helper
+
+          spec = RestartSpec(
+            chat_id=chat_id,
+            project_dir=project_dir,
+            agent=agent,
+            model=model,
+            permission_mode=permission_mode,
+            effort=ctx.effort,
+          )
+          try:
+            log_path = spawn_lifecycle_helper(spec)
+          except Exception as exc:
+            log.error("Failed to spawn restart helper: %s", exc, exc_info=True)
+            await _send_response(
+              channel, chat_id,
+              f"Restart failed before handoff: `{exc}`.",
+              db,
+            )
+            await _clear_ack()
+            continue
+          await _send_response(
+            channel, chat_id,
+            f"Restarting Nemo. Lifecycle log: `{log_path}`",
+            db,
+          )
+          running = False
+          await _clear_ack()
+          break
+        elif response == "__upgrade__":
+          from .lifecycle import (
+            RestartSpec, is_editable_install, run_pipx_upgrade,
+            spawn_lifecycle_helper,
+          )
+
+          if is_editable_install():
+            await _send_response(
+              channel, chat_id,
+              "Current install is editable. Update the source checkout, then "
+              "use `/restart` to reload Nemo.",
+              db,
+            )
+            await _clear_ack()
+            continue
+          await _send_response(
+            channel, chat_id,
+            "Running `pipx upgrade captain-nemo`...",
+            db,
+          )
+          result = await asyncio.to_thread(run_pipx_upgrade)
+          if result.returncode != 0:
+            output = result.output.strip()[-1500:] or "no output"
+            await _send_response(
+              channel, chat_id,
+              "Upgrade failed; current daemon is still running.\n\n"
+              f"```\n{output}\n```",
+              db,
+            )
+            await _clear_ack()
+            continue
+          spec = RestartSpec(
+            chat_id=chat_id,
+            project_dir=project_dir,
+            agent=agent,
+            model=model,
+            permission_mode=permission_mode,
+            effort=ctx.effort,
+          )
+          try:
+            log_path = spawn_lifecycle_helper(spec)
+          except Exception as exc:
+            log.error("Upgrade succeeded but restart helper failed: %s",
+                      exc, exc_info=True)
+            await _send_response(
+              channel, chat_id,
+              "Upgrade succeeded, but restart handoff failed. "
+              f"Start Nemo manually. Error: `{exc}`",
+              db,
+            )
+            await _clear_ack()
+            continue
+          await _send_response(
+            channel, chat_id,
+            f"Upgrade succeeded. Restarting Nemo. Lifecycle log: `{log_path}`",
+            db,
+          )
+          running = False
+          await _clear_ack()
+          break
         elif response and response.startswith("__btw__:"):
           # Fire-and-forget: a side question must never block the main
           # loop (it can take many seconds) and its failures must never

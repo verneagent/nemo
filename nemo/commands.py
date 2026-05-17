@@ -400,6 +400,14 @@ def try_dispatch(text: str, ctx: AgentContext) -> tuple[bool, str | None]:
   if t in ("/pid", "pid"):
     return True, f"Nemo PID: `{os.getpid()}`"
 
+  # /restart — replace this daemon process with a fresh nemo invocation.
+  if t in ("/restart", "restart"):
+    return True, "__restart__"
+
+  # /upgrade — pipx upgrade captain-nemo, then restart if successful.
+  if t in ("/upgrade", "upgrade"):
+    return True, "__upgrade__"
+
   # /help
   if t in ("/help", "help", "帮助"):
     return True, (
@@ -425,6 +433,8 @@ def try_dispatch(text: str, ctx: AgentContext) -> tuple[bool, str | None]:
       "| `/context` | Last known context token snapshot |\n"
       "| `/version` | Nemo and coding-agent runtime versions |\n"
       "| `/pid` | Current Nemo process ID |\n"
+      "| `/restart` | Restart this Nemo daemon |\n"
+      "| `/upgrade` | Run `pipx upgrade captain-nemo`, then restart |\n"
       "| `/mention` | Toggle @mention requirement |\n"
       "| `/name <name>` | Rename this group |\n"
       "| `/norm` | Manage group norms |\n"
@@ -572,7 +582,8 @@ def try_dispatch(text: str, ctx: AgentContext) -> tuple[bool, str | None]:
 
 # Commands that require SDK restart — NOT safe during a turn.
 _NEEDS_SDK = ("__clear__", "__undo_clear__", "__esc__",
-              "__model__:", "__cd__:", "__agent__:")
+              "__model__:", "__cd__:", "__agent__:",
+              "__restart__", "__upgrade__")
 
 
 def is_inline_safe(response: str | None) -> bool:
