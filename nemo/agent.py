@@ -40,6 +40,8 @@ log = logging.getLogger(__name__)
 if TYPE_CHECKING:
   from .sessions import SessionDeleteResult
 
+_USER_MESSAGE_EVENT_TYPES = {"", "message", "im.message.receive_v1"}
+
 
 # ---------------------------------------------------------------------------
 # Response helpers
@@ -111,6 +113,11 @@ def _should_send_plain_text(text: str) -> bool:
   return True
 
 
+def _is_user_message_event(msg: IncomingMessage) -> bool:
+  """Return True for events that represent user-authored chat messages."""
+  return msg.event_type in _USER_MESSAGE_EVENT_TYPES
+
+
 def _merge_pending(pending: list[IncomingMessage]) -> IncomingMessage | None:
   """Merge multiple pending messages into a single IncomingMessage.
 
@@ -126,11 +133,10 @@ def _merge_pending(pending: list[IncomingMessage]) -> IncomingMessage | None:
   # Separate regular text messages from non-text (commands, card actions, etc.)
   # Real events from the relay/Lark stream carry event_type
   # "im.message.receive_v1"; older code paths and tests use "message" or "".
-  _TEXT_EVENT_TYPES = {"", "message", "im.message.receive_v1"}
   text_msgs: list[IncomingMessage] = []
   other_msgs: list[IncomingMessage] = []
   for msg in pending:
-    if msg.event_type in _TEXT_EVENT_TYPES and msg.text.strip():
+    if _is_user_message_event(msg) and msg.text.strip():
       text_msgs.append(msg)
     else:
       other_msgs.append(msg)
@@ -600,8 +606,9 @@ async def _handle_btw(
   Ephemerality is enforced on Nemo's side here: the answer card is sent
   WITHOUT ``db.record_sent`` / ``_register_msg``, so it never lands in
   the SQLite ``messages`` table the agent reads back as chat history.
-  Combined with the adapter forking the SDK session, the answer can
-  never re-enter the agent's context. (The inbound ``/btw`` line itself
+  Combined with the adapter forking (or, pre-first-turn, never
+  persisting) the SDK session, the answer can never re-enter the
+  agent's context. (The inbound ``/btw`` line itself
   is still recorded like any other command — only the answer and any
   reasoning are kept out of history.)
   """
@@ -613,9 +620,8 @@ async def _handle_btw(
     answer = f"⚠️ btw failed: {exc}"
   if not answer:
     answer = (
-      "btw is unavailable here — it needs an active Claude session "
-      "with context (the current agent may not support side "
-      "questions, or no turn has run yet)."
+      "btw isn't supported by the current agent. Side questions are "
+      "Claude-only — switch with `/agent claude`."
     )
   body = (
     f"{answer}\n\n"
@@ -1056,6 +1062,10 @@ async def main_loop(
 
       # Skip recall events at top level (handled during turns)
       if reply.event_type == "im.message.recalled_v1":
+        continue
+
+      if not _is_user_message_event(reply):
+        log.info("Ignoring unsupported event outside turn: %s", reply.event_type)
         continue
 
       # Scope to this session's chat (WebSocket receives all chats)
@@ -1969,6 +1979,9 @@ async def main_loop(
                 msg.operator_id, operator_open_id, _member_roles):
               signal_detected = "stop"
               return
+            continue
+          if not _is_user_message_event(msg):
+            log.info("Skipping during turn: unsupported event=%s", msg.event_type)
             continue
           # Apply @mention filter so non-bot-directed chat doesn't get
           # pulled into the in-turn pending queue (mirrors the top-level

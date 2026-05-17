@@ -7,6 +7,7 @@ from unittest import mock
 from nemo.agent import (
   _format_rate_limit_notice,
   _in_turn_filtered_out,
+  _is_user_message_event,
   _merge_pending,
   _requeue_pending,
   _send_response,
@@ -1235,6 +1236,23 @@ def test_merge_pending_real_event_type():
   assert result.message_id == "om_3"
 
 
+def test_user_message_event_accepts_lark_receive_and_legacy_types():
+  assert _is_user_message_event(_IM(event_type="im.message.receive_v1")) is True
+  assert _is_user_message_event(_IM(event_type="message")) is True
+  assert _is_user_message_event(_IM(event_type="")) is True
+
+
+def test_reaction_event_is_not_user_message_event():
+  msg = _IM(
+    event_type="im.message.reaction.created_v1",
+    chat_id="oc_test",
+    sender_id="ou_user",
+    message_id="om_target",
+    text="Yes",
+  )
+  assert _is_user_message_event(msg) is False
+
+
 def test_merge_pending_after_recall():
   """Recalling a message should leave it out of the merge."""
   msgs = [
@@ -1815,7 +1833,7 @@ def test_handle_btw_unsupported_falls_back_to_note():
   asyncio.run(_handle_btw(ch, "c", ag, "", "q"))
 
   assert len(ch.cards) == 1
-  assert "unavailable" in repr(ch.cards[0][1])
+  assert "isn't supported" in repr(ch.cards[0][1])
 
 
 def test_handle_btw_swallows_adapter_exception():

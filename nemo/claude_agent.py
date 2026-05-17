@@ -277,17 +277,21 @@ class ClaudeCodingAgent(CodingAgent):
   async def side_question(self, question: str, sdk_session_id: str) -> str:
     """Read-only ephemeral side question — see CodingAgent.side_question.
 
-    Implementation: a one-shot ``query()`` that ``resume``s the live
-    session for full context + parent prompt-cache reuse, but with
+    Implementation: a one-shot ``query()``. When a live session exists
+    we ``resume`` it for full context + parent prompt-cache reuse, with
     ``fork_session=True`` so every message it generates lands in a
     throwaway forked transcript — the real session is never touched, so
-    the answer can never re-enter conversation history. No tools and
-    ``max_turns=1`` keep it strictly read-only and single-response. It
-    spawns its own CLI subprocess (top-level ``query()``), entirely
-    independent of ``SDKThread`` — so a turn running concurrently on the
-    main client is neither blocked nor interrupted.
+    the answer can never re-enter conversation history. Before the first
+    turn completes there is no session id yet; we still answer, just
+    from a fresh ephemeral session (no prior context to draw on, but
+    /btw must work as the very first message too — Claude Code's does).
+    No tools and ``max_turns=1`` keep it strictly read-only and
+    single-response. It spawns its own CLI subprocess (top-level
+    ``query()``), entirely independent of ``SDKThread`` — so a turn
+    running concurrently on the main client is neither blocked nor
+    interrupted.
     """
-    if not sdk_session_id or not self._project_dir:
+    if not self._project_dir:
       return ""
 
     from claude_agent_sdk import (
@@ -298,15 +302,13 @@ class ClaudeCodingAgent(CodingAgent):
       query,
     )
 
-    # Reuse the main turn's system prompt verbatim so the forked query
+    # Reuse the main turn's system prompt verbatim so a forked query
     # hits the parent's cached prefix; the btw directive is a short
     # suffix appended after it.
     agent_prompt = (
       f"{self._build_agent_prompt()}\n\n{_BTW_DIRECTIVE}"
     )
-    opts = ClaudeAgentOptions(
-      resume=sdk_session_id,
-      fork_session=True,
+    opts_kwargs: dict[str, object] = dict(
       allowed_tools=[],
       # Belt-and-suspenders: even with an empty allow-list, name every
       # mutating/IO tool so a preset system prompt can't coax one in.
@@ -328,6 +330,13 @@ class ClaudeCodingAgent(CodingAgent):
       },
       max_buffer_size=16 * 1024 * 1024,
     )
+    if sdk_session_id:
+      # Fork only makes sense with a session to fork; without resume it
+      # would be meaningless. With a session: read context + reuse the
+      # parent prompt cache, but keep the answer out of real history.
+      opts_kwargs["resume"] = sdk_session_id
+      opts_kwargs["fork_session"] = True
+    opts = ClaudeAgentOptions(**opts_kwargs)
 
     async def _collect() -> str:
       parts: list[str] = []

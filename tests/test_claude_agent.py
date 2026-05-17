@@ -407,11 +407,42 @@ def _btw_claude_agent():
   return agent
 
 
-def test_side_question_requires_session_id():
-  """No live session → nothing to read context from → unsupported ('')."""
+def test_side_question_without_session_runs_fresh(monkeypatch):
+  """First message of a session: no sdk_session_id yet. /btw must still
+  answer (Claude Code's does) — from a FRESH session, i.e. NO resume and
+  NO fork_session (forking nothing is meaningless), but still read-only."""
+  import asyncio
+  import claude_agent_sdk as sdk
+
+  captured: dict[str, object] = {}
+
+  async def fake_query(*, prompt, options=None, transport=None):
+    captured["options"] = options
+    yield sdk.AssistantMessage(
+      content=[sdk.TextBlock(text="fresh answer")], model="m")
+    yield sdk.ResultMessage(
+      subtype="success", duration_ms=1, duration_api_ms=1,
+      is_error=False, num_turns=1, session_id="fresh")
+
+  monkeypatch.setattr(sdk, "query", fake_query)
+
+  agent = _btw_claude_agent()
+  answer = asyncio.run(agent.side_question("hello?", ""))
+
+  assert answer == "fresh answer"
+  opts = captured["options"]
+  assert getattr(opts, "resume", None) in (None, "")
+  assert getattr(opts, "fork_session", False) is False
+  assert opts.allowed_tools == []
+  assert opts.max_turns == 1
+
+
+def test_side_question_requires_project_dir():
+  """Hard guard: no project dir means the adapter isn't initialised."""
   import asyncio
   agent = _btw_claude_agent()
-  assert asyncio.run(agent.side_question("q", "")) == ""
+  agent._project_dir = ""
+  assert asyncio.run(agent.side_question("q", "sess")) == ""
 
 
 def test_side_question_forks_resumes_and_is_readonly(monkeypatch):
