@@ -251,7 +251,7 @@ class SDKThread:
     preserves conversation context. Falls back to the static `options`
     parameter when not provided.
     """
-    from .turn import TransientAPIError  # avoid import cycle
+    from .turn import StaleLeakError, TransientAPIError  # avoid import cycle
     self._cancelled.clear()
     for attempt in range(max_attempts):
       if self._cancelled.is_set():
@@ -268,7 +268,12 @@ class SDKThread:
               and "not connected" in exc_msg)
         )
         if isinstance(exc, TimeoutError) or is_disconnected or is_transient_api:
-          if is_transient_api:
+          if isinstance(exc, StaleLeakError):
+            # #788 stale leak: reconnect with resume preserves history;
+            # NO interrupt (the wedged control channel is dead — _do_close
+            # SIGKILLs the subprocess, which is strictly more thorough).
+            label = "stale-leak-resume"
+          elif is_transient_api:
             label = "transient-api-error"
           elif is_disconnected:
             label = "disconnected"

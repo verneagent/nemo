@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import secrets
 from dataclasses import dataclass
 from typing import Callable
 
@@ -17,50 +16,27 @@ from .types import JsonObject, TurnClient
 
 log = logging.getLogger(__name__)
 
-# Max turns we'll burn to drain stale TaskNotifications + retry the real turn.
-# With drain-prompt strategy, each drain turn clears exactly one stale without
-# spawning new tasks, so this caps the number of accumulated stales we can
-# recover from in a single user turn. See SDK #788.
-MAX_RETRIES = 20
-
-# Drain prompt: deliberately minimal and tool-forbidding so it cannot
-# trigger Agent/subagent calls that would spawn new background tasks (the
-# amplification trap). The whole point is to consume a stale TaskNotification
-# without adding state. See SDK #788 analysis.
+# SDK #788 — stale TaskNotification leak.
 #
-# CRITICAL: Each drain prompt embeds a unique nonce, and asks the model to
-# reply with that same nonce. Why: drain messages enter the SDK conversation
-# history as a normal USER turn (the SDK has no API for system-privileged
-# control messages — see #788 follow-up). If every drain were identical and
-# the assistant always replied "ack", N drain rounds would form an N-shot
-# pattern of `user: <fixed text> → assistant: ack`. The model then continues
-# the pattern on the next *real* user message, replying "ack" to anything.
-# Observed in production 2026-04-29: 13 stales drained in one turn, then
-# every subsequent user message got "ack" until the daemon was restarted.
+# A background task spawned in an earlier turn can complete *after* that
+# turn ends; the SDK then queues its TaskNotification and leaks it at the
+# FRONT of the next turn's stream. The model sees it and answers the stale
+# instead of the user's new prompt.
 #
-# Nonce-per-drain breaks the pattern: each `(prompt, response)` pair is
-# unique, so there is no fixed answer template for the model to copy onto
-# the user's next real prompt.
-DRAIN_PROMPT_MARKER = "[NEMO_DRAIN"
-_DRAIN_NONCE_BYTES = 4  # 8 hex chars — plenty unique across a turn's drains
-
-
-def make_drain_prompt() -> tuple[str, str]:
-  """Return ``(prompt, expected_reply)`` for one drain turn.
-
-  Each call produces a unique nonce so the resulting user/assistant pair
-  never matches the previous drain in conversation history — see the
-  module-level note above for why this matters.
-  """
-  nonce = secrets.token_hex(_DRAIN_NONCE_BYTES)
-  expected = f"NEMO_DRAIN_OK {nonce}"
-  prompt = (
-    f"{DRAIN_PROMPT_MARKER} {nonce}] Internal stale-notification drain. "
-    f"Ignore any prior background-task notifications; they are stale "
-    f"leftovers from earlier turns. Reply with exactly: {expected}. "
-    f"Use NO tools. Do not spawn agents, read files, or run commands."
-  )
-  return prompt, expected
+# The leak is a *stream/transport* artifact of the wedged claude CLI
+# subprocess — NOT durable conversation history. We proved (scripts/
+# poc_resume_recovery.py, 5/5 deterministic repro+recovery) that the clean,
+# deterministic fix is: detect the leak via the ``task_id ∈ stale_tasks``
+# check, raise StaleLeakError, and let SDKThread.run_turn_with_reconnect
+# tear the subprocess down and reconnect with ``resume=<session_id>`` (NO
+# interrupt — the wedged control channel is dead; the SIGKILL in
+# _do_close is strictly more thorough). The resumed subprocess replays
+# clean history from the session jsonl, so the leaked turn never recurs
+# and conversation context is preserved.
+#
+# This replaces the earlier nonce-drain workaround, which polluted
+# conversation history with synthetic user/assistant pairs and could
+# pattern-train the model to reply "ack" to real prompts.
 
 
 class TransientAPIError(RuntimeError):
@@ -70,6 +46,18 @@ class TransientAPIError(RuntimeError):
   matches a transient-error pattern (e.g. ECONNRESET to api.anthropic.com).
   The claude subprocess is usually wedged in this state; SDKThread's
   reconnect loop catches this and spawns a fresh CLI.
+  """
+
+
+class StaleLeakError(TransientAPIError):
+  """A prior turn's stale TaskNotification leaked into this turn's stream.
+
+  See the module note above (SDK #788). Raised from ``_single_turn`` the
+  moment a ``TaskNotificationMessage`` whose id is in ``stale_tasks``
+  appears. Subclasses ``TransientAPIError`` so the existing
+  ``SDKThread.run_turn_with_reconnect`` path catches it and recovers by
+  reconnecting with ``resume=<session_id>`` (no interrupt) then retrying
+  the *real* user prompt on the fresh, clean-history subprocess.
   """
 
 
@@ -253,10 +241,23 @@ class RateLimitNoticeEvent:
   utilization: float | None = None
 
 
+@dataclass
+class StaleLeakNoticeEvent:
+  """A prior turn's stale TaskNotification leaked into this turn (SDK #788).
+
+  Emitted right before ``StaleLeakError`` is raised, so the host can leave
+  a visible breadcrumb explaining the (otherwise silent) reconnect-with-
+  resume recovery and the brief delay it causes. ``task_id`` is the leaked
+  task's id, for log/trace correlation.
+  """
+  task_id: str
+
+
 TurnEvent = (
   ProgressEvent | AnswerEvent |
   TaskStartedEvent | TaskDoneEvent | DoneEvent | ErrorEvent |
-  RateLimitNoticeEvent | CompactStartedEvent | CompactNoticeEvent
+  RateLimitNoticeEvent | CompactStartedEvent | CompactNoticeEvent |
+  StaleLeakNoticeEvent
 )
 
 
@@ -266,15 +267,11 @@ TurnEvent = (
 
 @dataclass
 class _TurnResult:
-  found_stale: bool
   cost: float
   usage: JsonObject
   session_id: str
   last_emitted: str
   last_thinking: str
-
-
-_NOOP_EVENT: Callable[[TurnEvent], None] = lambda _e: None
 
 
 async def _single_turn(
@@ -286,10 +283,10 @@ async def _single_turn(
 ) -> _TurnResult:
   """Issue one query() and consume its receive_response() stream.
 
-  If a stale TaskNotification (id in ``stale_tasks``) appears at the front of
-  the stream, set ``found_stale=True`` and suppress downstream events until
-  ResultMessage. The outer ``run_turn`` uses this flag to decide whether to
-  emit drain/retry turns.
+  If a stale TaskNotification (id in ``stale_tasks``) appears anywhere in
+  the stream, raise ``StaleLeakError`` immediately (SDK #788). It subclasses
+  ``TransientAPIError`` so ``SDKThread.run_turn_with_reconnect`` recovers by
+  reconnecting with ``resume=<session_id>`` and retrying the real prompt.
 
   ``stop_task_disabled`` is a one-element mutable flag: once ``stop_task``
   returns "Control request timeout" the control channel is presumed wedged
@@ -312,7 +309,6 @@ async def _single_turn(
   sdk_session_id = ""
   pending_tasks: set[str] = set()
   progress_started = False
-  found_stale = False
   timed_out = False
   last_emitted: str = ""
   last_thinking: str = ""
@@ -401,20 +397,28 @@ async def _single_turn(
       log.info("turn msg: %s", msg_type)
       last_progress_at = _time.monotonic()
 
-    # --- Stale task detection (SDK bug #788 workaround) ---
+    # --- Stale task leak detection (SDK bug #788) ---
+    # Deterministic: a TaskNotification whose id we already know is stale
+    # leaked from a prior turn into this stream. The wedged subprocess
+    # cannot be salvaged in-stream; raise so run_turn_with_reconnect
+    # rebuilds it with resume=<session_id> (no interrupt) and retries the
+    # real prompt on clean replayed history. Clear stale_tasks: every id
+    # we are tracking belongs to the subprocess we are about to discard;
+    # the resumed session starts clean (proven by poc_resume_recovery.py).
     if isinstance(message, TaskNotificationMessage) and message.task_id in stale_tasks:
-      stale_tasks.discard(message.task_id)
-      found_stale = True
-      log.warning("Stale TaskNotification task=%s — will drain", message.task_id)
-      continue
-
-    if found_stale:
-      if isinstance(message, ResultMessage):
-        cost = getattr(message, "total_cost_usd", 0) or 0.0
-        usage = getattr(message, "usage", None) or {}
-        sdk_session_id = getattr(message, "session_id", "") or ""
-        break
-      continue
+      log.warning(
+        "Stale TaskNotification task=%s leaked into turn stream (#788) — "
+        "raising StaleLeakError for reconnect-with-resume recovery",
+        message.task_id)
+      # Visible breadcrumb BEFORE the raise: the recovery (reconnect with
+      # resume + silent retry) is otherwise invisible to the user — they'd
+      # only see an unexplained delay. The same on_event closure is reused
+      # across the reconnect retry, so this step persists onto the final
+      # card's timeline.
+      on_event(StaleLeakNoticeEvent(task_id=message.task_id))
+      stale_tasks.clear()
+      raise StaleLeakError(
+        f"stale task {message.task_id} leaked into turn stream")
 
     # --- Normal message handling ---
     if isinstance(message, AssistantMessage):
@@ -527,7 +531,6 @@ async def _single_turn(
     raise TimeoutError("receive_response() heartbeat timeout")
 
   return _TurnResult(
-    found_stale=found_stale,
     cost=cost,
     usage=usage,
     session_id=sdk_session_id,
@@ -544,13 +547,14 @@ async def run_turn(
 ) -> tuple[float, JsonObject]:
   """Send prompt to SDK client, stream responses, emit events.
 
-  Orchestrates the SDK #788 workaround: if a stale TaskNotification leaks
-  into the front of a turn, we discard that turn's events and then alternate
-  between *drain* turns (using a fresh nonce-bearing drain prompt that
-  cannot spawn new tasks) and *real* retries of the user's prompt. A drain
-  turn clears at most one stale notification at a time, but crucially never
-  adds to the pending-task backlog, so the retry budget converges instead
-  of amplifying.
+  Single pass. SDK #788 (a prior turn's stale TaskNotification leaking
+  into this stream) is handled by ``_single_turn`` raising
+  ``StaleLeakError``; that propagates out of here to
+  ``SDKThread.run_turn_with_reconnect``, which reconnects with
+  ``resume=<session_id>`` (no interrupt) and calls run_turn again with the
+  same real prompt on a fresh, clean-history subprocess. We deliberately
+  do NOT catch it here — recovery requires tearing down the wedged
+  subprocess, which only the reconnect layer can do.
 
   Returns (cost, usage_dict).
   """
@@ -558,112 +562,25 @@ async def run_turn(
     stale_tasks = set()
   stop_task_disabled: list[bool] = [False]
 
-  # Snapshot the ids we inherited from prior turns. The ResultMessage
-  # handler may promote fresh pending_tasks into ``stale_tasks`` mid-run;
-  # those newcomers must NOT be swept by the "clean real turn" /
-  # "drain clean but stales not surfaced" drop paths, otherwise we lose
-  # the legitimately-pending task ids that the SDK will deliver on a
-  # future turn.
-  stale_at_start: set[str] = set(stale_tasks)
+  # _single_turn raises (StaleLeakError / TimeoutError / TransientAPIError)
+  # straight through; the reconnect layer owns recovery.
+  result = await _single_turn(
+    client, prompt, on_event, stale_tasks, stop_task_disabled,
+  )
 
-  # Always start in real mode: attempting the user's prompt first is the
-  # minimum cost in the common case (stale_tasks populated but stop_task
-  # succeeded → no notification ever arrives). If a stale does leak in at the
-  # front of the stream, `found_stale` will trip and we'll switch to drain
-  # mode for the retry.
-  mode = "real"
-  mode_final = "real"
-  total_cost = 0.0
-  total_usage: JsonObject = {}
-  result: _TurnResult | None = None
-  exhausted = False
+  total_cost = result.cost
+  total_usage: JsonObject = result.usage or {}
 
-  for attempt in range(MAX_RETRIES + 1):
-    if mode == "drain":
-      cur_prompt, _ = make_drain_prompt()
-      cur_on_event = _NOOP_EVENT
-    else:
-      cur_prompt = prompt
-      cur_on_event = on_event
-    log.info("turn attempt=%d mode=%s pending_stales=%d",
-             attempt, mode, len(stale_tasks))
-
-    try:
-      result = await _single_turn(
-        client, cur_prompt, cur_on_event, stale_tasks, stop_task_disabled,
-      )
-    except TimeoutError:
-      # _single_turn already emitted ErrorEvent on its on_event. In drain
-      # mode that was _NOOP_EVENT — the user saw nothing. Surface it now
-      # via the real on_event so the caller knows the turn failed.
-      if mode == "drain":
-        on_event(ErrorEvent(message="Turn timed out while draining stale notifications"))
-      raise
-
-    mode_final = mode
-    total_cost += result.cost
-    if result.usage:
-      total_usage = result.usage
-
-    if mode == "real" and not result.found_stale:
-      # Clean real turn. Any stale ids that were INHERITED from prior
-      # turns (stale_at_start) and still remain never arrived and likely
-      # never will (bug #788 only leaks them at the front of the next
-      # turn). Drop ONLY those — freshly promoted ids (added by this
-      # turn's ResultMessage handler) must stay so the SDK's future
-      # delivery is recognised as stale.
-      never_surfaced = stale_at_start & stale_tasks
-      if never_surfaced:
-        log.info("Clean real turn: dropping %d never-surfaced inherited stales",
-                 len(never_surfaced))
-        stale_tasks -= never_surfaced
-      break
-    if result.found_stale:
-      mode = "drain"
-      continue
-    # mode == "drain" and no found_stale.
-    if not stale_tasks:
-      mode = "real"
-      continue
-    # Drain clean but stale_tasks still populated — inherited ids that
-    # never surfaced (likely dead-session). Drop ONLY inherited ids, not
-    # newly promoted ones.
-    inherited_remaining = stale_at_start & stale_tasks
-    if inherited_remaining:
-      log.info("Drain turn clean: dropping %d never-surfaced inherited stales",
-               len(inherited_remaining))
-      stale_tasks -= inherited_remaining
-    mode = "real"
-  else:
-    exhausted = True
-    log.warning("Exhausted MAX_RETRIES=%d draining stales; stale_tasks=%s",
-                MAX_RETRIES, stale_tasks)
-    on_event(ErrorEvent(
-      message=(
-        f"Stale-task drain exhausted after {MAX_RETRIES} retries — user "
-        "prompt may not have reached the model. Consider /clear."
-      )
-    ))
-
-  if result is None:
-    raise RuntimeError("run_turn exited without executing any _single_turn")
-
-  # Trailing thinking compensation only makes sense when the last turn was a
-  # real turn whose thinking-only tail was shown to the user as a
-  # ProgressEvent.  Drain-turn thinking was suppressed via _NOOP_EVENT, so
-  # synthesizing it here would surface content the user never saw building up.
-  if (mode_final == "real"
-      and not exhausted
-      and result.last_emitted == "progress"
-      and result.last_thinking):
+  # Trailing thinking compensation: if the turn ended on a thinking-only
+  # tail shown as a ProgressEvent, surface it as the answer.
+  if result.last_emitted == "progress" and result.last_thinking:
     log.info("Compensating trailing thinking (%d chars)",
              len(result.last_thinking))
     on_event(AnswerEvent(text=result.last_thinking))
 
-  log.info("turn done (cost=%.4f cumulative, session=%s, final_mode=%s)",
+  log.info("turn done (cost=%.4f, session=%s)",
            total_cost,
-           result.session_id[:8] if result.session_id else "?",
-           mode_final)
+           result.session_id[:8] if result.session_id else "?")
   on_event(DoneEvent(cost=total_cost, usage=total_usage,
                      session_id=result.session_id))
   return total_cost, total_usage

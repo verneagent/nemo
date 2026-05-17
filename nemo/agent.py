@@ -32,7 +32,7 @@ from .db import Database
 from .lark_channel import LarkChannel
 from .turn import (
   AnswerEvent, CompactNoticeEvent, CompactStartedEvent, DoneEvent,
-  ProgressEvent, RateLimitNoticeEvent,
+  ProgressEvent, RateLimitNoticeEvent, StaleLeakNoticeEvent,
 )
 
 log = logging.getLogger(__name__)
@@ -1630,6 +1630,20 @@ async def main_loop(
           # Surface upstream rate-limit pressure even when the turn hasn't
           # produced any visible work yet — that silence is exactly what we
           # want to explain.
+          _ensure_card()
+          _update_working()
+
+        elif isinstance(event, StaleLeakNoticeEvent):
+          # SDK #788: a stale background-task notification from a prior
+          # turn leaked in. The turn is being transparently recovered
+          # (reconnect with resume + retry the same prompt). Leave a
+          # timeline breadcrumb so the brief delay is explained and the
+          # user can correlate it with the daemon log if needed.
+          _turn_steps.append(cards.ThinkingStep(
+            "reasoning",
+            "♻️ Recovered a stale background-task notification "
+            f"(SDK #788, task {event.task_id}) — reconnected with resume "
+            "and retried this prompt; conversation context preserved."))
           _ensure_card()
           _update_working()
 

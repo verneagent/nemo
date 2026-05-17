@@ -1685,3 +1685,77 @@ def test_compact_events_set_banner_not_thinking_steps(tmp_path):
         assert "🗜" not in repr(el), (
           f"compact glyph leaked into collapsible thinking: {el!r}"
         )
+
+
+def test_stale_leak_notice_leaves_visible_breadcrumb(tmp_path):
+  """SDK #788 recovery must NOT be silent: a StaleLeakNoticeEvent emitted
+  mid-turn (right before the reconnect-with-resume) must surface as a
+  visible breadcrumb in the turn card so the user can see what happened.
+  """
+  from nemo.channel import IncomingMessage
+  from nemo.turn import StaleLeakNoticeEvent
+
+  card_payloads: list[object] = []
+
+  class _CapturingChannel(_FakeChannel):
+    async def send_card(self, _chat_id, card):
+      card_payloads.append(card)
+      return "om_working"
+
+    async def update_card(self, card_id, card):
+      card_payloads.append(card)
+      return card_id
+
+  class _StaleLeakAgent(_FakeAgent):
+    async def run_turn(self, _prompt, on_event):
+      def _emit():
+        on_event(ProgressEvent(kind="tool", summary="Read", first=True))
+        # Leak detected -> breadcrumb -> (reconnect+retry happens in the
+        # reconnect layer; here we just continue with the recovered answer).
+        on_event(StaleLeakNoticeEvent(task_id="task_abc123"))
+        on_event(AnswerEvent("recovered answer"))
+        on_event(DoneEvent(cost=0.0, usage={"input_tokens": 1}))
+      await asyncio.to_thread(_emit)
+      return 0.0, {"input_tokens": 1}
+
+  channel = _CapturingChannel("sl_test")
+  channel._messages = [
+    IncomingMessage(
+      event_type="im.message.receive_v1",
+      chat_id="sl_test", sender_id="ou_user",
+      message_id="om_msg", msg_type="text",
+      text="hi", create_time="1",
+    ),
+    IncomingMessage(
+      event_type="im.message.receive_v1",
+      chat_id="sl_test", sender_id="ou_user",
+      message_id="om_exit", msg_type="text",
+      text="/exit", create_time="2",
+    ),
+  ]
+  async def _recv(timeout=300):
+    del timeout
+    if channel._messages:
+      return channel._messages.pop(0)
+    return None
+  channel.receive = _recv
+
+  with mock.patch("nemo.agent.load_credentials", return_value={
+    "app_id": "app_id", "app_secret": "app_secret", "email": "u@e.com",
+  }), \
+       mock.patch("nemo.agent.Database", _FakeDB), \
+       mock.patch("nemo.agent.LarkChannel", return_value=channel), \
+       mock.patch("nemo.agent.build_coding_agent", return_value=_StaleLeakAgent()), \
+       mock.patch("nemo.agent._send_response", new=mock.AsyncMock()), \
+       mock.patch("nemo.group_config.load_config", return_value={}), \
+       mock.patch("nemo.config.load_relay_config", return_value=("", "")), \
+       mock.patch("signal.signal"):
+    rc = asyncio.run(main_loop("sl_test", str(tmp_path), "claude-opus-4-6"))
+
+  assert rc == 0
+  assert any(
+    "SDK #788" in repr(card) and "task_abc123" in repr(card)
+    for card in card_payloads
+  ), "stale-leak breadcrumb (SDK #788 + task id) not visible in any card"
+  # Sanity: the StaleLeakNoticeEvent type itself is part of TurnEvent.
+  assert StaleLeakNoticeEvent(task_id="x").task_id == "x"

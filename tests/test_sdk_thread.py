@@ -204,6 +204,63 @@ class TestRunTurnWithReconnect:
     assert result == expected
     assert call_count == 2
 
+  def test_retries_on_stale_leak_with_resume(self, sdk_thread: SDKThread):
+    """SDK #788: StaleLeakError must route through the same reconnect path
+    and reconnect with the options_factory result (resume=<session_id>),
+    then retry the SAME real prompt — no interrupt anywhere.
+    """
+    from nemo.turn import StaleLeakError, TransientAPIError
+
+    assert issubclass(StaleLeakError, TransientAPIError)
+
+    expected = (0.7, {"input_tokens": 9})
+    call_count = 0
+    seen_prompts: list[str] = []
+
+    async def fake_turn(prompt, on_event, stale_tasks=None):
+      nonlocal call_count
+      call_count += 1
+      seen_prompts.append(prompt)
+      if call_count < 2:
+        raise StaleLeakError("stale task X leaked into turn stream")
+      return expected
+
+    resume_options = mock.MagicMock(name="resumed_options")
+    factory_calls = 0
+
+    def options_factory():
+      nonlocal factory_calls
+      factory_calls += 1
+      return resume_options
+
+    reconnect_args: list = []
+
+    async def fake_reconnect(options):
+      reconnect_args.append(options)
+
+    sdk_thread._client = mock.MagicMock()
+
+    with mock.patch.object(sdk_thread, "run_turn", side_effect=fake_turn):
+      with mock.patch.object(sdk_thread, "interrupt") as interrupt_mock:
+        with mock.patch.object(sdk_thread, "reconnect",
+                               side_effect=fake_reconnect):
+          result = _run(sdk_thread.run_turn_with_reconnect(
+            "real prompt", on_event=lambda e: None,
+            options=mock.MagicMock(),
+            options_factory=options_factory,
+            max_attempts=3,
+          ))
+
+    assert result == expected
+    assert call_count == 2
+    # Same real prompt retried (never a drain prompt).
+    assert seen_prompts == ["real prompt", "real prompt"]
+    # Reconnected exactly once, with the resume-bearing options.
+    assert reconnect_args == [resume_options]
+    assert factory_calls == 1
+    # Recovery must NOT interrupt — the wedged control channel is dead.
+    interrupt_mock.assert_not_called()
+
   def test_raises_without_options(self, sdk_thread: SDKThread):
     """If options is None, TimeoutError propagates immediately."""
     sdk_thread._client = mock.MagicMock()

@@ -168,90 +168,20 @@ def test_task_lifecycle():
   assert any(isinstance(e, TaskDoneEvent) and e.task_id == "task_1" for e in events)
 
 
-def test_stale_task_detection():
-  """Stale task notifications should trigger a drain turn then a real retry.
-
-  With the drain-prompt workaround for SDK #788, we always start in real
-  mode (the prior turn's stop_task may have succeeded, in which case no
-  stale ever surfaces). When a stale *does* leak at the front of the real
-  turn we expect:
-    attempt 0 (real, contaminated): stale discarded, rest suppressed;
-    attempt 1 (drain):              clean response, mode → real;
-    attempt 2 (real, clean):        real answer delivered.
+def test_stale_leak_raises_for_reconnect_resume():
+  """SDK #788: a stale TaskNotification leaking into the stream must raise
+  StaleLeakError (a TransientAPIError) so SDKThread.run_turn_with_reconnect
+  recovers via reconnect-with-resume — NOT an in-band drain.
   """
-  from nemo.turn import DRAIN_PROMPT_MARKER
+  from nemo.turn import StaleLeakError, TransientAPIError
+
+  assert issubclass(StaleLeakError, TransientAPIError), \
+    "StaleLeakError must subclass TransientAPIError so the existing " \
+    "reconnect-with-resume path catches it"
+
   stale_messages = [
     FakeTaskNotificationMessage(task_id="stale_1", status="completed"),
-    FakeResultMessage(total_cost_usd=0.01),
-  ]
-  drain_clean_messages = [
-    FakeAssistantMessage(content=[FakeTextBlock(text="NEMO_DRAIN_OK xxxx")]),
-    FakeResultMessage(total_cost_usd=0.0),
-  ]
-  real_messages = [
-    FakeAssistantMessage(content=[FakeTextBlock(text="Fresh response")]),
-    FakeResultMessage(total_cost_usd=0.02, usage={"input_tokens": 300}),
-  ]
-
-  sent_prompts: list[str] = []
-  call_count = 0
-  events = []
-
-  class DrainRetryClient:
-    async def query(self, prompt):
-      sent_prompts.append(prompt)
-
-    async def receive_response(self):
-      nonlocal call_count
-      idx = call_count
-      call_count += 1
-      msgs = [stale_messages, drain_clean_messages, real_messages][idx]
-      for msg in msgs:
-        yield msg
-
-    async def stop_task(self, task_id):
-      pass
-
-  async def _run():
-    with mock.patch.dict("sys.modules", _sdk_modules()):
-      client = DrainRetryClient()
-      cost, _usage = await run_turn(
-        client, "test", events.append,
-        stale_tasks={"stale_1"},
-      )
-      # Cost is now cumulative across contaminated+drain+real turns.
-      assert cost == pytest.approx(0.01 + 0.0 + 0.02)
-
-  asyncio.run(_run())
-  assert call_count == 3, f"expected 3 turns (real+drain+real), got {call_count}"
-  # Prompt ordering: real (contaminated), drain, real (clean).
-  assert sent_prompts[0] == "test"
-  assert sent_prompts[1].startswith(DRAIN_PROMPT_MARKER), \
-    f"drain prompt must carry the drain marker, got: {sent_prompts[1][:80]!r}"
-  assert sent_prompts[2] == "test"
-  # Drain turn's AssistantMessage must not surface as AnswerEvent.
-  answer_events = [e for e in events if isinstance(e, AnswerEvent)]
-  assert any(e.text == "Fresh response" for e in answer_events)
-  assert not any(e.text.startswith("NEMO_DRAIN_OK") for e in answer_events), \
-    "drain turn's reply must not leak to on_event"
-
-
-def test_drain_does_not_amplify_stale_tasks():
-  """Drain turns use a drain prompt that must not emit TaskStartedEvents.
-
-  Even if the SDK delivers a TaskStartedMessage during a drain turn (which
-  shouldn't happen because the drain prompt forbids tools, but we verify
-  defensively), the event must be suppressed so the consumer doesn't think
-  the user turn is spawning tasks.
-  """
-  from nemo.turn import DRAIN_PROMPT_MARKER
-  stale_messages = [
-    FakeTaskNotificationMessage(task_id="stale_1", status="completed"),
-    FakeTaskStartedMessage(task_id="rogue_in_drain"),
-    FakeResultMessage(total_cost_usd=0.0),
-  ]
-  clean_messages = [
-    FakeAssistantMessage(content=[FakeTextBlock(text="answer")]),
+    FakeAssistantMessage(content=[FakeTextBlock(text="answer to a STALE")]),
     FakeResultMessage(total_cost_usd=0.01),
   ]
   sent_prompts: list[str] = []
@@ -264,99 +194,66 @@ def test_drain_does_not_amplify_stale_tasks():
 
     async def receive_response(self):
       nonlocal call_count
-      idx = call_count
       call_count += 1
-      msgs = stale_messages if idx == 0 else clean_messages
-      for msg in msgs:
+      for msg in stale_messages:
         yield msg
 
     async def stop_task(self, task_id):
       pass
 
+  stale = {"stale_1"}
+
   async def _run():
     with mock.patch.dict("sys.modules", _sdk_modules()):
-      await run_turn(Client(), "test", events.append,
-                     stale_tasks={"stale_1"})
-  asyncio.run(_run())
+      await run_turn(Client(), "real prompt", events.append,
+                     stale_tasks=stale)
 
-  # Drain prompt must have been used (identified by its marker).
-  assert any(p.startswith(DRAIN_PROMPT_MARKER) for p in sent_prompts), \
-    "no drain-marked prompt was sent"
-  # No TaskStartedEvent must reach the consumer
-  assert not any(isinstance(e, TaskStartedEvent) for e in events), \
-    "drain-turn TaskStartedMessage leaked as TaskStartedEvent"
+  with pytest.raises(StaleLeakError):
+    asyncio.run(_run())
+
+  # Exactly one turn attempted — no in-band drain/retry loop.
+  assert call_count == 1
+  assert sent_prompts == ["real prompt"]
+  # The leaked stale's answer must NOT surface to the user.
+  assert not any(isinstance(e, AnswerEvent) for e in events), \
+    "stale-contaminated output leaked to on_event"
+  # No DoneEvent — turn did not complete; the reconnect layer retries.
+  assert not any(isinstance(e, DoneEvent) for e in events)
+  # A visible breadcrumb MUST be emitted before the raise so the recovery
+  # is not silent.
+  from nemo.turn import StaleLeakNoticeEvent
+  notices = [e for e in events if isinstance(e, StaleLeakNoticeEvent)]
+  assert len(notices) == 1 and notices[0].task_id == "stale_1", \
+    f"expected one StaleLeakNoticeEvent for stale_1, got {notices}"
+  # All tracked stale ids cleared: they belong to the about-to-be-killed
+  # subprocess; the resumed session starts clean.
+  assert stale == set(), f"stale_tasks must be cleared on leak, got {stale}"
 
 
-def test_multiple_stales_drained_without_amplification():
-  """N accumulated stales should converge in N+1 drain turns + 1 real turn.
-
-  Previous naive re-query workaround amplified when the user prompt itself
-  spawned subagents. Drain prompt cannot spawn tasks, so each drain turn
-  clears exactly one stale notification, and after all are drained the
-  real prompt runs cleanly. Cost is cumulative across all turns.
+def test_stale_leak_detected_after_some_clean_output():
+  """The leak guard fires wherever the stale appears — even after some
+  legitimate output — still raising StaleLeakError and stopping the turn.
   """
-  from nemo.turn import DRAIN_PROMPT_MARKER
-  ids = ["stale_a", "stale_b", "stale_c"]
-  # Turn 0 (real, contaminated): sees first stale, suppresses rest.
-  # Turns 1-2 (drain): each sees one more stale.
-  # Turn 3 (drain): clean (no stale) → switch back to real.
-  # Turn 4 (real): clean final answer.
-  per_turn_messages: list[list] = [
-    [FakeTaskNotificationMessage(task_id=ids[0], status="completed"),
-     FakeResultMessage(total_cost_usd=0.01)],
-    [FakeTaskNotificationMessage(task_id=ids[1], status="completed"),
-     FakeResultMessage(total_cost_usd=0.0)],
-    [FakeTaskNotificationMessage(task_id=ids[2], status="completed"),
-     FakeResultMessage(total_cost_usd=0.0)],
-    [FakeAssistantMessage(content=[FakeTextBlock(text="NEMO_DRAIN_OK xxxx")]),
-     FakeResultMessage(total_cost_usd=0.0)],
-    [FakeAssistantMessage(content=[FakeTextBlock(text="final answer")]),
-     FakeResultMessage(total_cost_usd=0.05, usage={"input_tokens": 50})],
+  from nemo.turn import StaleLeakError, StaleLeakNoticeEvent
+
+  messages = [
+    FakeAssistantMessage(content=[FakeTextBlock(text="partial work")]),
+    FakeTaskNotificationMessage(task_id="ghost", status="completed"),
+    FakeResultMessage(total_cost_usd=0.0),
   ]
-  sent_prompts: list[str] = []
-  call_count = 0
   events: list = []
-
-  class MultiStaleClient:
-    async def query(self, prompt):
-      sent_prompts.append(prompt)
-
-    async def receive_response(self):
-      nonlocal call_count
-      idx = call_count
-      call_count += 1
-      for msg in per_turn_messages[idx]:
-        yield msg
-
-    async def stop_task(self, task_id):
-      pass
+  stale = {"ghost"}
 
   async def _run():
     with mock.patch.dict("sys.modules", _sdk_modules()):
-      cost, _ = await run_turn(MultiStaleClient(), "real", events.append,
-                               stale_tasks=set(ids))
-      assert cost == pytest.approx(0.01 + 0.05)
+      await run_turn(FakeClient(messages), "hi", events.append,
+                     stale_tasks=stale)
 
-  asyncio.run(_run())
-  assert call_count == 5, f"expected 5 turns (real+3 drain+real), got {call_count}"
-  # First prompt is real (contaminated), next three are drain, last is real.
-  assert sent_prompts[0] == "real"
-  drain_prompts = sent_prompts[1:4]
-  assert all(p.startswith(DRAIN_PROMPT_MARKER) for p in drain_prompts), \
-    f"drain prompts must carry the drain marker, got: {drain_prompts!r}"
-  # Each drain must be UNIQUE — that's the whole point of fix 1: no fixed
-  # answer template can poison the model into replying the same way to the
-  # next real user message.
-  assert len(set(drain_prompts)) == len(drain_prompts), \
-    "drain prompts must be unique per call (nonce-bearing)"
-  assert sent_prompts[4] == "real"
-  # Only the final real answer must surface.
-  answer_texts = [e.text for e in events if isinstance(e, AnswerEvent)]
-  assert answer_texts == ["final answer"]
-  # Exactly one DoneEvent.
-  done = [e for e in events if isinstance(e, DoneEvent)]
-  assert len(done) == 1
-  assert done[0].cost == pytest.approx(0.01 + 0.05)
+  with pytest.raises(StaleLeakError):
+    asyncio.run(_run())
+  assert stale == set()
+  notices = [e for e in events if isinstance(e, StaleLeakNoticeEvent)]
+  assert len(notices) == 1 and notices[0].task_id == "ghost"
 
 
 def test_stop_task_circuit_breaker_on_control_timeout():
@@ -517,30 +414,6 @@ def test_clean_real_turn_preserves_freshly_promoted_stales():
     f"freshly promoted stales were wrongly dropped: {stale}"
 
 
-def test_clean_real_turn_drops_inherited_never_surfaced_stales():
-  """Inherited stale ids that never surface ARE dropped on clean real turn.
-
-  This is the anti-amplification guard: if the prior turn left phantom
-  ids (e.g. dead-session ids) and a clean real turn goes through without
-  any stale notification appearing, we should not carry them forever.
-  """
-  # Inherited {ghost}; current turn sees neither a stale notification
-  # nor any new TaskStarted. Clean turn → inherited 'ghost' must be dropped.
-  messages = [
-    FakeAssistantMessage(content=[FakeTextBlock(text="hi")]),
-    FakeResultMessage(total_cost_usd=0.01),
-  ]
-  stale = {"ghost"}
-
-  async def _run():
-    with mock.patch.dict("sys.modules", _sdk_modules()):
-      await run_turn(FakeClient(messages), "hello", lambda _e: None,
-                     stale_tasks=stale)
-
-  asyncio.run(_run())
-  assert stale == set(), "inherited 'ghost' must be dropped after clean turn"
-
-
 def test_progress_timeout_fires_on_systemmessage_storm(monkeypatch):
   """SDK emitting SystemMessages indefinitely must not keep a dead turn alive.
 
@@ -596,8 +469,8 @@ def test_reset_clears_stale_tasks_on_claude_adapter():
   """ClaudeCodingAgent.reset() must clear self._stale_tasks.
 
   Task ids from a dead SDK session will never produce notifications on a
-  fresh session, so keeping them would force a pointless drain turn after
-  every reconnect.
+  fresh session, so keeping them would risk a spurious StaleLeakError
+  after every reconnect.
   """
   from nemo.claude_agent import ClaudeCodingAgent
 
@@ -873,62 +746,6 @@ def test_no_compensation_when_answer_is_last():
   answer_events = [e for e in events if isinstance(e, AnswerEvent)]
   assert len(answer_events) == 1
   assert answer_events[0].text == "Here is my answer"
-
-
-def test_stale_task_retry_exhaustion():
-  """When MAX_RETRIES is exhausted, stale detection should give up and emit DoneEvent."""
-  call_count = 0
-  events = []
-
-  class AlwaysStaleClient:
-    """Client where every response is contaminated by a stale notification.
-
-    On each call, we inject a fresh stale task ID into the stale_tasks set
-    (via a TaskNotification whose ID we pre-add to stale_tasks before
-    each receive_response iteration).
-    """
-    async def query(self, _prompt: str) -> None:
-      pass
-
-    async def receive_response(self):
-      nonlocal call_count
-      call_count += 1
-      # Each retry yields a stale notification with a unique task_id
-      tid = f"stale_{call_count}"
-      yield FakeTaskNotificationMessage(task_id=tid, status="completed")
-      yield FakeResultMessage(total_cost_usd=0.01)
-
-    async def stop_task(self, _task_id: str) -> None:
-      pass
-
-  # Use a custom set subclass that always re-populates with the next stale id
-  class PerpetualStaleSet(set):  # type: ignore[type-arg]
-    """A set that, after being discarded/checked, injects the next stale id."""
-    def __init__(self, *args: object, **kwargs: object) -> None:
-      super().__init__(*args, **kwargs)  # type: ignore[arg-type]
-      self._counter = 1
-
-    def discard(self, elem: object) -> None:
-      super().discard(elem)
-      # Pre-add the next stale task so the next retry also sees stale
-      self._counter += 1
-      self.add(f"stale_{self._counter}")
-
-  async def _run():
-    with mock.patch.dict("sys.modules", _sdk_modules()):
-      from nemo.turn import MAX_RETRIES  # noqa: F811
-      stale = PerpetualStaleSet({"stale_1"})
-      client = AlwaysStaleClient()
-      await run_turn(
-        client, "test", events.append,
-        stale_tasks=stale,
-      )
-      # Should have retried MAX_RETRIES times then given up
-      assert call_count == MAX_RETRIES + 1
-      # Should still emit a DoneEvent at the end
-      assert any(isinstance(e, DoneEvent) for e in events)
-
-  asyncio.run(_run())
 
 
 def test_first_message_timeout():
