@@ -16,6 +16,7 @@ import json
 import os
 import re
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Iterable
 
 
@@ -46,6 +47,32 @@ class SessionDeleteResult:
   """Outcome for a session deletion request."""
   deleted: list[SessionInfo] = field(default_factory=list)
   failures: list[SessionDeleteFailure] = field(default_factory=list)
+  ambiguous: list[SessionInfo] = field(default_factory=list)
+  not_found: str = ""
+
+
+@dataclass
+class SessionMessage:
+  """A user/assistant message extracted from a session transcript."""
+  role: str
+  text: str
+  timestamp: str
+
+
+@dataclass
+class SessionDetail:
+  """Detailed transcript summary for one session."""
+  session: SessionInfo
+  size_bytes: int
+  message_count: int
+  first_message: SessionMessage | None = None
+  last_messages: list[SessionMessage] = field(default_factory=list)
+
+
+@dataclass
+class SessionDetailResult:
+  """Resolution result for /session info."""
+  detail: SessionDetail | None = None
   ambiguous: list[SessionInfo] = field(default_factory=list)
   not_found: str = ""
 
@@ -158,6 +185,57 @@ def _codex_user_text(ev: dict) -> str:
   if p.get("type") != "message" or p.get("role") != "user":
     return ""
   return _clean_preview(_extract_text_blocks(p.get("content")))
+
+
+def _event_timestamp(ev: dict, fallback_mtime: float) -> str:
+  raw = ev.get("timestamp")
+  if isinstance(raw, str) and raw:
+    return raw
+  return datetime.fromtimestamp(
+    fallback_mtime, tz=timezone.utc).isoformat(timespec="seconds")
+
+
+def _claude_message(ev: dict, fallback_mtime: float) -> SessionMessage | None:
+  etype = ev.get("type")
+  if etype not in ("user", "assistant"):
+    return None
+  msg = ev.get("message")
+  if not isinstance(msg, dict):
+    return None
+  role = msg.get("role")
+  if not isinstance(role, str) or role not in ("user", "assistant"):
+    role = str(etype)
+  text = _clean_preview(_extract_text_blocks(msg.get("content")))
+  if not text:
+    return None
+  return SessionMessage(
+    role=role,
+    text=text,
+    timestamp=_event_timestamp(ev, fallback_mtime),
+  )
+
+
+def _codex_message(ev: dict, fallback_mtime: float) -> SessionMessage | None:
+  if ev.get("type") != "response_item":
+    return None
+  p = ev.get("payload")
+  if not isinstance(p, dict):
+    return None
+  if p.get("type") != "message":
+    return None
+  role = p.get("role")
+  if not isinstance(role, str) or role not in ("user", "assistant"):
+    return None
+  text = _clean_preview(_extract_text_blocks(p.get("content")))
+  if not text:
+    return None
+  if role == "user" and _looks_like_injected_context(text):
+    return None
+  return SessionMessage(
+    role=role,
+    text=text,
+    timestamp=_event_timestamp(ev, fallback_mtime),
+  )
 
 
 # ---------------------------------------------------------------------------
@@ -380,6 +458,67 @@ def find_session(
     elif u.startswith(needle):
       matches.append(s)
   return exact or matches
+
+
+def _read_session_detail(info: SessionInfo) -> SessionDetail:
+  try:
+    size = os.path.getsize(info.path)
+  except OSError:
+    size = 0
+  first: SessionMessage | None = None
+  last: list[SessionMessage] = []
+  count = 0
+  extractor = _claude_message if info.agent == "claude" else _codex_message
+  try:
+    with open(info.path, encoding="utf-8") as f:
+      for line in f:
+        try:
+          ev = json.loads(line)
+        except json.JSONDecodeError:
+          continue
+        if not isinstance(ev, dict):
+          continue
+        message = extractor(ev, info.mtime)
+        if message is None:
+          continue
+        count += 1
+        if first is None:
+          first = message
+        last.append(message)
+        if len(last) > 3:
+          last.pop(0)
+  except OSError:
+    pass
+  return SessionDetail(
+    session=info,
+    size_bytes=size,
+    message_count=count,
+    first_message=first,
+    last_messages=last,
+  )
+
+
+def session_detail(
+  project_dir: str,
+  uuid_or_prefix: str,
+  current_uuid: str = "",
+) -> SessionDetailResult:
+  """Return detailed info for one session.
+
+  Empty ``uuid_or_prefix`` means "current session". If no current SDK
+  session id exists yet, return not_found="" so callers can explain that
+  the daemon has not produced a transcript yet.
+  """
+  target = uuid_or_prefix.strip() or current_uuid.strip()
+  if not target:
+    return SessionDetailResult(not_found="")
+  all_sessions = list_sessions(project_dir)
+  matches = find_session(target, all_sessions)
+  if not matches:
+    return SessionDetailResult(not_found=target)
+  if len(matches) > 1:
+    return SessionDetailResult(ambiguous=matches)
+  return SessionDetailResult(detail=_read_session_detail(matches[0]))
 
 
 def _delete_session_files(candidates: Iterable[SessionInfo]) -> SessionDeleteResult:

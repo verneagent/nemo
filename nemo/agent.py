@@ -483,6 +483,87 @@ async def _handle_session_list(
   await _send_response(channel, chat_id, body, db)
 
 
+def _format_session_message(msg, label: str) -> str:
+  text = msg.text.replace("\n", " ").strip()
+  if len(text) > 240:
+    text = text[:237] + "..."
+  return f"- **{label}** `{msg.timestamp}` · {msg.role}: {text}"
+
+
+async def _handle_session_info(
+  channel: LarkChannel,
+  chat_id: str,
+  project_dir: str,
+  target: str,
+  current_sdk_session_id: str,
+  db: Database,
+) -> None:
+  """Send basic metadata plus first and last messages for one session."""
+  from . import sessions as _sessions
+  result = _sessions.session_detail(
+    project_dir, target, current_uuid=current_sdk_session_id)
+  if result.not_found or (not target.strip() and not current_sdk_session_id):
+    if not target.strip() and not current_sdk_session_id:
+      body = (
+        "Current session has no SDK session id yet. "
+        "If this daemon just started or no LLM turn has completed, "
+        "there is no transcript to inspect."
+      )
+    else:
+      body = (
+        f"No session matches `{result.not_found}` in this project. "
+        f"Run `/session list` to see what's available."
+      )
+    await _send_response(channel, chat_id, body, db)
+    return
+  if result.ambiguous:
+    ambig = ", ".join(f"`{m.uuid[:8]}`" for m in result.ambiguous[:5])
+    await _send_response(
+      channel, chat_id,
+      f"`{target}` is ambiguous — matches {ambig}. "
+      f"Use more characters from the uuid.",
+      db,
+    )
+    return
+  if result.detail is None:
+    await _send_response(channel, chat_id, "Session info unavailable.", db)
+    return
+
+  detail = result.detail
+  s = detail.session
+  import datetime as _dt
+  modified = _dt.datetime.fromtimestamp(s.mtime).strftime("%Y-%m-%d %H:%M:%S")
+  size_kb = max(1, detail.size_bytes // 1024) if detail.size_bytes else 0
+  current = "yes" if s.uuid == current_sdk_session_id else "no"
+  lines = [
+    "**Session Info**",
+    "",
+    f"- UUID: `{s.uuid}`",
+    f"- Agent: **{s.agent}**",
+    f"- Model: `{s.model or 'unknown'}`",
+    f"- Current: **{current}**",
+    f"- Messages: **{detail.message_count}**",
+    f"- Last modified: `{modified}`",
+    f"- File: `{s.path}`",
+    f"- Size: ~{size_kb}KB",
+  ]
+  if detail.message_count == 0:
+    lines.extend([
+      "",
+      "No user/assistant messages recorded yet. "
+      "This can happen for a newly-created session before the first "
+      "LLM turn writes its transcript.",
+    ])
+  else:
+    lines.extend(["", "**First Message**"])
+    if detail.first_message is not None:
+      lines.append(_format_session_message(detail.first_message, "first"))
+    lines.extend(["", "**Last Messages**"])
+    for idx, msg in enumerate(detail.last_messages, start=1):
+      lines.append(_format_session_message(msg, f"last {idx}"))
+  await _send_response(channel, chat_id, "\n".join(lines), db)
+
+
 def _format_session_previews(s) -> str:
   """Render the per-session preview lines: first prompt + the last few.
 
@@ -1541,6 +1622,10 @@ async def main_loop(
         elif response == "__session_list__":
           await _handle_session_list(
             channel, chat_id, project_dir, db, _sdk_session_id)
+        elif response and response.startswith("__session_info__:"):
+          target = response.split(":", 1)[1]
+          await _handle_session_info(
+            channel, chat_id, project_dir, target, _sdk_session_id, db)
         elif response and response.startswith("__session_recall__:"):
           target = response.split(":", 1)[1]
           # Recall injects the session's text contents as a synthetic

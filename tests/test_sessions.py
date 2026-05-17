@@ -298,6 +298,111 @@ def test_list_codex_sessions_captures_last_three_user_prompts(tmp_path):
   assert s.last_user_texts == ["user prompt 2", "user prompt 3", "user prompt 4"]
 
 
+def test_session_detail_reads_first_and_last_three_claude_messages(tmp_path):
+  home = str(tmp_path / "home")
+  project = str(tmp_path / "project")
+  os.makedirs(project, exist_ok=True)
+  _claude_session(home, project, "feedface-0000-0000-0000-000000000000", [
+    {"timestamp": "2026-05-17T01:00:00Z", "type": "user", "message": {
+      "role": "user", "content": "first user",
+    }},
+    {"timestamp": "2026-05-17T01:01:00Z", "type": "assistant", "message": {
+      "role": "assistant", "model": "claude-opus-4-7",
+      "content": [{"type": "text", "text": "first reply"}],
+    }},
+    {"timestamp": "2026-05-17T01:02:00Z", "type": "user", "message": {
+      "role": "user", "content": "second user",
+    }},
+    {"timestamp": "2026-05-17T01:03:00Z", "type": "assistant", "message": {
+      "role": "assistant", "model": "claude-opus-4-7",
+      "content": [{"type": "text", "text": "second reply"}],
+    }},
+  ])
+  with mock.patch.dict(os.environ, {"HOME": home}):
+    result = sessions.session_detail(project, "feedface")
+
+  assert result.detail is not None
+  detail = result.detail
+  assert detail.session.uuid == "feedface-0000-0000-0000-000000000000"
+  assert detail.message_count == 4
+  assert detail.first_message is not None
+  assert detail.first_message.text == "first user"
+  assert detail.first_message.timestamp == "2026-05-17T01:00:00Z"
+  assert [(m.role, m.text) for m in detail.last_messages] == [
+    ("assistant", "first reply"),
+    ("user", "second user"),
+    ("assistant", "second reply"),
+  ]
+
+
+def test_session_detail_reads_codex_messages_and_skips_injected_context(tmp_path):
+  home = str(tmp_path / "home")
+  project = str(tmp_path / "project")
+  os.makedirs(project, exist_ok=True)
+  _codex_session(home, "2026", "05", "17",
+                 "c0dec0de-1111-2222-3333-444444444444", [
+    {"timestamp": "2026-05-17T02:00:00Z", "type": "session_meta",
+     "payload": {
+       "id": "c0dec0de-1111-2222-3333-444444444444",
+       "cwd": os.path.abspath(project),
+       "model": "gpt-5.5",
+     }},
+    {"timestamp": "2026-05-17T02:00:01Z", "type": "response_item",
+     "payload": {
+       "type": "message", "role": "user",
+       "content": [{"type": "input_text", "text": "# AGENTS.md\n..."}],
+     }},
+    {"timestamp": "2026-05-17T02:01:00Z", "type": "response_item",
+     "payload": {
+       "type": "message", "role": "user",
+       "content": [{"type": "input_text", "text": "real question"}],
+     }},
+    {"timestamp": "2026-05-17T02:02:00Z", "type": "response_item",
+     "payload": {
+       "type": "message", "role": "assistant",
+       "content": [{"type": "output_text", "text": "real answer"}],
+     }},
+  ])
+  with mock.patch.dict(os.environ, {"HOME": home}):
+    result = sessions.session_detail(project, "", current_uuid="c0dec0de")
+
+  assert result.detail is not None
+  detail = result.detail
+  assert detail.message_count == 2
+  assert detail.first_message is not None
+  assert detail.first_message.text == "real question"
+  assert [(m.role, m.text) for m in detail.last_messages] == [
+    ("user", "real question"),
+    ("assistant", "real answer"),
+  ]
+
+
+def test_session_detail_empty_current_without_session_id(tmp_path):
+  project = str(tmp_path / "project")
+  os.makedirs(project, exist_ok=True)
+  result = sessions.session_detail(project, "", current_uuid="")
+  assert result.detail is None
+  assert result.ambiguous == []
+  assert result.not_found == ""
+
+
+def test_session_detail_handles_empty_transcript_file(tmp_path):
+  home = str(tmp_path / "home")
+  project = str(tmp_path / "project")
+  os.makedirs(project, exist_ok=True)
+  path = _claude_session(
+    home, project, "eeeeeeee-0000-0000-0000-000000000000", [])
+  assert os.path.exists(path)
+
+  with mock.patch.dict(os.environ, {"HOME": home}):
+    result = sessions.session_detail(project, "eeeeeeee")
+
+  assert result.detail is not None
+  assert result.detail.message_count == 0
+  assert result.detail.first_message is None
+  assert result.detail.last_messages == []
+
+
 def test_list_returns_empty_when_project_has_no_sessions(tmp_path):
   home = str(tmp_path / "home")
   project = str(tmp_path / "empty")

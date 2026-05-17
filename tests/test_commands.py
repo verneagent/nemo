@@ -1,6 +1,8 @@
 """Tests for nemo.commands — built-in agent commands."""
 
+import os
 from unittest.mock import patch
+import unittest.mock
 
 from nemo.commands import try_dispatch, is_inline_safe, AgentContext
 
@@ -44,6 +46,17 @@ def test_session_purge_command_with_and_without_target():
   handled, resp = try_dispatch("/session purge", _ctx())
   assert handled
   assert resp == "__session_purge__:"
+
+
+def test_session_info_command_with_and_without_target():
+  handled, resp = try_dispatch("/session info abc123", _ctx())
+  assert handled
+  assert resp == "__session_info__:abc123"
+
+  handled, resp = try_dispatch("/session info", _ctx())
+  assert handled
+  assert resp == "__session_info__:"
+  assert is_inline_safe(resp)
 
 
 def test_btw_with_question():
@@ -147,6 +160,41 @@ def test_agent_action_code_marked_needs_sdk():
   # _NEEDS_SDK guard list — otherwise the loop would try to handle it
   # mid-turn.
   assert is_inline_safe("__agent__:codex:gpt-5.5") is False
+
+
+def test_version_command_reports_all_agent_runtimes():
+  with __import__("unittest").mock.patch(
+      "nemo.commands._package_version",
+      side_effect=lambda name: {
+        "captain-nemo": "0.4.17",
+        "claude-agent-sdk": "0.1.55",
+      }[name],
+  ), __import__("unittest").mock.patch(
+      "nemo.commands._cli_version",
+      side_effect=lambda name: f"{name} cli 1.2.3",
+  ), __import__("unittest").mock.patch(
+      "nemo.commands._sidecar_dependency_version",
+      side_effect=lambda _path, dep: {
+        "@openai/codex-sdk": "0.128.0",
+        "@opencode-ai/sdk": "^1.4.7",
+      }[dep],
+  ):
+    handled, resp = try_dispatch("/version", _ctx())
+
+  assert handled
+  assert resp is not None
+  assert is_inline_safe(resp)
+  assert "Nemo" in resp and "0.4.17" in resp
+  assert "Claude" in resp and "0.1.55" in resp
+  assert "Codex" in resp and "0.128.0" in resp
+  assert "OpenCode" in resp and "^1.4.7" in resp
+
+
+def test_pid_command_reports_current_process_id():
+  handled, resp = try_dispatch("/pid", _ctx())
+  assert handled
+  assert resp == f"Nemo PID: `{os.getpid()}`"
+  assert is_inline_safe(resp)
 
 
 def test_model_typo_for_codex():

@@ -4,12 +4,71 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
+import subprocess
 import time
+from importlib.metadata import PackageNotFoundError, version
+from pathlib import Path
 
 from .types import JsonObject
 
 
 _EFFORT_LEVELS = ("low", "medium", "high", "max")
+
+
+def _package_version(name: str) -> str:
+  try:
+    return version(name)
+  except PackageNotFoundError:
+    return "not installed"
+
+
+def _cli_version(command: str) -> str:
+  exe = shutil.which(command)
+  if not exe:
+    return "not found"
+  try:
+    result = subprocess.run(
+      [exe, "--version"],
+      capture_output=True,
+      text=True,
+      timeout=3,
+    )
+  except (OSError, subprocess.TimeoutExpired) as exc:
+    return f"unavailable ({type(exc).__name__})"
+  output = (result.stdout or result.stderr).strip()
+  if result.returncode != 0:
+    return f"unavailable (exit {result.returncode})"
+  return output or "unknown"
+
+
+def _sidecar_dependency_version(package_json: Path, dependency: str) -> str:
+  import json
+
+  try:
+    data = json.loads(package_json.read_text(encoding="utf-8"))
+  except (OSError, json.JSONDecodeError):
+    return "unknown"
+  deps = data.get("dependencies", {}) if isinstance(data, dict) else {}
+  raw = deps.get(dependency, "") if isinstance(deps, dict) else ""
+  return str(raw) if isinstance(raw, str) and raw else "unknown"
+
+
+def format_version_report() -> str:
+  """Return local Nemo/agent runtime versions without touching any LLM."""
+  root = Path(__file__).resolve().parent
+  codex_package = root / "codex_sidecar" / "package.json"
+  opencode_package = root / "opencode_sidecar" / "package.json"
+  return (
+    "**Versions**\n\n"
+    f"- Nemo: `{_package_version('captain-nemo')}`\n"
+    f"- Claude: CLI `{_cli_version('claude')}`, SDK "
+    f"`{_package_version('claude-agent-sdk')}`\n"
+    f"- Codex: CLI `{_cli_version('codex')}`, sidecar SDK "
+    f"`{_sidecar_dependency_version(codex_package, '@openai/codex-sdk')}`\n"
+    f"- OpenCode: CLI `{_cli_version('opencode')}`, sidecar SDK "
+    f"`{_sidecar_dependency_version(opencode_package, '@opencode-ai/sdk')}`"
+  )
 
 
 def _format_model_catalog(catalog) -> str:
@@ -333,6 +392,14 @@ def try_dispatch(text: str, ctx: AgentContext) -> tuple[bool, str | None]:
   if t in ("/context", "context"):
     return True, _format_context_snapshot(ctx)
 
+  # /version
+  if t in ("/version", "version"):
+    return True, format_version_report()
+
+  # /pid
+  if t in ("/pid", "pid"):
+    return True, f"Nemo PID: `{os.getpid()}`"
+
   # /help
   if t in ("/help", "help", "帮助"):
     return True, (
@@ -355,12 +422,16 @@ def try_dispatch(text: str, ctx: AgentContext) -> tuple[bool, str | None]:
       "| `/cost` | Session API cost |\n"
       "| `/usage` | Plan usage limits |\n"
       "| `/context` | Last known context token snapshot |\n"
+      "| `/context` | Last known context token snapshot |\n"
+      "| `/version` | Nemo and coding-agent runtime versions |\n"
+      "| `/pid` | Current Nemo process ID |\n"
       "| `/mention` | Toggle @mention requirement |\n"
       "| `/name <name>` | Rename this group |\n"
       "| `/norm` | Manage group norms |\n"
       "| `/guest` | Manage guests |\n"
       "| `/diag` | Run diagnostics |\n"
       "| `/session list` | List past sessions in this project |\n"
+      "| `/session info [uuid]` | Show session metadata plus first and last messages |\n"
       "| `/session recall <uuid>` | Recall a past session's contents into context |\n"
       "| `/session rm <uuid>` | Remove one past session |\n"
       "| `/session purge [uuid]` | Remove sessions older than uuid, or all except current |\n"
@@ -467,6 +538,9 @@ def try_dispatch(text: str, ctx: AgentContext) -> tuple[bool, str | None]:
       sub = parts[1].lower()
       if sub == "list":
         return True, "__session_list__"
+      if sub == "info":
+        target = parts[2].strip() if len(parts) >= 3 else ""
+        return True, f"__session_info__:{target}"
       if sub == "recall" and len(parts) >= 3:
         return True, f"__session_recall__:{parts[2].strip()}"
       if sub == "rm" and len(parts) >= 3:
@@ -479,6 +553,7 @@ def try_dispatch(text: str, ctx: AgentContext) -> tuple[bool, str | None]:
       "| Command | Description |\n"
       "|---|---|\n"
       "| `/session list` | List past sessions in this project (Claude + Codex) |\n"
+      "| `/session info [uuid]` | Show session metadata plus first and last messages |\n"
       "| `/session recall <uuid>` | Read a past session and remember its contents |\n"
       "| `/session rm <uuid>` | Remove one past session |\n"
       "| `/session purge [uuid]` | Remove sessions older than uuid, or all except current |"
