@@ -2102,6 +2102,10 @@ async def main_loop(
           _requeue_pending(_pending_msgs, channel)
           continue
         except Exception as exc:
+          try:
+            await coding_agent.interrupt()
+          except Exception as interrupt_exc:
+            log.warning("SDK cleanup after turn error failed: %s", interrupt_exc)
           await _handle_turn_error(
             str(exc), exc, channel, chat_id, db, session_id,
             _turn_card_id, _turn_steps, _turn_start,

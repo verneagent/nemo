@@ -251,13 +251,19 @@ class SDKThread:
     preserves conversation context. Falls back to the static `options`
     parameter when not provided.
     """
-    from .turn import StaleLeakError, TransientAPIError  # avoid import cycle
+    from .turn import (
+      NonRetryableAPIError, StaleLeakError, TransientAPIError,
+    )  # avoid import cycle
     self._cancelled.clear()
     for attempt in range(max_attempts):
       if self._cancelled.is_set():
         raise asyncio.CancelledError("SDK turn cancelled")
       try:
         return await self.run_turn(prompt, on_event, stale_tasks=stale_tasks)
+      except NonRetryableAPIError:
+        log.warning("SDK turn non-retryable API error — closing client")
+        await self.close_client()
+        raise
       except (TimeoutError, TransientAPIError, RuntimeError, _CLIConnectionError) as exc:
         exc_msg = str(exc).lower()
         is_transient_api = isinstance(exc, TransientAPIError)
@@ -282,6 +288,7 @@ class SDKThread:
           log.warning("SDK turn %s (attempt %d/%d)", label, attempt + 1, max_attempts)
           fresh_options = options_factory() if options_factory is not None else options
           if attempt == max_attempts - 1 or fresh_options is None:
+            await self.close_client()
             raise
           if self._cancelled.is_set():
             raise asyncio.CancelledError("SDK turn cancelled")

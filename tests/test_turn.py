@@ -328,6 +328,35 @@ def test_transient_api_error_in_assistant_message_raises_and_suppresses():
   ), "CLI error message leaked to user as AnswerEvent"
 
 
+def test_non_retryable_402_api_error_raises_and_suppresses():
+  """402/billing failures are provider/account state, not transient network."""
+  from nemo.turn import NonRetryableAPIError
+  messages = [
+    FakeAssistantMessage(content=[FakeTextBlock(
+      text=(
+        'API Error: 402 {"error":{"message":"Insufficient Balance",'
+        '"type":"unknown_error"}}'
+      ))]),
+    FakeResultMessage(total_cost_usd=0.0),
+  ]
+  events: list = []
+
+  async def _run():
+    with mock.patch.dict("sys.modules", _sdk_modules()):
+      await run_turn(FakeClient(messages), "hello", events.append)
+
+  with pytest.raises(NonRetryableAPIError):
+    asyncio.run(_run())
+  assert not any(
+    isinstance(e, AnswerEvent) and "Insufficient Balance" in e.text
+    for e in events
+  ), "non-retryable API error leaked to user as AnswerEvent"
+  assert any(
+    isinstance(e, ErrorEvent) and "Insufficient Balance" in e.message
+    for e in events
+  )
+
+
 def test_transient_api_error_via_result_is_error_flag():
   """ResultMessage.is_error + transient-signal body → TransientAPIError."""
   from nemo.turn import TransientAPIError

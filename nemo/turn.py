@@ -49,6 +49,10 @@ class TransientAPIError(RuntimeError):
   """
 
 
+class NonRetryableAPIError(RuntimeError):
+  """claude CLI surfaced a provider/account error that retrying won't fix."""
+
+
 class StaleLeakError(TransientAPIError):
   """A prior turn's stale TaskNotification leaked into this turn's stream.
 
@@ -84,6 +88,15 @@ _TRANSIENT_ERROR_SIGNALS: tuple[str, ...] = (
   "network",
 )
 
+_NON_RETRYABLE_ERROR_SIGNALS: tuple[str, ...] = (
+  "402",
+  "insufficient balance",
+  "insufficient_quota",
+  "quota exceeded",
+  "billing",
+  "payment required",
+)
+
 
 def _looks_like_transient_api_error(text: str, *, is_error_flag: bool = False) -> bool:
   """Return True only when the body clearly came from the CLI error channel.
@@ -104,6 +117,21 @@ def _looks_like_transient_api_error(text: str, *, is_error_flag: bool = False) -
     lowered = text.lower()
     return any(sig in lowered for sig in _TRANSIENT_ERROR_SIGNALS)
   return False
+
+
+def _looks_like_non_retryable_api_error(
+  text: str,
+  *,
+  is_error_flag: bool = False,
+) -> bool:
+  """Return True for provider/account failures that should not be retried."""
+  if not text:
+    return False
+  stripped = text.lstrip()
+  if not stripped.startswith(_CLI_ERROR_PREFIX) and not is_error_flag:
+    return False
+  lowered = text.lower()
+  return any(sig in lowered for sig in _NON_RETRYABLE_ERROR_SIGNALS)
 
 # If receive_response() yields nothing for this long, assume the turn is stuck.
 # SDK docs: "If no ResultMessage is received, the iterator continues indefinitely."
@@ -313,6 +341,7 @@ async def _single_turn(
   last_emitted: str = ""
   last_thinking: str = ""
   transient_error_text: str = ""  # set if AssistantMessage body looked like API error
+  non_retryable_error_text: str = ""
 
   FIRST_MSG_TIMEOUT = 30
   msg_count = 0
@@ -449,11 +478,13 @@ async def _single_turn(
           on_event(ProgressEvent(kind="tool", summary=tool_summary, first=is_first))
           last_emitted = "progress"
       elif text:
-        # Detect claude-CLI-surfaced transient API errors BEFORE emitting as
-        # a user-facing AnswerEvent. If we see this pattern, the subprocess
-        # is wedged; suppress the event and raise after ResultMessage so
-        # SDKThread.run_turn_with_reconnect can spawn a fresh CLI.
-        if _looks_like_transient_api_error(text):
+        # Detect claude-CLI-surfaced API errors BEFORE emitting as a
+        # user-facing AnswerEvent. Provider/account failures such as 402
+        # balance are not retryable; network-ish failures are.
+        if _looks_like_non_retryable_api_error(text):
+          log.warning("Non-retryable API error in AssistantMessage: %r", text[:200])
+          non_retryable_error_text = text
+        elif _looks_like_transient_api_error(text):
           log.warning("Transient API error in AssistantMessage: %r", text[:200])
           transient_error_text = text
         else:
@@ -498,6 +529,16 @@ async def _single_turn(
       # fresh CLI for the retry.
       is_error_flag = bool(getattr(message, "is_error", False))
       result_text = getattr(message, "result", "") or ""
+      if (non_retryable_error_text
+          or _looks_like_non_retryable_api_error(
+            result_text, is_error_flag=is_error_flag)):
+        err_sample = (non_retryable_error_text or result_text)[:500]
+        log.warning("Non-retryable API error in turn result: %r", err_sample[:200])
+        for tid in list(pending_tasks):
+          stale_tasks.add(tid)
+        pending_tasks.clear()
+        on_event(ErrorEvent(message=err_sample))
+        raise NonRetryableAPIError(err_sample)
       if (transient_error_text
           or _looks_like_transient_api_error(result_text,
                                              is_error_flag=is_error_flag)):

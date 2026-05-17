@@ -355,6 +355,32 @@ class TestRunTurnWithReconnect:
     assert result == expected
     assert call_count == 2
 
+  def test_non_retryable_api_error_closes_without_retry(self, sdk_thread: SDKThread):
+    """402/billing failures should close the wedged CLI and not reconnect."""
+    from nemo.turn import NonRetryableAPIError
+
+    call_count = 0
+
+    async def fake_turn(prompt, on_event, stale_tasks=None):
+      nonlocal call_count
+      call_count += 1
+      raise NonRetryableAPIError("API Error: 402 Insufficient Balance")
+
+    sdk_thread._client = mock.MagicMock()
+
+    with mock.patch.object(sdk_thread, "run_turn", side_effect=fake_turn), \
+         mock.patch.object(sdk_thread, "close_client", new_callable=mock.AsyncMock) as close_client, \
+         mock.patch.object(sdk_thread, "reconnect", new_callable=mock.AsyncMock) as reconnect:
+      with pytest.raises(NonRetryableAPIError):
+        _run(sdk_thread.run_turn_with_reconnect(
+          "hello", on_event=lambda e: None,
+          options=mock.MagicMock(), max_attempts=3,
+        ))
+
+    assert call_count == 1
+    close_client.assert_awaited_once()
+    reconnect.assert_not_awaited()
+
   def test_not_connected_raises_after_max_attempts(self, sdk_thread: SDKThread):
     """Should raise after exhausting all reconnect attempts for not-connected."""
     async def fake_turn(prompt, on_event, stale_tasks=None):
