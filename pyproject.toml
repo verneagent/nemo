@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "captain-nemo"
-version = "0.4.16"
+version = "0.4.17"
 description = "Lark-connected coding agent daemon powered by Claude Agent SDK"
 requires-python = ">=3.14"
 license = "MIT"
@@ -45,5 +45,8 @@ nemo = [
 ]
 
 [tool.pytest.ini_options]
-markers = ["slow: marks tests as slow (deselect with '-m \"not slow\"')"]
+markers = [
+  "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+  "realsdk: hits the real Claude SDK/CLI (needs auth); run with NEMO_REAL_SDK=1",
+]
 addopts = "--ignore=tests/test_main.py --ignore=tests/test_relay_events.py --ignore=relay/"
