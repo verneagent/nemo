@@ -1,6 +1,8 @@
 """Tests for nemo.agent main loop behavior."""
 
 import asyncio
+import shlex
+import sys
 import urllib.error
 from unittest import mock
 
@@ -603,6 +605,200 @@ def test_pacing_hint_prepended_after_timeout(tmp_path):
   # Any later prompt must not carry the hint — one-shot semantics.
   for later in agent.prompts[2:]:
     assert not later.startswith("[Nemo 系统提示]"), later
+
+
+def test_shell_bang_context_injected_next_turn_double_bang_not_injected(tmp_path):
+  from nemo.channel import IncomingMessage
+
+  class _CapturingAgent(_FakeAgent):
+    def __init__(self):
+      self.prompts: list[str] = []
+
+    def trailing_note(self, _sdk_session_id):
+      return ""
+
+    async def run_turn(self, prompt, on_event):
+      self.prompts.append(prompt)
+      def _emit():
+        on_event(AnswerEvent("ok"))
+        on_event(DoneEvent(cost=0.0, usage={}))
+      await asyncio.to_thread(_emit)
+      return 0.0, {}
+
+  class _FakeShellManager:
+    def __init__(self, _channel, *, chat_id, project_dir, on_context, timeout=60.0):
+      del chat_id, project_dir, timeout
+      self._on_context = on_context
+      self.started: list[tuple[str, bool]] = []
+
+    async def start(self, shortcut):
+      self.started.append((shortcut.command, shortcut.inject_context))
+      if shortcut.inject_context:
+        self._on_context(
+          "[Nemo shell context]\n"
+          f"Command:\n{shortcut.command}\n\n"
+          "Output:\ninjected-output")
+      return "started"
+
+    async def abort(self, _job_id):
+      return True
+
+    async def close(self):
+      pass
+
+    def set_project_dir(self, _project_dir):
+      pass
+
+  msg_user = lambda mid, text, ts: IncomingMessage(
+    event_type="im.message.receive_v1", chat_id="oc_test",
+    sender_id="ou_user", message_id=mid, msg_type="text",
+    text=text, create_time=ts,
+  )
+
+  agent = _CapturingAgent()
+  channel = _QueuedChannel("oc_test", [
+    msg_user("om_shell1", "!echo injected-output", "1"),
+    msg_user("om_shell2", "!!echo hidden-output", "2"),
+    msg_user("om_prompt", "what happened?", "3"),
+    msg_user("om_exit", "/exit", "4"),
+  ])
+
+  with mock.patch("nemo.agent.load_credentials", return_value={
+    "app_id": "app_id",
+    "app_secret": "app_secret",
+    "email": "user@example.com",
+  }), \
+       mock.patch("nemo.agent.Database", _FakeDB), \
+       mock.patch("nemo.agent.LarkChannel", return_value=channel), \
+       mock.patch("nemo.agent.build_coding_agent", return_value=agent), \
+       mock.patch("nemo.agent.shell_command.ShellJobManager", _FakeShellManager), \
+       mock.patch("nemo.group_config.load_config", return_value={}), \
+       mock.patch("nemo.config.load_relay_config", return_value=("", "")), \
+       mock.patch("signal.signal"):
+    result = asyncio.run(main_loop("oc_test", str(tmp_path), "claude-opus-4-6"))
+
+  assert result == 0
+  assert agent.prompts
+  assert "[Nemo shell context]" in agent.prompts[0]
+  assert "echo injected-output" in agent.prompts[0]
+  assert "injected-output" in agent.prompts[0]
+  assert "hidden-output" not in agent.prompts[0]
+  assert agent.prompts[0].endswith("[User message]\nwhat happened?")
+
+
+def test_shell_complex_command_e2e_injects_real_subprocess_result(tmp_path):
+  from nemo.channel import IncomingMessage
+
+  class _CapturingAgent(_FakeAgent):
+    def __init__(self):
+      self.prompts: list[str] = []
+
+    def trailing_note(self, _sdk_session_id):
+      return ""
+
+    async def run_turn(self, prompt, on_event):
+      self.prompts.append(prompt)
+      def _emit():
+        on_event(AnswerEvent("ok"))
+        on_event(DoneEvent(cost=0.0, usage={}))
+      await asyncio.to_thread(_emit)
+      return 0.0, {}
+
+  class _ShellE2EChannel(_FakeChannel):
+    def __init__(self, _chat_id, queued):
+      super().__init__(_chat_id)
+      self._messages = list(queued)
+      self.sent_cards: list[object] = []
+      self.updated_cards: list[object] = []
+      self._shell_done = asyncio.Event()
+      self._card_count = 0
+
+    async def receive(self, timeout=300):
+      if not self._messages:
+        return None
+      # Do not let the in-turn watcher consume /exit; leave it for the
+      # top-level loop after the agent turn completes.
+      if self._messages[0].text == "/exit" and timeout < 100:
+        await asyncio.sleep(0.01)
+        return None
+      # Hold the user's follow-up until the real shell job has completed
+      # and queued its context.
+      if self._messages[0].text == "summarize shell result":
+        try:
+          await asyncio.wait_for(self._shell_done.wait(), timeout=5)
+        except TimeoutError:
+          pass
+      return self._messages.pop(0)
+
+    async def send_card(self, chat_id, card):
+      self.sent_cards.append(card)
+      self._card_count += 1
+      return f"om_card_{self._card_count}"
+
+    async def update_card(self, card_id, card):
+      self.updated_cards.append(card)
+      title = card.get("header", {}).get("title", {}).get("content", "")
+      if title.startswith("Shell ") and title != "Shell running":
+        self._shell_done.set()
+      return card_id
+
+    def push_back(self, message):
+      self._messages.insert(0, message)
+
+  msg_user = lambda mid, text, ts: IncomingMessage(
+    event_type="im.message.receive_v1", chat_id="oc_test",
+    sender_id="ou_user", message_id=mid, msg_type="text",
+    text=text, create_time=ts,
+  )
+  marker = "nemo-shell-e2e-marker"
+  out_path = tmp_path / "shell-e2e.txt"
+  code = (
+    "import json, pathlib, sys, time\n"
+    f"path = pathlib.Path({str(out_path)!r})\n"
+    "path.write_text('file-content', encoding='utf-8')\n"
+    "print('phase=begin', flush=True)\n"
+    "time.sleep(0.2)\n"
+    f"print(json.dumps({{'marker': {marker!r}, 'numbers': [1, 2, 3]}}), flush=True)\n"
+    "print('warn=stderr-line', file=sys.stderr, flush=True)\n"
+    "print('phase=end', flush=True)\n"
+  )
+  command = f"{shlex.quote(sys.executable)} -c {shlex.quote(code)}"
+  channel = _ShellE2EChannel("oc_test", [
+    msg_user("om_shell", f"!{command}", "1"),
+    msg_user("om_prompt", "summarize shell result", "2"),
+    msg_user("om_exit", "/exit", "3"),
+  ])
+  agent = _CapturingAgent()
+
+  with mock.patch("nemo.agent.load_credentials", return_value={
+    "app_id": "app_id",
+    "app_secret": "app_secret",
+    "email": "user@example.com",
+  }), \
+       mock.patch("nemo.agent.Database", _FakeDB), \
+       mock.patch("nemo.agent.LarkChannel", return_value=channel), \
+       mock.patch("nemo.agent.build_coding_agent", return_value=agent), \
+       mock.patch("nemo.group_config.load_config", return_value={}), \
+       mock.patch("nemo.config.load_relay_config", return_value=("", "")), \
+       mock.patch("signal.signal"):
+    result = asyncio.run(main_loop("oc_test", str(tmp_path), "claude-opus-4-6"))
+
+  assert result == 0
+  rendered_cards = "\n".join(str(card) for card in channel.updated_cards)
+  assert out_path.exists(), rendered_cards
+  assert out_path.read_text(encoding="utf-8") == "file-content", rendered_cards
+  assert agent.prompts
+  prompt = agent.prompts[0]
+  assert "[Nemo shell context]" in prompt
+  assert marker in prompt
+  assert "phase=begin" in prompt
+  assert "phase=end" in prompt
+  assert "warn=stderr-line" in prompt
+  assert prompt.endswith("[User message]\nsummarize shell result")
+  assert any(
+    card.get("header", {}).get("title", {}).get("content") == "Shell done"
+    for card in channel.updated_cards
+  )
 
 
 def test_main_loop_threads_agent_through_db_calls(tmp_path):

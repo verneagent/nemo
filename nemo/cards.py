@@ -348,6 +348,30 @@ def _stop_button(chat_id: str = "") -> JsonObject:
   }
 
 
+def _shell_abort_button(job_id: str, chat_id: str = "") -> JsonObject:
+  """Build an Abort button for an operator-started shell job."""
+  return {
+    "tag": "column_set",
+    "flex_mode": "none",
+    "background_style": "default",
+    "columns": [{
+      "tag": "column",
+      "width": "auto",
+      "vertical_align": "top",
+      "elements": [{
+        "tag": "button",
+        "text": {"tag": "plain_text", "content": "Abort"},
+        "type": "danger",
+        "value": {
+          "action": "shell_abort",
+          "job_id": job_id,
+          "chat_id": chat_id,
+        },
+      }],
+    }],
+  }
+
+
 def _working_elements(
   *,
   steps: list[ThinkingStep],
@@ -500,6 +524,89 @@ def build_turn_card(
   if header:
     card["header"] = header
   return card
+
+
+def _shell_status_title(phase: str) -> tuple[str, str]:
+  if phase == "running":
+    return "Shell running", "grey"
+  if phase == "done":
+    return "Shell done", "green"
+  if phase == "failed":
+    return "Shell failed", "red"
+  if phase == "timeout":
+    return "Shell timed out", "orange"
+  if phase == "aborted":
+    return "Shell aborted", "grey"
+  return "Shell error", "red"
+
+
+def _shell_tail(stdout: str, stderr: str, limit: int = 12_000) -> str:
+  parts: list[str] = []
+  if stdout:
+    parts.append("stdout:\n" + stdout)
+  if stderr:
+    parts.append("stderr:\n" + stderr)
+  text = "\n\n".join(parts)
+  if not text:
+    return ""
+  if len(text) > limit:
+    text = f"... {len(text) - limit} chars omitted ...\n{text[-limit:]}"
+  return text
+
+
+def build_shell_card(
+  phase: str,
+  *,
+  job_id: str,
+  command: str,
+  cwd: str,
+  elapsed: int,
+  inject_context: bool,
+  chat_id: str = "",
+  exit_code: int | None = None,
+  stdout: str = "",
+  stderr: str = "",
+) -> JsonObject:
+  """Build a Card V2 shell job card with optional Abort action."""
+  title, color = _shell_status_title(phase)
+  elements: list[JsonObject] = []
+  mode = "injects next turn" if inject_context else "no context injection"
+  elements.append({
+    "tag": "markdown",
+    "content": (
+      f"`$ {command}`\n\n"
+      f"<font color='grey'>cwd: `{cwd}` · job: `{job_id}` · {mode}</font>"
+    ),
+  })
+  status_parts = [_elapsed_text(elapsed)]
+  if exit_code is not None:
+    status_parts.append(f"exit {exit_code}")
+  if phase == "timeout":
+    status_parts.append("interactive commands are not supported")
+  elements.append(_note_element(" | ".join(status_parts)))
+  tail = _shell_tail(stdout, stderr)
+  if tail:
+    tail = tail.replace("```", "` ` `")
+    elements.append({
+      "tag": "markdown",
+      "content": "```\n" + _escape_md(tail) + "\n```",
+    })
+  elif phase == "running":
+    elements.append({
+      "tag": "markdown",
+      "content": "<font color='grey'>Waiting for output...</font>",
+    })
+  if phase == "running":
+    elements.append(_shell_abort_button(job_id, chat_id))
+  return {
+    "schema": "2.0",
+    "config": {"update_multi": True},
+    "header": {
+      "title": {"tag": "plain_text", "content": title},
+      "template": color,
+    },
+    "body": {"direction": "vertical", "elements": elements},
+  }
 
 
 # ---------------------------------------------------------------------------
