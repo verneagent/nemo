@@ -5,7 +5,7 @@ import json
 
 from nemo.relay import (
     send_heartbeat, is_alive, release_heartbeat, register_message,
-    _relay_request,
+    heartbeat_status, _relay_request,
 )
 
 
@@ -79,6 +79,22 @@ def test_is_alive_error_returns_false():
     """Network error should return False (treat as idle)."""
     with patch("nemo.relay._relay_request", side_effect=Exception("timeout")):
         assert is_alive("oc_123") is False
+
+
+def test_heartbeat_status_returns_error_instead_of_idle_on_failure():
+    with patch("nemo.relay._relay_request", side_effect=Exception("timeout")):
+        result = heartbeat_status("oc_123")
+
+    assert result["alive"] is False
+    assert "timeout" in str(result["error"])
+
+
+def test_heartbeat_status_returns_raw_response():
+    with patch("nemo.relay._relay_request",
+               return_value={"alive": True, "machine": "Mac"}):
+        result = heartbeat_status("oc_123")
+
+    assert result == {"alive": True, "machine": "Mac"}
 
 
 # ---------------------------------------------------------------------------

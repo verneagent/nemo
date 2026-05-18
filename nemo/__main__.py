@@ -261,6 +261,52 @@ def _cmd_list() -> int:
   return 0
 
 
+def _cmd_gc(argv: list[str]) -> int:
+  profile_parent = argparse.ArgumentParser(add_help=False)
+  profile_parent.add_argument("--profile", default="default",
+                              help="Config profile name (default: default)")
+  sub_profile_parent = argparse.ArgumentParser(add_help=False)
+  sub_profile_parent.add_argument("--profile", dest="sub_profile", default="",
+                                  help="Config profile name (default: default)")
+  parser = argparse.ArgumentParser(
+    prog="nemo gc",
+    description="List and manually clean idle Nemo Lark groups",
+    parents=[profile_parent],
+  )
+  sub = parser.add_subparsers(dest="cmd", required=True)
+  sub.add_parser(
+    "list", parents=[sub_profile_parent],
+    help="List Nemo Lark groups and heartbeat status")
+  clean = sub.add_parser(
+    "clean", parents=[sub_profile_parent],
+    help="Interactively dissolve idle Nemo Lark groups")
+  clean.add_argument("--chat-id", default="", help="Clean one specific Lark chat")
+  clean.add_argument("--yes", action="store_true",
+                     help="Skip prompts; still refuses active/unknown groups")
+  args = parser.parse_args(argv)
+
+  from .config import load_credentials, load_relay_config, profile_path, set_profile
+  set_profile(args.sub_profile or args.profile or "default")
+  relay_url, _relay_key = load_relay_config()
+  if not relay_url:
+    print("Error: relay is not configured; gc cannot safely determine remote heartbeat.",
+          file=sys.stderr)
+    return 1
+  credentials = load_credentials()
+  if not credentials:
+    print(f"Error: No credentials configured ({profile_path()})", file=sys.stderr)
+    return 1
+  from .lark.auth import get_token
+  from .group_gc import gc_clean, gc_list
+
+  token = get_token(credentials["app_id"], credentials["app_secret"])
+  if args.cmd == "list":
+    return gc_list(token)
+  if args.cmd == "clean":
+    return gc_clean(token, chat_id=args.chat_id, yes=args.yes)
+  return 1
+
+
 def _get_version() -> str:
   """Return the version for the running Nemo code."""
   from .version import get_version
@@ -271,6 +317,8 @@ def main():
   # Intercept subcommands before argparse
   if len(sys.argv) >= 2 and sys.argv[1] == "list":
     sys.exit(_cmd_list())
+  if len(sys.argv) >= 2 and sys.argv[1] == "gc":
+    sys.exit(_cmd_gc(sys.argv[2:]))
 
   def _validate_chat_id(value: str) -> str:
     """Reject obviously-invalid Lark chat IDs at parse time.

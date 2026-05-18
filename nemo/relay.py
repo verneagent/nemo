@@ -11,6 +11,7 @@ import logging
 import urllib.request
 
 from .config import load_relay_config
+from .types import JsonObject
 
 log = logging.getLogger(__name__)
 
@@ -53,6 +54,20 @@ def is_alive(chat_id: str) -> bool:
     except Exception as e:
         log.warning("Heartbeat check failed: %s", e)
         return False  # Can't reach relay → treat as idle
+
+
+def heartbeat_status(chat_id: str) -> JsonObject:
+    """Return raw heartbeat status for a chat.
+
+    Unlike ``is_alive()``, this does not collapse relay failures into idle.
+    GC uses it so a temporary relay outage cannot make active remote groups
+    look safe to dissolve.
+    """
+    try:
+        return _relay_request("GET", f"/heartbeat/chat:{chat_id}")
+    except Exception as e:
+        log.warning("Heartbeat status check failed: %s", e)
+        return {"alive": False, "error": str(e)}
 
 
 def release_heartbeat(chat_id: str) -> None:
