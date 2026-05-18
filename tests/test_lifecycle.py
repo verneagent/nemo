@@ -86,6 +86,56 @@ def test_run_pipx_upgrade_timeout():
   assert "Timed out" in result.output
 
 
+def test_check_pypi_upgrade_reports_available():
+  resp = mock.Mock()
+  resp.read.return_value = b'{"info":{"version":"0.4.21"}}'
+  resp.__enter__ = mock.Mock(return_value=resp)
+  resp.__exit__ = mock.Mock(return_value=False)
+  with mock.patch("nemo.lifecycle.urllib.request.urlopen", return_value=resp), \
+       mock.patch("nemo.version.get_version_info") as version_info:
+    version_info.return_value = mock.Mock(
+      version="0.4.20", source="installed package")
+    result = lifecycle.check_pypi_upgrade()
+
+  assert result.returncode == 0
+  assert result.current_version == "0.4.20"
+  assert result.latest_version == "0.4.21"
+  assert result.update_available is True
+  assert "/upgrade" in result.output
+
+
+def test_check_pypi_upgrade_source_checkout_note():
+  resp = mock.Mock()
+  resp.read.return_value = b'{"info":{"version":"0.4.20"}}'
+  resp.__enter__ = mock.Mock(return_value=resp)
+  resp.__exit__ = mock.Mock(return_value=False)
+  with mock.patch("nemo.lifecycle.urllib.request.urlopen", return_value=resp), \
+       mock.patch("nemo.version.get_version_info") as version_info:
+    version_info.return_value = mock.Mock(
+      version="0.4.20", source="source checkout")
+    result = lifecycle.check_pypi_upgrade()
+
+  assert result.returncode == 0
+  assert result.update_available is False
+  assert "source checkout" in result.output
+
+
+def test_check_pypi_upgrade_current_newer_than_pypi():
+  resp = mock.Mock()
+  resp.read.return_value = b'{"info":{"version":"0.4.19"}}'
+  resp.__enter__ = mock.Mock(return_value=resp)
+  resp.__exit__ = mock.Mock(return_value=False)
+  with mock.patch("nemo.lifecycle.urllib.request.urlopen", return_value=resp), \
+       mock.patch("nemo.version.get_version_info") as version_info:
+    version_info.return_value = mock.Mock(
+      version="0.4.20", source="source checkout")
+    result = lifecycle.check_pypi_upgrade()
+
+  assert result.returncode == 0
+  assert result.update_available is False
+  assert "newer than PyPI" in result.output
+
+
 def test_spawn_lifecycle_helper_returns_log_path(tmp_path):
   spec = lifecycle.RestartSpec(
     chat_id="oc_real",

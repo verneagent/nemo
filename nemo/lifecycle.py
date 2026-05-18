@@ -8,6 +8,8 @@ import os
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
 from importlib.metadata import PackageNotFoundError, distribution
 
@@ -32,6 +34,17 @@ class CommandResult:
   """Small subprocess result safe to show in chat/logs."""
 
   returncode: int
+  output: str
+
+
+@dataclass(frozen=True)
+class UpgradeCheckResult:
+  """Result of checking PyPI for a newer Nemo release."""
+
+  returncode: int
+  current_version: str
+  latest_version: str
+  update_available: bool
   output: str
 
 
@@ -158,6 +171,73 @@ def run_pipx_upgrade(timeout_s: float = 300.0) -> CommandResult:
     output = exc.stdout if isinstance(exc.stdout, str) else ""
     return CommandResult(124, output + "\nTimed out running `pipx upgrade captain-nemo`.")
   return CommandResult(result.returncode, result.stdout)
+
+
+def _version_key(version: str) -> tuple[int, ...]:
+  """Best-effort comparable key for Nemo's numeric release versions."""
+  parts: list[int] = []
+  for raw in version.replace("-", ".").split("."):
+    digits = ""
+    for ch in raw:
+      if ch.isdigit():
+        digits += ch
+      else:
+        break
+    if digits:
+      parts.append(int(digits))
+    else:
+      break
+  return tuple(parts)
+
+
+def check_pypi_upgrade(timeout_s: float = 10.0) -> UpgradeCheckResult:
+  """Check PyPI for the latest captain-nemo version without installing."""
+  from .version import get_version_info
+
+  info = get_version_info()
+  current = info.version
+  url = f"https://pypi.org/pypi/{PACKAGE_NAME}/json"
+  try:
+    req = urllib.request.Request(url, headers={"Accept": "application/json"})
+    with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+      payload: object = json.loads(resp.read())
+  except urllib.error.URLError as exc:
+    return UpgradeCheckResult(
+      1, current, "", False, f"Failed to query PyPI: {exc}")
+  except (TimeoutError, json.JSONDecodeError) as exc:
+    return UpgradeCheckResult(
+      1, current, "", False, f"Failed to parse PyPI response: {exc}")
+
+  if not isinstance(payload, dict):
+    return UpgradeCheckResult(1, current, "", False, "Unexpected PyPI response.")
+  info_obj = payload.get("info")
+  if not isinstance(info_obj, dict):
+    return UpgradeCheckResult(1, current, "", False, "PyPI response missing info.")
+  latest_obj = info_obj.get("version")
+  if not isinstance(latest_obj, str) or not latest_obj:
+    return UpgradeCheckResult(1, current, "", False, "PyPI response missing version.")
+
+  latest = latest_obj
+  latest_key = _version_key(latest)
+  current_key = _version_key(current)
+  update_available = latest_key > current_key
+  if update_available:
+    output = (
+      f"Update available: current `{current}`, latest `{latest}`. "
+      "Run `/upgrade` to install it with pipx and restart."
+    )
+  elif current_key > latest_key:
+    output = (
+      f"Running version `{current}` is newer than PyPI latest `{latest}`."
+    )
+  else:
+    output = f"Nemo is up to date: current `{current}`, latest `{latest}`."
+  if info.source == "source checkout":
+    output += (
+      "\n\nRunning from source checkout; `/upgrade` only applies to pipx "
+      "installs. Update the checkout and use `/restart`."
+    )
+  return UpgradeCheckResult(0, current, latest, update_available, output)
 
 
 def _pid_alive(pid: int) -> bool:

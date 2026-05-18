@@ -262,15 +262,9 @@ def _cmd_list() -> int:
 
 
 def _get_version() -> str:
-  """Return the installed captain-nemo version, or 'unknown' if unavailable."""
-  try:
-    from importlib.metadata import version, PackageNotFoundError
-    try:
-      return version("captain-nemo")
-    except PackageNotFoundError:
-      return "unknown"
-  except Exception:
-    return "unknown"
+  """Return the version for the running Nemo code."""
+  from .version import get_version
+  return get_version()
 
 
 def main():

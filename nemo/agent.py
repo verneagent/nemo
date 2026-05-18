@@ -1699,6 +1699,13 @@ async def main_loop(
           running = False
           await _clear_ack()
           break
+        elif response == "__upgrade_check__":
+          from .lifecycle import check_pypi_upgrade
+
+          result = await asyncio.to_thread(check_pypi_upgrade)
+          await _send_response(channel, chat_id, result.output, db)
+          await _clear_ack()
+          continue
         elif response and response.startswith("__btw__:"):
           # Fire-and-forget: a side question must never block the main
           # loop (it can take many seconds) and its failures must never

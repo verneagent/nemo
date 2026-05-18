@@ -46,6 +46,13 @@ def test_upgrade_command_not_inline_safe():
   assert not is_inline_safe(resp)
 
 
+def test_upgrade_check_command_is_inline_safe():
+  handled, resp = try_dispatch("/upgrade check", _ctx())
+  assert handled
+  assert resp == "__upgrade_check__"
+  assert is_inline_safe(resp)
+
+
 def test_session_rm_command():
   handled, resp = try_dispatch("/session rm abc123", _ctx())
   assert handled
@@ -177,10 +184,19 @@ def test_agent_action_code_marked_needs_sdk():
 
 
 def test_version_command_reports_all_agent_runtimes():
+  from nemo.version import VersionInfo
+
   with __import__("unittest").mock.patch(
+      "nemo.commands.nemo_version_info",
+      return_value=VersionInfo(
+        version="0.4.17",
+        source="source checkout",
+        path="/repo/nemo",
+        metadata_version="0.4.0",
+      ),
+  ), __import__("unittest").mock.patch(
       "nemo.commands._package_version",
       side_effect=lambda name: {
-        "captain-nemo": "0.4.17",
         "claude-agent-sdk": "0.1.55",
       }[name],
   ), __import__("unittest").mock.patch(
@@ -199,6 +215,8 @@ def test_version_command_reports_all_agent_runtimes():
   assert resp is not None
   assert is_inline_safe(resp)
   assert "Nemo" in resp and "0.4.17" in resp
+  assert "source checkout" in resp and "/repo/nemo" in resp
+  assert "metadata `0.4.0`" in resp
   assert "Claude" in resp and "0.1.55" in resp
   assert "Codex" in resp and "0.128.0" in resp
   assert "OpenCode" in resp and "^1.4.7" in resp

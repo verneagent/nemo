@@ -11,6 +11,7 @@ from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 
 from .types import JsonObject
+from .version import get_version_info as nemo_version_info
 
 
 _EFFORT_LEVELS = ("low", "medium", "high", "max")
@@ -59,9 +60,14 @@ def format_version_report() -> str:
   root = Path(__file__).resolve().parent
   codex_package = root / "codex_sidecar" / "package.json"
   opencode_package = root / "opencode_sidecar" / "package.json"
+  nemo_info = nemo_version_info()
+  metadata_note = ""
+  if nemo_info.metadata_version and nemo_info.metadata_version != nemo_info.version:
+    metadata_note = f", metadata `{nemo_info.metadata_version}`"
+  path_note = f", path `{nemo_info.path}`" if nemo_info.path else ""
   return (
     "**Versions**\n\n"
-    f"- Nemo: `{_package_version('captain-nemo')}`\n"
+    f"- Nemo: `{nemo_info.version}` ({nemo_info.source}{path_note}{metadata_note})\n"
     f"- Claude: CLI `{_cli_version('claude')}`, SDK "
     f"`{_package_version('claude-agent-sdk')}`\n"
     f"- Codex: CLI `{_cli_version('codex')}`, sidecar SDK "
@@ -404,6 +410,10 @@ def try_dispatch(text: str, ctx: AgentContext) -> tuple[bool, str | None]:
   if t in ("/restart", "restart"):
     return True, "__restart__"
 
+  # /upgrade check — check PyPI without installing.
+  if t in ("/upgrade check", "upgrade check"):
+    return True, "__upgrade_check__"
+
   # /upgrade — pipx upgrade captain-nemo, then restart if successful.
   if t in ("/upgrade", "upgrade"):
     return True, "__upgrade__"
@@ -434,6 +444,7 @@ def try_dispatch(text: str, ctx: AgentContext) -> tuple[bool, str | None]:
       "| `/version` | Nemo and coding-agent runtime versions |\n"
       "| `/pid` | Current Nemo process ID |\n"
       "| `/restart` | Restart this Nemo daemon |\n"
+      "| `/upgrade check` | Check whether a newer Nemo is available |\n"
       "| `/upgrade` | Run `pipx upgrade captain-nemo`, then restart |\n"
       "| `/mention` | Toggle @mention requirement |\n"
       "| `/name <name>` | Rename this group |\n"
