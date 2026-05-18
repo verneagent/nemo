@@ -354,8 +354,8 @@ def test_usage_for_opencode():
   assert "opencode stats" in resp
 
 
-def test_context_unknown_before_first_snapshot():
-  handled, resp = try_dispatch("/context", _ctx())
+def test_tokens_unknown_before_first_snapshot():
+  handled, resp = try_dispatch("/tokens", _ctx())
   assert handled
   assert resp is not None
   assert "unknown" in resp.lower()
@@ -363,7 +363,7 @@ def test_context_unknown_before_first_snapshot():
   assert is_inline_safe(resp)
 
 
-def test_context_reports_last_usage_snapshot():
+def test_tokens_reports_last_usage_snapshot():
   ctx = _ctx()
   ctx.record_context_usage({
     "input_tokens": 12345,
@@ -372,7 +372,7 @@ def test_context_reports_last_usage_snapshot():
     "context_window": 200000,
   }, updated_at=0)
 
-  handled, resp = try_dispatch("/context", ctx)
+  handled, resp = try_dispatch("/tokens", ctx)
 
   assert handled
   assert resp is not None
@@ -384,7 +384,7 @@ def test_context_reports_last_usage_snapshot():
   assert is_inline_safe(resp)
 
 
-def test_context_prefers_total_tokens_when_present():
+def test_tokens_prefers_total_tokens_when_present():
   ctx = _ctx()
   ctx.record_context_usage({
     "input_tokens": 1000,
@@ -392,7 +392,7 @@ def test_context_prefers_total_tokens_when_present():
     "context_window": 10000,
   }, updated_at=0)
 
-  handled, resp = try_dispatch("context", ctx)
+  handled, resp = try_dispatch("tokens", ctx)
 
   assert handled
   assert resp is not None
@@ -400,11 +400,11 @@ def test_context_prefers_total_tokens_when_present():
   assert "10,000 tokens (23.4%)" in resp
 
 
-def test_context_reports_last_compact_snapshot():
+def test_tokens_reports_last_compact_snapshot():
   ctx = _ctx()
   ctx.record_compact(180000, 42000, updated_at=0)
 
-  handled, resp = try_dispatch("/context", ctx)
+  handled, resp = try_dispatch("/tokens", ctx)
 
   assert handled
   assert resp is not None
@@ -412,13 +412,13 @@ def test_context_reports_last_compact_snapshot():
   assert "42,000" in resp
 
 
-def test_context_clear_resets_snapshots():
+def test_tokens_clear_resets_snapshots():
   ctx = _ctx()
   ctx.record_context_usage({"input_tokens": 100}, updated_at=0)
   ctx.record_compact(200, 50, updated_at=0)
 
   ctx.clear_context_usage()
-  handled, resp = try_dispatch("/context", ctx)
+  handled, resp = try_dispatch("/tokens", ctx)
 
   assert handled
   assert resp is not None
@@ -426,11 +426,18 @@ def test_context_clear_resets_snapshots():
   assert "Last compact" not in resp
 
 
+def test_context_slash_is_not_nemo_command():
+  handled, resp = try_dispatch("/context", _ctx())
+  assert not handled
+  assert resp is None
+
+
 def test_help():
   handled, resp = try_dispatch("/help", _ctx())
   assert handled
   assert "Commands" in resp
-  assert "/context" in resp
+  assert "/tokens" in resp
+  assert "/context" not in resp
 
 
 def test_autoapprove_on():

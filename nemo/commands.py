@@ -191,10 +191,10 @@ def _format_token_count(value: int) -> str:
   return f"{value:,}" if value > 0 else "unknown"
 
 
-def _format_context_snapshot(ctx: AgentContext) -> str:
+def _format_token_snapshot(ctx: AgentContext) -> str:
   if not ctx.context_usage and not ctx.compact_pre_tokens:
     return (
-      "Context: **unknown**\n\n"
+      "Tokens: **unknown**\n\n"
       "No token snapshot has been reported yet. Run one turn first; "
       "Nemo will show the last usage snapshot after the SDK reports it."
     )
@@ -206,7 +206,7 @@ def _format_context_snapshot(ctx: AgentContext) -> str:
   current_tokens = total_tokens or input_tokens
   context_window = _int_value(ctx.context_usage.get("context_window"))
 
-  lines = ["**Context**"]
+  lines = ["**Tokens**"]
   lines.append(f"- Current: **{_format_token_count(current_tokens)} tokens**")
   if context_window:
     pct = current_tokens / context_window * 100 if current_tokens else 0
@@ -394,9 +394,9 @@ def try_dispatch(text: str, ctx: AgentContext) -> tuple[bool, str | None]:
       return True, "Usage is agent-specific under OpenCode. Run `opencode stats` locally for totals."
     return True, "Usage is agent-specific. Check the local CLI/account UI for totals."
 
-  # /context
-  if t in ("/context", "context"):
-    return True, _format_context_snapshot(ctx)
+  # /tokens
+  if t in ("/tokens", "tokens"):
+    return True, _format_token_snapshot(ctx)
 
   # /version
   if t in ("/version", "version"):
@@ -439,8 +439,7 @@ def try_dispatch(text: str, ctx: AgentContext) -> tuple[bool, str | None]:
       "| `/ping` | Status check |\n"
       "| `/cost` | Session API cost |\n"
       "| `/usage` | Plan usage limits |\n"
-      "| `/context` | Last known context token snapshot |\n"
-      "| `/context` | Last known context token snapshot |\n"
+      "| `/tokens` | Last known context token snapshot |\n"
       "| `/version` | Nemo and coding-agent runtime versions |\n"
       "| `/pid` | Current Nemo process ID |\n"
       "| `/restart` | Restart this Nemo daemon |\n"
