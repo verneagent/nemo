@@ -14,9 +14,11 @@ def test_collect_gc_chats_uses_workspace_tag_and_heartbeat():
     {"chat_id": "oc_1", "name": "one"},
     {"chat_id": "oc_2", "name": "two"},
   ]), mock.patch("nemo.lark.api.get_chat_info", side_effect=[
-    {"name": "one", "description": "workspace:Mac|/repo"},
-    {"name": "two", "description": "plain"},
-  ]), mock.patch("nemo.group_gc._has_nemo_config_pin", return_value=False), \
+    {"name": "one", "description": "workspace:Mac|/repo", "owner_id": "ou_bot"},
+    {"name": "two", "description": "plain", "owner_id": "ou_bot"},
+  ]), mock.patch("nemo.lark.api.get_bot_info", return_value={
+    "open_id": "ou_bot",
+  }), mock.patch("nemo.group_gc._has_nemo_config_pin", return_value=False), \
        mock.patch("nemo.relay.heartbeat_status",
                   return_value={"alive": True, "machine": "Mac", "model": "opus"}):
     rows = collect_gc_chats("tok")
@@ -31,7 +33,14 @@ def test_collect_gc_chats_accepts_config_pin_without_workspace_tag():
   with mock.patch("nemo.lark.api.list_bot_chats", return_value=[
     {"chat_id": "oc_1", "name": "one"},
   ]), mock.patch("nemo.lark.api.get_chat_info",
-                  return_value={"name": "one", "description": ""}), \
+                  return_value={
+                    "name": "one",
+                    "description": "",
+                    "owner_id": "ou_bot",
+                  }), \
+       mock.patch("nemo.lark.api.get_bot_info", return_value={
+         "open_id": "ou_bot",
+       }), \
        mock.patch("nemo.lark.api.list_pins",
                   return_value=[{"message_id": "om_cfg"}]), \
        mock.patch("nemo.lark.api.get_message", return_value={
@@ -45,11 +54,43 @@ def test_collect_gc_chats_accepts_config_pin_without_workspace_tag():
   assert rows[0].status == "IDLE"
 
 
+def test_collect_gc_chats_skips_nemo_marked_chat_not_owned_by_bot():
+  with mock.patch("nemo.lark.api.list_bot_chats", return_value=[
+    {"chat_id": "oc_1", "name": "not-owned"},
+  ]), mock.patch("nemo.lark.api.get_chat_info", return_value={
+    "name": "not-owned",
+    "description": "workspace:Mac|/repo",
+    "owner_id": "ou_user",
+  }), mock.patch("nemo.lark.api.get_bot_info", return_value={
+    "open_id": "ou_bot",
+  }), mock.patch("nemo.relay.heartbeat_status") as heartbeat:
+    rows = collect_gc_chats("tok")
+
+  assert rows == []
+  heartbeat.assert_not_called()
+
+
+def test_collect_gc_chats_skips_when_bot_owner_unknown():
+  with mock.patch("nemo.lark.api.get_bot_info", return_value={}), \
+       mock.patch("nemo.lark.api.list_bot_chats") as list_chats:
+    rows = collect_gc_chats("tok")
+
+  assert rows == []
+  list_chats.assert_not_called()
+
+
 def test_format_gc_table_marks_relay_errors_unknown():
   with mock.patch("nemo.lark.api.list_bot_chats", return_value=[
     {"chat_id": "oc_1", "name": "one"},
   ]), mock.patch("nemo.lark.api.get_chat_info",
-                  return_value={"name": "one", "description": "workspace:x"}), \
+                  return_value={
+                    "name": "one",
+                    "description": "workspace:x",
+                    "owner_id": "ou_bot",
+                  }), \
+       mock.patch("nemo.lark.api.get_bot_info", return_value={
+         "open_id": "ou_bot",
+       }), \
        mock.patch("nemo.relay.heartbeat_status",
                   return_value={"alive": False, "error": "timeout"}):
     rows = collect_gc_chats("tok")

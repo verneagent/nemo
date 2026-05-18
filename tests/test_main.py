@@ -2,6 +2,8 @@
 
 from unittest import mock
 
+import pytest
+
 from nemo.__main__ import main
 
 
@@ -44,12 +46,23 @@ def test_invalid_chat_id_rejected_at_argparse():
   """A chat_id that doesn't start with 'oc_' must fail argparse early
   rather than spawn a daemon that mis-evicts every other nemo on the
   host (see _cmdline_targets_chat regression history)."""
-  import pytest
   with mock.patch("sys.argv", ["nemo", "--chat-id", "0",
                                 "--project-dir", "/tmp"]):
     with pytest.raises(SystemExit) as exc:
       main()
     assert exc.value.code == 2  # argparse error exit code
+
+
+def test_top_level_help_mentions_gc_commands(capsys):
+  with mock.patch("sys.argv", ["nemo", "--help"]):
+    with pytest.raises(SystemExit) as exc:
+      main()
+    assert exc.value.code == 0
+
+  out = capsys.readouterr().out
+  assert "Maintenance commands:" in out
+  assert "nemo gc list" in out
+  assert "nemo gc clean" in out
 
 
 def test_empty_chat_id_still_allowed():

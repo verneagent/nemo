@@ -34,6 +34,25 @@ def _bool_value(value: object) -> bool:
   return value if isinstance(value, bool) else False
 
 
+def _nested_str_value(value: object, key: str) -> str:
+  if not isinstance(value, dict):
+    return ""
+  nested = value.get(key)
+  return nested if isinstance(nested, str) else ""
+
+
+def _chat_owner_id(info: JsonObject) -> str:
+  """Return the chat owner's open_id when Lark includes it."""
+  for key in ("owner_id", "owner_open_id", "chat_owner_id"):
+    value = info.get(key)
+    if isinstance(value, str) and value:
+      return value
+    nested = _nested_str_value(value, "open_id")
+    if nested:
+      return nested
+  return ""
+
+
 def _is_config_message(msg: JsonObject) -> bool:
   from .group_config import _parse_config_text
 
@@ -65,6 +84,16 @@ def _is_nemo_chat(token: str, chat_id: str, description: str) -> bool:
   return _has_nemo_config_pin(token, chat_id)
 
 
+def _bot_open_id(token: str) -> str:
+  from .lark import api as lark_api
+
+  try:
+    bot_info = lark_api.get_bot_info(token)
+  except Exception:
+    return ""
+  return _str_value(bot_info.get("open_id"))
+
+
 def _heartbeat_status(chat_id: str) -> tuple[bool, str, str, str]:
   from . import relay
 
@@ -79,10 +108,13 @@ def _heartbeat_status(chat_id: str) -> tuple[bool, str, str, str]:
 
 
 def collect_gc_chats(token: str, *, include_unknown: bool = True) -> list[GcChat]:
-  """Collect Nemo-managed chats with heartbeat status."""
+  """Collect bot-owned Nemo-managed chats with heartbeat status."""
   from .lark import api as lark_api
 
   rows: list[GcChat] = []
+  bot_open_id = _bot_open_id(token)
+  if not bot_open_id:
+    return rows
   for chat in lark_api.list_bot_chats(token):
     chat_id = _str_value(chat.get("chat_id"))
     if not chat_id:
@@ -95,6 +127,8 @@ def collect_gc_chats(token: str, *, include_unknown: bool = True) -> list[GcChat
     description = _str_value(info.get("description"))
     is_nemo = _is_nemo_chat(token, chat_id, description)
     if not is_nemo:
+      continue
+    if _chat_owner_id(info) != bot_open_id:
       continue
     alive, error, machine, model = _heartbeat_status(chat_id)
     if error and not include_unknown:

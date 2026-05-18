@@ -341,6 +341,14 @@ def main():
   parser = argparse.ArgumentParser(
     prog="nemo",
     description="Lark-connected coding agent daemon",
+    formatter_class=argparse.RawDescriptionHelpFormatter,
+    epilog=(
+      "Maintenance commands:\n"
+      "  nemo list               List discoverable Lark chats\n"
+      "  nemo gc list            List Nemo Lark groups and heartbeat status\n"
+      "  nemo gc clean           Interactively dissolve idle Nemo Lark groups\n"
+      "  nemo gc clean --yes     Dissolve idle groups without prompts"
+    ),
   )
   parser.add_argument("--version", "-V", action="version",
                       version=f"nemo {_get_version()}")
