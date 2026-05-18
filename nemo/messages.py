@@ -91,6 +91,18 @@ def strip_parent_quote(text: str) -> str:
 def strip_mentions(text: str, replies: list[object],
                    bot_open_id: str = "") -> str:
   """Strip bot @-mentions; replace other @-mentions with the person's name."""
+  text = strip_mentions_preserve_newlines(text, replies, bot_open_id=bot_open_id)
+  return re.sub(r"\s+", " ", text).strip()
+
+
+def strip_mentions_preserve_newlines(text: str, replies: list[object],
+                                     bot_open_id: str = "") -> str:
+  """Strip mentions without collapsing whitespace.
+
+  Shell shortcuts may intentionally contain newlines (for example
+  ``python -c`` scripts), so they need mention cleanup without the
+  whitespace-normalization used by normal chat prompts and slash commands.
+  """
   for r in replies:
     for m in (_get(r, "mentions") or []):
       key = m.get("key", "") if isinstance(m, dict) else getattr(m, "key", "")
@@ -104,7 +116,7 @@ def strip_mentions(text: str, replies: list[object],
         text = text.replace(key, name)
       else:
         text = text.replace(key, "")
-  return re.sub(r"\s+", " ", text).strip()
+  return text.strip()
 
 
 def filter_self_bot(replies: list[object], bot_open_id: str) -> list[object]:

@@ -5,7 +5,8 @@ from dataclasses import dataclass, field
 from nemo.messages import (
   build_prompt, strip_mentions, filter_self_bot,
   filter_by_operator, filter_by_allowed_senders,
-  filter_bot_interactions, strip_parent_quote,
+  filter_bot_interactions, strip_mentions_preserve_newlines,
+  strip_parent_quote,
 )
 
 
@@ -108,6 +109,15 @@ def test_strip_mentions_object():
 
 def test_strip_mentions_no_mentions():
   assert strip_mentions("hello", [{"mentions": []}]) == "hello"
+
+
+def test_strip_mentions_preserve_newlines_for_shell_shortcuts():
+  text = "@bot !python -c 'print(1)'\nprint(2)"
+  replies = [{"mentions": [{"key": "@bot"}]}]
+  assert (
+    strip_mentions_preserve_newlines(text, replies)
+    == "!python -c 'print(1)'\nprint(2)"
+  )
 
 
 # ---------------------------------------------------------------------------

@@ -13,6 +13,14 @@ def test_interactive_card_title_extracts_done_title() -> None:
   assert interactive_card_title(msg) == "Done ✓"
 
 
+def test_interactive_card_title_extracts_card_v2_header() -> None:
+  msg = {
+    "type": "interactive",
+    "body": '{"schema":"2.0","header":{"title":{"tag":"plain_text","content":"Shell done"}}}',
+  }
+  assert interactive_card_title(msg) == "Shell done"
+
+
 def test_is_done_response_distinguishes_working_and_done_cards() -> None:
   working = {
     "type": "interactive",

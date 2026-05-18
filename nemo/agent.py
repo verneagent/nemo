@@ -23,7 +23,7 @@ import urllib.error
 import uuid
 from typing import TYPE_CHECKING, Callable
 
-from . import cards, commands, messages, monitor
+from . import cards, commands, messages, monitor, shell_command
 from .agent_factory import AgentKind, build_coding_agent, is_model_compatible
 from .coding_agent import CodingAgent, EndpointConfig
 from .channel import IncomingMessage
@@ -1096,6 +1096,18 @@ async def main_loop(
   # daemon-scoped (not turn-scoped) so an answer started in turn N can
   # still arrive after turn N ends without its task being GC'd.
   _btw_tasks: set[asyncio.Task[None]] = set()
+  _pending_shell_contexts: list[str] = []
+
+  def _queue_shell_context(context: str) -> None:
+    _pending_shell_contexts.append(context)
+    del _pending_shell_contexts[:-shell_command.MAX_PENDING_CONTEXTS]
+
+  shell_manager = shell_command.ShellJobManager(
+    channel,
+    chat_id=chat_id,
+    project_dir=project_dir,
+    on_context=_queue_shell_context,
+  )
   # One-shot flag: prepend a pacing hint to the next user prompt after an
   # SDK timeout. Cleared after use or on /clear.
   _pending_pacing_hint = False
@@ -1138,6 +1150,14 @@ async def main_loop(
 
       # Skip card action events at top level (handled during turns)
       if reply.event_type == "card.action.trigger":
+        if reply.action_value.get("action") == "shell_abort":
+          job_id = str(reply.action_value.get("job_id", ""))
+          if monitor.is_privileged(
+              reply.operator_id, operator_open_id, _member_roles):
+            await shell_manager.abort(job_id)
+          else:
+            log.info("Ignoring unauthorized shell abort by %s", reply.operator_id)
+          continue
         log.info("Ignoring card action outside turn: %s", reply.action_value)
         continue
 
@@ -1455,6 +1475,7 @@ async def main_loop(
           new_dir = response.split(":", 1)[1]
           project_dir = new_dir
           ctx.project_dir = project_dir
+          shell_manager.set_project_dir(project_dir)
           await _restart_client()
           await channel.update_workspace_tag(project_dir)
           await _send_response(channel, chat_id, f"Working directory: **{project_dir}**", db)
@@ -1757,6 +1778,18 @@ async def main_loop(
         await _clear_ack()
         continue
 
+      shell_shortcut = shell_command.parse_shell_shortcut(
+        messages.strip_parent_quote(
+          messages.strip_mentions_preserve_newlines(
+            text, [reply], bot_open_id=bot_open_id)))
+      if shell_shortcut is not None:
+        response_text = await shell_manager.start(shell_shortcut)
+        log.info("Shell shortcut handled: %s", response_text)
+        if response_text:
+          await _send_response(channel, chat_id, response_text, db)
+        await _clear_ack()
+        continue
+
       # --- Run SDK turn ---
       log.info("Processing: %s", user_message[:80])
       ctx.msg_count += 1
@@ -1962,6 +1995,15 @@ async def main_loop(
           ctx.total_cost += event.cost
           ctx.record_context_usage(event.usage)
 
+      if _pending_shell_contexts:
+        log.info(
+          "Injecting %d shell context(s) into next turn",
+          len(_pending_shell_contexts),
+        )
+        shell_context = "\n\n".join(_pending_shell_contexts)
+        _pending_shell_contexts.clear()
+        user_message = shell_context + "\n\n[User message]\n" + user_message
+
       if _pending_pacing_hint:
         log.info("Prepending pacing hint after prior timeout")
         prompt_for_agent = _PACING_HINT_PREFIX + user_message
@@ -2161,6 +2203,14 @@ async def main_loop(
           # Handle Stop button card action (check authorization)
           if msg.event_type == "card.action.trigger":
             action = msg.action_value.get("action", "")
+            if action == "shell_abort":
+              job_id = str(msg.action_value.get("job_id", ""))
+              if monitor.is_privileged(
+                  msg.operator_id, operator_open_id, _member_roles):
+                await shell_manager.abort(job_id)
+              else:
+                log.info("Ignoring unauthorized shell abort by %s", msg.operator_id)
+              continue
             # Relay-originated stop signals are already authenticated by the relay.
             # Raw "__stop__" actions should still require operator authorization.
             if action == "stop":
@@ -2215,6 +2265,22 @@ async def main_loop(
               if autoesc:
                 signal_detected = "autoesc"
                 return
+              continue
+            shell_shortcut = shell_command.parse_shell_shortcut(
+              messages.strip_parent_quote(
+                messages.strip_mentions_preserve_newlines(
+                  msg_text, [msg], bot_open_id=bot_open_id)))
+            if shell_shortcut is not None:
+              try:
+                response_text = await shell_manager.start(shell_shortcut)
+                if response_text:
+                  await _send_response(channel, chat_id, response_text, db)
+                if msg.message_id:
+                  await channel.add_reaction(msg.message_id, "DONE")
+              except Exception as exc:
+                log.warning("Shell shortcut during turn failed: %s", exc)
+                if msg.message_id:
+                  await channel.add_reaction(msg.message_id, "CROSS_MARK")
               continue
           # Re-queue non-signal messages so they aren't lost
           _pending_msgs.append(msg)
@@ -2328,7 +2394,7 @@ async def main_loop(
       pass  # expected on shutdown cancel
   # Close SDK, event stream, and Lark API calls all concurrently
   loop = asyncio.get_event_loop()
-  cleanup: list = [coding_agent.stop(), channel.stop()]
+  cleanup: list = [shell_manager.close(), coding_agent.stop(), channel.stop()]
   cleanup.append(channel.release_workspace())
   cleanup.append(channel.update_status(model, "stopped", agent))
   await asyncio.gather(*cleanup, return_exceptions=True)

@@ -13,6 +13,7 @@ Usage:
     python3 scripts/e2e_test.py --perm           # permission flow only
     python3 scripts/e2e_test.py --dual           # dual-instance only
     python3 scripts/e2e_test.py --media          # media & interaction only
+    python3 scripts/e2e_test.py --shell          # shell shortcut + abort only
     python3 scripts/e2e_test.py --switch         # /agent + preset switch only
     python3 scripts/e2e_test.py --verbose        # debug nemo logging
     python3 scripts/e2e_test.py --chat <ID>      # custom chat group
@@ -181,7 +182,8 @@ def _inject_relay_event(payload: dict, chat_id: str) -> str:
   req.add_header("Content-Type", "application/json")
   resp = urllib.request.urlopen(req, timeout=10)
   result = json.loads(resp.read())
-  if not result.get("ok", False):
+  if not result.get("ok", False) and not (
+      isinstance(result, dict) and ("toast" in result or "card" in result)):
     raise RuntimeError(f"Relay inject failed: {result}")
   return payload.get("event", {}).get("message", {}).get("message_id", "")
 
@@ -271,6 +273,23 @@ def send_topic_msg(text: str, thread_id: str, chat_id: str,
         "sender_type": "user",
         "sender_id": {"open_id": OPERATOR_OPEN_ID},
       },
+    },
+  }, chat_id)
+
+
+def send_card_action(action_value: dict, chat_id: str,
+                     operator_open_id: str = OPERATOR_OPEN_ID) -> str:
+  """Inject a card.action.trigger event through the relay webhook."""
+  ts = str(int(time.time() * 1000))
+  msg_id = f"test_action_{ts}_{os.getpid()}"
+  return _inject_relay_event({
+    "header": {
+      "event_type": "card.action.trigger",
+      "event_id": f"evt_{msg_id}",
+    },
+    "event": {
+      "operator": {"open_id": operator_open_id},
+      "action": {"value": {**action_value, "chat_id": chat_id}},
     },
   }, chat_id)
 
@@ -429,7 +448,67 @@ def interactive_card_title(msg: dict | None) -> str:
     text = title.get("content")
     if isinstance(text, str):
       return text
+  header = parsed.get("header")
+  if isinstance(header, dict):
+    header_title = header.get("title")
+    if isinstance(header_title, dict):
+      content = header_title.get("content")
+      if isinstance(content, str):
+        return content
+    if isinstance(header_title, str):
+      return header_title
   return ""
+
+
+def interactive_card_text(msg: dict | None) -> str:
+  """Return a searchable string for an interactive card body."""
+  if not msg or msg.get("type") != "interactive":
+    return ""
+  body = msg.get("body", "")
+  if not isinstance(body, str) or not body:
+    return ""
+  try:
+    parsed = json.loads(body)
+  except json.JSONDecodeError:
+    return body
+  return json.dumps(parsed, ensure_ascii=False)
+
+
+def wait_for_interactive_title(
+  chat_id: str,
+  after: str,
+  title_prefix: str,
+  timeout: int = 60,
+  poll: int = 2,
+) -> tuple[dict | None, float]:
+  """Poll bot messages until an interactive card title matches."""
+  start = time.time()
+  deadline = start + timeout
+  while time.time() < deadline:
+    for msg in get_bot_msgs(chat_id, after=after, limit=10):
+      if interactive_card_title(msg).startswith(title_prefix):
+        return msg, time.time() - start
+    time.sleep(poll)
+  return None, time.time() - start
+
+
+def wait_for_shell_terminal_card(
+  chat_id: str,
+  after: str,
+  timeout: int = 60,
+  poll: int = 2,
+) -> tuple[dict | None, float]:
+  """Wait for a shell card to leave the running state."""
+  start = time.time()
+  deadline = start + timeout
+  terminal = ("Shell done", "Shell failed", "Shell timed out", "Shell aborted", "Shell error")
+  while time.time() < deadline:
+    for msg in get_bot_msgs(chat_id, after=after, limit=10):
+      title = interactive_card_title(msg)
+      if any(title.startswith(t) for t in terminal):
+        return msg, time.time() - start
+    time.sleep(poll)
+  return None, time.time() - start
 
 
 def is_done_response(msg: dict | None) -> bool:
@@ -1486,12 +1565,188 @@ def run_topic_tests(pid: int, chat_id: str, result: E2EResult) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Phase 11: /agent + preset switching
+# Phase 11: Shell Shortcuts
+# ---------------------------------------------------------------------------
+
+def _extract_shell_job_id(msg: dict | None) -> str:
+  text = interactive_card_text(msg)
+  m = re.search(r"job: [`']?([0-9a-f]{8})", text)
+  return m.group(1) if m else ""
+
+
+def _extract_shell_job_id_from_log(log: LogAnalyzer, mark: int) -> str:
+  chunk = log.read_since(mark)
+  matches = re.findall(r"Shell job ([0-9a-f]{8}) started", chunk)
+  return matches[-1] if matches else ""
+
+
+def run_shell_tests(pid: int, chat_id: str, result: E2EResult) -> None:
+  """Phase 11: !/!! shell shortcuts, context injection, and abort."""
+  print(f"{Colors.BOLD}Phase 11: Shell Shortcuts{Colors.RESET}")
+  log = LogAnalyzer(pid)
+  tmpdir = tempfile.mkdtemp(prefix="nemo-shell-e2e-")
+  marker = f"NEMO_SHELL_MARKER_{int(time.time())}"
+  noinject_marker = f"NEMO_NOINJECT_{int(time.time())}"
+  print(f"  Temp dir: {tmpdir}")
+
+  try:
+    ts = str(int(time.time() * 1000))
+    send_msg(f"/cd {tmpdir}", chat_id)
+    msg, elapsed = wait_for_response(chat_id, after=ts, timeout=15)
+    if msg:
+      result.ok("T90 /cd for shell", f"{elapsed:.1f}s")
+    else:
+      result.fail("T90 /cd for shell", "no response")
+      return
+    wait_for_idle(pid, chat_id, timeout=20)
+
+    complex_cmd = (
+      "!python3 - <<'PY'\n"
+      "import json, pathlib, sys, time\n"
+      "pathlib.Path('shell-result.txt').write_text('file-content', encoding='utf-8')\n"
+      "print('phase=begin', flush=True)\n"
+      "time.sleep(0.2)\n"
+      f"print(json.dumps({{'marker': {marker!r}, 'numbers': [1, 2, 3]}}), flush=True)\n"
+      "print('warn=stderr-line', file=sys.stderr, flush=True)\n"
+      "print('phase=end', flush=True)\n"
+      "PY"
+    )
+    ts = str(int(time.time() * 1000))
+    log_mark = log.mark()
+    print("  [T91] Complex ! shell command...")
+    send_msg(complex_cmd, chat_id)
+    shell_msg, elapsed = wait_for_shell_terminal_card(
+      chat_id, ts, timeout=45, poll=2)
+    shell_title = interactive_card_title(shell_msg)
+    completed = log.wait_for_since(
+      r"Shell job [0-9a-f]{8} completed status=done",
+      log_mark,
+      timeout=5,
+      poll=1,
+    )
+    result_file = os.path.join(tmpdir, "shell-result.txt")
+    if (
+      shell_msg
+      and shell_title.startswith("Shell done")
+      and completed
+      and os.path.exists(result_file)
+    ):
+      result.ok("T91 shell complex command", f"{elapsed:.1f}s")
+    else:
+      result.fail(
+        "T91 shell complex command",
+        f"title={shell_title or 'none'} completed={completed} file={os.path.exists(result_file)}",
+      )
+      log.dump_tail(20, "T91")
+      return
+
+    ts = str(int(time.time() * 1000))
+    log_mark = log.mark()
+    print("  [T92] Shell context injection...")
+    send_msg(
+      "From the Nemo shell context, reply with only the marker value.",
+      chat_id,
+    )
+    msg, elapsed = wait_for_response(chat_id, after=ts, timeout=60, require_done=True)
+    injected = log.wait_for_since(
+      r"Injecting 1 shell context\(s\) into next turn",
+      log_mark,
+      timeout=5,
+      poll=1,
+    )
+    if msg and injected:
+      result.ok("T92 shell context injection", f"{elapsed:.1f}s")
+    else:
+      result.fail(
+        "T92 shell context injection",
+        f"response={bool(msg)} injected_log={injected}",
+      )
+      log.dump_tail(20, "T92")
+
+    ts = str(int(time.time() * 1000))
+    print("  [T93] !! shell command...")
+    send_msg(
+      f"!!sh -c 'printf {noinject_marker!r} > noinject.txt; printf {noinject_marker!r}'",
+      chat_id,
+    )
+    noinject_card, elapsed = wait_for_interactive_title(
+      chat_id, ts, "Shell done", timeout=30, poll=2)
+    noinject_file = os.path.join(tmpdir, "noinject.txt")
+    if noinject_card and os.path.exists(noinject_file):
+      result.ok("T93 shell no-inject command", f"{elapsed:.1f}s")
+    else:
+      result.fail("T93 shell no-inject command", "missing no-inject output")
+
+    ts = str(int(time.time() * 1000))
+    print("  [T94] Verify !! did not inject...")
+    send_msg(
+      "If the previous !! shell output is in your context, repeat it; "
+      "otherwise reply exactly NO_CONTEXT.",
+      chat_id,
+    )
+    msg, elapsed = wait_for_response(chat_id, after=ts, timeout=60, require_done=True)
+    body = json.dumps(msg.get("body", "") if msg else "")
+    if msg and noinject_marker not in body and "NO_CONTEXT" in body:
+      result.ok("T94 shell no-inject context", f"{elapsed:.1f}s")
+    elif msg and noinject_marker not in body:
+      result.ok("T94 shell no-inject context", "marker absent")
+    else:
+      result.fail("T94 shell no-inject context", "!! marker leaked to agent")
+      log.dump_tail(20, "T94")
+
+    long_cmd = (
+      "!python3 - <<'PY'\n"
+      "import time\n"
+      "print('abort-ready', flush=True)\n"
+      "time.sleep(30)\n"
+      "print('should-not-finish', flush=True)\n"
+      "PY"
+    )
+    ts = str(int(time.time() * 1000))
+    log_mark = log.mark()
+    print("  [T95] Shell abort button action...")
+    send_msg(long_cmd, chat_id)
+    running_msg, elapsed = wait_for_interactive_title(
+      chat_id, ts, "Shell running", timeout=20, poll=1)
+    job_id = _extract_shell_job_id(running_msg) or _extract_shell_job_id_from_log(
+      log, log_mark)
+    if running_msg and job_id:
+      result.ok("T95 shell running card", f"{elapsed:.1f}s job={job_id}")
+    else:
+      result.fail("T95 shell running card", "no running card/job id")
+      log.dump_tail(20, "T95")
+      return
+
+    send_card_action({"action": "shell_abort", "job_id": job_id}, chat_id)
+    aborted_msg, elapsed = wait_for_interactive_title(
+      chat_id, ts, "Shell aborted", timeout=20, poll=1)
+    aborted_log = log.wait_for_since(
+      rf"Shell job {job_id} completed status=aborted",
+      log_mark,
+      timeout=5,
+      poll=1,
+    )
+    if aborted_msg and aborted_log:
+      result.ok("T96 shell abort", f"{elapsed:.1f}s")
+    else:
+      result.fail("T96 shell abort", "no aborted card")
+      log.dump_tail(20, "T96")
+
+  finally:
+    send_msg(f"/cd {PROJECT_DIR}", chat_id)
+    time.sleep(5)
+    shutil.rmtree(tmpdir, ignore_errors=True)
+
+  print()
+
+
+# ---------------------------------------------------------------------------
+# Phase 12: /agent + preset switching
 # ---------------------------------------------------------------------------
 
 def run_switch_tests(pid: int, chat_id: str, result: E2EResult,
                      agent: str) -> None:
-  """Phase 11: exercise /agent runtime switching and the preset
+  """Phase 12: exercise /agent runtime switching and the preset
   registry's /model expansion.
 
   The daemon is started on the caller's --agent; we drive it
@@ -1743,8 +1998,10 @@ def main():
                       help="Run only media & interaction test (Phase 9)")
   parser.add_argument("--topic", action="store_true",
                       help="Run only topic-chat regression test (Phase 10)")
+  parser.add_argument("--shell", action="store_true",
+                      help="Run only shell shortcut test (Phase 11)")
   parser.add_argument("--switch", action="store_true",
-                      help="Run only /agent + preset switch test (Phase 11)")
+                      help="Run only /agent + preset switch test (Phase 12)")
   parser.add_argument("--verbose", "-v", action="store_true",
                       help="Verbose nemo logging")
   args = parser.parse_args()
@@ -1752,7 +2009,8 @@ def main():
   chat_id = args.chat_id.strip()
   result = E2EResult()
   single_phase = (args.stress or args.project or args.perm
-                  or args.dual or args.media or args.topic or args.switch)
+                  or args.dual or args.media or args.topic
+                  or args.shell or args.switch)
   run_all = not single_phase
   created_temp_chat = False
 
@@ -1819,6 +2077,8 @@ def main():
     print(f"  Mode: media & interaction test only")
   elif args.topic:
     print(f"  Mode: topic chat test only")
+  elif args.shell:
+    print(f"  Mode: shell shortcut test only")
   elif args.switch:
     print(f"  Mode: /agent + preset switch test only")
   print()
@@ -2043,6 +2303,8 @@ def main():
           wait_for_idle(pid, chat_id, timeout=30)
           run_topic_tests(pid, chat_id, result)
           wait_for_idle(pid, chat_id, timeout=30)
+          run_shell_tests(pid, chat_id, result)
+          wait_for_idle(pid, chat_id, timeout=30)
           run_switch_tests(pid, chat_id, result, args.agent)
         finally:
           send_msg("/exit", chat_id)
@@ -2069,7 +2331,7 @@ def main():
         # Phase 8: dual-instance (manages its own processes)
         run_dual_instance(chat_id, result, verbose=args.verbose)
       else:
-        for name in ["T20-T24", "T30-T38", "T40-T43", "T50-T56", "T60-T63"]:
+        for name in ["T20-T24", "T30-T38", "T40-T43", "T50-T56", "T60-T63", "T90-T96"]:
           result.skip(name, "skipped by --skip-sdk")
 
     elif args.stress:
@@ -2107,6 +2369,14 @@ def main():
     elif args.topic:
       try:
         run_topic_tests(pid, chat_id, result)
+      finally:
+        send_msg("/exit", chat_id)
+        if not wait_for_exit(pid, timeout=35):
+          kill_nemo(pid)
+
+    elif args.shell:
+      try:
+        run_shell_tests(pid, chat_id, result)
       finally:
         send_msg("/exit", chat_id)
         if not wait_for_exit(pid, timeout=35):

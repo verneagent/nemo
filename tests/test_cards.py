@@ -3,7 +3,7 @@
 from nemo.cards import (
   ToolRecord, ThinkingStep, build_turn_card, build_card, build_markdown_card,
   build_form_select, build_form_input, build_ask_user_question_card,
-  tool_use_summary, _elapsed_title, _elapsed_text, _usage_text,
+  build_shell_card, tool_use_summary, _elapsed_title, _elapsed_text, _usage_text,
   _collapsible_thinking,
 )
 
@@ -29,6 +29,40 @@ def test_usage_text():
   assert _usage_text({}) == ""
   assert _usage_text({"input_tokens": 1000}) == "in: 1,000"
   assert _usage_text({"input_tokens": 1000, "output_tokens": 200}) == "in: 1,000 | out: 200"
+
+
+def test_shell_card_running_has_abort_button():
+  card = build_shell_card(
+    "running",
+    job_id="job123",
+    command="echo hi",
+    cwd="/tmp/project",
+    elapsed=1,
+    inject_context=True,
+    chat_id="oc_test",
+  )
+  elements = card["body"]["elements"]
+  button_row = elements[-1]
+  button = button_row["columns"][0]["elements"][0]
+  assert button["text"]["content"] == "Abort"
+  assert button["value"]["action"] == "shell_abort"
+  assert button["value"]["job_id"] == "job123"
+
+
+def test_shell_card_done_removes_abort_button():
+  card = build_shell_card(
+    "done",
+    job_id="job123",
+    command="echo hi",
+    cwd="/tmp/project",
+    elapsed=1,
+    inject_context=True,
+    chat_id="oc_test",
+    exit_code=0,
+    stdout="hi\n",
+  )
+  assert "Shell done" == card["header"]["title"]["content"]
+  assert all(el.get("tag") != "column_set" for el in card["body"]["elements"])
 
 
 # ---------------------------------------------------------------------------
