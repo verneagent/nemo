@@ -220,9 +220,38 @@ def test_shell_job_manager_timeout_terminates_process(tmp_path):
   assert final_card["header"]["title"]["content"] == "Shell timed out"
 
 
+def test_shell_job_manager_double_bang_ignores_default_timeout(tmp_path):
+  contexts: list[str] = []
+  channel = _ShellChannel()
+  manager = ShellJobManager(
+    channel,
+    chat_id="oc_test",
+    project_dir=str(tmp_path),
+    on_context=contexts.append,
+    timeout=0.1,
+  )
+  code = "import time; time.sleep(0.25); print('done')"
+  command = f"{shlex.quote(sys.executable)} -c {shlex.quote(code)}"
+
+  async def _run():
+    req = parse_shell_shortcut(f"!!{command}")
+    assert req is not None
+    await manager.start(req)
+    while not channel.updated_cards:
+      await asyncio.sleep(0.05)
+    await manager.close()
+
+  asyncio.run(_run())
+
+  assert contexts == []
+  final_card = channel.updated_cards[-1][1]
+  assert final_card["header"]["title"]["content"] == "Shell done"
+
+
 def test_shell_job_manager_streaming_updates_card_before_done(tmp_path):
   contexts: list[str] = []
   channel = _ShellChannel()
+  update_now = asyncio.Event()
   manager = ShellJobManager(
     channel,
     chat_id="oc_test",
@@ -240,10 +269,21 @@ def test_shell_job_manager_streaming_updates_card_before_done(tmp_path):
   )
   command = f"{shlex.quote(sys.executable)} -c {shlex.quote(code)}"
 
+  async def _periodic_update(job):
+    await update_now.wait()
+    await manager._safe_update_card(job)
+
   async def _run():
     req = parse_shell_shortcut(f"!{command}")
     assert req is not None
-    await manager.start(req)
+    original_periodic_update = manager._periodic_update
+    manager._periodic_update = _periodic_update
+    try:
+      await manager.start(req)
+      await asyncio.sleep(0.1)
+      update_now.set()
+    finally:
+      manager._periodic_update = original_periodic_update
     while not contexts:
       await asyncio.sleep(0.05)
     await manager.close()

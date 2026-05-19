@@ -24,7 +24,8 @@ from .types import JsonObject
 
 log = logging.getLogger(__name__)
 
-DEFAULT_TIMEOUT = 60.0
+DEFAULT_TIMEOUT = 300.0
+CARD_UPDATE_INTERVAL = 3.0
 DISPLAY_TAIL_CHARS = 16_000
 CONTEXT_TAIL_CHARS = 32_000
 MAX_PENDING_CONTEXTS = 8
@@ -164,7 +165,7 @@ class ShellJobManager:
     chat_id: str,
     project_dir: str,
     on_context: Callable[[str], None],
-    timeout: float = DEFAULT_TIMEOUT,
+    timeout: float | None = DEFAULT_TIMEOUT,
   ) -> None:
     self._channel = channel
     self._chat_id = chat_id
@@ -259,12 +260,15 @@ class ShellJobManager:
         asyncio.create_task(self._read_stream(job, "stdout", proc.stdout)),
         asyncio.create_task(self._read_stream(job, "stderr", proc.stderr)),
       ]
-      try:
-        await asyncio.wait_for(proc.wait(), timeout=self._timeout)
-      except TimeoutError:
-        timed_out = True
-        job.status = "timeout"
-        await self._terminate_process_group(proc)
+      if job.inject_context and self._timeout is not None:
+        try:
+          await asyncio.wait_for(proc.wait(), timeout=self._timeout)
+        except TimeoutError:
+          timed_out = True
+          job.status = "timeout"
+          await self._terminate_process_group(proc)
+      else:
+        await proc.wait()
       await asyncio.gather(*readers, return_exceptions=True)
       if job.abort_requested:
         job.status = "aborted"
@@ -322,7 +326,7 @@ class ShellJobManager:
 
   async def _periodic_update(self, job: ShellJob) -> None:
     while job.status == "running":
-      await asyncio.sleep(0.75)
+      await asyncio.sleep(CARD_UPDATE_INTERVAL)
       await self._safe_update_card(job)
 
   async def _safe_update_card(self, job: ShellJob) -> None:
