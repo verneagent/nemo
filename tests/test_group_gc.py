@@ -73,6 +73,36 @@ def test_collect_gc_chats_lists_nemo_marked_chat_not_owned_by_bot():
   heartbeat.assert_called_once_with("oc_1")
 
 
+def test_collect_gc_chats_treats_missing_owner_as_bot_owned():
+  with mock.patch("nemo.lark.api.list_bot_chats", return_value=[
+    {"chat_id": "oc_1", "name": "owned"},
+  ]), mock.patch("nemo.lark.api.get_chat_info", return_value={
+    "name": "owned",
+    "description": "workspace:Mac|/repo",
+  }), mock.patch("nemo.lark.api.get_bot_info", return_value={
+    "open_id": "ou_bot",
+  }), mock.patch("nemo.relay.heartbeat_status", return_value={"alive": False}):
+    rows = collect_gc_chats("tok")
+
+  assert len(rows) == 1
+  assert rows[0].is_owner is True
+
+
+def test_collect_gc_chats_falls_back_to_list_owner_when_info_omits_owner():
+  with mock.patch("nemo.lark.api.list_bot_chats", return_value=[
+    {"chat_id": "oc_1", "name": "owned", "owner_id": "ou_bot"},
+  ]), mock.patch("nemo.lark.api.get_chat_info", return_value={
+    "name": "owned",
+    "description": "workspace:Mac|/repo",
+  }), mock.patch("nemo.lark.api.get_bot_info", return_value={
+    "open_id": "ou_bot",
+  }), mock.patch("nemo.relay.heartbeat_status", return_value={"alive": False}):
+    rows = collect_gc_chats("tok")
+
+  assert len(rows) == 1
+  assert rows[0].is_owner is True
+
+
 def test_collect_gc_chats_skips_when_bot_owner_unknown():
   with mock.patch("nemo.lark.api.get_bot_info", return_value={}), \
        mock.patch("nemo.lark.api.list_bot_chats") as list_chats:
@@ -135,17 +165,21 @@ def test_dissolve_chats_refuses_unknown_heartbeat():
   dissolve.assert_not_called()
 
 
-def test_dissolve_chats_leaves_not_owned_group():
+def test_dissolve_chats_leaves_not_owned_group_with_app_id():
   row = GcChat("oc_1", "one", "", True, False, "", "", "", False)
   with mock.patch("nemo.relay.heartbeat_status", return_value={"alive": False}), \
-       mock.patch("nemo.lark.api.get_bot_info", return_value={"open_id": "ou_bot"}), \
        mock.patch("nemo.lark.api.remove_chat_members") as remove, \
        mock.patch("nemo.lark.api.dissolve_chat") as dissolve:
-    dissolved, skipped = dissolve_chats("tok", [row])
+    dissolved, skipped = dissolve_chats("tok", [row], app_id="cli_app")
 
   assert skipped == []
   assert dissolved == ["Left one (oc_1)"]
-  remove.assert_called_once_with("tok", "oc_1", ["ou_bot"])
+  remove.assert_called_once_with(
+    "tok",
+    "oc_1",
+    ["cli_app"],
+    member_id_type="app_id",
+  )
   dissolve.assert_not_called()
 
 
@@ -157,7 +191,7 @@ def test_gc_clean_interactive_selection_dissolves_selected(capsys):
   with mock.patch("nemo.group_gc.collect_gc_chats", return_value=rows), \
        mock.patch("nemo.relay.heartbeat_status", return_value={"alive": False}), \
        mock.patch("nemo.lark.api.dissolve_chat") as dissolve, \
-       mock.patch("sys.stdin.readline", side_effect=["2\n", "dissolve\n"]):
+       mock.patch("sys.stdin.readline", side_effect=["2\n", "yes\n"]):
     rc = gc_clean("tok")
 
   assert rc == 0
@@ -172,14 +206,18 @@ def test_gc_clean_candidates_leave_not_owned_groups(capsys):
   ]
   with mock.patch("nemo.group_gc.collect_gc_chats", return_value=rows), \
        mock.patch("nemo.relay.heartbeat_status", return_value={"alive": False}), \
-       mock.patch("nemo.lark.api.get_bot_info", return_value={"open_id": "ou_bot"}), \
        mock.patch("nemo.lark.api.dissolve_chat") as dissolve, \
        mock.patch("nemo.lark.api.remove_chat_members") as remove:
-    rc = gc_clean("tok", yes=True)
+    rc = gc_clean("tok", yes=True, app_id="cli_app")
 
   assert rc == 0
   dissolve.assert_called_once_with("tok", "oc_1")
-  remove.assert_called_once_with("tok", "oc_2", ["ou_bot"])
+  remove.assert_called_once_with(
+    "tok",
+    "oc_2",
+    ["cli_app"],
+    member_id_type="app_id",
+  )
   out = capsys.readouterr().out
   assert "Dissolved owned" in out
   assert "Left not-owned" in out

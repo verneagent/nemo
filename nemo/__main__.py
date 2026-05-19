@@ -279,7 +279,7 @@ def _cmd_gc(argv: list[str]) -> int:
     help="List Nemo Lark groups and heartbeat status")
   clean = sub.add_parser(
     "clean", parents=[sub_profile_parent],
-    help="Interactively dissolve idle Nemo Lark groups")
+    help="Interactively clean idle Nemo Lark groups")
   clean.add_argument("--chat-id", default="", help="Clean one specific Lark chat")
   clean.add_argument("--yes", action="store_true",
                      help="Skip prompts; still refuses active/unknown groups")
@@ -303,7 +303,8 @@ def _cmd_gc(argv: list[str]) -> int:
   if args.cmd == "list":
     return gc_list(token)
   if args.cmd == "clean":
-    return gc_clean(token, chat_id=args.chat_id, yes=args.yes)
+    return gc_clean(token, chat_id=args.chat_id, yes=args.yes,
+                    app_id=credentials["app_id"])
   return 1
 
 
@@ -346,8 +347,8 @@ def main():
       "Maintenance commands:\n"
       "  nemo list               List discoverable Lark chats\n"
       "  nemo gc list            List Nemo Lark groups and heartbeat status\n"
-      "  nemo gc clean           Interactively dissolve idle Nemo Lark groups\n"
-      "  nemo gc clean --yes     Dissolve idle groups without prompts"
+      "  nemo gc clean           Interactively clean idle Nemo Lark groups\n"
+      "  nemo gc clean --yes     Clean idle groups without prompts"
     ),
   )
   parser.add_argument("--version", "-V", action="version",

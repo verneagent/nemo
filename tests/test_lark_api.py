@@ -551,8 +551,27 @@ def test_add_chat_members_failure():
 
 def test_remove_chat_members():
   data = {"code": 0}
-  with mock.patch("urllib.request.urlopen", return_value=_mock_response(data)):
+  with mock.patch("urllib.request.urlopen", return_value=_mock_response(data)) as urlopen:
     api.remove_chat_members("tok", "oc_1", ["ou_1"])
+  request = urlopen.call_args.args[0]
+  assert request.full_url.endswith(
+    "/im/v1/chats/oc_1/members?member_id_type=open_id"
+  )
+
+
+def test_remove_chat_members_accepts_app_id_type():
+  data = {"code": 0}
+  with mock.patch("urllib.request.urlopen", return_value=_mock_response(data)) as urlopen:
+    api.remove_chat_members(
+      "tok",
+      "oc_1",
+      ["cli_app"],
+      member_id_type="app_id",
+    )
+  request = urlopen.call_args.args[0]
+  assert request.full_url.endswith(
+    "/im/v1/chats/oc_1/members?member_id_type=app_id"
+  )
 
 
 def test_remove_chat_members_failure():
@@ -571,9 +590,11 @@ def test_remove_chat_members_failure():
 
 def test_get_chat_info_success():
   data = {"code": 0, "data": {"name": "Test", "description": "desc"}}
-  with mock.patch("urllib.request.urlopen", return_value=_mock_response(data)):
+  with mock.patch("urllib.request.urlopen", return_value=_mock_response(data)) as urlopen:
     info = api.get_chat_info("tok", "oc_1")
   assert info["name"] == "Test"
+  request = urlopen.call_args.args[0]
+  assert request.full_url.endswith("/im/v1/chats/oc_1?user_id_type=open_id")
 
 
 def test_get_chat_info_error():

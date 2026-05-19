@@ -121,7 +121,7 @@ def lookup_open_id_by_email(token: str, email: str) -> str | None:
 
 def get_chat_info(token: str, chat_id: str) -> JsonObject:
   """Get chat group info."""
-  url = f"{BASE_URL}/im/v1/chats/{chat_id}"
+  url = f"{BASE_URL}/im/v1/chats/{chat_id}?user_id_type=open_id"
   data = _request(url, token)
   if data.get("code") != 0:
     return {}
@@ -528,10 +528,19 @@ def add_chat_members(token: str, chat_id: str, user_ids: list[str]) -> None:
 
 
 
-def remove_chat_members(token: str, chat_id: str, user_ids: list[str]) -> None:
-  """Remove members from a chat."""
-  url = f"{BASE_URL}/im/v1/chats/{chat_id}/members?member_id_type=open_id"
-  data = _request(url, token, {"id_list": user_ids}, method="DELETE")
+def remove_chat_members(
+  token: str,
+  chat_id: str,
+  member_ids: list[str],
+  *,
+  member_id_type: str = "open_id",
+) -> None:
+  """Remove users or bots from a chat."""
+  url = (
+    f"{BASE_URL}/im/v1/chats/{chat_id}/members"
+    f"?member_id_type={member_id_type}"
+  )
+  data = _request(url, token, {"id_list": member_ids}, method="DELETE")
   if data.get("code") != 0:
     raise RuntimeError(f"Failed to remove chat members: {data}")
 

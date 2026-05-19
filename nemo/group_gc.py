@@ -132,7 +132,10 @@ def collect_gc_chats(token: str, *, include_unknown: bool = True) -> list[GcChat
     alive, error, machine, model = _heartbeat_status(chat_id)
     if error and not include_unknown:
       continue
-    owner_id = _chat_owner_id(info)
+    owner_id = _chat_owner_id(info) or _chat_owner_id(chat)
+    # Lark omits owner_id/owner_id_type when the group owner is a bot.
+    # A present non-bot owner_id is the only signal that this app is not owner.
+    is_owner = not owner_id or owner_id == bot_open_id
     rows.append(GcChat(
       chat_id=chat_id,
       name=name,
@@ -142,7 +145,7 @@ def collect_gc_chats(token: str, *, include_unknown: bool = True) -> list[GcChat
       heartbeat_error=error,
       machine=machine,
       model=model,
-      is_owner=owner_id == bot_open_id,
+      is_owner=is_owner,
     ))
   rows.sort(key=lambda r: (r.status, not r.is_owner, r.name.lower(), r.chat_id))
   return rows
@@ -197,7 +200,7 @@ def _parse_selection(selection: str, rows: list[GcChat]) -> list[GcChat]:
 
 def _confirm(prompt: str) -> bool:
   print(prompt, end="", flush=True)
-  return sys.stdin.readline().strip() == "dissolve"
+  return sys.stdin.readline().strip().lower() == "yes"
 
 
 def _safe_to_dissolve(chat_id: str) -> tuple[bool, str]:
@@ -209,12 +212,16 @@ def _safe_to_dissolve(chat_id: str) -> tuple[bool, str]:
   return True, ""
 
 
-def dissolve_chats(token: str, rows: list[GcChat]) -> tuple[list[str], list[str]]:
+def dissolve_chats(
+  token: str,
+  rows: list[GcChat],
+  *,
+  app_id: str = "",
+) -> tuple[list[str], list[str]]:
   from .lark import api as lark_api
 
   completed: list[str] = []
   skipped: list[str] = []
-  bot_open_id = ""
   for row in rows:
     ok, reason = _safe_to_dissolve(row.chat_id)
     if not ok:
@@ -225,12 +232,15 @@ def dissolve_chats(token: str, rows: list[GcChat]) -> tuple[list[str], list[str]
         lark_api.dissolve_chat(token, row.chat_id)
         completed.append(f"Dissolved {row.name} ({row.chat_id})")
       else:
-        if not bot_open_id:
-          bot_open_id = _bot_open_id(token)
-        if not bot_open_id:
-          skipped.append(f"{row.name} ({row.chat_id}): bot open_id unavailable")
+        if not app_id:
+          skipped.append(f"{row.name} ({row.chat_id}): app_id unavailable")
           continue
-        lark_api.remove_chat_members(token, row.chat_id, [bot_open_id])
+        lark_api.remove_chat_members(
+          token,
+          row.chat_id,
+          [app_id],
+          member_id_type="app_id",
+        )
         completed.append(f"Left {row.name} ({row.chat_id})")
     except Exception as exc:
       skipped.append(f"{row.name} ({row.chat_id}): {exc}")
@@ -242,7 +252,13 @@ def gc_list(token: str) -> int:
   return 0
 
 
-def gc_clean(token: str, *, chat_id: str = "", yes: bool = False) -> int:
+def gc_clean(
+  token: str,
+  *,
+  chat_id: str = "",
+  yes: bool = False,
+  app_id: str = "",
+) -> int:
   if chat_id:
     rows = [row for row in collect_gc_chats(token) if row.chat_id == chat_id]
     if not rows:
@@ -261,16 +277,16 @@ def gc_clean(token: str, *, chat_id: str = "", yes: bool = False) -> int:
     if yes:
       selected = candidates
     else:
-      print('\nSelect groups to dissolve (numbers separated by spaces, or "all"): ', end="", flush=True)
+      print('\nSelect groups to clean (numbers separated by spaces, or "all"): ', end="", flush=True)
       selected = _parse_selection(sys.stdin.readline(), candidates)
       if not selected:
         print("No groups selected.")
         return 0
   if not yes and not _confirm(
-      f'About to dissolve {len(selected)} Lark group(s). Type "dissolve" to continue: '):
+      f'About to clean {len(selected)} Lark group(s). Type "yes" to continue: '):
     print("Cancelled.")
     return 1
-  dissolved, skipped = dissolve_chats(token, selected)
+  dissolved, skipped = dissolve_chats(token, selected, app_id=app_id)
   for item in dissolved:
     print(item)
   for item in skipped:
