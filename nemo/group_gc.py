@@ -18,6 +18,7 @@ class GcChat:
   heartbeat_error: str
   machine: str
   model: str
+  is_owner: bool
 
   @property
   def status(self) -> str:
@@ -108,7 +109,7 @@ def _heartbeat_status(chat_id: str) -> tuple[bool, str, str, str]:
 
 
 def collect_gc_chats(token: str, *, include_unknown: bool = True) -> list[GcChat]:
-  """Collect bot-owned Nemo-managed chats with heartbeat status."""
+  """Collect Nemo-managed chats with heartbeat status."""
   from .lark import api as lark_api
 
   rows: list[GcChat] = []
@@ -128,11 +129,10 @@ def collect_gc_chats(token: str, *, include_unknown: bool = True) -> list[GcChat
     is_nemo = _is_nemo_chat(token, chat_id, description)
     if not is_nemo:
       continue
-    if _chat_owner_id(info) != bot_open_id:
-      continue
     alive, error, machine, model = _heartbeat_status(chat_id)
     if error and not include_unknown:
       continue
+    owner_id = _chat_owner_id(info)
     rows.append(GcChat(
       chat_id=chat_id,
       name=name,
@@ -142,8 +142,9 @@ def collect_gc_chats(token: str, *, include_unknown: bool = True) -> list[GcChat
       heartbeat_error=error,
       machine=machine,
       model=model,
+      is_owner=owner_id == bot_open_id,
     ))
-  rows.sort(key=lambda r: (r.status, r.name.lower(), r.chat_id))
+  rows.sort(key=lambda r: (r.status, not r.is_owner, r.name.lower(), r.chat_id))
   return rows
 
 
@@ -156,7 +157,7 @@ def _short(text: str, limit: int) -> str:
 def format_gc_table(rows: list[GcChat]) -> str:
   if not rows:
     return "No Nemo Lark groups found."
-  lines = [f"{'#':>3} {'STATUS':<8} {'CHAT_ID':<36} {'NAME':<28} DETAILS"]
+  lines = [f"{'#':>3} {'STATUS':<8} {'OWNER':<5} {'CHAT_ID':<36} {'NAME':<28} DETAILS"]
   for idx, row in enumerate(rows, start=1):
     details = ""
     if row.heartbeat_error:
@@ -169,7 +170,8 @@ def format_gc_table(rows: list[GcChat]) -> str:
         parts.append(f"model={row.model}")
       details = " ".join(parts)
     lines.append(
-      f"{idx:>3} {row.status:<8} {row.chat_id:<36} "
+      f"{idx:>3} {row.status:<8} {'yes' if row.is_owner else 'no':<5} "
+      f"{row.chat_id:<36} "
       f"{_short(row.name, 28):<28} {details}"
     )
   return "\n".join(lines)
@@ -210,19 +212,29 @@ def _safe_to_dissolve(chat_id: str) -> tuple[bool, str]:
 def dissolve_chats(token: str, rows: list[GcChat]) -> tuple[list[str], list[str]]:
   from .lark import api as lark_api
 
-  dissolved: list[str] = []
+  completed: list[str] = []
   skipped: list[str] = []
+  bot_open_id = ""
   for row in rows:
     ok, reason = _safe_to_dissolve(row.chat_id)
     if not ok:
       skipped.append(f"{row.name} ({row.chat_id}): {reason}")
       continue
     try:
-      lark_api.dissolve_chat(token, row.chat_id)
-      dissolved.append(f"{row.name} ({row.chat_id})")
+      if row.is_owner:
+        lark_api.dissolve_chat(token, row.chat_id)
+        completed.append(f"Dissolved {row.name} ({row.chat_id})")
+      else:
+        if not bot_open_id:
+          bot_open_id = _bot_open_id(token)
+        if not bot_open_id:
+          skipped.append(f"{row.name} ({row.chat_id}): bot open_id unavailable")
+          continue
+        lark_api.remove_chat_members(token, row.chat_id, [bot_open_id])
+        completed.append(f"Left {row.name} ({row.chat_id})")
     except Exception as exc:
       skipped.append(f"{row.name} ({row.chat_id}): {exc}")
-  return dissolved, skipped
+  return completed, skipped
 
 
 def gc_list(token: str) -> int:
@@ -260,7 +272,7 @@ def gc_clean(token: str, *, chat_id: str = "", yes: bool = False) -> int:
     return 1
   dissolved, skipped = dissolve_chats(token, selected)
   for item in dissolved:
-    print(f"Dissolved {item}")
+    print(item)
   for item in skipped:
     print(f"Skipped {item}", file=sys.stderr)
   return 1 if skipped and not dissolved else 0
