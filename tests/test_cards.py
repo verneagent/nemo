@@ -803,3 +803,149 @@ def test_askq_card_no_questions_still_renders():
   )
   assert card["schema"] == "2.0"
   assert isinstance(card["body"]["elements"], list)
+
+
+# ---------------------------------------------------------------------------
+# build_turn_card with embedded AskUserQuestion state
+# ---------------------------------------------------------------------------
+
+
+def test_turn_card_working_renders_pending_question_inline():
+  """A PendingQuestion on the working card injects question header,
+  options buttons (with chat_id) and an 'Other' fallback button."""
+  from nemo.channel import PendingQuestion
+
+  pending = PendingQuestion(
+    questions=[_question("Where?", "Screen", ["Login", "Match"])],
+    nonce="N1",
+  )
+  card = build_turn_card(
+    "working",
+    steps=[],
+    elapsed=5,
+    chat_id="oc_x",
+    pending_question=pending,
+  )
+  elements = card["body"]["elements"]
+  # Header markdown for the question must appear inline (not via a
+  # separate card body wrapper).
+  assert any(
+    e.get("tag") == "markdown" and "Screen" in e.get("content", "")
+    for e in elements
+  )
+  # Option + Other action strings show up with the right nonce/qidx/oidx.
+  actions: list[str] = []
+  for el in elements:
+    if el.get("tag") == "column_set":
+      for col in el.get("columns", []):
+        for child in col.get("elements", []):
+          a = child.get("value", {}).get("action", "")
+          if a:
+            actions.append(a)
+  assert "askq:N1:0:0" in actions
+  assert "askq:N1:0:1" in actions
+  assert "askq:N1:0:other" in actions
+
+
+def test_turn_card_working_renders_answered_summary_above_thinking():
+  """Answered questions render as a compact `❓ … → ✅ …` line near the
+  top of the card, before the current_tool / thinking sections."""
+  from nemo.channel import AnsweredQuestion
+
+  answered = [
+    AnsweredQuestion(header="Severity", question="How bad?", answer="P0"),
+    AnsweredQuestion(header="Where", question="Which screen?", answer="Login"),
+  ]
+  card = build_turn_card(
+    "working",
+    steps=[ThinkingStep("thinking", "looking around")],
+    elapsed=12,
+    chat_id="oc_x",
+    answered_questions=answered,
+    current_tool="Bash: grep",
+  )
+  elements = card["body"]["elements"]
+  # First element is the answered-questions block.
+  assert elements[0].get("tag") == "markdown"
+  content = elements[0]["content"]
+  assert "❓ **Severity**" in content
+  assert "✅ P0" in content
+  assert "❓ **Where**" in content
+  assert "✅ Login" in content
+  # Answered block appears before current_tool and thinking panel.
+  positions = {
+    "answered": 0,
+    "current_tool": next(
+      i for i, e in enumerate(elements)
+      if e.get("tag") == "markdown" and "`Bash: grep`" in e.get("content", "")
+    ),
+    "thinking": next(
+      i for i, e in enumerate(elements)
+      if e.get("tag") == "collapsible_panel"
+    ),
+  }
+  assert positions["answered"] < positions["current_tool"] < positions["thinking"]
+
+
+def test_turn_card_done_carries_answered_questions():
+  """The done card keeps the answered-question summary so the terminal
+  card shows what the user picked, not just the model's final reply."""
+  from nemo.channel import AnsweredQuestion
+
+  answered = [AnsweredQuestion(
+    header="Severity", question="How bad?", answer="P0")]
+  card = build_turn_card(
+    "done",
+    body="ok",
+    steps=[],
+    elapsed=20,
+    answered_questions=answered,
+  )
+  found = False
+  for el in card["body"]["elements"]:
+    if el.get("tag") == "markdown" and "❓ **Severity**" in el.get("content", ""):
+      assert "✅ P0" in el["content"]
+      found = True
+      break
+  assert found, "expected answered summary in the done card body"
+
+
+def test_turn_card_stopped_drops_pending_question():
+  """Once the turn is stopping/stopped/done the in-flight question
+  buttons must go away — there's no live handler waiting for clicks."""
+  from nemo.channel import PendingQuestion
+
+  pending = PendingQuestion(
+    questions=[_question("Q?", "Q", ["a"])],
+    nonce="N",
+  )
+  for phase in ("stopping", "stopped", "done", "error"):
+    card = build_turn_card(
+      phase,
+      body="x",
+      steps=[],
+      elapsed=1,
+      pending_question=pending,
+    )
+    for el in card["body"]["elements"]:
+      if el.get("tag") == "column_set":
+        for col in el.get("columns", []):
+          for child in col.get("elements", []):
+            a = child.get("value", {}).get("action", "")
+            assert not a.startswith("askq:"), \
+              f"{phase} card must not show askq buttons (saw {a})"
+
+
+def test_turn_card_multi_select_answer_renders_as_list():
+  """Multi-select answers render comma-separated in the summary line."""
+  from nemo.channel import AnsweredQuestion
+
+  answered = [AnsweredQuestion(
+    header="Tags", question="Pick any", answer=["a", "c"])]
+  card = build_turn_card("done", body="", steps=[], elapsed=1,
+                         answered_questions=answered)
+  for el in card["body"]["elements"]:
+    if el.get("tag") == "markdown" and "Tags" in el.get("content", ""):
+      assert "a, c" in el["content"]
+      return
+  raise AssertionError("expected multi-select answer rendered as 'a, c'")

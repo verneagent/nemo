@@ -26,7 +26,7 @@ from typing import TYPE_CHECKING, Callable
 from . import cards, commands, messages, monitor, shell_command
 from .agent_factory import AgentKind, build_coding_agent, is_model_compatible
 from .coding_agent import CodingAgent, EndpointConfig
-from .channel import IncomingMessage
+from .channel import IncomingMessage, TurnCardCtx
 from .config import load_credentials
 from .db import Database
 from .lark_channel import LarkChannel
@@ -272,6 +272,7 @@ def _update_done_card_with_fallback(
   await_channel,
   register_msg,
   compact_notice: str = "",
+  answered_questions=None,
 ) -> str:
   """Update the done card with tiered fallback; return the resulting id.
 
@@ -285,6 +286,7 @@ def _update_done_card_with_fallback(
     "done", body=final_text, steps=thinking,
     elapsed=elapsed, usage=usage, session_id=session_id,
     compact_notice=compact_notice,
+    answered_questions=answered_questions,
   )
   try:
     prev_id = turn_card_id
@@ -308,6 +310,7 @@ def _update_done_card_with_fallback(
     "done", body=preview_body, steps=thinking,
     elapsed=elapsed, usage=usage, session_id=session_id,
     compact_notice=compact_notice,
+    answered_questions=answered_questions,
   )
   try:
     prev_id = turn_card_id
@@ -337,6 +340,7 @@ def _update_done_card_with_fallback(
       "done", body=preview, steps=thinking,
       elapsed=elapsed, usage=usage, session_id=session_id,
       compact_notice=compact_notice,
+      answered_questions=answered_questions,
     )
     prev_id = turn_card_id
     turn_card_id = await_channel(
@@ -1824,6 +1828,7 @@ async def main_loop(
             elapsed=int(time.time() - _turn_start),
             rate_limit_notice=_turn_rate_limit_notice,
             compact_notice=_turn_compact_notice,
+            answered_questions=list(channel.turn_ctx.answered_questions),
           )
           prev_id = _turn_card_id
           _turn_card_id = await channel.update_card(_turn_card_id, card)
@@ -1835,6 +1840,83 @@ async def main_loop(
       def _await_channel(coro):
         return asyncio.run_coroutine_threadsafe(coro, main_loop_ref).result()
 
+      # _ensure_card and _update_working are lifted out of _on_event so the
+      # askq handler can call them via channel.turn_ctx.redraw to embed an
+      # in-flight AskUserQuestion into the working card (no separate card).
+      # Both run on the SDK thread (either via _on_event or via the
+      # can_use_tool callback) and use _await_channel to marshal IO to the
+      # main loop — same threading guarantee as before.
+
+      def _ensure_card():
+        """Create the working card if it doesn't exist yet."""
+        nonlocal _turn_card_id
+        if _turn_card_id:
+          return
+        _await_channel(_clear_ack())
+        card = cards.build_turn_card("working", chat_id=chat_id)
+        try:
+          _turn_card_id = _await_channel(channel.send_card(chat_id, card))
+          db.set_working(session_id, _turn_card_id)
+          _register_msg(_turn_card_id, chat_id)
+          channel.turn_ctx.turn_card_id = _turn_card_id
+        except Exception as e:
+          log.error("Working card error: %s", e)
+
+      def _update_working(**kwargs):
+        """Update the working card with current state."""
+        nonlocal _turn_card_id
+        if _turn_interrupt_phase:
+          return
+        if not _turn_card_id:
+          # The card-create call on the first progress event failed
+          # (transient Lark connection drop, rate-limit blip, etc).
+          # Retry now instead of staying silent for the rest of the
+          # turn — if the second attempt also fails, _ensure_card
+          # logs and leaves _turn_card_id None and we exit silently
+          # below, same as before.
+          _ensure_card()
+          if not _turn_card_id:
+            return
+        elapsed = int(time.time() - _turn_start)
+        # Merge in the AskUserQuestion state so the working card keeps
+        # showing both the picks the user already made and any in-flight
+        # question buttons. Callers may still pass `current_tool` etc as
+        # kwargs.
+        ctx_kwargs = {
+          "answered_questions": list(channel.turn_ctx.answered_questions),
+          "pending_question": channel.turn_ctx.pending_question,
+        }
+        ctx_kwargs.update(kwargs)
+        card = cards.build_turn_card(
+          "working",
+          steps=_turn_steps,
+          elapsed=elapsed,
+          chat_id=chat_id,
+          rate_limit_notice=_turn_rate_limit_notice,
+          compact_notice=_turn_compact_notice,
+          **ctx_kwargs,
+        )
+        try:
+          prev_id = _turn_card_id
+          _turn_card_id = _await_channel(channel.update_card(_turn_card_id, card))
+          if _turn_card_id != prev_id:
+            _register_msg(_turn_card_id, chat_id)
+            channel.turn_ctx.turn_card_id = _turn_card_id
+        except Exception as e:
+          log.debug("Failed to update working card: %s", e)
+
+      # Wire the askq handler's redraw signal to _update_working. The
+      # handler mutates channel.turn_ctx.pending_question / answered_questions
+      # and calls redraw() after each click; _update_working ensures the
+      # working card exists and PATCHes it.
+      def _turn_ctx_redraw():
+        try:
+          _update_working()
+        except Exception as e:
+          log.warning("turn_ctx redraw failed: %s", e)
+
+      channel.turn_ctx = TurnCardCtx(redraw=_turn_ctx_redraw)
+
       def _on_event(event):
         # Thread safety: this runs on the SDK thread. It mutates _turn_card_id,
         # _turn_steps. The main loop only reads these AFTER
@@ -1842,53 +1924,6 @@ async def main_loop(
         # _on_event calls have finished. No lock needed.
         nonlocal _turn_card_id, _sdk_session_id, _turn_current_tool
         nonlocal _turn_rate_limit_notice, _turn_compact_notice
-
-        def _ensure_card():
-          """Create working card if it doesn't exist yet."""
-          nonlocal _turn_card_id
-          if _turn_card_id:
-            return
-          _await_channel(_clear_ack())
-          card = cards.build_turn_card("working", chat_id=chat_id)
-          try:
-            _turn_card_id = _await_channel(channel.send_card(chat_id, card))
-            db.set_working(session_id, _turn_card_id)
-            _register_msg(_turn_card_id, chat_id)
-          except Exception as e:
-            log.error("Working card error: %s", e)
-
-        def _update_working(**kwargs):
-          """Update the working card with current state."""
-          nonlocal _turn_card_id
-          if _turn_interrupt_phase:
-            return
-          if not _turn_card_id:
-            # The card-create call on the first progress event failed
-            # (transient Lark connection drop, rate-limit blip, etc).
-            # Retry now instead of staying silent for the rest of the
-            # turn — if the second attempt also fails, _ensure_card
-            # logs and leaves _turn_card_id None and we exit silently
-            # below, same as before.
-            _ensure_card()
-            if not _turn_card_id:
-              return
-          elapsed = int(time.time() - _turn_start)
-          card = cards.build_turn_card(
-            "working",
-            steps=_turn_steps,
-            elapsed=elapsed,
-            chat_id=chat_id,
-            rate_limit_notice=_turn_rate_limit_notice,
-            compact_notice=_turn_compact_notice,
-            **kwargs,
-          )
-          try:
-            prev_id = _turn_card_id
-            _turn_card_id = _await_channel(channel.update_card(_turn_card_id, card))
-            if _turn_card_id != prev_id:
-              _register_msg(_turn_card_id, chat_id)
-          except Exception as e:
-            log.debug("Failed to update working card: %s", e)
 
         if isinstance(event, ProgressEvent):
           _turn_steps.append(cards.ThinkingStep(event.kind, event.summary))
@@ -1984,6 +2019,7 @@ async def main_loop(
               compact_notice=_turn_compact_notice,
               await_channel=_await_channel,
               register_msg=_register_msg,
+              answered_questions=list(channel.turn_ctx.answered_questions),
             )
             db.clear_working(session_id)
             if final_text:

@@ -396,13 +396,8 @@ def build_ask_user_question_handler(
 
     from .lark.auth import get_token
     from .lark.api import send_card, update_card
-    from .cards import build_ask_user_question_card
-
-    token = get_token(credentials["app_id"], credentials["app_secret"])
-    card = build_ask_user_question_card(questions, chat_id, nonce)
-    msg_id = send_card(token, chat_id, card)
-    log.info("AskUserQuestion: %d question(s) (card=%s, nonce=%s)",
-             len(questions), msg_id, nonce)
+    from .cards import build_ask_user_question_card, build_turn_card
+    from .channel import AnsweredQuestion, PendingQuestion
 
     # answers[qidx] = str (single-select) or list[str] (multi-select)
     answers: dict[int, object] = {}
@@ -411,6 +406,57 @@ def build_ask_user_question_handler(
     # only after it lands in multi_done — otherwise toggling a single option
     # would prematurely close the loop before the user picks the rest.
     multi_done: set[int] = set()
+
+    # Publish the in-flight question on the channel's turn context so the
+    # agent's working-card builder can render it inline. Mutating this
+    # object plus calling turn_ctx.redraw() is the only way we update the
+    # card — there is no separate card in the embedded path.
+    turn_ctx = getattr(events_source, "turn_ctx", None)
+    pending = PendingQuestion(
+      questions=questions,
+      answers=answers,
+      nonce=nonce,
+      multi_done=multi_done,
+    )
+    if turn_ctx is not None:
+      turn_ctx.pending_question = pending
+
+    def _redraw_via_turn_ctx() -> None:
+      """Repaint the working turn card after a click. Returns True if the
+      working card actually exists (so callers can decide to fall back to
+      a standalone card)."""
+      if turn_ctx is None:
+        return
+      try:
+        turn_ctx.redraw()
+      except Exception as e:
+        log.warning("turn_ctx redraw raised: %s", e)
+
+    # Initial paint into the working card. If the working card doesn't
+    # exist yet (e.g., AskUserQuestion is the very first event of the
+    # turn before any progress event), redraw() will run _ensure_card via
+    # the agent loop. We re-check turn_card_id afterwards and fall back
+    # to a standalone card if the working card still couldn't be created.
+    _redraw_via_turn_ctx()
+
+    fallback_msg_id: str = ""
+    use_standalone = turn_ctx is None or not turn_ctx.turn_card_id
+
+    if use_standalone:
+      log.info(
+        "AskUserQuestion: no working card available; "
+        "falling back to standalone card")
+      try:
+        token = get_token(credentials["app_id"], credentials["app_secret"])
+        card = build_ask_user_question_card(questions, chat_id, nonce)
+        fallback_msg_id = send_card(token, chat_id, card)
+      except Exception as e:
+        log.error("Failed to send fallback askq card: %s", e)
+
+    log.info(
+      "AskUserQuestion: %d question(s) (nonce=%s, embedded=%s, fallback=%s)",
+      len(questions), nonce, not use_standalone, fallback_msg_id or "-")
+
     awaiting_other_for: int | None = None
 
     import time as _time
@@ -440,9 +486,16 @@ def build_ask_user_question_handler(
       return True
 
     def _redraw_card() -> None:
+      """Repaint after a user action. Embedded path goes through the
+      turn-card redraw; standalone path PATCHes its own card."""
+      if not use_standalone:
+        _redraw_via_turn_ctx()
+        return
+      if not fallback_msg_id:
+        return
       try:
         new_token = get_token(credentials["app_id"], credentials["app_secret"])
-        update_card(new_token, msg_id, build_ask_user_question_card(
+        update_card(new_token, fallback_msg_id, build_ask_user_question_card(
           questions, chat_id, nonce, answers=answers))
       except Exception as e:
         log.warning("Failed to redraw askq card: %s", e)
@@ -515,6 +568,7 @@ def build_ask_user_question_handler(
             if qidx not in answers:
               answers[qidx] = []
             multi_done.add(qidx)
+            _redraw_card()
             continue
 
           if kind == "other":
@@ -526,8 +580,8 @@ def build_ask_user_question_handler(
                 chat_id,
                 f'Type your answer for "{question.get("header", "")}":',
               )
-            except Exception:
-              pass
+            except Exception as e:
+              log.warning("Failed to send 'Other' prompt: %s", e)
             continue
 
         # 2. Free-text reply
@@ -572,14 +626,10 @@ def build_ask_user_question_handler(
 
     if not _all_answered():
       log.info("AskUserQuestion: timed out without all answers; using partials")
-      try:
-        token = get_token(credentials["app_id"], credentials["app_secret"])
-        update_card(token, msg_id, build_ask_user_question_card(
-          questions, chat_id, nonce, answers=answers))
-      except Exception:
-        pass
       # Even on timeout, return whatever we got — the model can decide
-      # to file with defaults rather than retry forever.
+      # to file with defaults rather than retry forever. The standalone
+      # fallback card (if any) is repainted below alongside the embedded
+      # path's history flush.
 
     # Build the answers map keyed by question text (the format the SDK
     # tool's call() echoes back into the tool_result message).
@@ -593,12 +643,30 @@ def build_ask_user_question_handler(
 
     log.info("AskUserQuestion answered: %s", {k: str(v)[:60] for k, v in answers_by_text.items()})
 
-    try:
-      token = get_token(credentials["app_id"], credentials["app_secret"])
-      update_card(token, msg_id, build_ask_user_question_card(
-        questions, chat_id, nonce, answers=answers))
-    except Exception:
-      pass
+    # Move the resolved questions out of `pending_question` into the
+    # turn's `answered_questions` history so the working card keeps
+    # showing them for the rest of the turn — and into the final done
+    # card. Then drop the pending banner and repaint.
+    if turn_ctx is not None:
+      for qidx, question in enumerate(questions):
+        turn_ctx.answered_questions.append(AnsweredQuestion(
+          header=str(question.get("header") or question.get("question") or ""),
+          question=str(question.get("question", "")),
+          answer=answers.get(qidx, ""),
+        ))
+      turn_ctx.pending_question = None
+      _redraw_via_turn_ctx()
+
+    # Finalize standalone fallback card, if we ever sent one. Its
+    # purpose ends now that the model has the answers; refresh it with
+    # the final selections so the user has a record.
+    if use_standalone and fallback_msg_id:
+      try:
+        token = get_token(credentials["app_id"], credentials["app_secret"])
+        update_card(token, fallback_msg_id, build_ask_user_question_card(
+          questions, chat_id, nonce, answers=answers))
+      except Exception:
+        pass
 
     metadata: JsonObject = {"source": "nemo"}
     if not _all_answered():

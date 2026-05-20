@@ -15,8 +15,12 @@ from __future__ import annotations
 import os
 import time
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 from .types import JsonObject
+
+if TYPE_CHECKING:
+  from .channel import AnsweredQuestion, PendingQuestion
 
 
 # ---------------------------------------------------------------------------
@@ -372,6 +376,104 @@ def _shell_abort_button(job_id: str, chat_id: str = "") -> JsonObject:
   }
 
 
+def _format_answer_text(answer: object) -> str:
+  """Format an AskUserQuestion answer for inline display."""
+  if isinstance(answer, list):
+    if not answer:
+      return "_(none)_"
+    return ", ".join(_escape_md(str(a)) for a in answer)
+  text = str(answer or "")
+  if not text:
+    return "_(no answer)_"
+  return _escape_md(text)
+
+
+def _answered_questions_element(
+  answered: list["AnsweredQuestion"],
+) -> JsonObject:
+  """Render previously-answered AskUserQuestion entries as a single
+  markdown block: one ``❓ <header> → ✅ <answer>`` line per entry."""
+  lines: list[str] = []
+  for aq in answered:
+    header = _escape_md(aq.header or aq.question or "Question")
+    lines.append(f"❓ **{header}** → ✅ {_format_answer_text(aq.answer)}")
+  return {"tag": "markdown", "content": "\n".join(lines)}
+
+
+def _pending_question_elements(
+  pending: "PendingQuestion",
+  chat_id: str,
+) -> list[JsonObject]:
+  """Render an in-flight AskUserQuestion as inline card elements: each
+  question's header + body, a row of option buttons, an "Other" fallback,
+  and a Submit button for multi-select. Selected options get a leading
+  ``✓`` and a primary button colour so the user can see their picks
+  before the loop completes.
+
+  Action strings match ``askq:{nonce}:{qidx}:{oidx}`` (or ``:other`` /
+  ``:done``) so ``nemo.permissions._parse_askq_action`` parses them.
+  """
+  elements: list[JsonObject] = []
+  questions = pending.questions or []
+  answers = pending.answers or {}
+  nonce = pending.nonce
+
+  for qidx, question in enumerate(questions):
+    if not isinstance(question, dict):
+      continue
+    if qidx > 0:
+      elements.append({"tag": "hr"})
+
+    header = str(question.get("header") or question.get("question") or "Question")
+    q_text = str(question.get("question", ""))
+    multi_select = bool(question.get("multiSelect", False))
+    options = question.get("options", []) or []
+
+    elements.append({
+      "tag": "markdown",
+      "content": f"❓ **{_escape_md(header)}**",
+    })
+    if q_text and q_text != header:
+      elements.append({"tag": "markdown", "content": _escape_md(q_text)})
+
+    selected = answers.get(qidx)
+    selected_set: set[str] = set()
+    if isinstance(selected, list):
+      selected_set = {str(x) for x in selected}
+    elif isinstance(selected, str):
+      selected_set = {selected}
+
+    button_rows: list[tuple[str, str, str]] = []
+    for oidx, opt in enumerate(options):
+      if not isinstance(opt, dict):
+        continue
+      label = str(opt.get("label") or opt.get("description") or f"Option {oidx + 1}")
+      check = "✓ " if label in selected_set else ""
+      btn_type = "primary" if label in selected_set else "default"
+      button_rows.append((
+        f"{check}{label}",
+        f"askq:{nonce}:{qidx}:{oidx}",
+        btn_type,
+      ))
+    button_rows.append((
+      "Other (type below)",
+      f"askq:{nonce}:{qidx}:other",
+      "default",
+    ))
+
+    for start in range(0, len(button_rows), 2):
+      elements.append(_buttons_row(button_rows[start:start + 2], chat_id))
+
+    if multi_select:
+      done_label = "Submit ✓" if selected_set else "Submit"
+      elements.append(_buttons_row(
+        [(done_label, f"askq:{nonce}:{qidx}:done", "primary")],
+        chat_id,
+      ))
+
+  return elements
+
+
 def _working_elements(
   *,
   steps: list[ThinkingStep],
@@ -380,6 +482,8 @@ def _working_elements(
   chat_id: str = "",
   rate_limit_notice: str = "",
   compact_notice: str = "",
+  answered_questions: list["AnsweredQuestion"] | None = None,
+  pending_question: "PendingQuestion | None" = None,
 ) -> list[JsonObject]:
   """Build the shared body for working/stopping/stopped phases."""
   elements: list[JsonObject] = []
@@ -396,6 +500,13 @@ def _working_elements(
       "tag": "markdown",
       "content": f"<font color='grey'>{compact_notice}</font>",
     })
+  # Answered questions sit just below status banners and above the
+  # current-tool / thinking sections so the user keeps seeing what they
+  # picked for the rest of the turn.
+  if answered_questions:
+    elements.append(_answered_questions_element(answered_questions))
+  if pending_question is not None and pending_question.questions:
+    elements.extend(_pending_question_elements(pending_question, chat_id))
   if current_tool:
     elements.append({"tag": "markdown", "content": f"`{current_tool}`"})
   if steps:
@@ -417,6 +528,8 @@ def build_turn_card(
   session_id: str = "",
   rate_limit_notice: str = "",
   compact_notice: str = "",
+  answered_questions: list["AnsweredQuestion"] | None = None,
+  pending_question: "PendingQuestion | None" = None,
 ) -> JsonObject:
   """Build a unified turn card for any phase.
 
@@ -429,8 +542,16 @@ def build_turn_card(
     rendered in the same banner slot as rate_limit_notice. Lives outside
     the collapsible thinking panel so a 10–60s silent compaction doesn't
     look like the daemon has stalled.
+  answered_questions: previously-answered AskUserQuestion entries, shown
+    as a compact ``❓ <header> → ✅ <answer>`` block near the top of the
+    card in every phase. Persists through working/done so the user can
+    see what they picked for the rest of the turn.
+  pending_question: an in-flight AskUserQuestion, rendered inline with
+    its option buttons in the working phase only. Stopping/stopped/done/
+    error drop it (the loop has ended).
   """
   steps = steps or []
+  answered_questions = answered_questions or []
   elements: list[JsonObject] = []
 
   if phase == "working":
@@ -439,6 +560,8 @@ def build_turn_card(
       include_stop_button=True, chat_id=chat_id,
       rate_limit_notice=rate_limit_notice,
       compact_notice=compact_notice,
+      answered_questions=answered_questions,
+      pending_question=pending_question,
     )
     title = _elapsed_title(elapsed)
     header: JsonObject | None = {
@@ -452,6 +575,8 @@ def build_turn_card(
       include_stop_button=False,
       rate_limit_notice=rate_limit_notice,
       compact_notice=compact_notice,
+      answered_questions=answered_questions,
+      pending_question=None,
     )
     header = {
       "title": {"tag": "plain_text", "content": "Stopping..."},
@@ -464,6 +589,8 @@ def build_turn_card(
       include_stop_button=False,
       rate_limit_notice=rate_limit_notice,
       compact_notice=compact_notice,
+      answered_questions=answered_questions,
+      pending_question=None,
     )
     header = {
       "title": {"tag": "plain_text", "content": "Stopped"},
@@ -476,6 +603,10 @@ def build_turn_card(
         "tag": "markdown",
         "content": f"<font color='grey'>{compact_notice}</font>",
       })
+    # Answered questions sit above the model's final response so the
+    # decisions the user made stay visible in the terminal card.
+    if answered_questions:
+      elements.append(_answered_questions_element(answered_questions))
     # Final response (inline)
     if body:
       elements.append({"tag": "markdown", "content": body})
@@ -498,6 +629,10 @@ def build_turn_card(
     }
 
   elif phase == "error":
+    # Answered questions sit above the error message — they explain what
+    # the user picked before the failure.
+    if answered_questions:
+      elements.append(_answered_questions_element(answered_questions))
     # Error message (inline)
     if body:
       elements.append({"tag": "markdown", "content": body})
@@ -725,72 +860,26 @@ def build_ask_user_question_card(
   nonce: str,
   answers: dict[int, object] | None = None,
 ) -> JsonObject:
-  """Build a card that renders an AskUserQuestion tool call.
+  """Standalone AskUserQuestion card — used only as a fallback when the
+  working turn card hasn't been created yet (or its creation failed).
 
-  Each question is a section with header text and one button per option.
-  Action strings are `askq:{nonce}:{qidx}:{oidx}` for option clicks and
-  `askq:{nonce}:done` for the "Submit" button (multi-select only).
+  In the normal path the question is embedded directly into the working
+  turn card via ``build_turn_card(..., pending_question=...)`` and there
+  is no separate card. This builder exists so the askq handler can still
+  deliver a usable UI when there is no turn card to embed into.
 
-  `answers` is the in-progress selection: maps question index → selected
-  label (str) for single-select, or list[str] for multi-select. When
-  rendering an "answered" view, render selected options with a check mark.
+  Action strings: ``askq:{nonce}:{qidx}:{oidx}`` for option clicks,
+  ``askq:{nonce}:{qidx}:other`` for the "Other" fallback, and
+  ``askq:{nonce}:{qidx}:done`` for multi-select Submit.
   """
-  answers = answers or {}
-  elements: list[JsonObject] = []
+  from .channel import PendingQuestion
 
-  for qidx, question in enumerate(questions):
-    if qidx > 0:
-      elements.append({"tag": "hr"})
-
-    header = str(question.get("header") or question.get("question") or "Question")
-    q_text = str(question.get("question", ""))
-    multi_select = bool(question.get("multiSelect", False))
-    options = question.get("options", []) or []
-
-    elements.append({
-      "tag": "markdown",
-      "content": f"**{_escape_md(header)}**",
-    })
-    if q_text and q_text != header:
-      elements.append({"tag": "markdown", "content": _escape_md(q_text)})
-
-    selected = answers.get(qidx)
-    selected_set: set[str] = set()
-    if isinstance(selected, list):
-      selected_set = {str(x) for x in selected}
-    elif isinstance(selected, str):
-      selected_set = {selected}
-
-    # Render each option as a button. Lark cards lack visual radio
-    # buttons; primary color marks selected ones.
-    button_rows: list[tuple[str, str, str]] = []
-    for oidx, opt in enumerate(options):
-      label = str(opt.get("label") or opt.get("description") or f"Option {oidx + 1}")
-      check = "✓ " if label in selected_set else ""
-      btn_type = "primary" if label in selected_set else "default"
-      button_rows.append((
-        f"{check}{label}",
-        f"askq:{nonce}:{qidx}:{oidx}",
-        btn_type,
-      ))
-    # Always offer an "Other" → text input fallback
-    button_rows.append((
-      "Other (type below)",
-      f"askq:{nonce}:{qidx}:other",
-      "default",
-    ))
-
-    # Pack options into rows of 2 to keep mobile width manageable
-    for start in range(0, len(button_rows), 2):
-      elements.append(_buttons_row(button_rows[start:start + 2], chat_id))
-
-    if multi_select:
-      done_label = "Submit ✓" if selected_set else "Submit"
-      elements.append(_buttons_row(
-        [(done_label, f"askq:{nonce}:{qidx}:done", "primary")],
-        chat_id,
-      ))
-
+  pending = PendingQuestion(
+    questions=[q for q in questions if isinstance(q, dict)],
+    answers=dict(answers or {}),
+    nonce=nonce,
+  )
+  elements = _pending_question_elements(pending, chat_id)
   elements.append(_note_element(
     "Tap a button, or type your answer in chat. 10-min timeout."
   ))

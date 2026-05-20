@@ -10,9 +10,72 @@ on this interface, not on Lark specifics.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from .types import JsonObject
+
+
+@dataclass
+class PendingQuestion:
+  """An in-flight AskUserQuestion call rendered inline in the working
+  turn card. The action strings on the buttons follow
+  ``askq:{nonce}:{qidx}:{oidx}`` so ``nemo.permissions._parse_askq_action``
+  still parses them.
+
+  ``answers`` maps the question index to the selected value: a label
+  string for single-select questions, a list of labels for multi-select.
+  ``multi_done`` tracks which multi-select questions have been
+  finalised by the user clicking Submit.
+  """
+
+  questions: list[JsonObject] = field(default_factory=list)
+  answers: dict[int, object] = field(default_factory=dict)
+  nonce: str = ""
+  multi_done: set[int] = field(default_factory=set)
+
+
+@dataclass
+class AnsweredQuestion:
+  """A previously-answered question, rendered as a compact summary line
+  near the top of the working / done turn card (``❓ <header> → ✅
+  <answer>``). Persists in the turn card for the lifetime of the turn so
+  the user can always see what they picked."""
+
+  header: str = ""
+  question: str = ""
+  # str for single-select, list[str] for multi-select.
+  answer: object = ""
+
+
+def _noop_redraw() -> None:
+  pass
+
+
+@dataclass
+class TurnCardCtx:
+  """Per-turn state shared between the agent loop and tool handlers
+  (e.g. the AskUserQuestion handler) that need to repaint the working
+  turn card without owning it.
+
+  The agent wires ``redraw`` to a thread-safe wrapper around
+  ``_update_working`` and resets the rest of the fields at the start of
+  every turn. Handlers mutate ``pending_question`` / ``answered_questions``
+  and call ``redraw()`` to push their changes into the card.
+
+  The default-constructed value is intentionally inert: ``redraw`` is a
+  no-op and there is no card, so calling these on a Channel that hasn't
+  been wired into a turn does nothing harmful — handlers can fall back
+  to sending their own card if needed.
+  """
+
+  redraw: Callable[[], None] = field(default=_noop_redraw)
+  pending_question: PendingQuestion | None = None
+  answered_questions: list[AnsweredQuestion] = field(default_factory=list)
+  # Non-empty once the agent has actually sent the working card. Handlers
+  # use this to decide whether the embedded path is usable or whether
+  # they need to fall back to a standalone card.
+  turn_card_id: str = ""
 
 
 @dataclass
@@ -48,6 +111,13 @@ class IncomingMessage:
 
 class Channel(ABC):
   """Abstract channel for user I/O."""
+
+  # Per-turn turn-card state. The agent assigns a fresh TurnCardCtx at
+  # the start of each turn; tool handlers (AskUserQuestion) read it to
+  # request a card redraw. Annotated only — concrete subclasses are
+  # responsible for creating their own instance in ``__init__`` so the
+  # mutable state is not shared across channels.
+  turn_ctx: TurnCardCtx
 
   @abstractmethod
   async def receive(self, timeout: float = 300) -> IncomingMessage | None:

@@ -243,12 +243,17 @@ class LarkChannel(Channel):
   """Channel implementation backed by Lark IM APIs and event streams."""
 
   def __init__(self, chat_id: str):
+    from .channel import TurnCardCtx
     self.chat_id = chat_id
     self.credentials = load_credentials() or {}
     self._events: LarkEventStream | RelayEventStream | None = None
     # Optional: agent-supplied lookup to recover text of a quoted message
     # (e.g. from nemo's own DB) when the Lark API can't return it.
     self.parent_lookup: ParentLookup | None = None
+    # Per-turn turn-card state. Agent.run_turn replaces this with a
+    # freshly-wired TurnCardCtx at the start of each turn; the empty
+    # default keeps attribute access safe before the first turn.
+    self.turn_ctx = TurnCardCtx()
     # Chat mode from Lark API: "group" | "topic" | "p2p" | "". In topic
     # chats the bot must scope every reply to the current topic, so we
     # route sends through the /reply endpoint anchored at the latest
