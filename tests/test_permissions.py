@@ -827,6 +827,170 @@ def test_askq_handler_embedded_multi_question_no_lockout():
   assert headers == {"Screen", "How bad?"}
 
 
+def test_askq_handler_single_select_re_click_overwrites_while_loop_open():
+  """Single-select isn't locked: while the loop is still waiting on
+  another question, the user can re-click an already-answered question
+  to change their mind. (Once every question has an answer the loop
+  exits — re-selecting a single-question/single-select card after that
+  is intentionally not possible; the card is no longer interactive.)"""
+  questions = [
+    {"question": "颜色?", "header": "颜色",
+     "options": [{"label": "red"}, {"label": "green"}, {"label": "blue"}],
+     "multiSelect": False},
+    {"question": "时间?", "header": "时间",
+     "options": [{"label": "morning"}, {"label": "evening"}],
+     "multiSelect": False},
+  ]
+  fixtures = _make_askq_fixtures(events_seq=[
+    _askq_event("askq:abc123:0:0"),  # 颜色 → red
+    _askq_event("askq:abc123:0:1"),  # change mind → green (loop still open, 时间 unanswered)
+    _askq_event("askq:abc123:0:2"),  # change again → blue
+    _askq_event("askq:abc123:1:0"),  # 时间 → morning, now all answered
+  ], embed_card=True)
+  creds, chat_id, events, _sdk = fixtures
+  result = _run_askq(fixtures, questions)
+  # Last pick on q0 before the loop exits wins.
+  assert result.updated_input["answers"] == {"颜色?": "blue", "时间?": "morning"}
+  # Each click triggered a redraw with the then-current selection.
+  pending_redraws = [r for r in events.redraw_calls
+                     if r["pending_question"] is not None]
+  picks_for_q0 = [r["pending_answers"].get(0) for r in pending_redraws
+                  if 0 in r["pending_answers"]]
+  assert picks_for_q0[0] == "red"
+  assert "green" in picks_for_q0
+  assert picks_for_q0[-1] == "blue"
+
+
+def test_askq_handler_multi_select_re_click_toggles_off():
+  """Multi-select clicks toggle the option in and out of the list, so
+  re-clicking a previously-picked option deselects it. The submitted
+  list is exactly what is currently checked when the user hits Submit."""
+  questions = [{
+    "question": "Pick any", "header": "Tags",
+    "options": [{"label": "a"}, {"label": "b"}, {"label": "c"}],
+    "multiSelect": True,
+  }]
+  fixtures = _make_askq_fixtures(events_seq=[
+    _askq_event("askq:abc123:0:0"),  # +a
+    _askq_event("askq:abc123:0:1"),  # +b
+    _askq_event("askq:abc123:0:0"),  # -a (toggle off)
+    _askq_event("askq:abc123:0:2"),  # +c
+    _askq_event("askq:abc123:0:done"),
+  ], embed_card=True)
+  creds, chat_id, events, _sdk = fixtures
+  result = _run_askq(fixtures, questions)
+  # 'a' was added then removed; 'b' and 'c' remain. Order matches the
+  # insertion order in the answers list (b first, then c).
+  assert result.updated_input["answers"] == {"Pick any": ["b", "c"]}
+  # Intermediate redraws must reflect the toggle: at some point between
+  # the third click (-a) and the fourth (+c) the answers list contained
+  # exactly ['b']. Scan all pending redraws and assert that snapshot
+  # exists, rather than depending on the exact index (which shifts when
+  # the initial paint changes).
+  pending_redraws = [r for r in events.redraw_calls
+                     if r["pending_question"] is not None]
+  snapshots = [r["pending_answers"].get(0) for r in pending_redraws]
+  assert ["b"] in snapshots, (
+    f"expected one redraw with answers[0]==['b'] (the toggle-off "
+    f"moment); got snapshots={snapshots}")
+
+
+def test_askq_handler_multi_select_done_without_any_clicks():
+  """User hits Submit on a multi-select question without selecting any
+  option → the answer is an explicit empty list (intentional 'none'),
+  not missing. The loop must accept this and not block forever."""
+  questions = [{
+    "question": "Tags?", "header": "Tags",
+    "options": [{"label": "a"}, {"label": "b"}],
+    "multiSelect": True,
+  }]
+  fixtures = _make_askq_fixtures(events_seq=[
+    _askq_event("askq:abc123:0:done"),
+  ], embed_card=True)
+  result = _run_askq(fixtures, questions)
+  assert result.updated_input["answers"] == {"Tags?": []}
+
+
+def test_askq_handler_multi_select_done_redraws_with_submitted_marker():
+  """After Submit fires on a multi-select question, the redraw must
+  surface the finalized state so the working card shows what was
+  submitted (and the loop exits cleanly when it was the last
+  question)."""
+  questions = [{
+    "question": "Tags?", "header": "Tags",
+    "options": [{"label": "a"}, {"label": "b"}, {"label": "c"}],
+    "multiSelect": True,
+  }]
+  fixtures = _make_askq_fixtures(events_seq=[
+    _askq_event("askq:abc123:0:0"),
+    _askq_event("askq:abc123:0:2"),
+    _askq_event("askq:abc123:0:done"),
+  ], embed_card=True)
+  creds, chat_id, events, _sdk = fixtures
+  result = _run_askq(fixtures, questions)
+  assert result.updated_input["answers"] == {"Tags?": ["a", "c"]}
+  # The final redraw after `done` drops pending_question (loop exited)
+  # and lands the question in answered_questions history.
+  final = events.redraw_calls[-1]
+  assert final["pending_question"] is None
+  assert any(aq.answer == ["a", "c"] for aq in final["answered_questions"])
+
+
+def test_askq_handler_multi_question_out_of_order_clicks():
+  """Users can click answers in any order — the handler routes each
+  click by its qidx, not by which question is 'next'. Three questions
+  resolved by clicking q2 → q0 → q1 must yield the same answers map
+  as in-order clicks."""
+  questions = [
+    {"question": "颜色?", "header": "颜色",
+     "options": [{"label": "red"}, {"label": "green"}],
+     "multiSelect": False},
+    {"question": "时间?", "header": "时间",
+     "options": [{"label": "morning"}, {"label": "evening"}],
+     "multiSelect": False},
+    {"question": "心情?", "header": "心情",
+     "options": [{"label": "happy"}, {"label": "tired"}],
+     "multiSelect": False},
+  ]
+  # Click q2 first, then q0, then q1 — handler must wait for all three.
+  fixtures = _make_askq_fixtures(events_seq=[
+    _askq_event("askq:abc123:2:0"),  # q2 → happy
+    _askq_event("askq:abc123:0:1"),  # q0 → green
+    _askq_event("askq:abc123:1:1"),  # q1 → evening
+  ], embed_card=True)
+  creds, chat_id, events, _sdk = fixtures
+  result = _run_askq(fixtures, questions)
+  assert result.updated_input["answers"] == {
+    "颜色?": "green", "时间?": "evening", "心情?": "happy"}
+  # After the FIRST click (q2), pending must still be present — the
+  # handler must not treat one out-of-order answer as 'done'.
+  assert events.redraw_calls[1]["pending_question"] is not None
+  assert events.redraw_calls[1]["pending_answers"] == {2: "happy"}
+
+
+def test_askq_handler_partial_out_of_order_then_other_typed():
+  """Mix of click and Other+text in arbitrary order. Click q1 first,
+  then Other on q0 followed by typed text — both land on their own
+  questions; the third unanswered q2 gets the next free-text reply."""
+  questions = [
+    {"question": "A?", "header": "A",
+     "options": [{"label": "a1"}], "multiSelect": False},
+    {"question": "B?", "header": "B",
+     "options": [{"label": "b1"}, {"label": "b2"}], "multiSelect": False},
+    {"question": "C?", "header": "C",
+     "options": [{"label": "c1"}], "multiSelect": False},
+  ]
+  fixtures = _make_askq_fixtures(events_seq=[
+    _askq_event("askq:abc123:1:1"),    # q1 → b2 (out of order)
+    _askq_event("askq:abc123:0:other"),  # Other for q0
+    _text_event("custom-a"),            # text → q0 (awaiting_other_for=0)
+    _text_event("custom-c"),            # text → q2 (first unanswered)
+  ], embed_card=True)
+  result = _run_askq(fixtures, questions)
+  assert result.updated_input["answers"] == {
+    "A?": "custom-a", "B?": "b2", "C?": "custom-c"}
+
+
 def test_askq_handler_duplicate_other_action_does_not_re_prompt():
   """Lark webhook retries / WS replay can deliver the same :other action
   twice. We must only send the 'Type your answer for X:' prompt once per
