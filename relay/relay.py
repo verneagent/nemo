@@ -471,6 +471,21 @@ async def _handle_card_action(event: dict) -> tuple[int, dict]:
     toast_type = "warning" if is_deny else "success"
     toast_verb = "Denied" if is_deny else "Got it"
 
+    # Some actions are part of multi-step flows that the bot owns: the bot
+    # is going to PATCH the card to its next correct state shortly after
+    # the action lands. Returning a "Confirmed" card here briefly replaces
+    # the bot's UI with a generic green ack until the PATCH catches up —
+    # for AskUserQuestion that flashes "Confirmed / Selected: askq:..."
+    # over the question buttons and looks like the card got destroyed.
+    # For these prefixes we suppress the card update and only emit a toast,
+    # so the user sees a quick acknowledgement and the bot's PATCH lands
+    # without a visible flash.
+    BOT_OWNED_CARD_PREFIXES = ("askq:",)
+    if action_text.startswith(BOT_OWNED_CARD_PREFIXES):
+        return 200, {
+            "toast": {"type": toast_type, "content": f"{toast_verb}: {action_text}"},
+        }
+
     title = value.get("title", "Confirmed")
     body = value.get("body", "")
     elements = []

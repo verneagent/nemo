@@ -440,14 +440,21 @@ def _pending_question_elements(
     selected_set: set[str] = set()
     if isinstance(selected, list):
       selected_set = {str(x) for x in selected}
-    elif isinstance(selected, str):
+    elif isinstance(selected, str) and selected:
       selected_set = {selected}
 
+    # Collect option labels so we know which selected values are
+    # free-text "Other" answers (typed by the user, not in the option
+    # list) and need an explicit visual confirmation line — otherwise
+    # the click + typed-answer flow has no visible feedback on the card
+    # and looks like the bot silently ignored the reply.
+    option_labels: set[str] = set()
     button_rows: list[tuple[str, str, str]] = []
     for oidx, opt in enumerate(options):
       if not isinstance(opt, dict):
         continue
       label = str(opt.get("label") or opt.get("description") or f"Option {oidx + 1}")
+      option_labels.add(label)
       check = "✓ " if label in selected_set else ""
       btn_type = "primary" if label in selected_set else "default"
       button_rows.append((
@@ -463,6 +470,16 @@ def _pending_question_elements(
 
     for start in range(0, len(button_rows), 2):
       elements.append(_buttons_row(button_rows[start:start + 2], chat_id))
+
+    # Render any typed "Other" answer that is not in the option list so
+    # the user gets immediate confirmation that their reply was received.
+    free_text_answers = sorted(selected_set - option_labels)
+    if free_text_answers:
+      shown = ", ".join(_escape_md(a) for a in free_text_answers)
+      elements.append({
+        "tag": "markdown",
+        "content": f"<font color='green'>✓ Your answer: {shown}</font>",
+      })
 
     if multi_select:
       done_label = "Submit ✓" if selected_set else "Submit"

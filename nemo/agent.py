@@ -1848,12 +1848,24 @@ async def main_loop(
       # main loop — same threading guarantee as before.
 
       def _ensure_card():
-        """Create the working card if it doesn't exist yet."""
+        """Create the working card if it doesn't exist yet.
+
+        Bake in any current turn_ctx state (pending AskUserQuestion,
+        answered history) so the very first card the user sees already
+        has the question buttons. Without this the send_card → PATCH
+        sequence flashes an empty grey "Working..." card for one frame
+        before the question elements land.
+        """
         nonlocal _turn_card_id
         if _turn_card_id:
           return
         _await_channel(_clear_ack())
-        card = cards.build_turn_card("working", chat_id=chat_id)
+        card = cards.build_turn_card(
+          "working",
+          chat_id=chat_id,
+          answered_questions=list(channel.turn_ctx.answered_questions),
+          pending_question=channel.turn_ctx.pending_question,
+        )
         try:
           _turn_card_id = _await_channel(channel.send_card(chat_id, card))
           db.set_working(session_id, _turn_card_id)

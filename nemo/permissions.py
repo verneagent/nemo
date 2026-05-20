@@ -432,6 +432,21 @@ def build_ask_user_question_handler(
       except Exception as e:
         log.warning("turn_ctx redraw raised: %s", e)
 
+    try:
+      _current_loop = _asyncio.get_running_loop()
+    except RuntimeError:
+      _current_loop = None
+    _on_main_loop = _current_loop is _main_loop
+
+    # Set permission_active BEFORE the first card paint so any button
+    # click that lands during the paint is routed to this handler
+    # instead of being discarded by the in-turn `_watch_signals` loop
+    # (which treats unknown card actions as no-ops).
+    if _on_main_loop:
+      _set_permission_flag(True)
+    else:
+      _main_loop.call_soon_threadsafe(_set_permission_flag, True)
+
     # Initial paint into the working card. If the working card doesn't
     # exist yet (e.g., AskUserQuestion is the very first event of the
     # turn before any progress event), redraw() will run _ensure_card via
@@ -462,17 +477,11 @@ def build_ask_user_question_handler(
     import time as _time
     deadline = _time.time() + max_wait_seconds
     _pending: list[object] = []
-
-    try:
-      _current_loop = _asyncio.get_running_loop()
-    except RuntimeError:
-      _current_loop = None
-    _on_main_loop = _current_loop is _main_loop
-
-    if _on_main_loop:
-      _set_permission_flag(True)
-    else:
-      _main_loop.call_soon_threadsafe(_set_permission_flag, True)
+    # Track which questions we have already sent an "Other"-prompt for
+    # in this handler invocation so a duplicate `:other` action — Lark
+    # webhook retries, relay replay on WS reconnect, accidental
+    # double-tap — doesn't spam a fresh prompt and confuse the user.
+    other_prompts_sent: set[int] = set()
 
     def _all_answered() -> bool:
       for qidx, question in enumerate(questions):
@@ -573,6 +582,16 @@ def build_ask_user_question_handler(
 
           if kind == "other":
             awaiting_other_for = qidx
+            # Only send the "Type your answer for X:" prompt the first
+            # time this question's Other button fires. Lark webhook
+            # retries and WS replay can deliver the same `:other` event
+            # more than once; without this guard the user sees the same
+            # prompt repeated after they've already typed a reply, which
+            # makes it look like their reply was ignored.
+            if qidx in other_prompts_sent:
+              log.info("askq: duplicate :other for q%d; not re-prompting", qidx)
+              continue
+            other_prompts_sent.add(qidx)
             try:
               from .lark.api import send_text
               send_text(
@@ -590,6 +609,15 @@ def build_ask_user_question_handler(
           if not text:
             _pending.append(reply)
             continue
+          # `/esc` (or `/stop`) is the user's way to abort the askq loop
+          # without polluting the next unanswered question with their
+          # control word. Bail out with whatever partial answers we have
+          # so the model can decide what to do.
+          control = text.lower()
+          if control in ("/esc", "/stop", "/cancel"):
+            log.info("askq: user typed %s; aborting with partial answers", control)
+            _pending.append(reply)
+            break
           # Route to whichever question we're waiting on. If user typed
           # without clicking "Other", route to the first unanswered question.
           target_qidx = awaiting_other_for

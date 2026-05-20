@@ -936,6 +936,48 @@ def test_turn_card_stopped_drops_pending_question():
               f"{phase} card must not show askq buttons (saw {a})"
 
 
+def test_turn_card_pending_other_answer_renders_confirmation_line():
+  """When a question has a typed 'Other' answer that isn't in the
+  option list, the card must render a visible '✓ Your answer: <text>'
+  confirmation line — otherwise clicking Other + typing a reply has
+  no visual feedback on the card and looks like the bot ignored it."""
+  from nemo.channel import PendingQuestion
+
+  pending = PendingQuestion(
+    questions=[_question("颜色", "颜色", ["red", "blue", "green"])],
+    nonce="N",
+    answers={0: "绿色"},  # free-text, not in options
+  )
+  card = build_turn_card("working", steps=[], elapsed=1,
+                         chat_id="oc_x", pending_question=pending)
+  found = False
+  for el in card["body"]["elements"]:
+    if el.get("tag") == "markdown":
+      content = el.get("content", "")
+      if "Your answer" in content and "绿色" in content:
+        found = True
+        break
+  assert found, "expected '✓ Your answer: 绿色' confirmation line in card"
+
+
+def test_turn_card_pending_option_answer_does_not_add_confirmation_line():
+  """When the answer matches a predefined option (click, not Other),
+  the option button already shows ✓ + primary color — no extra
+  confirmation line is needed."""
+  from nemo.channel import PendingQuestion
+
+  pending = PendingQuestion(
+    questions=[_question("Where?", "Screen", ["Login", "Match"])],
+    nonce="N",
+    answers={0: "Login"},  # matches an option label
+  )
+  card = build_turn_card("working", steps=[], elapsed=1,
+                         chat_id="oc_x", pending_question=pending)
+  for el in card["body"]["elements"]:
+    if el.get("tag") == "markdown":
+      assert "Your answer" not in el.get("content", "")
+
+
 def test_turn_card_multi_select_answer_renders_as_list():
   """Multi-select answers render comma-separated in the summary line."""
   from nemo.channel import AnsweredQuestion

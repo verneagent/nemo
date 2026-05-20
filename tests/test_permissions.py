@@ -569,7 +569,7 @@ def _run_askq(fixtures, questions, nonce_patcher_value="abc123") -> _AllowResult
   with patch("nemo.permissions.uuid.uuid4") as uu, \
        patch("nemo.lark.api.send_card", return_value="msg_001") as send_card_mock, \
        patch("nemo.lark.api.update_card") as update_card_mock, \
-       patch("nemo.lark.api.send_text"), \
+       patch("nemo.lark.api.send_text") as send_text_mock, \
        patch("nemo.lark.auth.get_token", return_value="tok"):
     # Handler does `nonce = uuid.uuid4().hex[:12]`, and test events use
     # action strings with nonce=nonce_patcher_value. Give the mock a hex
@@ -581,6 +581,7 @@ def _run_askq(fixtures, questions, nonce_patcher_value="abc123") -> _AllowResult
     # call send_card?").
     events.send_card_mock = send_card_mock
     events.update_card_mock = update_card_mock
+    events.send_text_mock = send_text_mock
 
     async def _go():
       handler = build_ask_user_question_handler(creds, chat_id, events)
@@ -824,6 +825,83 @@ def test_askq_handler_embedded_multi_question_no_lockout():
   assert final["pending_question"] is None
   headers = {aq.header for aq in final["answered_questions"]}
   assert headers == {"Screen", "How bad?"}
+
+
+def test_askq_handler_duplicate_other_action_does_not_re_prompt():
+  """Lark webhook retries / WS replay can deliver the same :other action
+  twice. We must only send the 'Type your answer for X:' prompt once per
+  question — otherwise the user sees the prompt repeated after they
+  typed and thinks their reply was ignored."""
+  questions = [{
+    "question": "颜色", "header": "颜色",
+    "options": [{"label": "red"}, {"label": "blue"}],
+    "multiSelect": False,
+  }]
+  fixtures = _make_askq_fixtures(events_seq=[
+    _askq_event("askq:abc123:0:other"),
+    _askq_event("askq:abc123:0:other"),  # duplicate replay
+    _text_event("绿色"),
+  ], embed_card=True)
+  creds, chat_id, events, _sdk = fixtures
+  result = _run_askq(fixtures, questions)
+  assert events.send_text_mock.call_count == 1, (
+    f"expected exactly one 'Other' prompt, got "
+    f"{events.send_text_mock.call_count}")
+  assert result.updated_input["answers"] == {"颜色": "绿色"}
+
+
+def test_askq_handler_text_other_answer_lands_in_pending_state():
+  """When a typed 'Other' answer doesn't match any predefined option,
+  the handler must still record it in pending.answers so the working
+  card can render the typed value as visual confirmation (the
+  card-rendering side covers what the card actually shows)."""
+  questions = [{
+    "question": "颜色", "header": "颜色",
+    "options": [{"label": "red"}, {"label": "blue"}, {"label": "green"}],
+    "multiSelect": False,
+  }]
+  fixtures = _make_askq_fixtures(events_seq=[
+    _askq_event("askq:abc123:0:other"),
+    _text_event("绿色"),  # free-text not in options
+  ], embed_card=True)
+  creds, chat_id, events, _sdk = fixtures
+  result = _run_askq(fixtures, questions)
+  assert result.updated_input["answers"] == {"颜色": "绿色"}
+  # After the text was received, the redraw saw pending.answers[0] = "绿色"
+  text_redraw = events.redraw_calls[-1]
+  # Last redraw is the answered-history one (pending cleared), so look
+  # at the one before — the per-click redraw — and confirm it captured
+  # the typed answer.
+  pending_redraws = [r for r in events.redraw_calls
+                     if r["pending_question"] is not None]
+  assert pending_redraws, "expected at least one redraw with pending"
+  last_pending = pending_redraws[-1]
+  assert last_pending["pending_answers"] == {0: "绿色"}
+
+
+def test_askq_handler_esc_aborts_with_partial_answers():
+  """Typing `/esc` while askq is waiting must abort the loop with
+  partial answers — and not become the next unanswered question's
+  literal answer."""
+  questions = [
+    {"question": "颜色", "header": "颜色",
+     "options": [{"label": "red"}], "multiSelect": False},
+    {"question": "时间", "header": "时间",
+     "options": [{"label": "morning"}], "multiSelect": False},
+  ]
+  fixtures = _make_askq_fixtures(events_seq=[
+    _askq_event("askq:abc123:0:0"),  # q0 → red
+    _text_event("/esc"),             # abort, must NOT become q1's answer
+  ], embed_card=True)
+  result = _run_askq(fixtures, questions)
+  # q0 has its answer; q1 is empty string (the empty-fallback in the
+  # final answers_by_text loop), not "/esc".
+  assert result.updated_input["answers"]["颜色"] == "red"
+  assert result.updated_input["answers"]["时间"] == ""
+  metadata = cast(JsonObject, result.updated_input["metadata"])
+  assert metadata.get("timeout") is True, (
+    "aborted askq must mark metadata.timeout=True so the model can "
+    "decide what to do with the partial answers")
 
 
 def test_askq_handler_fallback_to_standalone_card_without_working_card():
