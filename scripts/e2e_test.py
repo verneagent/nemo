@@ -11,6 +11,7 @@ Usage:
     python3 scripts/e2e_test.py --stress         # stale-task stress only
     python3 scripts/e2e_test.py --project        # multi-turn project only
     python3 scripts/e2e_test.py --perm           # permission flow only
+    python3 scripts/e2e_test.py --askq           # AskUserQuestion flow only
     python3 scripts/e2e_test.py --dual           # dual-instance only
     python3 scripts/e2e_test.py --media          # media & interaction only
     python3 scripts/e2e_test.py --shell          # shell shortcut + abort only
@@ -1216,6 +1217,191 @@ def run_permission_tests(pid: int, chat_id: str,
 
 
 # ---------------------------------------------------------------------------
+# Phase 7b: AskUserQuestion (askq) interactive flow
+# ---------------------------------------------------------------------------
+
+def _wait_for_askq_nonce(log: "LogAnalyzer", offset: int,
+                         timeout: int = 60) -> str | None:
+  """Wait for the askq handler to announce a new question card and
+  return its nonce so the test can construct ``askq:{nonce}:...`` action
+  strings. Returns None if no card appeared within the timeout."""
+  deadline = time.time() + timeout
+  rx = re.compile(r"AskUserQuestion: \d+ question\(s\) \(nonce=([0-9a-f]+),")
+  while time.time() < deadline:
+    chunk = log.read_since(offset)
+    m = rx.search(chunk)
+    if m:
+      return m.group(1)
+    time.sleep(1)
+  return None
+
+
+def _wait_for_askq_answered(log: "LogAnalyzer", offset: int,
+                            timeout: int = 30) -> str | None:
+  """Wait for the askq handler to log the final answers map (one line
+  per answered call). Returns the matched log line so tests can inspect
+  what was returned to the model."""
+  deadline = time.time() + timeout
+  rx = re.compile(r"AskUserQuestion answered: (\{.*\})")
+  while time.time() < deadline:
+    chunk = log.read_since(offset)
+    m = rx.search(chunk)
+    if m:
+      return m.group(1)
+    time.sleep(1)
+  return None
+
+
+# Prompt designed to make Claude emit a single AskUserQuestion call with
+# multiple questions whose first option is what the test will click.
+# Order of options is constrained so oidx=0 lands on a known label.
+_ASKQ_PROMPT_3Q = (
+  "Use the AskUserQuestion tool to ask me three questions in ONE call. "
+  "Use EXACTLY these questions and options in this order:\n"
+  '  q0 header="颜色" question="Pick a color" '
+  'options=[{"label":"OPT_RED"},{"label":"OPT_BLUE"}] multiSelect=false\n'
+  '  q1 header="时间" question="Pick a time" '
+  'options=[{"label":"OPT_MORNING"},{"label":"OPT_EVENING"}] multiSelect=false\n'
+  '  q2 header="心情" question="Pick a mood" '
+  'options=[{"label":"OPT_HAPPY"},{"label":"OPT_TIRED"}] multiSelect=false\n'
+  "Do not answer anything yourself — just ask."
+)
+
+
+def run_askq_tests(pid: int, chat_id: str, result: E2EResult) -> None:
+  """Phase 7b: AskUserQuestion (askq) interactive flow.
+
+  Drives the askq handler end-to-end: triggers a multi-question askq via
+  a model prompt, then clicks buttons / sends text through the relay and
+  verifies the answers the daemon hands back to the model. Each test
+  starts a fresh askq turn so a failure doesn't poison the next one.
+  """
+  print(f"{Colors.BOLD}Phase 7b: AskUserQuestion Flow{Colors.RESET}")
+  log = LogAnalyzer(pid)
+
+  # --- T70: in-order single-select clicks on a 3-question askq ---
+  mark = log.mark()
+  send_msg(_ASKQ_PROMPT_3Q, chat_id)
+  nonce = _wait_for_askq_nonce(log, mark, timeout=90)
+  if not nonce:
+    result.fail("T70 askq triggered", "no askq card appeared within 90s")
+    log.dump_tail(20, "askq trigger")
+    return
+  result.ok("T70 askq triggered", f"nonce={nonce[:8]}")
+
+  for qidx in range(3):
+    send_card_action({"action": f"askq:{nonce}:{qidx}:0"}, chat_id)
+    time.sleep(0.5)
+  answered = _wait_for_askq_answered(log, mark, timeout=30)
+  if not answered:
+    result.fail("T70 askq in-order clicks", "no 'AskUserQuestion answered:' log")
+    log.dump_tail(20, "askq in-order")
+  elif "OPT_RED" in answered and "OPT_MORNING" in answered and "OPT_HAPPY" in answered:
+    result.ok("T70 askq in-order clicks", "all three first-option picks landed")
+  else:
+    result.fail("T70 askq in-order clicks",
+                f"unexpected answers: {answered[:200]}")
+
+  # Wait for turn to fully settle before the next test
+  wait_for_idle(pid, chat_id, timeout=30)
+
+  # --- T71: out-of-order clicks (q2 → q0 → q1) ---
+  mark = log.mark()
+  send_msg(_ASKQ_PROMPT_3Q, chat_id)
+  nonce = _wait_for_askq_nonce(log, mark, timeout=90)
+  if not nonce:
+    result.fail("T71 askq out-of-order", "no askq card appeared")
+    return
+  # Click q2 first, then q0, then q1 — handler must wait for all three.
+  for qidx in (2, 0, 1):
+    send_card_action({"action": f"askq:{nonce}:{qidx}:1"}, chat_id)
+    time.sleep(0.5)
+  answered = _wait_for_askq_answered(log, mark, timeout=30)
+  if not answered:
+    result.fail("T71 askq out-of-order", "no 'AskUserQuestion answered:' log")
+  elif ("OPT_BLUE" in answered and "OPT_EVENING" in answered
+        and "OPT_TIRED" in answered):
+    result.ok("T71 askq out-of-order", "all three second-option picks landed")
+  else:
+    result.fail("T71 askq out-of-order",
+                f"unexpected answers: {answered[:200]}")
+
+  wait_for_idle(pid, chat_id, timeout=30)
+
+  # --- T72: Other → text reply (free-text answer recorded) ---
+  mark = log.mark()
+  send_msg(_ASKQ_PROMPT_3Q, chat_id)
+  nonce = _wait_for_askq_nonce(log, mark, timeout=90)
+  if not nonce:
+    result.fail("T72 askq other+text", "no askq card appeared")
+    return
+  # Click Other on q0, then type a free-text answer for it. Click q1, q2
+  # with their first option so the loop finishes promptly.
+  send_card_action({"action": f"askq:{nonce}:0:other"}, chat_id)
+  time.sleep(1)
+  send_msg("FREE_TEXT_ANSWER_紫色", chat_id)
+  time.sleep(0.5)
+  send_card_action({"action": f"askq:{nonce}:1:0"}, chat_id)
+  time.sleep(0.5)
+  send_card_action({"action": f"askq:{nonce}:2:0"}, chat_id)
+  answered = _wait_for_askq_answered(log, mark, timeout=30)
+  if not answered:
+    result.fail("T72 askq other+text", "no 'AskUserQuestion answered:' log")
+  elif "FREE_TEXT_ANSWER_紫色" in answered:
+    result.ok("T72 askq other+text", "free-text answer landed in answers map")
+  else:
+    result.fail("T72 askq other+text",
+                f"free-text answer not in answers: {answered[:200]}")
+
+  wait_for_idle(pid, chat_id, timeout=30)
+
+  # --- T73: /esc aborts the loop with partial answers ---
+  mark = log.mark()
+  send_msg(_ASKQ_PROMPT_3Q, chat_id)
+  nonce = _wait_for_askq_nonce(log, mark, timeout=90)
+  if not nonce:
+    result.fail("T73 askq /esc abort", "no askq card appeared")
+    return
+  send_card_action({"action": f"askq:{nonce}:0:0"}, chat_id)
+  time.sleep(0.5)
+  send_msg("/esc", chat_id)
+  # Look for the explicit abort log from permissions.py
+  if log.wait_for_since(r"askq: user typed /esc; aborting", mark, timeout=20):
+    result.ok("T73 askq /esc abort", "abort log seen")
+  else:
+    result.fail("T73 askq /esc abort", "no abort log within 20s")
+    log.dump_tail(20, "askq /esc")
+
+  wait_for_idle(pid, chat_id, timeout=30)
+
+  # --- T74: duplicate :other action sends prompt only once ---
+  mark = log.mark()
+  send_msg(_ASKQ_PROMPT_3Q, chat_id)
+  nonce = _wait_for_askq_nonce(log, mark, timeout=90)
+  if not nonce:
+    result.fail("T74 askq dedup other", "no askq card appeared")
+    return
+  # Fire :other twice in quick succession — the handler must suppress
+  # the second prompt.
+  send_card_action({"action": f"askq:{nonce}:0:other"}, chat_id)
+  time.sleep(0.5)
+  send_card_action({"action": f"askq:{nonce}:0:other"}, chat_id)
+  time.sleep(2)
+  dupe_logs = log.count(
+    r"askq: duplicate :other for q0; not re-prompting", last_n=50)
+  if dupe_logs >= 1:
+    result.ok("T74 askq dedup other", "duplicate :other suppressed")
+  else:
+    result.fail("T74 askq dedup other",
+                "no 'duplicate :other' log — prompt may have been sent twice")
+  # Clean up this turn so we don't leave an open askq behind
+  send_msg("/esc", chat_id)
+  wait_for_idle(pid, chat_id, timeout=30)
+
+  print()
+
+
+# ---------------------------------------------------------------------------
 # Phase 8: Dual-Instance (same dir, two groups)
 # ---------------------------------------------------------------------------
 
@@ -1992,6 +2178,8 @@ def main():
                       help="Run only multi-turn project test (Phase 6)")
   parser.add_argument("--perm", action="store_true",
                       help="Run only permission flow test (Phase 7)")
+  parser.add_argument("--askq", action="store_true",
+                      help="Run only AskUserQuestion flow test (Phase 7b)")
   parser.add_argument("--dual", action="store_true",
                       help="Run only dual-instance test (Phase 8)")
   parser.add_argument("--media", action="store_true",
@@ -2009,6 +2197,7 @@ def main():
   chat_id = args.chat_id.strip()
   result = E2EResult()
   single_phase = (args.stress or args.project or args.perm
+                  or args.askq
                   or args.dual or args.media or args.topic
                   or args.shell or args.switch)
   run_all = not single_phase
@@ -2071,6 +2260,8 @@ def main():
     print(f"  Mode: project flow only")
   elif args.perm:
     print(f"  Mode: permission test only")
+  elif args.askq:
+    print(f"  Mode: AskUserQuestion flow only")
   elif args.dual:
     print(f"  Mode: dual-instance test only")
   elif args.media:
@@ -2353,6 +2544,14 @@ def main():
     elif args.perm:
       try:
         run_permission_tests(pid, chat_id, result)
+      finally:
+        send_msg("/exit", chat_id)
+        if not wait_for_exit(pid, timeout=35):
+          kill_nemo(pid)
+
+    elif args.askq:
+      try:
+        run_askq_tests(pid, chat_id, result)
       finally:
         send_msg("/exit", chat_id)
         if not wait_for_exit(pid, timeout=35):
