@@ -64,6 +64,17 @@ _BTW_DIRECTIVE = (
 # Hard ceiling so a wedged side query can't hang the chat indefinitely.
 _BTW_TIMEOUT = 120
 
+# Why not 1: the side query exposes NO tools, but an agentic model
+# (notably non-Claude models resumed into a tool-heavy coding session)
+# will still *attempt* tool calls before answering in prose. Each blocked
+# attempt burns a turn; with max_turns=1 the turn ends as `error_max_turns`
+# before any text block is produced and `/btw` comes back blank (observed
+# on deepseek-v4-pro). A few turns let the model recover and answer after
+# its tool calls are denied. Read-only is still guaranteed by the empty
+# allow-list — extra turns can't execute anything; well-behaved models
+# answer on turn 1 regardless, so this adds no latency to the common path.
+_BTW_MAX_TURNS = 6
+
 
 def _session_jsonl_path(project_dir: str, sdk_session_id: str) -> str:
   """Compute the absolute path to a Claude session's jsonl transcript."""
@@ -285,8 +296,11 @@ class ClaudeCodingAgent(CodingAgent):
     turn completes there is no session id yet; we still answer, just
     from a fresh ephemeral session (no prior context to draw on, but
     /btw must work as the very first message too — Claude Code's does).
-    No tools and ``max_turns=1`` keep it strictly read-only and
-    single-response.
+    Read-only is enforced solely by the empty tool allow-list (no tool
+    can execute regardless of how many turns run); ``max_turns`` is a few
+    (see ``_BTW_MAX_TURNS``) rather than 1 so an agentic model that burns
+    turns attempting blocked tool calls still reaches a prose answer
+    instead of ending as ``error_max_turns`` with no text.
 
     Isolation: ``claude_agent_sdk.query()`` drives an internal anyio
     task group whose cancel scopes MUST be entered and exited on the
@@ -328,7 +342,7 @@ class ClaudeCodingAgent(CodingAgent):
         "Glob", "Grep", "WebSearch", "WebFetch", "TodoWrite",
         "AskUserQuestion", "mcp__*",
       ],
-      max_turns=1,
+      max_turns=_BTW_MAX_TURNS,
       permission_mode="bypassPermissions",
       cwd=self._project_dir,
       model=self._model,
@@ -356,30 +370,61 @@ class ClaudeCodingAgent(CodingAgent):
       loop = asyncio.get_running_loop()
       deadline = loop.time() + _BTW_TIMEOUT
       parts: list[str] = []
+      n_assistant = 0
+      result_subtype: str | None = None
+      result_is_error: bool | None = None
       timed_out = False
       gen = query(prompt=question, options=opts)
       try:
         async for msg in gen:
           if isinstance(msg, AssistantMessage):
+            n_assistant += 1
             for block in msg.content:
               if isinstance(block, TextBlock) and block.text:
                 parts.append(block.text)
           elif isinstance(msg, ResultMessage):
-            break
+            result_subtype = getattr(msg, "subtype", None)
+            result_is_error = getattr(msg, "is_error", None)
+            # Deliberately NO `break` here. Breaking out of the async-for
+            # leaves the SDK generator suspended at its yield; the
+            # subsequent aclose() then finalises it from a different task
+            # than the one that entered its anyio task group, raising
+            # "Attempted to exit cancel scope in a different task than it
+            # was entered in" — the crash class this whole isolation
+            # exists to prevent (and the cause of empty `/btw` answers:
+            # the teardown aborted before any text was collected). Letting
+            # the loop run on to StopAsyncIteration makes the SDK close
+            # its own task group on THIS worker task; the one-shot
+            # `query()` stops right after its final ResultMessage, and the
+            # deadline below still bounds it.
           if loop.time() >= deadline:
             timed_out = True
             break
       finally:
+        # On the normal path the generator is already exhausted, so this
+        # is a harmless no-op; only the timeout-break leaves it suspended,
+        # where closing it here (in-task) is the safe place to do so. Any
+        # late anyio trip is swallowed so it can't escape the worker loop.
         aclose = getattr(gen, "aclose", None)
         if aclose is not None:
           try:
             await aclose()
           except (Exception, asyncio.CancelledError) as exc:
-            # Closing within this task is the safe path; if the SDK still
-            # trips, swallow it here so it can't escape the worker loop.
             log.warning("side_question generator close: %s",
                         _short_error(exc))
       text = "".join(parts).strip()
+      if not text:
+        # The empty/timeout fallbacks used to return silently, leaving no
+        # trace in the daemon log of WHY `/btw` came back blank. Record
+        # the shape of the forked turn so the next blank answer is
+        # diagnosable (timeout vs. a result with no assistant text vs. an
+        # error result from the model/endpoint).
+        log.warning(
+          "side_question empty: timed_out=%s assistant_msgs=%d "
+          "result_subtype=%s result_is_error=%s model=%s",
+          timed_out, n_assistant, result_subtype, result_is_error,
+          self._model,
+        )
       if timed_out and not text:
         return "⚠️ btw timed out before an answer came back."
       return text or "⚠️ btw returned no answer."

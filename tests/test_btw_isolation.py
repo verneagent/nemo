@@ -185,6 +185,152 @@ def test_side_question_teardown_error_does_not_kill_host_loop(monkeypatch):
     loop.close()
 
 
+def test_side_question_drains_generator_before_closing(monkeypatch):
+  """The teardown crash (and the empty-answer symptom) came from breaking
+  out of the async-for on ResultMessage and then aclose()-ing the still
+  suspended generator — finalising it from a different task than the one
+  that entered its anyio task group. Lock the fix: side_question must
+  consume the generator to StopAsyncIteration, so the SDK closes its own
+  task group on the worker task; any aclose() only runs after the
+  generator is already exhausted (where it is a no-op)."""
+  import claude_agent_sdk as sdk
+
+  events: list[str] = []
+
+  class _Gen:
+    def __init__(self):
+      self._msgs = iter([
+        sdk.AssistantMessage(
+          content=[sdk.TextBlock(text="hi there")], model="m"),
+        sdk.ResultMessage(
+          subtype="success", duration_ms=1, duration_api_ms=1,
+          is_error=False, num_turns=1, session_id="s"),
+      ])
+      self._exhausted = False
+
+    def __aiter__(self):
+      return self
+
+    async def __anext__(self):
+      try:
+        return next(self._msgs)
+      except StopIteration:
+        self._exhausted = True
+        events.append("exhausted")
+        raise StopAsyncIteration
+
+    async def aclose(self):
+      # Real exhausted async generators no-op here; the bug was aclose()
+      # being called on a *suspended* one. Fail loudly if that regresses.
+      assert self._exhausted, (
+        "aclose() called before the generator drained — this is exactly "
+        "the cross-task finalisation that crashes anyio")
+      events.append("aclose")
+
+  monkeypatch.setattr(sdk, "query", lambda **_kw: _Gen())
+
+  agent = _btw_claude_agent()
+  answer = asyncio.run(agent.side_question("q", "sess"))
+
+  assert answer == "hi there"
+  # Drained to completion first; the ResultMessage did NOT short-circuit
+  # the loop before the generator naturally stopped.
+  assert events[0] == "exhausted", events
+
+
+def test_side_question_empty_answer_is_logged(monkeypatch, caplog):
+  """A blank `/btw` (a result with no assistant text) used to return the
+  fallback string while logging nothing — leaving zero forensic trace of
+  why it was blank. Lock that it now emits a diagnostic WARNING."""
+  import logging
+
+  import claude_agent_sdk as sdk
+
+  class _Gen:
+    def __init__(self):
+      self._done = False
+
+    def __aiter__(self):
+      return self
+
+    async def __anext__(self):
+      if self._done:
+        raise StopAsyncIteration
+      self._done = True
+      return sdk.ResultMessage(
+        subtype="success", duration_ms=1, duration_api_ms=1,
+        is_error=False, num_turns=1, session_id="s")
+
+    async def aclose(self):
+      pass
+
+  monkeypatch.setattr(sdk, "query", lambda **_kw: _Gen())
+
+  agent = _btw_claude_agent()
+  with caplog.at_level(logging.WARNING, logger="nemo.claude_agent"):
+    answer = asyncio.run(agent.side_question("q", "sess"))
+
+  assert answer == "⚠️ btw returned no answer."
+  msgs = [r.getMessage() for r in caplog.records]
+  assert any("side_question empty" in m for m in msgs), msgs
+  # The diagnostic must carry the shape needed to triage (no text, a
+  # success result, not a timeout).
+  hit = next(m for m in msgs if "side_question empty" in m)
+  assert "assistant_msgs=0" in hit and "timed_out=False" in hit, hit
+
+
+def test_side_question_allows_more_than_one_turn(monkeypatch):
+  """Production blank `/btw`: deepseek-v4-pro, resumed into a tool-heavy
+  session, attempted (denied) tool calls and the turn ended as
+  `error_max_turns` before any text — because max_turns was 1. The side
+  query exposes no tools, so read-only is guaranteed by the allow-list,
+  not by capping turns; capping at 1 only starves agentic models of the
+  turn they need to answer after their tool calls bounce. Lock max_turns
+  > 1 so this can't regress."""
+  import claude_agent_sdk as sdk
+
+  captured: dict[str, object] = {}
+
+  class _Gen:
+    def __init__(self):
+      self._msgs = iter([
+        sdk.AssistantMessage(
+          content=[sdk.TextBlock(text="ok")], model="m"),
+        sdk.ResultMessage(
+          subtype="success", duration_ms=1, duration_api_ms=1,
+          is_error=False, num_turns=1, session_id="s"),
+      ])
+
+    def __aiter__(self):
+      return self
+
+    async def __anext__(self):
+      try:
+        return next(self._msgs)
+      except StopIteration:
+        raise StopAsyncIteration
+
+    async def aclose(self):
+      pass
+
+  def _fake_query(*, prompt, options):  # noqa: ARG001
+    captured["max_turns"] = getattr(options, "max_turns", None)
+    captured["allowed_tools"] = getattr(options, "allowed_tools", None)
+    return _Gen()
+
+  monkeypatch.setattr(sdk, "query", _fake_query)
+
+  agent = _btw_claude_agent()
+  answer = asyncio.run(agent.side_question("q", "sess"))
+
+  assert answer == "ok"
+  assert isinstance(captured["max_turns"], int) and captured["max_turns"] > 1, (
+    f"max_turns must be > 1 to survive blocked tool attempts; "
+    f"got {captured['max_turns']!r}")
+  # Read-only must still rest on the empty allow-list, not on the turn cap.
+  assert captured["allowed_tools"] == [], captured["allowed_tools"]
+
+
 # ---------------------------------------------------------------------------
 # 3. Real-SDK smoke (gated; release must run with NEMO_REAL_SDK=1)
 # ---------------------------------------------------------------------------

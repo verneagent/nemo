@@ -434,7 +434,9 @@ def test_side_question_without_session_runs_fresh(monkeypatch):
   assert getattr(opts, "resume", None) in (None, "")
   assert getattr(opts, "fork_session", False) is False
   assert opts.allowed_tools == []
-  assert opts.max_turns == 1
+  # >1: read-only rests on the empty allow-list, not the turn cap; a cap
+  # of 1 starves agentic models that burn turns on blocked tool calls.
+  assert opts.max_turns > 1
 
 
 def test_side_question_requires_project_dir():
@@ -474,7 +476,9 @@ def test_side_question_forks_resumes_and_is_readonly(monkeypatch):
   assert opts.resume == "live-session"
   assert opts.fork_session is True
   assert opts.allowed_tools == []
-  assert opts.max_turns == 1
+  # >1: read-only rests on the empty allow-list, not the turn cap; a cap
+  # of 1 starves agentic models that burn turns on blocked tool calls.
+  assert opts.max_turns > 1
   assert "Bash" in opts.disallowed_tools and "Write" in opts.disallowed_tools
 
 
