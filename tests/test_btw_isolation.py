@@ -331,6 +331,59 @@ def test_side_question_allows_more_than_one_turn(monkeypatch):
   assert captured["allowed_tools"] == [], captured["allowed_tools"]
 
 
+def test_side_question_captures_cli_stderr_on_failure(monkeypatch, caplog):
+  """When the forked CLI exits non-zero the SDK only says "Command failed
+  with exit code N (Check stderr output for details)" — the real reason is
+  in the CLI's stderr, which the SDK discards unless a callback is given.
+  Lock that side_question (a) passes a stderr callback so the SDK pipes it,
+  and (b) logs the captured tail on failure, so `⚠️ btw failed: …` is
+  diagnosable instead of opaque."""
+  import logging
+
+  import claude_agent_sdk as sdk
+
+  captured: dict[str, object] = {}
+
+  class _Gen:
+    def __init__(self, options):
+      self._options = options
+      self._started = False
+
+    def __aiter__(self):
+      return self
+
+    async def __anext__(self):
+      if not self._started:
+        self._started = True
+        # The SDK pipes the CLI's stderr line-by-line into this callback,
+        # then surfaces the non-zero exit as ProcessError.
+        if callable(self._options.stderr):
+          self._options.stderr("Error: deepseek endpoint 429 rate limited")
+        raise sdk.ProcessError(
+          "Command failed with exit code 1", exit_code=1,
+          stderr="Check stderr output for details")
+      raise StopAsyncIteration
+
+    async def aclose(self):
+      pass
+
+  def _fake_query(*, prompt, options):  # noqa: ARG001
+    captured["stderr_cb"] = options.stderr
+    return _Gen(options)
+
+  monkeypatch.setattr(sdk, "query", _fake_query)
+
+  agent = _btw_claude_agent()
+  with caplog.at_level(logging.WARNING, logger="nemo.claude_agent"):
+    answer = asyncio.run(agent.side_question("q", "sess"))
+
+  assert answer.startswith("⚠️ btw failed"), answer
+  assert callable(captured["stderr_cb"]), "no stderr callback passed to query()"
+  msgs = [r.getMessage() for r in caplog.records]
+  assert any(
+    "cli stderr" in m and "429 rate limited" in m for m in msgs), msgs
+
+
 # ---------------------------------------------------------------------------
 # 3. Real-SDK smoke (gated; release must run with NEMO_REAL_SDK=1)
 # ---------------------------------------------------------------------------

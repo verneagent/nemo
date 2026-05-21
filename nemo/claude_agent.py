@@ -6,6 +6,7 @@ import asyncio
 import logging
 import os
 import re
+from collections import deque
 from typing import Awaitable, Callable, cast
 
 from .channel import Channel
@@ -86,6 +87,12 @@ def _session_jsonl_path(project_dir: str, sdk_session_id: str) -> str:
 def _short_error(exc: BaseException) -> str:
   """One-line summary suitable for a log breadcrumb."""
   return str(exc).split("\n")[0][:200]
+
+
+def _stderr_tail(lines: "deque[str] | list[str]", limit: int = 20) -> str:
+  """Last few CLI stderr lines, flattened to one log-friendly breadcrumb."""
+  tail = [ln.strip() for ln in list(lines)[-limit:] if ln.strip()]
+  return " ⏎ ".join(tail) if tail else "(empty)"
 
 
 _EXIT_1_PATTERN = re.compile(r"\bexit code 1\b", re.IGNORECASE)
@@ -332,7 +339,14 @@ class ClaudeCodingAgent(CodingAgent):
     agent_prompt = (
       f"{self._build_agent_prompt()}\n\n{_BTW_DIRECTIVE}"
     )
+    # Capture the forked CLI's stderr. Without a callback the SDK discards
+    # it and a non-zero exit surfaces only as the opaque "Command failed
+    # with exit code N (Check stderr output for details)" — leaving no way
+    # to tell WHY (`⚠️ btw failed: …`). Bounded so a chatty/wedged CLI
+    # can't grow it without limit.
+    stderr_lines: deque[str] = deque(maxlen=200)
     opts_kwargs: dict[str, object] = dict(
+      stderr=stderr_lines.append,
       allowed_tools=[],
       # Belt-and-suspenders: even with an empty allow-list, name every
       # mutating/IO tool so a preset system prompt can't coax one in.
@@ -421,9 +435,9 @@ class ClaudeCodingAgent(CodingAgent):
         # error result from the model/endpoint).
         log.warning(
           "side_question empty: timed_out=%s assistant_msgs=%d "
-          "result_subtype=%s result_is_error=%s model=%s",
+          "result_subtype=%s result_is_error=%s model=%s stderr=%s",
           timed_out, n_assistant, result_subtype, result_is_error,
-          self._model,
+          self._model, _stderr_tail(stderr_lines),
         )
       if timed_out and not text:
         return "⚠️ btw timed out before an answer came back."
@@ -435,7 +449,12 @@ class ClaudeCodingAgent(CodingAgent):
       try:
         return asyncio.run(_amain())
       except BaseException as exc:  # nothing may propagate to the host
-        log.warning("side_question worker failed: %s", _short_error(exc))
+        # The SDK's ProcessError says only "Command failed with exit code
+        # N (Check stderr output for details)" — the CLI's real stderr is
+        # the only thing that explains it, so log the captured tail.
+        tail = _stderr_tail(stderr_lines)
+        log.warning("side_question worker failed: %s; cli stderr: %s",
+                    _short_error(exc), tail)
         return f"⚠️ btw failed: {_short_error(exc)}"
 
     try:
