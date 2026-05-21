@@ -51,6 +51,18 @@ Lark-connected coding agent daemon. Repo focus:
 - `<font color=…>…</font>` (and any inline HTML) cannot span a markdown paragraph break (`\n\n`): the open lands in one block, the close in the next, and Lark leaks a bare `</font>` into the rendered card. Keep a grey `_note_element` to a single line; render multi-line content as plain markdown. A literal `<name>`-style token in card text also opens a stray tag — write `NAME`, not `<name>`.
 - Form submit (`form_action_type: "submit"`): Lark puts every *named* form child into `action.form_value` and may DROP the button's `action.value`. So (a) leave the submit button nameless or the single-field `form_value` becomes multi-field and the relay JSON-encodes it (breaking a `startswith(prefix)` route), and (b) the relay must fall back to `event.context.open_chat_id` / `open_message_id` for routing since `value.chat_id` can be missing. Encode the routing discriminator in the *select option value* (e.g. `model_switch:<name>`), not in the button.
 
+## Debugging
+
+- Pulling a chat's messages when analysing a bug — three sources, most-useful first:
+  - **Daemon log (primary / forensic).** Map the chat to its daemon, then read the log:
+    ```bash
+    pid=$(cat ~/.nemo/pids/<chat_id>.pid)
+    less ~/.nemo/logs/nemo-$pid.log
+    ```
+    Every inbound event is logged as `Event: type=… chat=… sender=… text=…` and every reply as `Response sent …`. This is the source of truth for what the daemon actually saw and did (including synthesised internal messages and card actions).
+  - **Lark itself (the real conversation).** Use `lark-cli` (lark-im skill) to read what users actually sent, including interactive card bodies that `get_message` strips: `lark-cli im +chat-search` (find chat_id by group name), `+chat-messages-list --chat-id <cid>` (history, time range / pagination), `+messages-search` (keyword / sender / time), `+messages-mget` (batch by `om_` ids).
+  - **Relay queue (live only).** `GET <relay_url>/replies/chat:<chat_id>?since=` (header `Authorization: Bearer <relay_api_key>`) returns only UN-consumed messages — an active daemon has already drained them, so this reflects the live queue / injected test events, not history.
+
 ## Error Handling
 
 - Never `except Exception: pass` — always log the exception. Silent swallowing hides bugs (e.g. the zombie CLI subprocess bug was invisible because `__aexit__` failures were silently passed).
