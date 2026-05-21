@@ -48,6 +48,8 @@ Lark-connected coding agent daemon. Repo focus:
   - no `note` tag
   - `collapsible_panel` headers must use `plain_text`
 - `get_message` loses original card body content. Persistent config/state must not depend on reading interactive card bodies back.
+- `<font color=…>…</font>` (and any inline HTML) cannot span a markdown paragraph break (`\n\n`): the open lands in one block, the close in the next, and Lark leaks a bare `</font>` into the rendered card. Keep a grey `_note_element` to a single line; render multi-line content as plain markdown. A literal `<name>`-style token in card text also opens a stray tag — write `NAME`, not `<name>`.
+- Form submit (`form_action_type: "submit"`): Lark puts every *named* form child into `action.form_value` and may DROP the button's `action.value`. So (a) leave the submit button nameless or the single-field `form_value` becomes multi-field and the relay JSON-encodes it (breaking a `startswith(prefix)` route), and (b) the relay must fall back to `event.context.open_chat_id` / `open_message_id` for routing since `value.chat_id` can be missing. Encode the routing discriminator in the *select option value* (e.g. `model_switch:<name>`), not in the button.
 
 ## Error Handling
 
@@ -72,3 +74,8 @@ Lark-connected coding agent daemon. Repo focus:
   python3 scripts/e2e_test.py --skip-sdk
   python3 scripts/e2e_test.py --perm
   ```
+- Interactive card features (forms / dropdowns / buttons) must be tested at all three layers, not just the daemon. A daemon test that hand-builds `action_value={"action": …}` stubs away the wire format and will miss bugs in how Lark/the relay actually deliver the action (this is exactly how a `/model` picker form submit shipped broken — the relay dropped it because `value.chat_id` was empty). Cover:
+  - `relay/test_relay.py` — POST a realistic webhook (try with AND without `action.value`, since Lark V2 form submits are flaky about preserving it).
+  - `tests/test_relay_events.py` — round-trip the relay reply dict through `_relay_msg_to_event`.
+  - `tests/test_agent.py` — the daemon main-loop handler.
+  - `python3 scripts/e2e_test.py --picker` for the live `/model` picker chain.
