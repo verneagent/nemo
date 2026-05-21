@@ -1574,102 +1574,82 @@ def run_picker_tests(pid: int, chat_id: str, result: E2EResult) -> None:
       result.ok("TM2 no ugly 'Selected:' card",
                 "relay toast-only for model_switch:* (BOT_OWNED_CARD_PREFIXES)")
 
-  wait_for_idle(pid, chat_id, timeout=30)
-
-  # --- TM3: next /model shows the new current model ---
-  # Verify via the daemon's ctx.model: a fresh ``/model`` triggers
-  # _send_model_picker which logs the catalog + current model. The
-  # picker card itself comes through Lark with the title intact;
-  # absence of "Model switch to" log on a re-pick of the SAME target
-  # confirms we're already on it (no-op).
-  mark = log.mark()
-  send_msg("/model", chat_id)
-  picker2, elapsed = wait_for_interactive_title(
-    chat_id, after=str(int(time.time() * 1000) - 5000),
-    title_prefix="Switch Model", timeout=15)
-  if not picker2:
-    result.fail("TM3 next /model reflects switch", "no follow-up picker")
-    return
-  # Re-submit the SAME model as a no-op probe. If the daemon already
-  # has ctx.model = target_model the existing /model dispatch will
-  # NOT emit "Model switch to" again (it's a real swap, but on the
-  # same name). Instead it'll just confirm. We accept either:
-  # (a) no "Model switch to" log = already on it; (b) a second
-  # "Model switch to target" log = re-applied.
-  send_form_action(
-    form_value={"model": f"model_switch:{target_model}"},
-    chat_id=chat_id,
-    card_msg_id=picker2.get("message_id", ""),
-    include_value=False,
-  )
-  # Give the daemon up to 10s to log either a fresh switch or
-  # process the action silently.
-  time.sleep(10)
-  re_switched = log.find(
-    rf"Model switch to {target_model}", last_n=80)
-  # The interesting question is: did the SECOND submit also flow
-  # through the card-action → synthetic /model path? That at least
-  # tells us the picker is still wired up.
-  second_card = log.count(
-    r"card\.action\.trigger", last_n=80)
-  if second_card >= 2:
-    result.ok("TM3 next /model picker still wired",
-              f"second submit also reached card.action handler "
-              f"(re_switched_log={'yes' if re_switched else 'no-op'})")
+  # The TM1 submit must also have LOCKED the picker card — the daemon
+  # PATCHes it into a no-form confirmation state (dropdown + Submit
+  # removed) so it can't be re-submitted with a stale model list.
+  # Verified via the daemon log since get_message strips card bodies.
+  # The lock fires AFTER the SDK reconnect + response send (a few
+  # seconds past the "Model switch to" line), so wait for it rather
+  # than checking instantly.
+  locked = log.wait_for_since(
+    rf"Locked /model picker .*ok=True.*model={target_model}",
+    offset=mark, timeout=20)
+  if locked:
+    result.ok("TM1c picker locked after submit",
+              "card PATCHed to confirmation state (no form)")
   else:
-    result.fail("TM3 next /model picker still wired",
-                "second submit did not reach card.action handler")
+    result.fail("TM1c picker locked after submit",
+                "no 'Locked /model picker ok=True' log")
+    log.dump_tail(20, "TM1c")
 
   wait_for_idle(pid, chat_id, timeout=30)
 
-  # --- TM4: the SAME picker card accepts repeated submits ---
-  # Because the relay returns toast-only for model_switch:* the card is
-  # never replaced, so its dropdown + Submit stay live. Neither the
-  # relay (per-event_id idempotency only) nor the daemon dedupe
-  # submits, so picking a different model on the same card and
-  # submitting again must drive a second, distinct switch.
-  #
-  # NB: this injects two webhook submits against ONE picker
-  # message_id. It proves the relay+daemon accept multiple submits
-  # from the same card; it cannot prove the Lark *client* keeps the
-  # form interactive after the first submit (webhook injection
-  # bypasses the client). That client-side caveat is called out in
-  # the summary, not asserted here.
+  # --- TM3: a fresh /model after the switch still works ---
+  # Each /model emits its own picker; the old one is locked. Confirm a
+  # new picker renders and its submit drives another switch (back to a
+  # different model so the log line is distinct).
+  ts = str(int(time.time() * 1000))
+  send_msg("/model", chat_id)
+  picker2, _ = wait_for_interactive_title(
+    chat_id, after=ts, title_prefix="Switch Model", timeout=15)
+  if not picker2:
+    result.fail("TM3 fresh /model works", "no follow-up picker")
+    return
+  mark = log.mark()
+  send_form_action(
+    form_value={"model": "model_switch:claude-opus-4-7"},
+    chat_id=chat_id, card_msg_id=picker2.get("message_id", ""),
+    include_value=False)
+  back_ok = log.wait_for_since(
+    r"Model switch to claude-opus-4-7", offset=mark, timeout=20)
+  if back_ok:
+    result.ok("TM3 fresh /model works", "fresh picker submit switched to opus")
+  else:
+    result.fail("TM3 fresh /model works", "fresh picker submit did not switch")
+    log.dump_tail(20, "TM3")
+
+  wait_for_idle(pid, chat_id, timeout=30)
+
+  # --- TM4: stale/incompatible model is rejected and the card locks ---
+  # Simulate a picker submitting a model that is NOT valid for the
+  # current agent (the stale-after-/agent-switch scenario). The daemon
+  # must NOT switch, must tell the user, and must lock the picker to an
+  # error state. We're on a claude agent here, so a codex slug stands
+  # in for "incompatible".
   ts = str(int(time.time() * 1000))
   send_msg("/model", chat_id)
   picker3, _ = wait_for_interactive_title(
     chat_id, after=ts, title_prefix="Switch Model", timeout=15)
   if not picker3:
-    result.fail("TM4 same card repeated submit", "no picker for repeat test")
+    result.fail("TM4 incompatible model rejected", "no picker for reject test")
     return
-  same_card = picker3.get("message_id", "")
-
-  # First submit on this card: sonnet.
   mark = log.mark()
   send_form_action(
-    form_value={"model": "model_switch:claude-sonnet-4-6"},
-    chat_id=chat_id, card_msg_id=same_card, include_value=False)
-  first_ok = log.wait_for_since(
-    r"Model switch to claude-sonnet-4-6", offset=mark, timeout=20)
-  wait_for_idle(pid, chat_id, timeout=30)
-
-  # Second submit on the SAME card: switch to a different model.
-  mark2 = log.mark()
-  send_form_action(
-    form_value={"model": "model_switch:claude-opus-4-7"},
-    chat_id=chat_id, card_msg_id=same_card, include_value=False)
-  second_ok = log.wait_for_since(
-    r"Model switch to claude-opus-4-7", offset=mark2, timeout=20)
-
-  if first_ok and second_ok:
-    result.ok("TM4 same card repeated submit",
-              "both submits on one picker drove distinct switches "
-              "(sonnet → opus)")
+    form_value={"model": "model_switch:gpt-5.5"},  # codex slug on claude
+    chat_id=chat_id, card_msg_id=picker3.get("message_id", ""),
+    include_value=False)
+  # The picker must lock to an error state (ok=False) and NO switch log.
+  err_locked = log.wait_for_since(
+    r"Locked /model picker .*ok=False", offset=mark, timeout=15)
+  bad_switch = log.find(r"Model switch to gpt-5.5", last_n=80)
+  if err_locked and not bad_switch:
+    result.ok("TM4 incompatible model rejected",
+              "no switch, picker locked to error state")
   else:
-    result.fail("TM4 same card repeated submit",
-                f"first(sonnet)={'ok' if first_ok else 'NO'} "
-                f"second(opus)={'ok' if second_ok else 'NO'}")
-    log.dump_tail(30, "TM4")
+    result.fail("TM4 incompatible model rejected",
+                f"err_locked={'yes' if err_locked else 'NO'} "
+                f"bad_switch={'YES(bad!)' if bad_switch else 'no'}")
+    log.dump_tail(25, "TM4")
 
   print()
 

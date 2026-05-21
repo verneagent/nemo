@@ -954,6 +954,59 @@ def build_model_picker_card(
   }
 
 
+def build_model_switched_card(
+  *,
+  agent: str,
+  model: str,
+  ok: bool = True,
+  attempted: str = "",
+  reason: str = "",
+) -> JsonObject:
+  """Build the locked, post-submit replacement for the /model picker.
+
+  Once a model is picked and submitted the picker rewrites itself into
+  this static card — no dropdown, no Submit button — so it can't be
+  re-submitted with a now-stale model list (e.g. after the user has
+  since switched agent). To change model again the user runs ``/model``
+  for a fresh picker.
+
+  ``ok=True``: the switch landed; prominently shows the current agent +
+  model. ``ok=False``: the submitted ``attempted`` model was rejected
+  (typically because the agent changed under a stale picker); shows the
+  unchanged current agent + model plus ``reason``.
+  """
+  if ok:
+    header_title = "✅ Model Switched"
+    template = "green"
+    lines = [
+      f"**Agent:** {_escape_md(agent)}",
+      f"**Model:** {_escape_md(model)}",
+    ]
+  else:
+    header_title = "⚠️ Model Not Switched"
+    template = "orange"
+    lines = []
+    if attempted:
+      lines.append(f"Couldn't switch to **{_escape_md(attempted)}**.")
+    if reason:
+      lines.append(_escape_md(reason))
+    lines.append(f"**Current agent:** {_escape_md(agent)}")
+    lines.append(f"**Current model:** {_escape_md(model)}")
+  elements: list[JsonObject] = [
+    {"tag": "markdown", "content": "\n".join(lines)},
+    _note_element("Run `/model` for a fresh picker."),
+  ]
+  return {
+    "schema": "2.0",
+    "config": {"update_multi": True},
+    "header": {
+      "title": {"tag": "plain_text", "content": header_title},
+      "template": template,
+    },
+    "body": {"direction": "vertical", "elements": elements},
+  }
+
+
 def build_form_input(title: str, placeholder: str = "",
                      chat_id: str = "") -> JsonObject:
   """Build a card with text input."""

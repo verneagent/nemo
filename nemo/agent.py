@@ -993,6 +993,36 @@ async def _send_model_picker(
     )
 
 
+async def _lock_model_picker(
+  channel: LarkChannel,
+  picker_msg_id: str,
+  *,
+  agent: str,
+  model: str,
+  ok: bool = True,
+  attempted: str = "",
+  reason: str = "",
+) -> None:
+  """PATCH a submitted /model picker into its locked confirmation state.
+
+  Removes the dropdown + Submit button (the card is rebuilt without a
+  form) so the picker can't be re-submitted with a now-stale model
+  list, and prominently shows the current agent + model. No-op when
+  there is no picker card to lock (e.g. the submit came from the
+  standalone fallback card, or the card id wasn't propagated).
+  """
+  if not picker_msg_id:
+    return
+  try:
+    card = cards.build_model_switched_card(
+      agent=agent, model=model, ok=ok, attempted=attempted, reason=reason)
+    await channel.update_card(picker_msg_id, card)
+    log.info("Locked /model picker %s (ok=%s agent=%s model=%s)",
+             picker_msg_id, ok, agent, model)
+  except Exception as exc:
+    log.warning("Picker confirm-lock update failed: %s", exc)
+
+
 # ---------------------------------------------------------------------------
 # Main loop
 # ---------------------------------------------------------------------------
@@ -1204,6 +1234,12 @@ async def main_loop(
   # One-shot flag: prepend a pacing hint to the next user prompt after an
   # SDK timeout. Cleared after use or on /clear.
   _pending_pacing_hint = False
+  # Message id of the /model picker card awaiting a confirmation PATCH.
+  # Set when a picker submit (model_switch:*) is accepted; the __model__
+  # handler reads it after the switch lands and rewrites that card into
+  # a locked "now on agent/model" state (dropdown + Submit removed) so
+  # the picker can't be re-submitted with a now-stale model list.
+  _pending_picker_msg_id = ""
 
   def handle_sig(_sig, _frame):
     nonlocal running
@@ -1265,11 +1301,6 @@ async def main_loop(
           # `/model` picker form submitted. The select_static's value
           # carries the ``model_switch:<name>`` prefix; the relay passes
           # the single-field form_value through as the action string.
-          # Synthesise an internal ``/model <name>`` so the existing
-          # /model dispatch handles the actual switch (catalog
-          # validation, SDK restart, response card). is_internal=True
-          # bypasses sender/mention filters since the click already
-          # came from an authorized operator.
           model_name = action_str.split(":", 1)[1].strip()
           if not model_name:
             await _send_response(
@@ -1285,6 +1316,36 @@ async def main_loop(
               reply.operator_id,
             )
             continue
+          # Pre-validate against the CURRENT agent. A picker built under
+          # one agent can be submitted after the user has since switched
+          # agents (the card stays live until submitted), at which point
+          # its model list is stale. Reject up front and lock the card to
+          # an error state so the now-incompatible model never reaches
+          # the switch logic — and the stale dropdown can't be retried.
+          if not is_model_compatible(agent, model_name):
+            await _lock_model_picker(
+              channel, reply.message_id, agent=agent, model=model,
+              ok=False, attempted=model_name,
+              reason=(
+                f"`{model_name}` isn't available for agent **{agent}** "
+                f"(the picker may be from before an /agent switch)."
+              ),
+            )
+            await _send_response(
+              channel, chat_id,
+              f"**{model_name}** isn't available for agent **{agent}**. "
+              f"Run `/model` for the current list.",
+              db,
+            )
+            continue
+          # Compatible — synthesise an internal ``/model <name>`` so the
+          # existing /model dispatch handles the real switch (preset
+          # resolution, SDK restart, response card). is_internal=True
+          # bypasses sender/mention filters since the click already came
+          # from an authorized operator. Stash the picker card id so the
+          # __model__ handler can lock it to a confirmation state once
+          # the switch lands.
+          _pending_picker_msg_id = reply.message_id
           synthetic = dataclasses.replace(
             reply,
             event_type="im.message.receive_v1",
@@ -1460,6 +1521,12 @@ async def main_loop(
                 f"agent **{agent}**.",
                 db,
               )
+              await _lock_model_picker(
+                channel, _pending_picker_msg_id,
+                agent=agent, model=model, ok=False, attempted=new_model,
+                reason=f"Preset **{new_model}** has no endpoint for "
+                       f"agent **{agent}**.")
+              _pending_picker_msg_id = ""
               await _clear_ack()
               continue
             if preset.api_key_env and not os.environ.get(preset.api_key_env):
@@ -1469,6 +1536,12 @@ async def main_loop(
                 f"in the daemon's environment.",
                 db,
               )
+              await _lock_model_picker(
+                channel, _pending_picker_msg_id,
+                agent=agent, model=model, ok=False, attempted=new_model,
+                reason=f"Preset **{new_model}** needs "
+                       f"`${preset.api_key_env}` in the daemon env.")
+              _pending_picker_msg_id = ""
               await _clear_ack()
               continue
             old_endpoint_key = _endpoint_key
@@ -1499,6 +1572,10 @@ async def main_loop(
               f"(remote: `{switched_to}`).{note}",
               db,
             )
+            await _lock_model_picker(
+              channel, _pending_picker_msg_id,
+              agent=agent, model=model, ok=True)
+            _pending_picker_msg_id = ""
             continue
           if not is_model_compatible(agent, new_model):
             await _send_response(
@@ -1507,6 +1584,11 @@ async def main_loop(
               f"Model **{new_model}** is not supported by agent **{agent}**.",
               db,
             )
+            await _lock_model_picker(
+              channel, _pending_picker_msg_id,
+              agent=agent, model=model, ok=False, attempted=new_model,
+              reason=f"`{new_model}` isn't available for agent **{agent}**.")
+            _pending_picker_msg_id = ""
             await _clear_ack()
             continue
           # Plain model swap. Clear any preset endpoint that was active
@@ -1531,6 +1613,10 @@ async def main_loop(
             channel, chat_id,
             f"Model switched to **{model}**.{note}", db,
           )
+          await _lock_model_picker(
+            channel, _pending_picker_msg_id,
+            agent=agent, model=model, ok=True)
+          _pending_picker_msg_id = ""
         elif response and response.startswith("__agent__:"):
           # Format: "__agent__:<name>:<default_model>"
           _, new_agent, default_model = response.split(":", 2)

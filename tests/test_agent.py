@@ -1236,10 +1236,19 @@ def test_model_picker_submit_switches_model(tmp_path):
 
   class _ReplayChannel(_QueuedChannel):
     """_QueuedChannel + a working push_back so the daemon's synthetic
-    /model message actually gets replayed on the next receive()."""
+    /model message actually gets replayed on the next receive(). Also
+    records update_card calls so we can assert the picker gets locked."""
+
+    def __init__(self, *a, **kw):
+      super().__init__(*a, **kw)
+      self.update_card_calls: list[tuple[str, object]] = []
 
     def push_back(self, message):
       self._messages.insert(0, message)
+
+    async def update_card(self, card_id, card):
+      self.update_card_calls.append((card_id, card))
+      return card_id
 
   class _SpyAgent(_FakeAgent):
     def __init__(self):
@@ -1257,11 +1266,14 @@ def test_model_picker_submit_switches_model(tmp_path):
   queued = _ReplayChannel("oc_test", [
     # The picker submit arrives as a card.action.trigger from the
     # operator with the model_switch:<name> action discriminator.
+    # message_id is the picker card's id (relay propagates it from
+    # event.context.open_message_id) — the daemon locks THIS card.
     IncomingMessage(
       event_type="card.action.trigger",
       chat_id="oc_test",
       operator_id="ou_user",
       sender_id="ou_user",
+      message_id="om_picker_card",
       action_value={"action": "model_switch:claude-sonnet-4-6",
                     "chat_id": "oc_test"},
       create_time="1",
@@ -1291,6 +1303,15 @@ def test_model_picker_submit_switches_model(tmp_path):
   # The synthesised /model claude-sonnet-4-6 must have driven a reset
   # to sonnet — bare "switch happened" is the contract here.
   assert "claude-sonnet-4-6" in agent.reset_calls, agent.reset_calls
+  # And the picker card must have been locked to a confirmation state
+  # (no form). The lock targets the picker's own message_id.
+  locks = [c for c in queued.update_card_calls if c[0] == "om_picker_card"]
+  assert locks, queued.update_card_calls
+  locked_card = locks[-1][1]
+  import json as _json
+  blob = _json.dumps(locked_card, ensure_ascii=False)
+  assert "select_static" not in blob and "form_action_type" not in blob
+  assert "claude-sonnet-4-6" in blob
 
 
 def test_model_picker_submit_unauthorized_is_ignored(tmp_path):

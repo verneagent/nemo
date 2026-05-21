@@ -5,8 +5,9 @@ import json
 from nemo.cards import (
   ToolRecord, ThinkingStep, build_turn_card, build_card, build_markdown_card,
   build_form_select, build_form_input, build_ask_user_question_card,
-  build_model_picker_card, build_shell_card, tool_use_summary, _elapsed_title,
-  _elapsed_text, _usage_text, _collapsible_thinking,
+  build_model_picker_card, build_model_switched_card, build_shell_card,
+  tool_use_summary, _elapsed_title, _elapsed_text, _usage_text,
+  _collapsible_thinking,
 )
 
 
@@ -751,6 +752,45 @@ def test_model_picker_card_empty_options():
   form = _find_element(card["body"]["elements"], "form")
   select = _find_element(form["elements"], "select_static")
   assert select["options"] == []
+
+
+# ---------------------------------------------------------------------------
+# build_model_switched_card (locked post-submit state)
+# ---------------------------------------------------------------------------
+
+def test_model_switched_card_ok_has_no_form():
+  """After a successful submit the picker is rebuilt WITHOUT a form —
+  no dropdown, no Submit button — so it can't be re-submitted with a
+  stale model list. It prominently shows the current agent + model."""
+  card = build_model_switched_card(
+    agent="claude", model="claude-sonnet-4-6", ok=True)
+  blob = json.dumps(card, ensure_ascii=False)
+  assert card["header"]["template"] == "green"
+  assert "Switched" in card["header"]["title"]["content"]
+  # No interactive elements survive the lock.
+  assert "select_static" not in blob
+  assert "form" not in blob
+  assert "form_action_type" not in blob
+  assert "model_switch:" not in blob
+  # Current agent + model prominently shown.
+  assert "claude" in blob
+  assert "claude-sonnet-4-6" in blob
+
+
+def test_model_switched_card_error_state():
+  """A stale-picker submit (model incompatible with the now-current
+  agent) locks to an orange error card naming the attempted model and
+  keeping the unchanged current agent/model — still no form."""
+  card = build_model_switched_card(
+    agent="codex", model="gpt-5.5", ok=False,
+    attempted="claude-sonnet-4-6",
+    reason="`claude-sonnet-4-6` isn't available for agent **codex**.")
+  blob = json.dumps(card, ensure_ascii=False)
+  assert card["header"]["template"] == "orange"
+  assert "select_static" not in blob and "form_action_type" not in blob
+  assert "claude-sonnet-4-6" in blob  # attempted
+  assert "gpt-5.5" in blob            # unchanged current
+  assert "codex" in blob
 
 
 # ---------------------------------------------------------------------------
