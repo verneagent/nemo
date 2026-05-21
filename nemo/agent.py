@@ -904,6 +904,94 @@ def _endpoint_change_note(
           "endpoint's history is preserved, switch back to continue it.")
 
 
+def _model_picker_options(
+  agent: AgentKind, project_dir: str,
+) -> list[tuple[str, str]]:
+  """Flatten the model catalog into ``(display_label, model_name)``
+  pairs for the picker dropdown.
+
+  Visible models come first (the everyday picks), then API-only slugs
+  with a `(API-only)` suffix, then aliases pointing at their canonical
+  name. ``hidden`` legacy entries are intentionally omitted — they stay
+  reachable via ``/model <name>`` for muscle memory but don't deserve a
+  slot in the dropdown.
+  """
+  from .agent_factory import model_catalog_for_agent
+  catalog = model_catalog_for_agent(agent, project_dir)
+  options: list[tuple[str, str]] = []
+  seen: set[str] = set()
+  for name in catalog.visible:
+    options.append((name, name))
+    seen.add(name)
+  for name in getattr(catalog, "api_only", ()):
+    label = f"{name} (API-only)"
+    options.append((label, name))
+    seen.add(name)
+  for alias, full in catalog.aliases.items():
+    if alias in seen:
+      continue
+    options.append((f"{alias} → {full}", alias))
+    seen.add(alias)
+  return options
+
+
+async def _send_model_picker(
+  channel: LarkChannel,
+  chat_id: str,
+  project_dir: str,
+  ctx: commands.AgentContext,
+  db: Database,
+) -> None:
+  """Send the interactive `/model` picker card.
+
+  Falls back to a plain-text listing when there are no models to pick
+  (e.g. opencode with no configured catalog) so the user still gets a
+  helpful response instead of an empty dropdown.
+  """
+  from .agent_factory import model_catalog_for_agent
+  options = _model_picker_options(ctx.agent, project_dir)
+  catalog = model_catalog_for_agent(ctx.agent, project_dir)
+  if not options:
+    listing = commands._format_model_catalog(catalog)
+    await _send_response(
+      channel, chat_id,
+      f"Current model: **{ctx.model}** (agent **{ctx.agent}**)\n\n"
+      f"{listing}\n\nUsage: `/model <name>`",
+      db,
+    )
+    return
+  # Build the note shown below the dropdown. We include the formatted
+  # catalog so the helpful annotations (API-only warnings, aliases,
+  # opencode's dynamic-models note) stay visible in the picker — the
+  # bare dropdown labels can't carry those nuances.
+  listing = commands._format_model_catalog(catalog)
+  note_parts = [
+    listing,
+    "Pick a model and click Submit. Or type `/model <name>` directly.",
+  ]
+  note = "\n\n".join(p for p in note_parts if p)
+  card = cards.build_model_picker_card(
+    options,
+    current_model=ctx.model,
+    current_agent=ctx.agent,
+    chat_id=chat_id,
+    note=note,
+  )
+  try:
+    msg_id = await channel.send_card(chat_id, card)
+    db.record_sent(msg_id, text="Switch Model", chat_id=chat_id)
+    _register_msg(msg_id, chat_id)
+  except Exception as e:
+    log.error("Model picker send failed: %s", e)
+    listing = commands._format_model_catalog(catalog)
+    await _send_response(
+      channel, chat_id,
+      f"Current model: **{ctx.model}** (agent **{ctx.agent}**)\n\n"
+      f"{listing}\n\nUsage: `/model <name>`",
+      db,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Main loop
 # ---------------------------------------------------------------------------
@@ -1162,6 +1250,52 @@ async def main_loop(
           else:
             log.info("Ignoring unauthorized shell abort by %s", reply.operator_id)
           continue
+        action_str = str(reply.action_value.get("action", ""))
+        if action_str == "model_picker_submit":
+          # Submit clicked but the dropdown was empty — Lark falls back
+          # to the button's own action value when form_value carries no
+          # selection. Tell the user instead of silently dropping it.
+          await _send_response(
+            channel, chat_id,
+            "Pick a model from the dropdown before submitting.", db,
+          )
+          continue
+        if action_str.startswith("model_switch:"):
+          # `/model` picker form submitted. The select_static's value
+          # carries the ``model_switch:<name>`` prefix; the relay passes
+          # the single-field form_value through as the action string.
+          # Synthesise an internal ``/model <name>`` so the existing
+          # /model dispatch handles the actual switch (catalog
+          # validation, SDK restart, response card). is_internal=True
+          # bypasses sender/mention filters since the click already
+          # came from an authorized operator.
+          model_name = action_str.split(":", 1)[1].strip()
+          if not model_name:
+            await _send_response(
+              channel, chat_id,
+              "Pick a model from the dropdown before submitting.", db,
+            )
+            continue
+          from .guests import is_authorized_sender
+          if operator_open_id and not is_authorized_sender(
+              reply.operator_id, operator_open_id, _member_roles):
+            log.info(
+              "Ignoring unauthorized model picker submit by %s",
+              reply.operator_id,
+            )
+            continue
+          synthetic = dataclasses.replace(
+            reply,
+            event_type="im.message.receive_v1",
+            msg_type="text",
+            text=f"/model {model_name}",
+            sender_id=reply.operator_id or operator_open_id,
+            is_internal=True,
+            action_value={},
+            action_tag="",
+          )
+          channel.push_back(synthetic)
+          continue
         log.info("Ignoring card action outside turn: %s", reply.action_value)
         continue
 
@@ -1299,6 +1433,14 @@ async def main_loop(
             follow_up = response.split(":", 1)[1]
             follow_msg = dataclasses.replace(reply, text=follow_up)
             channel.push_back(follow_msg)
+        elif response == "__model_picker__":
+          # `/model` (no args) — send the interactive picker card. The
+          # actual model switch happens later when the user submits the
+          # form (routed through the model_switch:<name> card action
+          # handler at the top of this loop).
+          await _send_model_picker(
+            channel, chat_id, project_dir, ctx, db,
+          )
         elif response and response.startswith("__model__:"):
           new_model = response.split(":", 1)[1]
           # Resolve against the preset registry first. A preset name
@@ -2155,6 +2297,15 @@ async def main_loop(
               await _send_response(channel, chat_id, f"Rename failed: {e}", db)
           elif response == "__diag__":
             await _handle_diag(channel, chat_id, project_dir, db)
+          elif response == "__model_picker__":
+            # Sending the picker card during an active turn is fine —
+            # it only displays the dropdown; the submit click is what
+            # actually switches the model and that path is queued
+            # behind any in-flight turn by the top-level card.action
+            # handler (it push_back's an internal /model <name>).
+            await _send_model_picker(
+              channel, chat_id, project_dir, ctx, db,
+            )
           elif response and response.startswith("__btw__:"):
             # During a running turn, run the side question in the
             # background so the signal watcher keeps reacting to
@@ -2268,6 +2419,40 @@ async def main_loop(
                 msg.operator_id, operator_open_id, _member_roles):
               signal_detected = "stop"
               return
+            if action == "model_picker_submit":
+              # Empty Submit click mid-turn — tell the user to pick a
+              # model first so they're not left wondering why nothing
+              # happened. Same response as outside the turn.
+              await _send_response(
+                channel, chat_id,
+                "Pick a model from the dropdown before submitting.", db,
+              )
+              continue
+            if action.startswith("model_switch:"):
+              # Picker submitted mid-turn. Model switch needs an SDK
+              # restart so it can't run inline. Append the original
+              # card.action.trigger event (not a synthesised /model
+              # text message) so _merge_pending routes it into
+              # ``other_msgs`` and it survives the post-turn requeue
+              # individually — a text synthesis here would get glued
+              # together with any concurrent user replies and the
+              # ``/model`` prefix would be lost.
+              model_name = action.split(":", 1)[1].strip()
+              if not model_name:
+                continue
+              from .guests import is_authorized_sender
+              if operator_open_id and not is_authorized_sender(
+                  msg.operator_id, operator_open_id, _member_roles):
+                log.info(
+                  "Ignoring unauthorized in-turn model picker submit by %s",
+                  msg.operator_id,
+                )
+                continue
+              _pending_msgs.append(msg)
+              if autoesc:
+                signal_detected = "autoesc"
+                return
+              continue
             continue
           if not _is_user_message_event(msg):
             log.info("Skipping during turn: unsupported event=%s", msg.event_type)

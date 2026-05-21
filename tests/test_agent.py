@@ -1226,6 +1226,132 @@ def test_agent_switch_message_says_fresh_when_no_prior_session(tmp_path):
   assert "switching back" in switch_msg.lower()
 
 
+def test_model_picker_submit_switches_model(tmp_path):
+  """Clicking Submit on the `/model` picker fires a card.action.trigger
+  with action='model_switch:<name>'. The main loop must synthesise an
+  internal /model <name>, push it back to itself, and run the regular
+  /model dispatch on the next iteration so the SDK is restarted with
+  the picked model."""
+  from nemo.channel import IncomingMessage
+
+  class _ReplayChannel(_QueuedChannel):
+    """_QueuedChannel + a working push_back so the daemon's synthetic
+    /model message actually gets replayed on the next receive()."""
+
+    def push_back(self, message):
+      self._messages.insert(0, message)
+
+  class _SpyAgent(_FakeAgent):
+    def __init__(self):
+      super().__init__()
+      self.reset_calls: list[str] = []
+
+    def set_endpoint(self, _endpoint):
+      pass
+
+    async def reset(self, _project_dir, model, resume=""):
+      del resume
+      self.reset_calls.append(model)
+
+  agent = _SpyAgent()
+  queued = _ReplayChannel("oc_test", [
+    # The picker submit arrives as a card.action.trigger from the
+    # operator with the model_switch:<name> action discriminator.
+    IncomingMessage(
+      event_type="card.action.trigger",
+      chat_id="oc_test",
+      operator_id="ou_user",
+      sender_id="ou_user",
+      action_value={"action": "model_switch:claude-sonnet-4-6",
+                    "chat_id": "oc_test"},
+      create_time="1",
+    ),
+    IncomingMessage(
+      event_type="im.message.receive_v1", chat_id="oc_test",
+      sender_id="ou_user", message_id="om_exit", msg_type="text",
+      text="/exit", create_time="2",
+    ),
+  ])
+
+  with mock.patch("nemo.agent.load_credentials", return_value={
+    "app_id": "app_id", "app_secret": "app_secret",
+    "email": "user@example.com",
+  }), \
+       mock.patch("nemo.agent.Database", _FakeDB), \
+       mock.patch("nemo.agent.LarkChannel", return_value=queued), \
+       mock.patch("nemo.agent.build_coding_agent", return_value=agent), \
+       mock.patch("nemo.agent._send_response", new=mock.AsyncMock()), \
+       mock.patch("nemo.group_config.load_config", return_value={}), \
+       mock.patch("nemo.config.load_relay_config", return_value=("", "")), \
+       mock.patch("signal.signal"):
+    rc = asyncio.run(
+      main_loop("oc_test", str(tmp_path), "claude-opus-4-7", agent="claude"))
+
+  assert rc == 0
+  # The synthesised /model claude-sonnet-4-6 must have driven a reset
+  # to sonnet — bare "switch happened" is the contract here.
+  assert "claude-sonnet-4-6" in agent.reset_calls, agent.reset_calls
+
+
+def test_model_picker_submit_unauthorized_is_ignored(tmp_path):
+  """A submit from a sender who is not the operator/coowner/guest must
+  NOT swap the model — otherwise any chat member could hijack /model
+  by clicking the picker card."""
+  from nemo.channel import IncomingMessage
+
+  class _ReplayChannel(_QueuedChannel):
+    def push_back(self, message):
+      self._messages.insert(0, message)
+
+  class _SpyAgent(_FakeAgent):
+    def __init__(self):
+      super().__init__()
+      self.reset_calls: list[str] = []
+
+    def set_endpoint(self, _endpoint):
+      pass
+
+    async def reset(self, _project_dir, model, resume=""):
+      del resume
+      self.reset_calls.append(model)
+
+  agent = _SpyAgent()
+  queued = _ReplayChannel("oc_test", [
+    IncomingMessage(
+      event_type="card.action.trigger",
+      chat_id="oc_test",
+      # operator_id is some random user, not "ou_user" (the daemon's
+      # operator per _FakeChannel.resolve_operator_and_bot).
+      operator_id="ou_stranger",
+      sender_id="ou_stranger",
+      action_value={"action": "model_switch:claude-sonnet-4-6",
+                    "chat_id": "oc_test"},
+      create_time="1",
+    ),
+    IncomingMessage(
+      event_type="im.message.receive_v1", chat_id="oc_test",
+      sender_id="ou_user", message_id="om_exit", msg_type="text",
+      text="/exit", create_time="2",
+    ),
+  ])
+
+  with mock.patch("nemo.agent.load_credentials", return_value={
+    "app_id": "app_id", "app_secret": "app_secret",
+    "email": "user@example.com",
+  }), \
+       mock.patch("nemo.agent.Database", _FakeDB), \
+       mock.patch("nemo.agent.LarkChannel", return_value=queued), \
+       mock.patch("nemo.agent.build_coding_agent", return_value=agent), \
+       mock.patch("nemo.agent._send_response", new=mock.AsyncMock()), \
+       mock.patch("nemo.group_config.load_config", return_value={}), \
+       mock.patch("nemo.config.load_relay_config", return_value=("", "")), \
+       mock.patch("signal.signal"):
+    rc = asyncio.run(
+      main_loop("oc_test", str(tmp_path), "claude-opus-4-7", agent="claude"))
+  assert rc == 0
+  assert agent.reset_calls == [], agent.reset_calls
+
+
 def test_codex_agent_rejects_claude_model_switch(tmp_path):
   from nemo.channel import IncomingMessage
 

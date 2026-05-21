@@ -849,6 +849,90 @@ def build_form_select(title: str, options: list[dict[str, str]],
   }
 
 
+def build_model_picker_card(
+  options: list[tuple[str, str]],
+  *,
+  current_model: str,
+  current_agent: str,
+  chat_id: str = "",
+  note: str = "",
+) -> JsonObject:
+  """Build the interactive `/model` picker card.
+
+  Renders a dropdown of available models inside a Lark V2 ``form`` so the
+  selection only fires when the user clicks the Submit button — matching
+  the user's "select model 然后 submit" UX request. Each option's value
+  carries the ``model_switch:<name>`` discriminator so the daemon can
+  route the resulting card.action.trigger event back to the model-switch
+  flow without collisions with other actions.
+
+  ``options`` is a list of ``(display_label, model_name)`` tuples in the
+  order they should appear in the dropdown. ``display_label`` is what the
+  user sees; ``model_name`` is the canonical slug passed to ``/model``.
+  Empty option list still renders the card (the user is told there are
+  no models to pick from) — same defensive shape as ``build_form_select``.
+  """
+  select_options = [
+    {
+      "text": {"tag": "plain_text", "content": label},
+      "value": f"model_switch:{model_name}",
+    }
+    for label, model_name in options
+  ]
+  summary = (
+    f"Current model: **{current_model}** "
+    f"(agent **{current_agent}**)"
+  )
+  form_elements: list[JsonObject] = [
+    {
+      "tag": "select_static",
+      "name": "model",
+      "placeholder": {"tag": "plain_text", "content": "Pick a model..."},
+      "options": select_options,
+    },
+    {
+      "tag": "column_set",
+      "flex_mode": "none",
+      "background_style": "default",
+      "columns": [{
+        "tag": "column",
+        "width": "auto",
+        "vertical_align": "top",
+        "elements": [{
+          "tag": "button",
+          "text": {"tag": "plain_text", "content": "Submit"},
+          "type": "primary",
+          # form_action_type: "submit" tells Lark this button submits the
+          # enclosing form rather than firing a button_action — that's
+          # what makes the dropdown selection arrive via form_value.
+          "form_action_type": "submit",
+          "name": "submit",
+          "value": {"action": "model_picker_submit", "chat_id": chat_id},
+        }],
+      }],
+    },
+  ]
+  elements: list[JsonObject] = [
+    {"tag": "markdown", "content": summary},
+    {
+      "tag": "form",
+      "name": "model_picker_form",
+      "elements": form_elements,
+    },
+  ]
+  if note:
+    elements.append(_note_element(note))
+  return {
+    "schema": "2.0",
+    "config": {"update_multi": True},
+    "header": {
+      "title": {"tag": "plain_text", "content": "Switch Model"},
+      "template": "blue",
+    },
+    "body": {"direction": "vertical", "elements": elements},
+  }
+
+
 def build_form_input(title: str, placeholder: str = "",
                      chat_id: str = "") -> JsonObject:
   """Build a card with text input."""

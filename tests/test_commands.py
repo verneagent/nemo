@@ -108,10 +108,19 @@ def test_bare_btw_is_not_a_command():
   assert not handled
 
 
-def test_model_show():
+def test_model_show_emits_picker_action():
+  """Bare `/model` returns the picker action code — the main loop turns
+  this into an interactive dropdown card. Old behaviour (text listing)
+  is preserved as a fallback inside the picker handler."""
   handled, resp = try_dispatch("/model", _ctx())
   assert handled
-  assert "opus" in resp
+  assert resp == "__model_picker__"
+
+
+def test_model_picker_is_inline_safe():
+  """The picker card is purely UI — no SDK restart required, so it must
+  flow through the inline-safe path (mid-turn invocation also works)."""
+  assert is_inline_safe("__model_picker__") is True
 
 
 def test_model_switch():
@@ -239,36 +248,37 @@ def test_model_typo_for_codex():
 
 
 def test_model_list_separates_chatgpt_from_api_only_codex():
-  """Codex /model listing must warn that -codex slugs need API auth."""
-  ctx = _ctx()
-  ctx.agent = "codex"
-  handled, resp = try_dispatch("/model", ctx)
-  assert handled
-  assert resp is not None
-  # ChatGPT-safe defaults surface under Available.
-  available_line = next(l for l in resp.split("\n") if l.startswith("Available:"))
+  """The catalog feeding the picker note must keep the API-only warning
+  separate from the everyday Available list so codex users on a ChatGPT
+  account don't pick a slug that'll 400."""
+  from nemo.agent_factory import model_catalog_for_agent
+  from nemo.commands import _format_model_catalog
+  catalog = model_catalog_for_agent("codex")
+  listing = _format_model_catalog(catalog)
+  available_line = next(l for l in listing.split("\n") if l.startswith("Available:"))
   assert "gpt-5.5" in available_line
   assert "gpt-5.4" in available_line
   # The codex-specialized variants must be in a separate API-only bucket,
   # not mixed into the plain Available list.
   assert "gpt-5.3-codex" not in available_line
-  api_line = next(l for l in resp.split("\n") if l.startswith("API-only"))
+  api_line = next(l for l in listing.split("\n") if l.startswith("API-only"))
   assert "gpt-5.3-codex" in api_line
   assert "ChatGPT" in api_line  # explains why they're segregated
 
 
 def test_model_list_for_opencode_shows_dynamic_note():
-  ctx = _ctx()
-  ctx.agent = "opencode"
+  """Opencode's dynamic-models note must be visible in the picker note
+  block — the dropdown can't surface that nuance on its own."""
+  from nemo.agent_factory import model_catalog_for_agent
+  from nemo.commands import _format_model_catalog
   with patch(
       "nemo.opencode_agent.query_opencode_model_catalog_data",
       return_value=(("anthropic/claude-sonnet-4-5",), "Config default: `anthropic/claude-sonnet-4-5`."),
   ):
-    handled, resp = try_dispatch("/model", ctx)
-    assert handled
-    assert resp is not None
-    assert "anthropic/claude-sonnet-4-5" in resp
-    assert "Config default" in resp
+    catalog = model_catalog_for_agent("opencode")
+    listing = _format_model_catalog(catalog)
+    assert "anthropic/claude-sonnet-4-5" in listing
+    assert "Config default" in listing
 
 
 def test_model_switch_for_opencode_accepts_provider_slug_model():

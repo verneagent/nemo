@@ -3,8 +3,8 @@
 from nemo.cards import (
   ToolRecord, ThinkingStep, build_turn_card, build_card, build_markdown_card,
   build_form_select, build_form_input, build_ask_user_question_card,
-  build_shell_card, tool_use_summary, _elapsed_title, _elapsed_text, _usage_text,
-  _collapsible_thinking,
+  build_model_picker_card, build_shell_card, tool_use_summary, _elapsed_title,
+  _elapsed_text, _usage_text, _collapsible_thinking,
 )
 
 
@@ -625,6 +625,90 @@ def test_form_select_with_chat_id():
 def test_form_select_empty_options():
   card = build_form_select("Empty", [])
   assert card["body"]["elements"][0]["options"] == []
+
+
+# ---------------------------------------------------------------------------
+# build_model_picker_card
+# ---------------------------------------------------------------------------
+
+def _find_element(elements, tag):
+  for el in elements:
+    if isinstance(el, dict) and el.get("tag") == tag:
+      return el
+  raise AssertionError(f"No element with tag {tag!r} in {elements!r}")
+
+
+def test_model_picker_card_structure():
+  """Picker wraps the dropdown in a Lark V2 form so selection only
+  fires when Submit is clicked. Each option's value carries the
+  ``model_switch:<name>`` discriminator the daemon routes on."""
+  options = [
+    ("claude-opus-4-7", "claude-opus-4-7"),
+    ("claude-sonnet-4-6", "claude-sonnet-4-6"),
+  ]
+  card = build_model_picker_card(
+    options,
+    current_model="claude-opus-4-7",
+    current_agent="claude",
+    chat_id="oc_abc",
+  )
+  assert card["schema"] == "2.0"
+  assert card["header"]["title"]["content"] == "Switch Model"
+
+  elements = card["body"]["elements"]
+  summary = _find_element(elements, "markdown")
+  assert "claude-opus-4-7" in summary["content"]
+  assert "claude" in summary["content"]
+
+  form = _find_element(elements, "form")
+  assert form["name"] == "model_picker_form"
+  form_elements = form["elements"]
+
+  select = _find_element(form_elements, "select_static")
+  assert select["name"] == "model"
+  values = [opt["value"] for opt in select["options"]]
+  assert values == [
+    "model_switch:claude-opus-4-7",
+    "model_switch:claude-sonnet-4-6",
+  ]
+  labels = [opt["text"]["content"] for opt in select["options"]]
+  assert labels == ["claude-opus-4-7", "claude-sonnet-4-6"]
+
+  # Submit button — must declare form_action_type so Lark treats the
+  # click as a form submission (delivering form_value) rather than a
+  # bare button_action.
+  col_set = _find_element(form_elements, "column_set")
+  button = col_set["columns"][0]["elements"][0]
+  assert button["tag"] == "button"
+  assert button["form_action_type"] == "submit"
+  assert button["type"] == "primary"
+  assert button["value"]["chat_id"] == "oc_abc"
+
+
+def test_model_picker_card_with_note():
+  card = build_model_picker_card(
+    [("opus", "claude-opus-4-7")],
+    current_model="claude-opus-4-7",
+    current_agent="claude",
+    chat_id="",
+    note="Available: opus, sonnet, haiku",
+  )
+  # The catalog/help note goes below the form so the dropdown is still
+  # the focal element — but the note must still be present.
+  last = card["body"]["elements"][-1]
+  assert "Available" in str(last)
+
+
+def test_model_picker_card_empty_options():
+  card = build_model_picker_card(
+    [],
+    current_model="claude-opus-4-7",
+    current_agent="claude",
+    chat_id="",
+  )
+  form = _find_element(card["body"]["elements"], "form")
+  select = _find_element(form["elements"], "select_static")
+  assert select["options"] == []
 
 
 # ---------------------------------------------------------------------------

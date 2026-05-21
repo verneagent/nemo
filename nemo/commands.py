@@ -256,21 +256,22 @@ def try_dispatch(text: str, ctx: AgentContext) -> tuple[bool, str | None]:
   # /model
   if t.startswith("/model"):
     from .agent_factory import is_model_compatible, model_catalog_for_agent
-    catalog = model_catalog_for_agent(ctx.agent, ctx.project_dir)
-    listing = _format_model_catalog(catalog)
     parts = text.strip().split(None, 1)
     if len(parts) >= 2:
       new_model = parts[1].strip()
       if not is_model_compatible(ctx.agent, new_model, ctx.project_dir):
+        catalog = model_catalog_for_agent(ctx.agent, ctx.project_dir)
+        listing = _format_model_catalog(catalog)
         return True, (
           f"Unknown model `{new_model}` for agent **{ctx.agent}**.\n\n"
           f"{listing}"
         )
       return True, f"__model__:{new_model}"
-    return True, (
-      f"Current model: **{ctx.model}** (agent **{ctx.agent}**)\n\n"
-      f"{listing}\n\nUsage: `/model <name>`"
-    )
+    # No argument — emit an interactive picker card. The main loop
+    # builds the option list (so the card stays in sync with whatever
+    # model_catalog_for_agent returns at click time) and sends the
+    # actual card; here we only signal the action.
+    return True, "__model_picker__"
 
   # /agent
   if t.startswith("/agent"):
