@@ -9,6 +9,7 @@ from unittest import mock
 from nemo.agent import (
   _format_rate_limit_notice,
   _in_turn_filtered_out,
+  _interrupt_and_drain,
   _is_user_message_event,
   _merge_pending,
   _requeue_pending,
@@ -2392,3 +2393,70 @@ def test_restart_model_arg_passes_plain_default_model_through():
   """No preset active (default endpoint, empty key) → the plain model id is
   already a valid --model, pass it through untouched."""
   assert _restart_model_arg("claude-opus-4-7", "", "claude") == "claude-opus-4-7"
+
+
+# ---------------------------------------------------------------------------
+# Stop/esc must interrupt the turn, never kill the daemon
+# ---------------------------------------------------------------------------
+
+class _InterruptAgent:
+  """Mirrors ClaudeCodingAgent.interrupt → cancel() then client.interrupt()."""
+
+  def __init__(self, raises: Exception | None = None):
+    self._raises = raises
+
+  async def interrupt(self) -> None:
+    if self._raises is not None:
+      raise self._raises
+
+
+def test_interrupt_and_drain_swallows_turn_self_cancellation():
+  """Regression for the oc_03b7c9b… daemon death: a Stop pressed while the
+  turn was in a #788 stale-leak-resume reconnect made run_turn_with_reconnect
+  raise CancelledError (it aborts the reconnect loop when _cancelled is set).
+  The old `except Exception` couldn't catch CancelledError, so it bubbled to
+  the loop-level `except asyncio.CancelledError` and shut the daemon down.
+  The helper must swallow the turn task's own cancellation → 'aborted', and
+  must NOT re-raise (which would propagate to the loop and stop the daemon)."""
+  async def _scenario():
+    async def _turn():
+      raise asyncio.CancelledError("SDK turn cancelled")
+    sdk_task = asyncio.ensure_future(_turn())
+    return await _interrupt_and_drain(_InterruptAgent(), sdk_task, timeout=5)
+
+  # Must return normally (not raise) — the daemon stays alive.
+  assert asyncio.run(_scenario()) == "aborted"
+
+
+def test_interrupt_and_drain_reports_clean_on_normal_finish():
+  """Stop during an ordinary turn: client.interrupt() lets the turn end on
+  its own, the task completes normally → 'clean', daemon lives."""
+  async def _scenario():
+    async def _turn():
+      return (1.0, {})
+    sdk_task = asyncio.ensure_future(_turn())
+    return await _interrupt_and_drain(_InterruptAgent(), sdk_task, timeout=5)
+
+  assert asyncio.run(_scenario()) == "clean"
+
+
+def test_interrupt_and_drain_forces_cancel_when_interrupt_raises():
+  """If interrupt() itself raises, the helper force-cancels the turn task
+  and reports 'forced' — still no propagation that could kill the daemon."""
+  async def _scenario():
+    ev = asyncio.Event()
+
+    async def _turn():
+      await ev.wait()  # hang until force-cancelled
+
+    sdk_task = asyncio.ensure_future(_turn())
+    await asyncio.sleep(0)  # let the turn task start and block
+    status = await _interrupt_and_drain(
+      _InterruptAgent(raises=RuntimeError("boom")), sdk_task, timeout=5)
+    try:
+      await sdk_task
+    except asyncio.CancelledError:
+      pass
+    return status
+
+  assert asyncio.run(_scenario()) == "forced"

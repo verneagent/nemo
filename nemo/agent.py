@@ -1047,6 +1047,43 @@ def _restart_model_arg(model: str, endpoint_key: str, agent: str) -> str:
   return model
 
 
+async def _interrupt_and_drain(
+  coding_agent: CodingAgent,
+  sdk_task: "asyncio.Task[object]",
+  timeout: float = 10.0,
+) -> str:
+  """Interrupt the running turn for a stop/esc and wait for it to wind down.
+
+  Returns a short status for logging: ``"clean"`` (turn ended on its own),
+  ``"aborted"`` (the turn cancelled itself in response to the interrupt),
+  or ``"forced"`` (interrupt raised, task force-cancelled).
+
+  The subtle case this exists for: stop pressed while the turn is inside a
+  reconnect loop (e.g. SDK #788 stale-leak-resume). ``interrupt()`` calls
+  ``cancel()``, so the turn raises ``asyncio.CancelledError`` to abort the
+  reconnect — exactly what stop wants. But ``CancelledError`` is a
+  ``BaseException``, so the old ``except Exception`` let it escape to the
+  main loop's loop-level ``except asyncio.CancelledError``, which set
+  ``running = False`` and tore the whole daemon down. Stop must only
+  interrupt the turn (AGENTS.md), so swallow the turn task's own
+  cancellation here — while still re-raising if *this* caller is the one
+  genuinely being cancelled (a real shutdown).
+  """
+  try:
+    await coding_agent.interrupt()
+    await asyncio.wait_for(sdk_task, timeout=timeout)
+    return "clean"
+  except asyncio.CancelledError:
+    current = asyncio.current_task()
+    if current is not None and current.cancelling():
+      raise  # we ourselves are being cancelled → genuine shutdown
+    return "aborted"
+  except Exception as exc:
+    log.warning("SDK interrupt failed (%s), cancelling task", exc)
+    sdk_task.cancel()
+    return "forced"
+
+
 async def main_loop(
   chat_id: str,
   project_dir: str,
@@ -2644,13 +2681,13 @@ async def main_loop(
             log.info("Stop signal received — interrupting SDK")
           await _clear_ack()
           await _update_interrupt_card("stopping")
-          try:
-            await coding_agent.interrupt()
-            await asyncio.wait_for(sdk_task, timeout=10)
+          status = await _interrupt_and_drain(coding_agent, sdk_task)
+          if status == "clean":
             log.info("SDK turn interrupted cleanly")
-          except Exception as exc:
-            log.warning("SDK interrupt failed (%s), cancelling task", exc)
-            sdk_task.cancel()
+          elif status == "aborted":
+            # Turn cancelled its own reconnect loop (e.g. stop during a
+            # #788 stale-leak-resume). Interrupt succeeded; daemon lives.
+            log.info("SDK turn aborted by interrupt")
           await _update_interrupt_card("stopped")
 
         elif signal_detected in ("exit", "dissolve"):
