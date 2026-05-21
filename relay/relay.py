@@ -410,9 +410,26 @@ async def _handle_card_action(event: dict) -> tuple[int, dict]:
     action = event.get("action", {})
     value = action.get("value", {})
     operator = event.get("operator", {})
+    context = event.get("context", {})
     chat_id = value.get("chat_id", "")
     root_id = value.get("root_id", "")
     nonce = value.get("nonce", "")
+    # Fall back to event.context.open_chat_id. Lark V2 form
+    # submissions (form_action_type="submit") sometimes drop the
+    # button's ``value`` field — only ``form_value`` survives. Without
+    # this fallback ``chat_id`` is empty, the ``if chat_id and
+    # action_text`` push branch below silently no-ops, and the daemon
+    # never sees the form submission even though we still happily
+    # return a "Confirmed" card to Lark.
+    if not chat_id:
+        chat_id = context.get("open_chat_id", "")
+    # The id of the card that fired the action. Stored as part of the
+    # reply so daemon-side handlers can ``update_card`` the originating
+    # card (e.g. the /model picker rewrites itself with the new model
+    # after the switch lands). Plain button_action / select_action
+    # callbacks already carry chat_id in value; form submissions are
+    # the case where this fallback matters most.
+    card_message_id = context.get("open_message_id", "")
 
     action_text, msg_type = _extract_action_info(action)
 
@@ -453,7 +470,10 @@ async def _handle_card_action(event: dict) -> tuple[int, dict]:
             "sender_type": "user",
             "sender_id": operator.get("open_id", ""),
             "create_time": str(int(time.time() * 1000)),
-            "message_id": "",
+            # The id of the card that fired the action. Daemon-side
+            # card handlers (e.g. /model picker → confirm-state PATCH)
+            # use this to ``update_card`` the originating card.
+            "message_id": card_message_id,
         }
         keys = []
         if chat_id:
@@ -480,7 +500,14 @@ async def _handle_card_action(event: dict) -> tuple[int, dict]:
     # For these prefixes we suppress the card update and only emit a toast,
     # so the user sees a quick acknowledgement and the bot's PATCH lands
     # without a visible flash.
-    BOT_OWNED_CARD_PREFIXES = ("askq:",)
+    # ``model_switch:`` and ``model_picker_submit`` belong to the
+    # /model picker, which PATCHes the picker card to a confirmation
+    # state once the switch lands — same multi-step ownership pattern
+    # as askq. Without these prefixes the relay's generic "Selected:
+    # <action_text>" card would replace the picker, flashing
+    # "Selected: model_switch:claude-opus-4-7" over the bot's actual
+    # confirmation.
+    BOT_OWNED_CARD_PREFIXES = ("askq:", "model_switch:", "model_picker_submit")
     if action_text.startswith(BOT_OWNED_CARD_PREFIXES):
         return 200, {
             "toast": {"type": toast_type, "content": f"{toast_verb}: {action_text}"},

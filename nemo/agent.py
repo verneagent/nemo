@@ -967,7 +967,11 @@ async def _send_model_picker(
   listing = commands._format_model_catalog(catalog)
   note_parts = [
     listing,
-    "Pick a model and click Submit. Or type `/model <name>` directly.",
+    # Use `NAME` (no angle brackets). Lark renders the note through
+    # ``<font color='grey'>...</font>`` and a literal ``<name>`` is
+    # parsed as an unclosed HTML tag, eating the closing ``</font>``
+    # and showing it bare in the rendered card.
+    "Pick a model and click Submit. Or type `/model NAME` directly.",
   ]
   note = "\n\n".join(p for p in note_parts if p)
   card = cards.build_model_picker_card(
@@ -987,7 +991,7 @@ async def _send_model_picker(
     await _send_response(
       channel, chat_id,
       f"Current model: **{ctx.model}** (agent **{ctx.agent}**)\n\n"
-      f"{listing}\n\nUsage: `/model <name>`",
+      f"{listing}\n\nUsage: `/model NAME`",
       db,
     )
 

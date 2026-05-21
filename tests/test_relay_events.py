@@ -146,6 +146,29 @@ def test_convert_form_action():
     assert ev.event_type == "card.action.trigger"
 
 
+def test_convert_form_action_for_model_picker_keeps_prefix():
+    """End-to-end shape check: the relay pushes the picker's
+    ``model_switch:<name>`` form_value as the reply text; the
+    converter must land it in action_value['action'] unchanged so the
+    daemon's ``startswith("model_switch:")`` routing still fires.
+
+    The picker card's own message_id rides along via reply.message_id
+    so daemon-side handlers can PATCH the originating card after the
+    switch completes."""
+    msg = {
+        "text": "model_switch:claude-sonnet-4-6",
+        "msg_type": "form_action",
+        "sender_id": "ou_picker_clicker",
+        "create_time": "1700000020000",
+        "message_id": "om_picker_xyz",
+    }
+    ev = _relay_msg_to_event(msg, "oc_chat1")
+    assert ev.event_type == "card.action.trigger"
+    assert ev.action_value == {"action": "model_switch:claude-sonnet-4-6"}
+    assert ev.operator_id == "ou_picker_clicker"
+    assert ev.message_id == "om_picker_xyz"
+
+
 def test_convert_input_action():
     msg = {
         "text": "user input text",

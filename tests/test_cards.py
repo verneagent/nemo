@@ -683,6 +683,12 @@ def test_model_picker_card_structure():
   assert button["form_action_type"] == "submit"
   assert button["type"] == "primary"
   assert button["value"]["chat_id"] == "oc_abc"
+  # The submit button must NOT carry a ``name`` field — Lark includes
+  # every named form child in form_value at submit time, and a named
+  # submit would turn the single-field form_value into a multi-field
+  # one which the relay JSON-encodes, breaking the daemon's
+  # ``startswith("model_switch:")`` routing.
+  assert "name" not in button, button
 
 
 def test_model_picker_card_with_note():

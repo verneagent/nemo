@@ -734,6 +734,58 @@ class RelayTestCase(unittest.TestCase):
     self.assertEqual(parsed["name"], "Alice")
     self.assertEqual(parsed["age"], "30")
 
+  def test_form_action_falls_back_to_context_chat_id(self):
+    """Lark V2 form submissions (form_action_type='submit') sometimes
+    drop the button's ``value`` field — only ``form_value`` survives.
+    Without ``value.chat_id`` the original push branch was a silent
+    no-op, so the daemon never saw the submission. ``event.context``
+    always carries ``open_chat_id`` for card actions; the relay must
+    fall back to it so the form click still reaches the bot."""
+    self._webhook({
+      "header": {"token": "tok1", "event_type": "card.action.trigger"},
+      "event": {
+        "action": {
+          # No value at all — like Lark's form_action_type=submit
+          # behaviour where the button's value is sometimes dropped.
+          "form_value": {"model": "model_switch:claude-sonnet-4-6"},
+          "tag": "button",
+        },
+        "operator": {"open_id": "ou_op"},
+        "context": {
+          "open_chat_id": "oc_ctx_fallback",
+          "open_message_id": "om_picker_xyz",
+        },
+      },
+    })
+    poll = self._get("/replies/chat:oc_ctx_fallback?since=")
+    r = [x for x in poll["replies"] if x["msg_type"] == "form_action"]
+    self.assertEqual(len(r), 1, poll)
+    self.assertEqual(r[0]["text"], "model_switch:claude-sonnet-4-6")
+    # And the card's own message_id flows through so the daemon can
+    # PATCH the picker into its post-submit confirmation state.
+    self.assertEqual(r[0]["message_id"], "om_picker_xyz")
+
+  def test_card_action_skips_confirm_card_for_model_picker_prefixes(self):
+    """``model_switch:*`` is a bot-owned action: the daemon PATCHes
+    the picker into a confirmation state shortly after the click
+    lands. Without this suppression Lark briefly flashes a generic
+    ``Confirmed / Selected: model_switch:claude-opus-4-7`` card over
+    the picker. Same pattern as ``askq:``."""
+    result = self._webhook({
+      "header": {"token": "tok1", "event_type": "card.action.trigger"},
+      "event": {
+        "action": {
+          "value": {"chat_id": "oc_model_pref"},
+          "form_value": {"model": "model_switch:claude-opus-4-7"},
+        },
+        "operator": {"open_id": "ou_op"},
+      },
+    })
+    # Toast-only response — no ``card`` key, so Lark leaves the
+    # picker visible until the bot PATCHes it.
+    self.assertIn("toast", result)
+    self.assertNotIn("card", result)
+
   def test_select_action(self):
     """Worker extractActionInfo: action.option → select_action."""
     self._webhook({

@@ -905,8 +905,12 @@ def build_model_picker_card(
           # form_action_type: "submit" tells Lark this button submits the
           # enclosing form rather than firing a button_action — that's
           # what makes the dropdown selection arrive via form_value.
+          # No ``name`` on the button: Lark includes every named form
+          # child in form_value at submit time, and a named submit
+          # would turn the single-field form_value into a multi-field
+          # one, which the relay then JSON-encodes — breaking the
+          # daemon's ``startswith("model_switch:")`` routing.
           "form_action_type": "submit",
-          "name": "submit",
           "value": {"action": "model_picker_submit", "chat_id": chat_id},
         }],
       }],
