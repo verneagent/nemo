@@ -1620,6 +1620,57 @@ def run_picker_tests(pid: int, chat_id: str, result: E2EResult) -> None:
     result.fail("TM3 next /model picker still wired",
                 "second submit did not reach card.action handler")
 
+  wait_for_idle(pid, chat_id, timeout=30)
+
+  # --- TM4: the SAME picker card accepts repeated submits ---
+  # Because the relay returns toast-only for model_switch:* the card is
+  # never replaced, so its dropdown + Submit stay live. Neither the
+  # relay (per-event_id idempotency only) nor the daemon dedupe
+  # submits, so picking a different model on the same card and
+  # submitting again must drive a second, distinct switch.
+  #
+  # NB: this injects two webhook submits against ONE picker
+  # message_id. It proves the relay+daemon accept multiple submits
+  # from the same card; it cannot prove the Lark *client* keeps the
+  # form interactive after the first submit (webhook injection
+  # bypasses the client). That client-side caveat is called out in
+  # the summary, not asserted here.
+  ts = str(int(time.time() * 1000))
+  send_msg("/model", chat_id)
+  picker3, _ = wait_for_interactive_title(
+    chat_id, after=ts, title_prefix="Switch Model", timeout=15)
+  if not picker3:
+    result.fail("TM4 same card repeated submit", "no picker for repeat test")
+    return
+  same_card = picker3.get("message_id", "")
+
+  # First submit on this card: sonnet.
+  mark = log.mark()
+  send_form_action(
+    form_value={"model": "model_switch:claude-sonnet-4-6"},
+    chat_id=chat_id, card_msg_id=same_card, include_value=False)
+  first_ok = log.wait_for_since(
+    r"Model switch to claude-sonnet-4-6", offset=mark, timeout=20)
+  wait_for_idle(pid, chat_id, timeout=30)
+
+  # Second submit on the SAME card: switch to a different model.
+  mark2 = log.mark()
+  send_form_action(
+    form_value={"model": "model_switch:claude-opus-4-7"},
+    chat_id=chat_id, card_msg_id=same_card, include_value=False)
+  second_ok = log.wait_for_since(
+    r"Model switch to claude-opus-4-7", offset=mark2, timeout=20)
+
+  if first_ok and second_ok:
+    result.ok("TM4 same card repeated submit",
+              "both submits on one picker drove distinct switches "
+              "(sonnet → opus)")
+  else:
+    result.fail("TM4 same card repeated submit",
+                f"first(sonnet)={'ok' if first_ok else 'NO'} "
+                f"second(opus)={'ok' if second_ok else 'NO'}")
+    log.dump_tail(30, "TM4")
+
   print()
 
 
