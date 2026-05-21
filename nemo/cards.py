@@ -855,7 +855,8 @@ def build_model_picker_card(
   current_model: str,
   current_agent: str,
   chat_id: str = "",
-  note: str = "",
+  info: str = "",
+  hint: str = "",
 ) -> JsonObject:
   """Build the interactive `/model` picker card.
 
@@ -871,6 +872,17 @@ def build_model_picker_card(
   user sees; ``model_name`` is the canonical slug passed to ``/model``.
   Empty option list still renders the card (the user is told there are
   no models to pick from) — same defensive shape as ``build_form_select``.
+
+  ``info`` is the multi-line catalog listing (Available / API-only /
+  aliases). It is rendered as a PLAIN markdown element. ``hint`` is a
+  one-line usage tip rendered as a small grey footer note. They are
+  kept separate on purpose: ``_note_element`` wraps its text in a
+  single ``<font color='grey'>…</font>`` span, and a ``<font>`` tag
+  cannot span a markdown paragraph break (``\\n\\n``). Stuffing the
+  multi-line ``info`` into the note would split the span across blocks
+  and leak a bare ``</font>`` into the rendered card (the bug the user
+  hit). The footer ``hint`` must therefore stay single-line and free
+  of raw ``<...>`` tags.
   """
   select_options = [
     {
@@ -924,8 +936,13 @@ def build_model_picker_card(
       "elements": form_elements,
     },
   ]
-  if note:
-    elements.append(_note_element(note))
+  # Catalog listing as plain markdown (it is multi-line, so it must NOT
+  # go through the <font>-wrapped note — see the docstring).
+  if info:
+    elements.append({"tag": "markdown", "content": info})
+  # One-line footer hint — safe to grey-wrap.
+  if hint:
+    elements.append(_note_element(hint))
   return {
     "schema": "2.0",
     "config": {"update_multi": True},

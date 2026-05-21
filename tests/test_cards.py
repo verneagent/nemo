@@ -1,5 +1,7 @@
 """Tests for nemo.cards — card builders and tool summary."""
 
+import json
+
 from nemo.cards import (
   ToolRecord, ThinkingStep, build_turn_card, build_card, build_markdown_card,
   build_form_select, build_form_input, build_ask_user_question_card,
@@ -691,18 +693,52 @@ def test_model_picker_card_structure():
   assert "name" not in button, button
 
 
-def test_model_picker_card_with_note():
+def test_model_picker_card_info_and_hint():
   card = build_model_picker_card(
     [("opus", "claude-opus-4-7")],
     current_model="claude-opus-4-7",
     current_agent="claude",
     chat_id="",
-    note="Available: opus, sonnet, haiku",
+    info="Available: opus, sonnet, haiku\n\nAliases: `o` → `opus`",
+    hint="Pick a model and click Submit. Or type `/model NAME` directly.",
   )
-  # The catalog/help note goes below the form so the dropdown is still
-  # the focal element — but the note must still be present.
-  last = card["body"]["elements"][-1]
-  assert "Available" in str(last)
+  elements = card["body"]["elements"]
+  blob = json.dumps(elements, ensure_ascii=False)
+  # Catalog info present, AND rendered as a plain markdown element
+  # (NOT wrapped in <font>) so a \n\n paragraph break can't split the
+  # span and leak a bare </font>.
+  assert "Available" in blob
+  info_el = next(
+    e for e in elements
+    if e.get("tag") == "markdown" and "Available" in e.get("content", ""))
+  assert "<font" not in info_el["content"]
+  # Hint present and single-line (no \n\n), so its <font> wrapper is safe.
+  assert "Pick a model" in blob
+  hint_el = elements[-1]
+  assert "Pick a model" in hint_el["content"]
+  assert "\n\n" not in hint_el["content"]
+
+
+def test_model_picker_card_note_never_leaks_unbalanced_font():
+  """Regression: the picker footer must never produce an unbalanced
+  <font> span. The original bug stuffed a multi-line catalog +
+  `/model <name>` into a single <font>-wrapped note; the `\\n\\n`
+  paragraph break split the span and Lark leaked a bare </font>, and
+  the literal `<name>` opened a stray tag. Guard both: every <font>
+  occurrence is matched by a </font> in the same markdown element, and
+  no element carries a raw `<name>`-style tag."""
+  card = build_model_picker_card(
+    [("claude-opus-4-7", "claude-opus-4-7")],
+    current_model="claude-opus-4-7",
+    current_agent="claude",
+    chat_id="oc_x",
+    info="Available: `claude-opus-4-7`\n\nAliases: `opus`",
+    hint="Pick a model and click Submit. Or type `/model NAME` directly.",
+  )
+  for el in card["body"]["elements"]:
+    content = el.get("content", "") if isinstance(el, dict) else ""
+    assert content.count("<font") == content.count("</font>"), el
+    assert "<name>" not in content, el
 
 
 def test_model_picker_card_empty_options():

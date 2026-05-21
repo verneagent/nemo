@@ -960,26 +960,23 @@ async def _send_model_picker(
       db,
     )
     return
-  # Build the note shown below the dropdown. We include the formatted
-  # catalog so the helpful annotations (API-only warnings, aliases,
-  # opencode's dynamic-models note) stay visible in the picker — the
-  # bare dropdown labels can't carry those nuances.
+  # The catalog listing (multi-line: Available / API-only / aliases /
+  # opencode dynamic-models note) renders as plain markdown so its
+  # nuances stay visible — the bare dropdown labels can't carry them.
+  # The one-line usage hint renders as a small grey footer note. They
+  # MUST stay separate: a <font>-wrapped note can't span a \n\n
+  # paragraph break without leaking a bare </font> (see
+  # build_model_picker_card). The hint also uses `/model NAME` (no
+  # angle brackets) so a literal `<name>` can't open a stray tag.
   listing = commands._format_model_catalog(catalog)
-  note_parts = [
-    listing,
-    # Use `NAME` (no angle brackets). Lark renders the note through
-    # ``<font color='grey'>...</font>`` and a literal ``<name>`` is
-    # parsed as an unclosed HTML tag, eating the closing ``</font>``
-    # and showing it bare in the rendered card.
-    "Pick a model and click Submit. Or type `/model NAME` directly.",
-  ]
-  note = "\n\n".join(p for p in note_parts if p)
+  hint = "Pick a model and click Submit. Or type `/model NAME` directly."
   card = cards.build_model_picker_card(
     options,
     current_model=ctx.model,
     current_agent=ctx.agent,
     chat_id=chat_id,
-    note=note,
+    info=listing,
+    hint=hint,
   )
   try:
     msg_id = await channel.send_card(chat_id, card)
