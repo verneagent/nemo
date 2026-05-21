@@ -12,6 +12,7 @@ from nemo.agent import (
   _is_user_message_event,
   _merge_pending,
   _requeue_pending,
+  _restart_model_arg,
   _send_response,
   _should_send_plain_text,
   _update_done_card_with_fallback,
@@ -2370,3 +2371,24 @@ def test_handle_btw_swallows_adapter_exception():
 
   assert len(ch.cards) == 1
   assert "btw failed" in repr(ch.cards[0][1])
+
+
+# ---------------------------------------------------------------------------
+# /restart and /upgrade relaunch with a routable --model
+# ---------------------------------------------------------------------------
+
+def test_restart_model_arg_reverses_preset_remote_to_name():
+  """Regression: a preset switch leaves `model` holding the resolved remote
+  id (deepseek-v4-pro[1m]) and `_endpoint_key` the preset URL. /restart fed
+  that remote id straight to --model, which startup can't resolve as a
+  preset → no endpoint → every turn (and the forked /btw CLI) failed
+  "model not found". The relaunch arg must reverse to the preset NAME."""
+  arg = _restart_model_arg(
+    "deepseek-v4-pro[1m]", "https://api.deepseek.com/anthropic", "claude")
+  assert arg == "deepseek-v4-pro"
+
+
+def test_restart_model_arg_passes_plain_default_model_through():
+  """No preset active (default endpoint, empty key) → the plain model id is
+  already a valid --model, pass it through untouched."""
+  assert _restart_model_arg("claude-opus-4-7", "", "claude") == "claude-opus-4-7"

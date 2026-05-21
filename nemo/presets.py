@@ -298,3 +298,34 @@ def resolve_preset(
   user_path: str = _USER_OVERRIDE_PATH,
 ) -> Preset | None:
   return load_presets(builtin_path=builtin_path, user_path=user_path).get(name)
+
+
+def preset_name_for_endpoint(
+  remote_model: str,
+  base_url: str,
+  agent: str,
+  *,
+  builtin_path: str | os.PathLike = _BUILTIN_PATH,
+  user_path: str = _USER_OVERRIDE_PATH,
+) -> str | None:
+  """Inverse of preset resolution: map a *live* (remote model id, endpoint
+  base URL) back to the preset NAME that produced them for ``agent``.
+
+  Resolution is one-way at startup / on ``/model``: ``deepseek-v4-pro`` →
+  remote ``deepseek-v4-pro[1m]`` + an endpoint URL, and only the remote id
+  survives in the running daemon's ``model`` variable. But ``--model``
+  accepts preset *names*, so a restart must hand the name back or the new
+  process re-sends the remote id to the default endpoint and every turn
+  fails "model not found". This recovers the name. Any preset matching the
+  same (url, remote) round-trips to identical routing, so ties are
+  harmless; ``None`` means no preset matches (a plain model on the default
+  endpoint — pass it through unchanged).
+  """
+  if not base_url:
+    return None
+  presets = load_presets(builtin_path=builtin_path, user_path=user_path)
+  for preset in presets.values():
+    if (preset.base_url_for(agent) == base_url
+        and preset.remote_for(agent) == remote_model):
+      return preset.name
+  return None

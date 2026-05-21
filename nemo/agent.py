@@ -1027,6 +1027,26 @@ async def _lock_model_picker(
 # Main loop
 # ---------------------------------------------------------------------------
 
+def _restart_model_arg(model: str, endpoint_key: str, agent: str) -> str:
+  """The value to pass as ``--model`` when relaunching the daemon.
+
+  Once a preset is active ``model`` is the resolved *remote id* (e.g.
+  ``deepseek-v4-pro[1m]``) and ``endpoint_key`` is its base URL — but
+  ``--model`` at startup only routes preset *names* through the endpoint
+  registry. Reverse-resolve so /restart and /upgrade relaunch with a name
+  the next boot can route; otherwise the new daemon sends the remote id to
+  the default endpoint and every turn fails "model not found" (including
+  the forked /btw CLI exiting 1). Plain models on the default endpoint
+  (no ``endpoint_key``) pass through unchanged.
+  """
+  if endpoint_key:
+    from .presets import preset_name_for_endpoint
+    name = preset_name_for_endpoint(model, endpoint_key, agent)
+    if name:
+      return name
+  return model
+
+
 async def main_loop(
   chat_id: str,
   project_dir: str,
@@ -1870,7 +1890,7 @@ async def main_loop(
             chat_id=chat_id,
             project_dir=project_dir,
             agent=agent,
-            model=model,
+            model=_restart_model_arg(model, _endpoint_key, agent),
             permission_mode=permission_mode,
             effort=ctx.effort,
           )
@@ -1928,7 +1948,7 @@ async def main_loop(
             chat_id=chat_id,
             project_dir=project_dir,
             agent=agent,
-            model=model,
+            model=_restart_model_arg(model, _endpoint_key, agent),
             permission_mode=permission_mode,
             effort=ctx.effort,
           )

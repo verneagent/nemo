@@ -8,7 +8,7 @@ from unittest import mock
 
 from nemo.presets import (
   Preset, _flatten_providers, _parse_api_key_env,
-  load_presets, resolve_preset,
+  load_presets, preset_name_for_endpoint, resolve_preset,
 )
 
 
@@ -241,6 +241,40 @@ def test_resolve_preset_returns_none_for_unknown(tmp_path):
     "definitely-not-a-real-model",
     user_path=str(tmp_path / "missing.json"),
   ) is None
+
+
+# ---------------------------------------------------------------------------
+# preset_name_for_endpoint — inverse mapping used by /restart and /upgrade
+# ---------------------------------------------------------------------------
+
+def test_preset_name_for_endpoint_round_trips_resolved_remote():
+  # The bug this guards: /restart relaunched with the *remote id*
+  # (deepseek-v4-pro[1m]) instead of the preset NAME (deepseek-v4-pro),
+  # so the new daemon couldn't resolve the endpoint and every turn (and
+  # the forked /btw CLI) failed "model not found". Forward resolution is
+  # deepseek-v4-pro → remote deepseek-v4-pro[1m] @ the anthropic URL; the
+  # inverse must recover the name from exactly those two live values.
+  name = preset_name_for_endpoint(
+    "deepseek-v4-pro[1m]", "https://api.deepseek.com/anthropic", "claude",
+    user_path="/nonexistent/path",
+  )
+  assert name == "deepseek-v4-pro"
+  # codex advertises the bare name on the OpenAI endpoint — must also map.
+  assert preset_name_for_endpoint(
+    "deepseek-v4-pro", "https://api.deepseek.com", "codex",
+    user_path="/nonexistent/path",
+  ) == "deepseek-v4-pro"
+
+
+def test_preset_name_for_endpoint_none_when_no_endpoint_or_no_match():
+  # Default endpoint (no preset active) → nothing to reverse-resolve;
+  # the caller passes the plain model id through unchanged.
+  assert preset_name_for_endpoint(
+    "claude-opus-4-7", "", "claude", user_path="/nonexistent/path") is None
+  # Right URL but a remote id no preset emits → no match.
+  assert preset_name_for_endpoint(
+    "deepseek-v4-pro", "https://api.deepseek.com/anthropic", "claude",
+    user_path="/nonexistent/path") is None
 
 
 def test_load_presets_handles_malformed_user_file(tmp_path, caplog):
