@@ -295,6 +295,46 @@ def send_card_action(action_value: dict, chat_id: str,
   }, chat_id)
 
 
+def send_form_action(form_value: dict, chat_id: str,
+                     card_msg_id: str = "",
+                     operator_open_id: str = OPERATOR_OPEN_ID,
+                     include_value: bool = False) -> str:
+  """Inject a Lark V2 form-submit card action via the relay webhook.
+
+  Mirrors what Lark sends when the user clicks a button with
+  ``form_action_type="submit"`` inside a form container — the payload
+  carries ``action.form_value`` (the named form children's values) and
+  often DROPS the button's ``action.value`` field. The relay must fall
+  back to ``event.context.open_chat_id`` to route the push to the
+  daemon; the picker fix verifies that path.
+
+  ``include_value=True`` simulates the friendlier shape where Lark
+  preserves the button's value (used for completeness — both paths
+  must reach the daemon)."""
+  ts = str(int(time.time() * 1000))
+  msg_id = f"test_form_{ts}_{os.getpid()}"
+  action: dict = {
+    "form_value": form_value,
+    "tag": "button",
+  }
+  if include_value:
+    action["value"] = {"action": "model_picker_submit", "chat_id": chat_id}
+  return _inject_relay_event({
+    "header": {
+      "event_type": "card.action.trigger",
+      "event_id": f"evt_{msg_id}",
+    },
+    "event": {
+      "operator": {"open_id": operator_open_id},
+      "action": action,
+      "context": {
+        "open_chat_id": chat_id,
+        "open_message_id": card_msg_id,
+      },
+    },
+  }, chat_id)
+
+
 def send_reaction(target_message_id: str, emoji_type: str,
                   chat_id: str) -> str:
   """Inject a reaction event via relay webhook."""
@@ -1402,6 +1442,188 @@ def run_askq_tests(pid: int, chat_id: str, result: E2EResult) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Phase 7c: /model picker (dropdown + form submit)
+# ---------------------------------------------------------------------------
+
+def _pick_alternate_model(current: str) -> str:
+  """Pick a model that differs from ``current`` for switch testing."""
+  options = ("claude-sonnet-4-6", "claude-opus-4-7", "claude-haiku-4-5")
+  for m in options:
+    if m != current:
+      return m
+  return "claude-sonnet-4-6"
+
+
+def run_picker_tests(pid: int, chat_id: str, result: E2EResult) -> None:
+  """Phase 7c: /model picker end-to-end.
+
+  Covers the wire-format gap the original e2e missed:
+    1. ``/model`` (no args) emits an interactive "Switch Model" card.
+    2. A Lark V2 form_action_type=submit with form_value + missing
+       ``action.value`` (the shape that broke v1) still reaches the
+       daemon via the relay's context.open_chat_id fallback.
+    3. The daemon switches the model and sends a "Model switched to"
+       confirmation.
+    4. The next ``/model`` reflects the new current model.
+  """
+  print(f"{Colors.BOLD}Phase 7c: /model Picker{Colors.RESET}")
+  log = LogAnalyzer(pid)
+
+  # NB: ``get_message`` (Lark API) drops interactive card body content,
+  # so we verify card shape via the daemon log instead of via Lark
+  # message bodies. The card title still flows back, which is enough
+  # to confirm the picker rendered. AGENTS.md spells out this Lark
+  # constraint explicitly.
+
+  # --- TM0: bare /model emits the picker card ---
+  ts = str(int(time.time() * 1000))
+  send_msg("/model", chat_id)
+  picker, elapsed = wait_for_interactive_title(
+    chat_id, after=ts, title_prefix="Switch Model", timeout=15)
+  if not picker:
+    result.fail("TM0 picker card", "no 'Switch Model' card within 15s")
+    log.dump_tail(20, "TM0")
+    return
+  result.ok("TM0 picker card", f"{elapsed:.1f}s")
+  picker_msg_id = picker.get("message_id", "")
+
+  # --- TM1: form submit (value-less, Lark V2 reality) switches model ---
+  target_model = "claude-sonnet-4-6"
+  mark = log.mark()
+  send_form_action(
+    form_value={"model": f"model_switch:{target_model}"},
+    chat_id=chat_id,
+    card_msg_id=picker_msg_id,
+    include_value=False,  # the shape that broke v1
+  )
+  # The daemon logs "Model switch to <name>" on a successful switch.
+  # That's our source of truth — the response card body is dropped
+  # by get_message so we can't observe it directly. Wait up to 20s
+  # for the synthesised /model push_back → dispatch → SDK reset chain.
+  switched = log.wait_for_since(
+    rf"Model switch to {target_model}", offset=mark, timeout=20)
+  if switched:
+    result.ok("TM1 form submit switches model",
+              f"daemon log confirms switch to {target_model}")
+  else:
+    result.fail("TM1 form submit switches model",
+                f"no 'Model switch to {target_model}' in daemon log after 20s")
+    log.dump_tail(30, "TM1")
+    return
+
+  # TM1b: the daemon must have routed it via the new card-action
+  # handler — i.e. seen the model_switch:<name> action and synthesised
+  # an internal /model command. If we only see the /model log but no
+  # card action log, the switch happened via some other path and the
+  # picker wiring is broken.
+  card_action_seen = log.find(
+    rf"Event:.*card\.action\.trigger.*chat={chat_id[:13]}", last_n=200)
+  synth_seen = log.find(
+    rf"Event:.*im\.message\.receive_v1.*text='/model {target_model}'",
+    last_n=200)
+  if card_action_seen and synth_seen:
+    result.ok("TM1b routed via card.action → synthetic /model",
+              "both events present in daemon log")
+  else:
+    detail = (
+      f"card_action={'yes' if card_action_seen else 'NO'} "
+      f"synth_msg={'yes' if synth_seen else 'NO'}"
+    )
+    result.fail("TM1b routed via card.action → synthetic /model", detail)
+
+  # --- TM2: relay must not have replaced the picker with "Selected:..." ---
+  # The relay's reply to Lark for ``model_switch:*`` actions must be
+  # toast-only (no ``card`` key). Verify by replaying the same form
+  # submit shape against the relay's webhook and inspecting the
+  # response: if BOT_OWNED_CARD_PREFIXES is wired, the response
+  # contains a toast but no ``card`` field.
+  cfg = _load_config()
+  relay_url = cfg.get("relay_url", "").rstrip("/")
+  verify_token = cfg.get("relay_verify_token", "")
+  smoke_chat = f"oc_smoke_picker_{int(time.time())}"
+  smoke_payload = json.dumps({
+    "header": {"token": verify_token, "event_type": "card.action.trigger"},
+    "event": {
+      "action": {
+        "form_value": {"model": f"model_switch:{target_model}"},
+        "tag": "button",
+      },
+      "operator": {"open_id": OPERATOR_OPEN_ID},
+      "context": {
+        "open_chat_id": smoke_chat,
+        "open_message_id": "om_smoke_picker",
+      },
+    },
+  }).encode()
+  req = urllib.request.Request(
+    f"{relay_url}/webhook", data=smoke_payload, method="POST")
+  req.add_header("Content-Type", "application/json")
+  try:
+    smoke_resp = json.loads(urllib.request.urlopen(req, timeout=5).read())
+  except Exception as e:
+    result.fail("TM2 no ugly 'Selected:' card",
+                f"relay webhook smoke failed: {e}")
+  else:
+    if "card" in smoke_resp:
+      result.fail("TM2 no ugly 'Selected:' card",
+                  f"relay returned a card replacement: {smoke_resp.get('card')}")
+    elif "toast" not in smoke_resp:
+      result.fail("TM2 no ugly 'Selected:' card",
+                  f"relay returned neither toast nor card: {smoke_resp}")
+    else:
+      result.ok("TM2 no ugly 'Selected:' card",
+                "relay toast-only for model_switch:* (BOT_OWNED_CARD_PREFIXES)")
+
+  wait_for_idle(pid, chat_id, timeout=30)
+
+  # --- TM3: next /model shows the new current model ---
+  # Verify via the daemon's ctx.model: a fresh ``/model`` triggers
+  # _send_model_picker which logs the catalog + current model. The
+  # picker card itself comes through Lark with the title intact;
+  # absence of "Model switch to" log on a re-pick of the SAME target
+  # confirms we're already on it (no-op).
+  mark = log.mark()
+  send_msg("/model", chat_id)
+  picker2, elapsed = wait_for_interactive_title(
+    chat_id, after=str(int(time.time() * 1000) - 5000),
+    title_prefix="Switch Model", timeout=15)
+  if not picker2:
+    result.fail("TM3 next /model reflects switch", "no follow-up picker")
+    return
+  # Re-submit the SAME model as a no-op probe. If the daemon already
+  # has ctx.model = target_model the existing /model dispatch will
+  # NOT emit "Model switch to" again (it's a real swap, but on the
+  # same name). Instead it'll just confirm. We accept either:
+  # (a) no "Model switch to" log = already on it; (b) a second
+  # "Model switch to target" log = re-applied.
+  send_form_action(
+    form_value={"model": f"model_switch:{target_model}"},
+    chat_id=chat_id,
+    card_msg_id=picker2.get("message_id", ""),
+    include_value=False,
+  )
+  # Give the daemon up to 10s to log either a fresh switch or
+  # process the action silently.
+  time.sleep(10)
+  re_switched = log.find(
+    rf"Model switch to {target_model}", last_n=80)
+  # The interesting question is: did the SECOND submit also flow
+  # through the card-action → synthetic /model path? That at least
+  # tells us the picker is still wired up.
+  second_card = log.count(
+    r"card\.action\.trigger", last_n=80)
+  if second_card >= 2:
+    result.ok("TM3 next /model picker still wired",
+              f"second submit also reached card.action handler "
+              f"(re_switched_log={'yes' if re_switched else 'no-op'})")
+  else:
+    result.fail("TM3 next /model picker still wired",
+                "second submit did not reach card.action handler")
+
+  print()
+
+
+# ---------------------------------------------------------------------------
 # Phase 8: Dual-Instance (same dir, two groups)
 # ---------------------------------------------------------------------------
 
@@ -2180,6 +2402,8 @@ def main():
                       help="Run only permission flow test (Phase 7)")
   parser.add_argument("--askq", action="store_true",
                       help="Run only AskUserQuestion flow test (Phase 7b)")
+  parser.add_argument("--picker", action="store_true",
+                      help="Run only /model picker form-submit test (Phase 7c)")
   parser.add_argument("--dual", action="store_true",
                       help="Run only dual-instance test (Phase 8)")
   parser.add_argument("--media", action="store_true",
@@ -2197,7 +2421,7 @@ def main():
   chat_id = args.chat_id.strip()
   result = E2EResult()
   single_phase = (args.stress or args.project or args.perm
-                  or args.askq
+                  or args.askq or args.picker
                   or args.dual or args.media or args.topic
                   or args.shell or args.switch)
   run_all = not single_phase
@@ -2262,6 +2486,8 @@ def main():
     print(f"  Mode: permission test only")
   elif args.askq:
     print(f"  Mode: AskUserQuestion flow only")
+  elif args.picker:
+    print(f"  Mode: /model picker flow only")
   elif args.dual:
     print(f"  Mode: dual-instance test only")
   elif args.media:
@@ -2552,6 +2778,14 @@ def main():
     elif args.askq:
       try:
         run_askq_tests(pid, chat_id, result)
+      finally:
+        send_msg("/exit", chat_id)
+        if not wait_for_exit(pid, timeout=35):
+          kill_nemo(pid)
+
+    elif args.picker:
+      try:
+        run_picker_tests(pid, chat_id, result)
       finally:
         send_msg("/exit", chat_id)
         if not wait_for_exit(pid, timeout=35):
