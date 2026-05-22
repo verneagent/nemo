@@ -677,14 +677,16 @@ def test_model_picker_card_structure():
   labels = [opt["text"]["content"] for opt in select["options"]]
   assert labels == ["claude-opus-4-7", "claude-sonnet-4-6"]
 
-  # Submit button — the Card JSON 2.0 field that triggers a form submit is
-  # ``action_type: "form_submit"`` (matches the working handoff schema).
-  # The wrong name ``form_action_type: "submit"`` made Lark not recognise
-  # it as a form submit, so no callback fired and the user got a 200530
-  # "callback not received" toast.
-  col_set = _find_element(form_elements, "column_set")
-  button = col_set["columns"][0]["elements"][0]
-  assert button["tag"] == "button"
+  # Submit button — must be a DIRECT child of the form (matching the working
+  # handoff card). A button nested in a column_set isn't treated by Lark as
+  # the form's submit trigger, so clicking fires nothing → 200530. And the
+  # Card JSON 2.0 field that triggers a form submit is
+  # ``action_type: "form_submit"`` (not the unrecognised
+  # ``form_action_type: "submit"``).
+  button = _find_element(form_elements, "button")
+  assert button is not None, form_elements
+  # No column_set wrapper around the submit button.
+  assert not any(e.get("tag") == "column_set" for e in form_elements), form_elements
   assert button["action_type"] == "form_submit"
   assert "form_action_type" not in button, button  # the broken field name
   assert button["type"] == "primary"

@@ -902,37 +902,26 @@ def build_model_picker_card(
       "placeholder": {"tag": "plain_text", "content": "Pick a model..."},
       "options": select_options,
     },
+    # The submit button is a DIRECT child of the form (matching the working
+    # handoff card). When nested inside a column_set, Lark does not treat it
+    # as the form's submit trigger, so clicking fires nothing and the user
+    # gets a 200530 "callback not received" toast.
     {
-      "tag": "column_set",
-      "flex_mode": "none",
-      "background_style": "default",
-      "columns": [{
-        "tag": "column",
-        "width": "auto",
-        "vertical_align": "top",
-        "elements": [{
-          "tag": "button",
-          "text": {"tag": "plain_text", "content": "Submit"},
-          "type": "primary",
-          # The Card JSON 2.0 field that makes a button submit its enclosing
-          # form is ``action_type: "form_submit"`` (per the working handoff
-          # card schema). We previously used ``form_action_type: "submit"``,
-          # which Lark does NOT recognise as a form-submit trigger — the
-          # button fired nothing, so the callback never reached the server
-          # and the user got a 200530 "callback not received" toast.
-          "action_type": "form_submit",
-          # No ``name`` on the button: Lark includes every named form child
-          # in form_value at submit time, and a named submit would turn the
-          # single-field form_value (just the model select) into a
-          # multi-field one, which the relay JSON-encodes — breaking the
-          # daemon's ``startswith("model_switch:")`` routing. The discriminator
-          # rides in the select option value (model_switch:<name>) → arrives
-          # in form_value; chat_id rides in the button value (→ action.value,
-          # with the relay falling back to context.open_chat_id when Lark
-          # drops it on a form submit).
-          "value": {"action": "model_picker_submit", "chat_id": chat_id},
-        }],
-      }],
+      "tag": "button",
+      "text": {"tag": "plain_text", "content": "Submit"},
+      "type": "primary",
+      # ``action_type: "form_submit"`` is the Card JSON 2.0 field that makes
+      # a button submit its enclosing form (per handoff's schema). We used to
+      # use ``form_action_type: "submit"``, which Lark doesn't recognise.
+      "action_type": "form_submit",
+      # No ``name`` on the button: Lark puts every named form child into
+      # form_value, and a named submit would turn the single-field form_value
+      # (just the model select) into a multi-field one, which the relay
+      # JSON-encodes — breaking the daemon's ``startswith("model_switch:")``
+      # routing. The discriminator rides in the select option value
+      # (model_switch:<name>) → form_value; chat_id rides in the button value
+      # (→ action.value, relay falls back to context.open_chat_id if dropped).
+      "value": {"action": "model_picker_submit", "chat_id": chat_id},
     },
   ]
   elements: list[JsonObject] = [
