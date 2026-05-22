@@ -677,26 +677,18 @@ def test_model_picker_card_structure():
   labels = [opt["text"]["content"] for opt in select["options"]]
   assert labels == ["claude-opus-4-7", "claude-sonnet-4-6"]
 
-  # Submit button — must declare form_action_type so Lark treats the
-  # click as a form submission (delivering form_value) rather than a
-  # bare button_action.
+  # Submit button — the Card JSON 2.0 field that triggers a form submit is
+  # ``action_type: "form_submit"`` (matches the working handoff schema).
+  # The wrong name ``form_action_type: "submit"`` made Lark not recognise
+  # it as a form submit, so no callback fired and the user got a 200530
+  # "callback not received" toast.
   col_set = _find_element(form_elements, "column_set")
   button = col_set["columns"][0]["elements"][0]
   assert button["tag"] == "button"
-  assert button["form_action_type"] == "submit"
+  assert button["action_type"] == "form_submit"
+  assert "form_action_type" not in button, button  # the broken field name
   assert button["type"] == "primary"
-  # Card JSON 2.0 fires a *server* callback through a ``behaviors`` array,
-  # not a top-level ``value``. A form-submit button with only a bare
-  # ``value`` never POSTs to the server (Lark shows a 200530
-  # "callback not received" toast), so the callback must be declared as a
-  # ``callback`` behavior. The chat_id rides in the behavior value for
-  # relay routing.
-  behaviors = button["behaviors"]
-  assert behaviors == [
-    {"type": "callback",
-     "value": {"action": "model_picker_submit", "chat_id": "oc_abc"}}
-  ], behaviors
-  assert "value" not in button, button  # not the V1 top-level shape
+  assert button["value"] == {"action": "model_picker_submit", "chat_id": "oc_abc"}
   # The submit button must NOT carry a ``name`` field — Lark includes
   # every named form child in form_value at submit time, and a named
   # submit would turn the single-field form_value into a multi-field

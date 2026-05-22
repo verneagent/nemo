@@ -914,31 +914,23 @@ def build_model_picker_card(
           "tag": "button",
           "text": {"tag": "plain_text", "content": "Submit"},
           "type": "primary",
-          # form_action_type: "submit" tells Lark this button submits the
-          # enclosing form rather than firing a button_action — that's
-          # what makes the dropdown selection arrive via form_value.
-          # No ``name`` on the button: Lark includes every named form
-          # child in form_value at submit time, and a named submit
-          # would turn the single-field form_value into a multi-field
-          # one, which the relay then JSON-encodes — breaking the
-          # daemon's ``startswith("model_switch:")`` routing.
-          "form_action_type": "submit",
-          # Card JSON 2.0 routes a *server* callback through a
-          # ``behaviors`` array, NOT a top-level ``value``. Plain buttons
-          # (stop/askq) get away with bare ``value`` because Lark tolerates
-          # the V1 shape for them, but a form-submit button does NOT fire a
-          # callback from bare ``value`` — Lark collects the form client
-          # side and, finding no callback behavior, never POSTs it, so the
-          # user sees a 200530 "callback not received" toast and the daemon
-          # never sees the submit. The callback ``value`` still surfaces as
-          # ``action.value`` (carrying chat_id for relay routing) alongside
-          # ``action.form_value`` (the model_switch:<name> selection).
-          "behaviors": [
-            {
-              "type": "callback",
-              "value": {"action": "model_picker_submit", "chat_id": chat_id},
-            }
-          ],
+          # The Card JSON 2.0 field that makes a button submit its enclosing
+          # form is ``action_type: "form_submit"`` (per the working handoff
+          # card schema). We previously used ``form_action_type: "submit"``,
+          # which Lark does NOT recognise as a form-submit trigger — the
+          # button fired nothing, so the callback never reached the server
+          # and the user got a 200530 "callback not received" toast.
+          "action_type": "form_submit",
+          # No ``name`` on the button: Lark includes every named form child
+          # in form_value at submit time, and a named submit would turn the
+          # single-field form_value (just the model select) into a
+          # multi-field one, which the relay JSON-encodes — breaking the
+          # daemon's ``startswith("model_switch:")`` routing. The discriminator
+          # rides in the select option value (model_switch:<name>) → arrives
+          # in form_value; chat_id rides in the button value (→ action.value,
+          # with the relay falling back to context.open_chat_id when Lark
+          # drops it on a form submit).
+          "value": {"action": "model_picker_submit", "chat_id": chat_id},
         }],
       }],
     },
