@@ -677,26 +677,21 @@ def test_model_picker_card_structure():
   labels = [opt["text"]["content"] for opt in select["options"]]
   assert labels == ["claude-opus-4-7", "claude-sonnet-4-6"]
 
-  # Submit button — must be a DIRECT child of the form (matching the working
-  # handoff card). A button nested in a column_set isn't treated by Lark as
-  # the form's submit trigger, so clicking fires nothing → 200530. And the
-  # Card JSON 2.0 field that triggers a form submit is
-  # ``action_type: "form_submit"`` (not the unrecognised
-  # ``form_action_type: "submit"``).
+  # Submit button — exact official Card JSON 2.0 form-submit shape:
+  #   * ``form_action_type: "submit"`` (the documented field; NOT action_type)
+  #   * a DIRECT child of the form (a button nested in a column_set isn't
+  #     treated as the form's submit trigger → clicking fires nothing → 200530)
+  #   * a ``name`` (required; the callback puts it in action.name, while
+  #     form_value carries only the data components — so the named submit does
+  #     NOT pollute the single-field form_value the relay routes on).
   button = _find_element(form_elements, "button")
   assert button is not None, form_elements
-  # No column_set wrapper around the submit button.
   assert not any(e.get("tag") == "column_set" for e in form_elements), form_elements
-  assert button["action_type"] == "form_submit"
-  assert "form_action_type" not in button, button  # the broken field name
+  assert button["form_action_type"] == "submit"
+  assert "action_type" not in button, button
+  assert button["name"] == "submit"
   assert button["type"] == "primary"
   assert button["value"] == {"action": "model_picker_submit", "chat_id": "oc_abc"}
-  # The submit button must NOT carry a ``name`` field — Lark includes
-  # every named form child in form_value at submit time, and a named
-  # submit would turn the single-field form_value into a multi-field
-  # one which the relay JSON-encodes, breaking the daemon's
-  # ``startswith("model_switch:")`` routing.
-  assert "name" not in button, button
 
 
 def test_model_picker_card_info_and_hint():

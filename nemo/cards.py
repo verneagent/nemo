@@ -902,25 +902,24 @@ def build_model_picker_card(
       "placeholder": {"tag": "plain_text", "content": "Pick a model..."},
       "options": select_options,
     },
-    # The submit button is a DIRECT child of the form (matching the working
-    # handoff card). When nested inside a column_set, Lark does not treat it
-    # as the form's submit trigger, so clicking fires nothing and the user
-    # gets a 200530 "callback not received" toast.
+    # Submit button — exact Card JSON 2.0 form-submit shape from the official
+    # docs (feishu-cards/card-json-v2-components → button + form container):
+    #   - ``form_action_type: "submit"`` is the field that submits the form
+    #     (NOT ``action_type``);
+    #   - the submit button is a DIRECT child of the form (nesting it in a
+    #     column_set means Lark doesn't treat it as the form's submit
+    #     trigger — clicking fires nothing → 200530 "callback not received");
+    #   - the submit button MUST have a ``name``. The official callback
+    #     payload puts the button's name in ``action.name`` and ONLY the data
+    #     components (the select) in ``action.form_value``, so a named submit
+    #     does NOT pollute form_value — the select still arrives as the single
+    #     ``{"model": "model_switch:<name>"}`` entry the relay routes on.
     {
       "tag": "button",
       "text": {"tag": "plain_text", "content": "Submit"},
       "type": "primary",
-      # ``action_type: "form_submit"`` is the Card JSON 2.0 field that makes
-      # a button submit its enclosing form (per handoff's schema). We used to
-      # use ``form_action_type: "submit"``, which Lark doesn't recognise.
-      "action_type": "form_submit",
-      # No ``name`` on the button: Lark puts every named form child into
-      # form_value, and a named submit would turn the single-field form_value
-      # (just the model select) into a multi-field one, which the relay
-      # JSON-encodes — breaking the daemon's ``startswith("model_switch:")``
-      # routing. The discriminator rides in the select option value
-      # (model_switch:<name>) → form_value; chat_id rides in the button value
-      # (→ action.value, relay falls back to context.open_chat_id if dropped).
+      "form_action_type": "submit",
+      "name": "submit",
       "value": {"action": "model_picker_submit", "chat_id": chat_id},
     },
   ]
