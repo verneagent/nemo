@@ -923,7 +923,22 @@ def build_model_picker_card(
           # one, which the relay then JSON-encodes — breaking the
           # daemon's ``startswith("model_switch:")`` routing.
           "form_action_type": "submit",
-          "value": {"action": "model_picker_submit", "chat_id": chat_id},
+          # Card JSON 2.0 routes a *server* callback through a
+          # ``behaviors`` array, NOT a top-level ``value``. Plain buttons
+          # (stop/askq) get away with bare ``value`` because Lark tolerates
+          # the V1 shape for them, but a form-submit button does NOT fire a
+          # callback from bare ``value`` — Lark collects the form client
+          # side and, finding no callback behavior, never POSTs it, so the
+          # user sees a 200530 "callback not received" toast and the daemon
+          # never sees the submit. The callback ``value`` still surfaces as
+          # ``action.value`` (carrying chat_id for relay routing) alongside
+          # ``action.form_value`` (the model_switch:<name> selection).
+          "behaviors": [
+            {
+              "type": "callback",
+              "value": {"action": "model_picker_submit", "chat_id": chat_id},
+            }
+          ],
         }],
       }],
     },

@@ -685,7 +685,18 @@ def test_model_picker_card_structure():
   assert button["tag"] == "button"
   assert button["form_action_type"] == "submit"
   assert button["type"] == "primary"
-  assert button["value"]["chat_id"] == "oc_abc"
+  # Card JSON 2.0 fires a *server* callback through a ``behaviors`` array,
+  # not a top-level ``value``. A form-submit button with only a bare
+  # ``value`` never POSTs to the server (Lark shows a 200530
+  # "callback not received" toast), so the callback must be declared as a
+  # ``callback`` behavior. The chat_id rides in the behavior value for
+  # relay routing.
+  behaviors = button["behaviors"]
+  assert behaviors == [
+    {"type": "callback",
+     "value": {"action": "model_picker_submit", "chat_id": "oc_abc"}}
+  ], behaviors
+  assert "value" not in button, button  # not the V1 top-level shape
   # The submit button must NOT carry a ``name`` field — Lark includes
   # every named form child in form_value at submit time, and a named
   # submit would turn the single-field form_value into a multi-field
