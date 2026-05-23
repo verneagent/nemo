@@ -793,6 +793,21 @@ def test_model_switched_card_error_state():
   assert "codex" in blob
 
 
+def test_model_switched_card_keeps_available_catalog():
+  """After the switch the locked card must NOT wipe content down to bare
+  agent+model — it keeps the available-model catalog (passed as ``info``)
+  so the user can still see what else they can switch to. Still no form, so
+  it can't be re-submitted."""
+  listing = ("Available: `claude-opus-4-7`, `claude-sonnet-4-6`, "
+             "`claude-haiku-4-5`")
+  card = build_model_switched_card(
+    agent="claude", model="claude-haiku-4-5", ok=True, info=listing)
+  blob = json.dumps(card, ensure_ascii=False)
+  assert "claude-opus-4-7" in blob and "claude-sonnet-4-6" in blob
+  # The catalog stays as plain markdown; the card is still locked (no form).
+  assert "select_static" not in blob and "form_action_type" not in blob
+
+
 # ---------------------------------------------------------------------------
 # build_form_input
 # ---------------------------------------------------------------------------

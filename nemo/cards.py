@@ -956,6 +956,7 @@ def build_model_switched_card(
   ok: bool = True,
   attempted: str = "",
   reason: str = "",
+  info: str = "",
 ) -> JsonObject:
   """Build the locked, post-submit replacement for the /model picker.
 
@@ -989,8 +990,15 @@ def build_model_switched_card(
     lines.append(f"**Current model:** {_escape_md(model)}")
   elements: list[JsonObject] = [
     {"tag": "markdown", "content": "\n".join(lines)},
-    _note_element("Run `/model` for a fresh picker."),
   ]
+  # Keep the available-model catalog visible after the switch so the locked
+  # card stays useful (the user can see what else they could switch to)
+  # instead of being wiped down to just agent+model. Multi-line, so it goes
+  # through plain markdown — NOT the <font>-wrapped note, which can't span a
+  # \n\n paragraph break without leaking a bare </font>.
+  if info:
+    elements.append({"tag": "markdown", "content": info})
+  elements.append(_note_element("Run `/model` for a fresh picker."))
   return {
     "schema": "2.0",
     "config": {"update_multi": True},

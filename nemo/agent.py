@@ -999,6 +999,7 @@ async def _lock_model_picker(
   *,
   agent: str,
   model: str,
+  project_dir: str,
   ok: bool = True,
   attempted: str = "",
   reason: str = "",
@@ -1007,15 +1008,22 @@ async def _lock_model_picker(
 
   Removes the dropdown + Submit button (the card is rebuilt without a
   form) so the picker can't be re-submitted with a now-stale model
-  list, and prominently shows the current agent + model. No-op when
-  there is no picker card to lock (e.g. the submit came from the
-  standalone fallback card, or the card id wasn't propagated).
+  list, and prominently shows the current agent + model. Keeps the
+  available-model catalog visible so the locked card still tells the user
+  what else they can switch to (via ``/model NAME``) instead of wiping it
+  down to bare agent+model. No-op when there is no picker card to lock
+  (e.g. the submit came from the standalone fallback card, or the card id
+  wasn't propagated).
   """
   if not picker_msg_id:
     return
   try:
+    from .agent_factory import model_catalog_for_agent
+    listing = commands._format_model_catalog(
+      model_catalog_for_agent(agent, project_dir))
     card = cards.build_model_switched_card(
-      agent=agent, model=model, ok=ok, attempted=attempted, reason=reason)
+      agent=agent, model=model, ok=ok, attempted=attempted, reason=reason,
+      info=listing)
     await channel.update_card(picker_msg_id, card)
     log.info("Locked /model picker %s (ok=%s agent=%s model=%s)",
              picker_msg_id, ok, agent, model)
@@ -1382,7 +1390,7 @@ async def main_loop(
           if not is_model_compatible(agent, model_name):
             await _lock_model_picker(
               channel, reply.message_id, agent=agent, model=model,
-              ok=False, attempted=model_name,
+              project_dir=project_dir, ok=False, attempted=model_name,
               reason=(
                 f"`{model_name}` isn't available for agent **{agent}** "
                 f"(the picker may be from before an /agent switch)."
@@ -1580,7 +1588,8 @@ async def main_loop(
               )
               await _lock_model_picker(
                 channel, _pending_picker_msg_id,
-                agent=agent, model=model, ok=False, attempted=new_model,
+                agent=agent, model=model, project_dir=project_dir,
+              ok=False, attempted=new_model,
                 reason=f"Preset **{new_model}** has no endpoint for "
                        f"agent **{agent}**.")
               _pending_picker_msg_id = ""
@@ -1595,7 +1604,8 @@ async def main_loop(
               )
               await _lock_model_picker(
                 channel, _pending_picker_msg_id,
-                agent=agent, model=model, ok=False, attempted=new_model,
+                agent=agent, model=model, project_dir=project_dir,
+              ok=False, attempted=new_model,
                 reason=f"Preset **{new_model}** needs "
                        f"`${preset.api_key_env}` in the daemon env.")
               _pending_picker_msg_id = ""
@@ -1631,7 +1641,7 @@ async def main_loop(
             )
             await _lock_model_picker(
               channel, _pending_picker_msg_id,
-              agent=agent, model=model, ok=True)
+              agent=agent, model=model, project_dir=project_dir, ok=True)
             _pending_picker_msg_id = ""
             continue
           if not is_model_compatible(agent, new_model):
@@ -1643,7 +1653,8 @@ async def main_loop(
             )
             await _lock_model_picker(
               channel, _pending_picker_msg_id,
-              agent=agent, model=model, ok=False, attempted=new_model,
+              agent=agent, model=model, project_dir=project_dir,
+              ok=False, attempted=new_model,
               reason=f"`{new_model}` isn't available for agent **{agent}**.")
             _pending_picker_msg_id = ""
             await _clear_ack()
@@ -1672,7 +1683,7 @@ async def main_loop(
           )
           await _lock_model_picker(
             channel, _pending_picker_msg_id,
-            agent=agent, model=model, ok=True)
+            agent=agent, model=model, project_dir=project_dir, ok=True)
           _pending_picker_msg_id = ""
         elif response and response.startswith("__agent__:"):
           # Format: "__agent__:<name>:<default_model>"
