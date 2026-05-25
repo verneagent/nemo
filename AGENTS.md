@@ -83,9 +83,15 @@ Lark-connected coding agent daemon. Repo focus:
   ```
 - Run relay-injection e2e when touching channel/event/permission flow:
   ```bash
-  python3 scripts/e2e_test.py --skip-sdk
-  python3 scripts/e2e_test.py --perm
+  python3 -u scripts/e2e_test.py --skip-sdk
+  python3 -u scripts/e2e_test.py --perm
   ```
+  The e2e injects events via the relay and uses the bot/tenant token (app_id +
+  app_secret) to send/read cards — it does NOT need a Lark **user** token. An
+  "User token expired / refresh failed" line is expected and auto-falls back to
+  relay; never stop to refresh it. Run with `-u` (stdout is block-buffered when
+  piped — without it the run looks frozen until exit; don't kill it, SDK phases
+  take minutes). See the `scripts/e2e_test.py` header for full details.
 - Interactive card features (forms / dropdowns / buttons) must be tested at all three layers, not just the daemon. A daemon test that hand-builds `action_value={"action": …}` stubs away the wire format and will miss bugs in how Lark/the relay actually deliver the action (this is exactly how a `/model` picker form submit shipped broken — the relay dropped it because `value.chat_id` was empty). Cover:
   - `relay/test_relay.py` — POST a realistic webhook (try with AND without `action.value`, since Lark V2 form submits are flaky about preserving it).
   - `tests/test_relay_events.py` — round-trip the relay reply dict through `_relay_msg_to_event`.

@@ -1,28 +1,40 @@
 #!/usr/bin/env python3
 """Nemo E2E test runner.
 
-Starts a live nemo instance, sends real Lark messages, and verifies responses
-via the Lark IM API. Designed to be run by a human or AI agent after major
-code changes.
+Starts a live nemo daemon and drives it by INJECTING events through the relay
+webhook (simulating Lark), then verifies the daemon's responses. Run after
+major code changes — by a human or an AI agent.
 
-Usage:
-    python3 scripts/e2e_test.py                 # full run (all phases)
-    python3 scripts/e2e_test.py --skip-sdk       # commands only (fast)
-    python3 scripts/e2e_test.py --stress         # stale-task stress only
-    python3 scripts/e2e_test.py --project        # multi-turn project only
-    python3 scripts/e2e_test.py --perm           # permission flow only
-    python3 scripts/e2e_test.py --askq           # AskUserQuestion flow only
-    python3 scripts/e2e_test.py --dual           # dual-instance only
-    python3 scripts/e2e_test.py --media          # media & interaction only
-    python3 scripts/e2e_test.py --shell          # shell shortcut + abort only
-    python3 scripts/e2e_test.py --switch         # /agent + preset switch only
-    python3 scripts/e2e_test.py --verbose        # debug nemo logging
-    python3 scripts/e2e_test.py --chat <ID>      # custom chat group
+Usage (run with `-u`, see "Running it" below):
+    python3 -u scripts/e2e_test.py               # full run (all phases)
+    python3 -u scripts/e2e_test.py --skip-sdk    # commands only (fast, no SDK turns)
+    python3 -u scripts/e2e_test.py --perm        # permission flow
+    python3 -u scripts/e2e_test.py --askq        # AskUserQuestion flow
+    python3 -u scripts/e2e_test.py --picker      # /model picker form-submit
+    python3 -u scripts/e2e_test.py --topic       # topic-chat / thread_id
+    python3 -u scripts/e2e_test.py --fork        # /fork sub-thread (local relay)
+    python3 -u scripts/e2e_test.py --stress|--project|--dual|--media|--shell|--switch
+    python3 -u scripts/e2e_test.py --chat-id <ID>  # reuse a chat (else a temp group)
+    python3 -u scripts/e2e_test.py --verbose
 
-Prerequisites:
-    - ~/.nemo/default.json (app_id, app_secret, relay_url, email)
-    - ~/.nemo/user_token.json (2h TTL — refreshed automatically)
-    - Relay server running (http://47.95.232.145)
+Credentials — do NOT reach for a Lark user token:
+    - Required: ~/.nemo/default.json with app_id + app_secret (the bot/TENANT
+      token sends and reads cards) and relay_url + relay_verify_token (for
+      event injection). That is all the suite needs.
+    - OPTIONAL: ~/.nemo/user_token.json powers ONE path only — sending a user
+      message via the user API to trigger a real WS event. When it is missing
+      or expired the suite prints "User token expired / refresh failed" and
+      silently FALLS BACK to relay injection. That message is EXPECTED and
+      harmless — never pause to refresh the token or ask the user for it.
+    - With no --chat-id a fresh temp Lark group is created and dissolved for you.
+
+Running it:
+    - Use `python3 -u` (or PYTHONUNBUFFERED=1). stdout is block-buffered when not
+      a TTY, so WITHOUT -u the output looks frozen/empty until the process exits
+      — do NOT assume it hung and kill it. SDK-turn phases take minutes.
+    - Live progress: tail ~/.nemo/logs/nemo-<pid>.log.
+    - --fork spins up its OWN local relay (the configured remote relay_url
+      predates the thread_id forwarding fix); all other phases use relay_url.
 """
 
 from __future__ import annotations
