@@ -108,6 +108,32 @@ class CodingAgent(ABC):
     del question, sdk_session_id
     return ""
 
+  def supports_fork(self) -> bool:
+    """True if this adapter can spawn a read-only forked sub-session.
+
+    Forking branches the *current* conversation context into an
+    independent, multi-turn, tool-enabled sub-session that is physically
+    unable to modify the project (see ``fork``). Only Claude supports it
+    (it relies on the SDK's ``fork_session`` + OS sandbox); Codex /
+    OpenCode inherit ``False``.
+    """
+    return False
+
+  async def fork(
+    self, parent_session_id: str, project_dir: str, model: str,
+  ) -> "CodingAgent | None":
+    """Spawn a read-only forked sub-agent for a `/fork` sub-thread.
+
+    The returned agent is started and ready to ``run_turn``: it branches
+    from ``parent_session_id`` (so it sees the current context, ephemeral
+    — nothing written back), exposes tools but is sandboxed so it CANNOT
+    modify ``project_dir``. Returns ``None`` when unsupported (the caller
+    surfaces a "Claude-only" note). Caller owns the lifecycle and must
+    ``stop()`` the fork to release its subprocess + scratch dir.
+    """
+    del parent_session_id, project_dir, model
+    return None
+
   def trailing_note(self, sdk_session_id: str) -> str:
     """Return an optional markdown note to append to the final turn response.
 

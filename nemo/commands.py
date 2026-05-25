@@ -341,6 +341,29 @@ def try_dispatch(text: str, ctx: AgentContext) -> tuple[bool, str | None]:
       )
     return True, f"__btw__:{question}"
 
+  # /fork <prompt> — open a read-only forked sub-thread (Claude only). Unlike
+  # /btw it is multi-turn and tool-enabled (incl. Bash), but runs sandboxed so
+  # it physically cannot modify the project. Lives in its own Lark sub-thread;
+  # keep replying in the thread to continue it. `/fork close` ends it.
+  fork_m = re.match(
+    r"^/fork(?:\s+(.+))?$",
+    text.strip(),
+    re.IGNORECASE | re.DOTALL,
+  )
+  if fork_m:
+    arg = (fork_m.group(1) or "").strip()
+    if arg.lower() == "close":
+      return True, "__fork_close__"
+    if not arg:
+      return True, (
+        "Usage: `/fork <prompt>` — open a read-only branch in a Lark "
+        "sub-thread. It shares the current conversation context and has "
+        "tools (including Bash), but is sandboxed so it CANNOT modify "
+        "project files. Multi-turn — just keep replying in the thread. "
+        "`/fork close` ends it. Claude agent only."
+      )
+    return True, f"__fork__:{arg}"
+
   # /esc — bare cancels the current turn; with trailing text, cancel then
   # send the text as a new message (case preserved from the original input).
   esc_m = re.match(
@@ -437,6 +460,7 @@ def try_dispatch(text: str, ctx: AgentContext) -> tuple[bool, str | None]:
       "| `/esc` | Cancel current operation |\n"
       "| `/esc <text>` | Cancel and send `<text>` as the next message |\n"
       "| `/btw <question>` | Read-only side question; ephemeral, never enters history, doesn't interrupt the turn (Claude only) |\n"
+      "| `/fork <prompt>` | Open a read-only branch in a sub-thread: shares context, has tools (incl. Bash), but sandboxed so it can't modify project files. Multi-turn; `/fork close` to end (Claude only) |\n"
       "| `/ping` | Status check |\n"
       "| `/cost` | Session API cost |\n"
       "| `/usage` | Plan usage limits |\n"
@@ -595,6 +619,11 @@ def try_dispatch(text: str, ctx: AgentContext) -> tuple[bool, str | None]:
 _NEEDS_SDK = ("__clear__", "__undo_clear__", "__esc__",
               "__model__:", "__cd__:", "__agent__:",
               "__restart__", "__upgrade__")
+
+
+def is_fork_close(text: str) -> bool:
+  """True if `text` is the `/fork close` command (sent inside a fork thread)."""
+  return bool(re.match(r"^/fork\s+close\s*$", text.strip(), re.IGNORECASE))
 
 
 def is_inline_safe(response: str | None) -> bool:

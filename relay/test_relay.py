@@ -359,6 +359,20 @@ class RelayTestCase(unittest.TestCase):
     r = self._get("/replies/chat:oc_pid?since=")["replies"][0]
     self.assertEqual(r["parent_id"], "om_parent")
 
+  def test_thread_id_present(self):
+    """thread_id included when the message belongs to a Lark thread —
+    nemo routes /fork sub-threads by it, so the relay must not drop it."""
+    self._push_text("oc_tid", "in thread", "27500", evt_id="evt_tid",
+                    thread_id="omt_fork_xyz")
+    r = self._get("/replies/chat:oc_tid?since=")["replies"][0]
+    self.assertEqual(r["thread_id"], "omt_fork_xyz")
+
+  def test_thread_id_omitted_when_absent(self):
+    """Top-level messages carry no thread_id key."""
+    self._push_text("oc_no_tid", "top level", "27600", evt_id="evt_no_tid")
+    r = self._get("/replies/chat:oc_no_tid?since=")["replies"][0]
+    self.assertNotIn("thread_id", r)
+
   def test_mentions_structure(self):
     """Worker: mentions = [{key, id: openid, name}]."""
     self._webhook({

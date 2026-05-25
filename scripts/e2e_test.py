@@ -2416,6 +2416,205 @@ def run_switch_tests(pid: int, chat_id: str, result: E2EResult,
   print()
 
 
+# ---------------------------------------------------------------------------
+# Phase 13: /fork (read-only forked sub-thread) — local-relay round-trip
+# ---------------------------------------------------------------------------
+
+def _start_local_relay(port: int):
+  """Start the REPO relay in-process (background thread). Returns
+  (stop_fn, verify_token, api_key).
+
+  The /fork phase needs a relay that carries our thread_id forwarding fix; the
+  configured remote relay predates it. Inbound events go through this local
+  relay; outbound card sends still hit real Lark via the tenant token.
+  """
+  import asyncio as _aio
+  import importlib
+  import threading
+  relay_dir = os.path.join(PROJECT_DIR, "relay")
+  if relay_dir not in sys.path:
+    sys.path.insert(0, relay_dir)
+  vtok, akey = "fork-e2e-vtok", "fork-e2e-key"
+  db_path = f"/tmp/nemo_e2e_fork_relay_{os.getpid()}.db"
+  os.environ["RELAY_PORT"] = str(port)
+  os.environ["RELAY_DB"] = db_path
+  os.environ["RELAY_API_KEY"] = akey
+  os.environ["VERIFY_TOKENS"] = vtok
+  import relay as relay_mod
+  importlib.reload(relay_mod)
+  if os.path.exists(db_path):
+    os.remove(db_path)
+  relay_mod._init_db()
+  loop = _aio.new_event_loop()
+  app = relay_mod.create_app()
+
+  async def _start():
+    runner = relay_mod.web.AppRunner(app)
+    await runner.setup()
+    site = relay_mod.web.TCPSite(runner, "127.0.0.1", port)
+    await site.start()
+    return runner
+
+  runner = loop.run_until_complete(_start())
+  th = threading.Thread(target=loop.run_forever, daemon=True)
+  th.start()
+
+  def _stop():
+    try:
+      _aio.run_coroutine_threadsafe(runner.cleanup(), loop).result(5)
+    except Exception:
+      pass
+    loop.call_soon_threadsafe(loop.stop)
+    try:
+      os.remove(db_path)
+    except OSError:
+      pass
+
+  return _stop, vtok, akey
+
+
+def _inject_local_webhook(relay_url: str, vtok: str, message: dict) -> None:
+  """POST an im.message.receive_v1 webhook to a (local) relay /webhook."""
+  payload = {
+    "header": {"token": vtok, "event_type": "im.message.receive_v1",
+               "event_id": f"evt_{message['message_id']}"},
+    "event": {"message": message,
+              "sender": {"sender_type": "user",
+                         "sender_id": {"open_id": OPERATOR_OPEN_ID}}},
+  }
+  req = urllib.request.Request(
+    f"{relay_url}/webhook", data=json.dumps(payload).encode(), method="POST")
+  req.add_header("Content-Type", "application/json")
+  urllib.request.urlopen(req, timeout=10).read()
+
+
+def run_fork_tests(chat_id: str, result: "E2EResult", agent: str = "claude",
+                   verbose: bool = False) -> str:
+  """Phase 13: /fork live round-trip through a LOCAL relay.
+
+  Validates the full stack with our thread_id forwarding fix in the loop:
+  /fork opens a REAL Lark sub-thread (tenant-token send), the read-only fork
+  runs a turn, a follow-up injected with the Lark-assigned thread_id routes
+  back to that fork (the round-trip the remote relay can't do yet), and
+  /fork close tears it down. Manages its own relay + daemon + temp chat.
+  """
+  print(f"{Colors.BOLD}Phase 13: /fork (local-relay round-trip){Colors.RESET}")
+  port = 19877
+  stop_relay, vtok, akey = _start_local_relay(port)
+  relay_url = f"http://127.0.0.1:{port}"
+  prev_url = os.environ.get("NEMO_RELAY_URL")
+  prev_key = os.environ.get("NEMO_RELAY_API_KEY")
+  os.environ["NEMO_RELAY_URL"] = relay_url
+  os.environ["NEMO_RELAY_API_KEY"] = akey
+  created = False
+  pid = 0
+  try:
+    if not chat_id:
+      print("  Creating fresh temp group...")
+      chat_id = create_temp_group("nemo-e2e-fork")
+      if not chat_id:
+        result.fail("T100 setup", "could not create temp group")
+        return ""
+      created = True
+    print(f"  Starting nemo against local relay {relay_url}...")
+    pid = start_nemo(chat_id, verbose=verbose, agent=agent)
+    if not wait_for_ready(pid, timeout=40, agent=agent):
+      result.fail("T100 daemon ready", "no SDK connection in 40s")
+      LogAnalyzer(pid).dump_tail(20, "fork-start")
+      return chat_id
+    log = LogAnalyzer(pid)
+
+    # The fork root card is a threaded reply to the /fork message, so that
+    # message must be a REAL Lark message (Lark rejects reply-in-thread to a
+    # fabricated id). Relay injection fakes ids, so anchor the injected /fork
+    # message on the daemon's start card (a real message id from the log). The
+    # follow-up/close can keep fake ids — they route by thread_id, not by
+    # replying to them.
+    anchor_m = re.search(r"Start card sent: (\S+)", log.read(200))
+    anchor_id = anchor_m.group(1) if anchor_m else ""
+    if not anchor_id.startswith("om_"):
+      result.fail("T100 anchor", f"no real start-card id to anchor on ({anchor_id!r})")
+      return chat_id
+
+    # T101: /fork opens a real Lark sub-thread (capture the assigned id).
+    print("  [T101] /fork opens a sub-thread...")
+    m = log.mark()
+    ts = str(int(time.time() * 1000))
+    _inject_local_webhook(relay_url, vtok, {
+      "chat_id": chat_id, "message_type": "text",
+      "content": json.dumps(
+        {"text": "/fork Reply with exactly the word READY and nothing else."}),
+      "create_time": ts, "message_id": anchor_id})
+    if not log.wait_for_since(r"fork opened: thread=", m, timeout=90):
+      result.fail("T101 /fork opens thread", "no 'fork opened' in daemon log")
+      log.dump_tail(30, "T101")
+      return chat_id
+    tm = re.search(r"fork opened: thread=(\S+)", log.read_since(m))
+    thread_id = tm.group(1) if tm else ""
+    if not thread_id.startswith("omt_"):
+      result.fail("T101 /fork opens thread",
+                  f"no real Lark thread_id (got {thread_id!r})")
+      return chat_id
+    result.ok("T101 /fork opens thread", f"thread={thread_id[:24]}")
+
+    # T102: the read-only fork ran its first turn.
+    print("  [T102] fork first turn runs...")
+    if log.wait_for_since(r"fork turn start: thread=", m, timeout=15):
+      result.ok("T102 fork first turn", "turn started")
+    else:
+      result.fail("T102 fork first turn", "no 'fork turn start' in log")
+
+    # T103: follow-up carrying the REAL thread_id routes back to the fork —
+    # exercises relay thread_id forwarding + daemon routing end-to-end.
+    print("  [T103] follow-up routes by thread_id...")
+    m2 = log.mark()
+    ts2 = str(int(time.time() * 1000))
+    _inject_local_webhook(relay_url, vtok, {
+      "chat_id": chat_id, "message_type": "text",
+      "content": json.dumps({"text": "Reply with the word AGAIN only."}),
+      "create_time": ts2, "message_id": f"fork_follow_{ts2}",
+      "thread_id": thread_id})
+    if log.wait_for_since(
+        r"fork route: thread=" + re.escape(thread_id), m2, timeout=25):
+      result.ok("T103 follow-up routes to fork", "routed by thread_id")
+    else:
+      result.fail("T103 follow-up routes to fork",
+                  "no 'fork route' — thread_id not forwarded or not routed")
+      log.dump_tail(30, "T103")
+
+    # T104: /fork close (inside the thread) tears it down.
+    print("  [T104] /fork close...")
+    m3 = log.mark()
+    ts3 = str(int(time.time() * 1000))
+    _inject_local_webhook(relay_url, vtok, {
+      "chat_id": chat_id, "message_type": "text",
+      "content": json.dumps({"text": "/fork close"}),
+      "create_time": ts3, "message_id": f"fork_close_{ts3}",
+      "thread_id": thread_id})
+    if log.wait_for_since(
+        r"fork closed: thread=" + re.escape(thread_id), m3, timeout=30):
+      result.ok("T104 /fork close", "fork torn down")
+    else:
+      result.fail("T104 /fork close", "no 'fork closed' in log")
+      log.dump_tail(20, "T104")
+    print()
+    return chat_id
+  finally:
+    if pid:
+      kill_nemo(pid)
+    stop_relay()
+    if prev_url is None:
+      os.environ.pop("NEMO_RELAY_URL", None)
+    else:
+      os.environ["NEMO_RELAY_URL"] = prev_url
+    if prev_key is None:
+      os.environ.pop("NEMO_RELAY_API_KEY", None)
+    else:
+      os.environ["NEMO_RELAY_API_KEY"] = prev_key
+    if created and chat_id:
+      dissolve_temp_group(chat_id)
+
+
 def main():
   import argparse
   parser = argparse.ArgumentParser(description="Nemo E2E test runner")
@@ -2445,6 +2644,8 @@ def main():
                       help="Run only shell shortcut test (Phase 11)")
   parser.add_argument("--switch", action="store_true",
                       help="Run only /agent + preset switch test (Phase 12)")
+  parser.add_argument("--fork", action="store_true",
+                      help="Run only /fork sub-thread test (Phase 13, local relay)")
   parser.add_argument("--verbose", "-v", action="store_true",
                       help="Verbose nemo logging")
   args = parser.parse_args()
@@ -2454,7 +2655,7 @@ def main():
   single_phase = (args.stress or args.project or args.perm
                   or args.askq or args.picker
                   or args.dual or args.media or args.topic
-                  or args.shell or args.switch)
+                  or args.shell or args.switch or args.fork)
   run_all = not single_phase
   created_temp_chat = False
 
@@ -2529,6 +2730,8 @@ def main():
     print(f"  Mode: shell shortcut test only")
   elif args.switch:
     print(f"  Mode: /agent + preset switch test only")
+  elif args.fork:
+    print(f"  Mode: /fork sub-thread test only (local relay)")
   print()
 
   # Dual-instance manages its own processes
@@ -2538,6 +2741,16 @@ def main():
     print()
     ok = result.summary()
     return _finish(0 if ok else 1)
+
+  # /fork manages its own relay + daemon (needs the thread_id-forwarding relay).
+  if args.fork:
+    print()
+    used_chat = run_fork_tests(chat_id, result, agent=args.agent,
+                               verbose=args.verbose)
+    # run_fork_tests dissolves its own temp chat; don't double-dissolve.
+    print()
+    ok = result.summary()
+    return 0 if ok else 1
 
   # Start nemo for other phases
   # NOTE: can_use_tool callback requires CLI support for --permission-prompt-tool

@@ -84,6 +84,7 @@ def _relay_msg_to_event(msg: JsonObject, chat_id: str) -> LarkEvent:
         file_key=msg.get("file_key", ""),
         file_name=msg.get("file_name", ""),
         parent_id=msg.get("parent_id", ""),
+        thread_id=msg.get("thread_id", ""),
         create_time=msg.get("create_time", ""),
     )
 

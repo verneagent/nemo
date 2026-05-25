@@ -91,3 +91,4 @@ Lark-connected coding agent daemon. Repo focus:
   - `tests/test_relay_events.py` — round-trip the relay reply dict through `_relay_msg_to_event`.
   - `tests/test_agent.py` — the daemon main-loop handler.
   - `python3 scripts/e2e_test.py --picker` for the live `/model` picker chain.
+- `/fork` (read-only sub-thread) is thread-routed, so it has the same wire-format risk as the picker — the relay must forward `thread_id` or follow-ups never reach the fork. `python3 scripts/e2e_test.py --fork` covers the live round-trip; because the configured remote relay predates the `thread_id` forwarding fix, this phase spins up a LOCAL relay (repo `relay/relay.py`) for inbound events while outbound card sends still hit real Lark. The `/fork` message must anchor on a REAL Lark message id (Lark rejects reply-in-thread to a fabricated id); the phase reuses the daemon's start-card id. No user token needed — relay injection + the tenant token suffice.

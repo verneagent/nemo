@@ -62,6 +62,38 @@ _BTW_DIRECTIVE = (
   "and will not be part of the conversation."
 )
 
+# Appended after the main system prompt for `/fork` read-only branches.
+# The OS sandbox physically blocks writes to the project (cwd is a private
+# scratch dir, the project lives outside the writable workspace), but the
+# model still needs to be told where the project is and that it is read-only,
+# otherwise it operates in the empty scratch dir.
+_FORK_DIRECTIVE = (
+  "FORK MODE — read-only branch. You are a forked side-conversation that "
+  "branched from the main session's context; it is ephemeral and nothing you "
+  "do is written back to the main conversation. The project under review is "
+  "at {project} — treat it as STRICTLY READ-ONLY: you may read files, grep, "
+  "and run read-only commands or tests, but you CANNOT modify any file there "
+  "(an OS sandbox blocks all writes outside your scratch dir, so write "
+  "attempts will fail with 'operation not permitted'). Use absolute paths "
+  "under {project} to read project files. Your working directory is a private "
+  "scratch space ({scratch}) — put any temporary scripts or output there."
+)
+
+# Tools a read-only fork may use: everything investigative, minus the file
+# mutators. Bash stays (sandbox makes project writes impossible) so the fork
+# can run tests / git / grep. Write/Edit/NotebookEdit are removed because they
+# bypass the bash sandbox; Agent/Skill are removed as escape hatches (a
+# subagent/skill could write outside the sandbox); AskUserQuestion is removed
+# because rendering it into the fork sub-thread is not wired for v1.
+_FORK_ALLOWED_TOOLS = [
+  "Bash", "BashOutput", "KillShell",
+  "Read", "Grep", "Glob", "WebSearch", "WebFetch", "TodoWrite",
+]
+_FORK_DISALLOWED_TOOLS = [
+  "Write", "Edit", "NotebookEdit", "Agent", "Skill", "AskUserQuestion",
+  "mcp__*",
+]
+
 # Hard ceiling so a wedged side query can't hang the chat indefinitely.
 _BTW_TIMEOUT = 120
 
@@ -77,11 +109,26 @@ _BTW_TIMEOUT = 120
 _BTW_MAX_TURNS = 6
 
 
+def _project_slug(project_dir: str) -> str:
+  """Replicate the Claude CLI's project-dir → transcript-dir slug.
+
+  The CLI does NOT do a naive ``path.replace("/", "-")``: it resolves the
+  realpath (so ``/var`` → ``/private/var`` on macOS) and replaces EVERY
+  non-alphanumeric char with ``-`` (so ``_`` and ``.`` collapse to ``-``
+  too — ``foo_bar`` → ``foo-bar``, ``.supacode`` → ``-supacode``). Getting
+  this exactly right matters: ``_seed_fork_transcript`` copies a parent
+  transcript into a fork's slug dir, and the CLI only finds it if the slug
+  matches byte-for-byte. (A naive replace also silently broke trailing_note's
+  size nudge for any project path containing ``_``/``.``/a symlink.)
+  """
+  return re.sub(r"[^a-zA-Z0-9]", "-", os.path.realpath(project_dir))
+
+
 def _session_jsonl_path(project_dir: str, sdk_session_id: str) -> str:
   """Compute the absolute path to a Claude session's jsonl transcript."""
   config_dir = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
-  slug = project_dir.replace("/", "-")
-  return os.path.join(config_dir, "projects", slug, f"{sdk_session_id}.jsonl")
+  return os.path.join(
+    config_dir, "projects", _project_slug(project_dir), f"{sdk_session_id}.jsonl")
 
 
 def _short_error(exc: BaseException) -> str:
@@ -151,6 +198,7 @@ class ClaudeCodingAgent(CodingAgent):
     permission_mode: str = "bypassPermissions",
     system_prompt: str = "",
     endpoint: EndpointConfig | None = None,
+    read_only: bool = False,
   ):
     self._credentials = credentials
     self._chat_id = chat_id
@@ -159,6 +207,14 @@ class ClaudeCodingAgent(CodingAgent):
     self._permission_mode = permission_mode
     self._system_prompt = system_prompt
     self._endpoint = endpoint or EndpointConfig()
+    # Read-only fork mode (see fork()/_build_options): the project is
+    # exposed read-only via an OS sandbox while cwd points at a private
+    # scratch dir. _fork_parent_id is the session this fork branched from;
+    # it drives fork_session=True on (re)connect until the fork's own
+    # session id materialises.
+    self._read_only = read_only
+    self._scratch_dir = ""
+    self._fork_parent_id = ""
     self._sdk = SDKThread()
     self._sdk_started = False
     self._options: object = None
@@ -187,7 +243,10 @@ class ClaudeCodingAgent(CodingAgent):
   def set_endpoint(self, endpoint: EndpointConfig) -> None:
     self._endpoint = endpoint
 
-  async def start(self, project_dir: str, model: str, resume: str = "") -> None:
+  async def start(
+    self, project_dir: str, model: str, resume: str = "",
+    fork_session: bool = False,
+  ) -> None:
     if not self._sdk_started:
       self._sdk.start()
       self._sdk_started = True
@@ -197,6 +256,21 @@ class ClaudeCodingAgent(CodingAgent):
     self._project_dir = project_dir
     self._model = model
     self._latest_session_id = resume
+    # fork_session=True means "branch from `resume` on first connect". Record
+    # the parent id so _build_options re-forks from it on any mid-first-turn
+    # reconnect, and stops forking once the fork's own session id arrives.
+    self._fork_parent_id = resume if (fork_session and resume) else ""
+    if self._read_only and not self._scratch_dir:
+      import tempfile
+      self._scratch_dir = tempfile.mkdtemp(prefix="nemo_fork_")
+    # A read-only fork runs with cwd=scratch (so the project stays read-only),
+    # but the Claude CLI keys session transcripts by a cwd-derived slug. The
+    # parent transcript lives under the PROJECT slug; resuming/forking it from
+    # the scratch cwd would look under the SCRATCH slug and miss it (→ silent
+    # "fresh session", losing all branched context). Copy the parent jsonl
+    # into the scratch slug so resume+fork_session find it.
+    if self._read_only and self._fork_parent_id:
+      self._seed_fork_transcript(project_dir, self._fork_parent_id)
     self._options = self._build_options(project_dir, model, resume=resume)
     try:
       await self._sdk.create_client(self._options)
@@ -473,11 +547,68 @@ class ClaudeCodingAgent(CodingAgent):
       return ""
     return _format_size_warning(size)
 
+  def _seed_fork_transcript(self, parent_project_dir: str, parent_sid: str) -> None:
+    """Copy the parent session jsonl into this fork's scratch-cwd slug.
+
+    Claude stores transcripts at ``<config>/projects/<cwd-slug>/<sid>.jsonl``.
+    Resume/fork look them up by the *current* cwd's slug, so a fork running in
+    a scratch cwd can only branch the parent if the parent transcript also
+    exists under the scratch slug. Best-effort: if the source isn't there yet
+    (parent never flushed), resume falls back to a fresh session, same as the
+    main agent's start() path.
+    """
+    import shutil
+    src = _session_jsonl_path(parent_project_dir, parent_sid)
+    dst = _session_jsonl_path(self._scratch_dir, parent_sid)
+    try:
+      if os.path.exists(src) and src != dst:
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        shutil.copy2(src, dst)
+    except OSError as e:
+      log.warning("fork transcript seed failed (%s) — fork starts fresh", e)
+
+  def supports_fork(self) -> bool:
+    return True
+
+  async def fork(
+    self, parent_session_id: str, project_dir: str, model: str,
+  ) -> "CodingAgent | None":
+    """Spawn a started, read-only Claude fork — see CodingAgent.fork.
+
+    Branches from ``parent_session_id`` (fork_session=True) so the fork sees
+    the current context but writes to a throwaway transcript; runs sandboxed
+    over a scratch cwd so it cannot modify ``project_dir``. Inherits this
+    agent's credentials / endpoint / effort / system prompt so the fork hits
+    the same model routing (and the parent's cached prompt prefix).
+    """
+    fork = ClaudeCodingAgent(
+      self._credentials, self._chat_id, self._db, self._channel,
+      permission_mode="bypassPermissions",
+      system_prompt=self._system_prompt,
+      endpoint=self._endpoint,
+      read_only=True,
+    )
+    fork.set_effort(self._effort)
+    await fork.start(
+      project_dir, model, resume=parent_session_id,
+      fork_session=bool(parent_session_id),
+    )
+    return fork
+
   async def stop(self) -> None:
     await self._sdk.close_client()
     if self._sdk_started:
       self._sdk.stop()
       self._sdk_started = False
+    if self._scratch_dir:
+      import shutil
+      shutil.rmtree(self._scratch_dir, ignore_errors=True)
+      # Also drop the fork's per-cwd transcript dir (seeded parent copy +
+      # the fork's own throwaway jsonl) so ~/.claude/projects doesn't grow a
+      # dead slug per fork.
+      slug_dir = os.path.dirname(_session_jsonl_path(self._scratch_dir, "x"))
+      shutil.rmtree(slug_dir, ignore_errors=True)
+      self._scratch_dir = ""
 
   def _build_agent_prompt(self) -> str:
     agent_prompt = (
@@ -557,7 +688,68 @@ class ClaudeCodingAgent(CodingAgent):
       env.setdefault("CLAUDE_CODE_SUBAGENT_MODEL", model)
     return env
 
+  def _build_fork_options(
+    self, project_dir: str, model: str, resume: str = "",
+  ) -> object:
+    """Options for a read-only fork (see _FORK_DIRECTIVE).
+
+    cwd is a private scratch dir, NOT the project — the OS bash sandbox makes
+    cwd writable but blocks writes everywhere else, so keeping the project
+    outside the workspace (and out of add_dirs, which would re-add it as
+    writable) makes it physically read-only while reads/Read/Grep/Glob still
+    work on absolute project paths. File-mutating tools are disallowed
+    outright since they bypass the bash sandbox. Runs bypassPermissions: with
+    writes impossible there is nothing dangerous to gate, so no permission
+    cards are needed in the fork sub-thread.
+    """
+    from claude_agent_sdk import ClaudeAgentOptions, HookMatcher
+    from claude_agent_sdk.types import PermissionMode
+
+    agent_prompt = (
+      f"{self._build_agent_prompt()}\n\n"
+      + _FORK_DIRECTIVE.format(project=project_dir, scratch=self._scratch_dir)
+    )
+
+    def _stderr_handler(line: str) -> None:
+      log.info("[fork-stderr] %s", line.rstrip())
+
+    opts: dict[str, object] = dict(
+      allowed_tools=list(_FORK_ALLOWED_TOOLS),
+      disallowed_tools=list(_FORK_DISALLOWED_TOOLS),
+      sandbox={"enabled": True, "autoAllowBashIfSandboxed": True},
+      permission_mode=cast(PermissionMode, "bypassPermissions"),
+      # Don't auto-load the project's hooks/settings into the fork — its cwd
+      # is scratch anyway, and a fork should stay lean and side-effect-free.
+      setting_sources=["user"],
+      system_prompt={
+        "type": "preset",
+        "preset": "claude_code",
+        "append": agent_prompt,
+      },
+      cwd=self._scratch_dir,
+      model=model,
+      env=self._build_env(project_dir, model),
+      stderr=_stderr_handler,
+      hooks={
+        "PreCompact": [HookMatcher(hooks=[self._on_pre_compact])],
+      },
+      max_buffer_size=16 * 1024 * 1024,
+    )
+    if resume:
+      opts["resume"] = resume
+      # Branch from the parent transcript on first connect (and on any
+      # reconnect that still resumes the parent); once the fork's own
+      # session id materialises, resume != parent and we stop re-forking.
+      if self._fork_parent_id and resume == self._fork_parent_id:
+        opts["fork_session"] = True
+    if self._effort:
+      opts["effort"] = self._effort
+    return ClaudeAgentOptions(**opts)
+
   def _build_options(self, project_dir: str, model: str, resume: str = "") -> object:
+    if self._read_only:
+      return self._build_fork_options(project_dir, model, resume=resume)
+
     from claude_agent_sdk import ClaudeAgentOptions, HookMatcher
     from claude_agent_sdk.types import PermissionMode
 

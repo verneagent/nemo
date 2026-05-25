@@ -199,6 +199,25 @@ class Channel(ABC):
     """Set whether the permission bridge is currently consuming channel events."""
     ...
 
+  def supports_threads(self) -> bool:
+    """True if this channel can host sub-threads (for /fork branches).
+
+    Default False; channels with native threading (Lark) override. The fork
+    feature checks this before opening a branch.
+    """
+    return False
+
+  async def send_card_in_thread(
+    self, anchor_message_id: str, card: JsonObject,
+  ) -> tuple[str, str]:
+    """Send a card as a threaded reply anchored at ``anchor_message_id``.
+
+    Returns ``(message_id, thread_id)``. ``thread_id`` is the stable routing
+    key for the sub-thread (every later message in it carries the same id).
+    Only meaningful when ``supports_threads()`` — default raises.
+    """
+    raise NotImplementedError("channel does not support threads")
+
   async def update_workspace_tag(self, project_dir: str) -> None:
     """Update the workspace tag for the current chat. No-op by default."""
     pass

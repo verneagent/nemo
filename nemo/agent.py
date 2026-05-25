@@ -21,12 +21,13 @@ import signal
 import time
 import urllib.error
 import uuid
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING, Awaitable, Callable
 
 from . import cards, commands, messages, monitor, shell_command
 from .agent_factory import AgentKind, build_coding_agent, is_model_compatible
 from .coding_agent import CodingAgent, EndpointConfig
 from .channel import IncomingMessage, TurnCardCtx
+from .fork import ForkManager
 from .config import load_credentials
 from .db import Database
 from .lark_channel import LarkChannel
@@ -1284,6 +1285,10 @@ async def main_loop(
   # daemon-scoped (not turn-scoped) so an answer started in turn N can
   # still arrive after turn N ends without its task being GC'd.
   _btw_tasks: set[asyncio.Task[None]] = set()
+  # In-flight `/fork` open/close tasks — spawned fire-and-forget so opening a
+  # fork (which starts a separate SDK subprocess) never blocks the main loop
+  # or the in-turn signal watcher. Daemon-scoped so they survive turn ends.
+  _fork_tasks: set[asyncio.Task[None]] = set()
   _pending_shell_contexts: list[str] = []
 
   def _queue_shell_context(context: str) -> None:
@@ -1296,6 +1301,38 @@ async def main_loop(
     project_dir=project_dir,
     on_context=_queue_shell_context,
   )
+
+  # /fork — read-only multi-turn sub-threads. The manager owns all fork
+  # lifecycle + card rendering; the main loop only routes thread-scoped
+  # messages to it (see fork-routing below) and spawns open/close tasks.
+  async def _fork_notify(text: str) -> None:
+    await _send_response(channel, chat_id, text, db)
+
+  fork_mgr = ForkManager(channel, chat_id, _fork_notify)
+
+  def _spawn_fork(coro: Awaitable[None]) -> None:
+    t = asyncio.create_task(coro)
+    _fork_tasks.add(t)
+    t.add_done_callback(_fork_tasks.discard)
+
+  def _route_fork_message(msg: IncomingMessage) -> bool:
+    """If `msg` lands in a live fork's sub-thread, route it to that fork
+    (concurrent with the main conversation) and return True. `/fork close`
+    inside the thread closes it. Fork messages never enter main-chat
+    history and bypass the @mention requirement (being in the thread is
+    intent enough)."""
+    sess = fork_mgr.get(msg.thread_id)
+    if sess is None:
+      return False
+    ftext = (msg.text or "").strip()
+    if ftext:
+      fp = messages.strip_parent_quote(
+        messages.strip_mentions(ftext, [msg], bot_open_id=bot_open_id) or ftext)
+      if commands.is_fork_close(fp):
+        _spawn_fork(fork_mgr.close(msg.thread_id))
+      else:
+        fork_mgr.route(msg.thread_id, fp)
+    return True
   # One-shot flag: prepend a pacing hint to the next user prompt after an
   # SDK timeout. Cleared after use or on /clear.
   _pending_pacing_hint = False
@@ -1457,6 +1494,13 @@ async def main_loop(
             sender, operator_open_id, _member_roles):
           log.info("Skipping: unauthorized sender %s (operator=%s)", sender, operator_open_id)
           continue
+
+      # /fork sub-thread routing — a message inside a live fork's thread goes
+      # to that fork (concurrent with the main conversation), never the main
+      # session. Checked before need_mention since being in the thread is
+      # intent enough; after auth so only authorized members drive a fork.
+      if not reply.is_internal and _route_fork_message(reply):
+        continue
 
       # need_mention mode: only respond to @mentions and interactions
       # directed at nemo's own messages (text reply or emoji reaction).
@@ -2038,6 +2082,20 @@ async def main_loop(
               _sdk_session_id, response.split(":", 1)[1]))
           _btw_tasks.add(_idle_btw)
           _idle_btw.add_done_callback(_btw_tasks.discard)
+        elif response and response.startswith("__fork__:"):
+          # Fire-and-forget: opening a fork starts a separate SDK subprocess
+          # (seconds) and must not block the main loop. ForkManager.open is
+          # self-contained — it posts its own decline/status messages.
+          _spawn_fork(fork_mgr.open(
+            main_agent=coding_agent, anchor_msg_id=reply.message_id,
+            parent_sid=_sdk_session_id, project_dir=project_dir,
+            model=model, prompt=response.split(":", 1)[1]))
+        elif response == "__fork_close__":
+          # `/fork close` is meant to be sent INSIDE a fork thread (handled by
+          # fork routing before dispatch). Reaching here = typed in main chat.
+          await _send_response(
+            channel, chat_id,
+            "Send `/fork close` inside the fork's own thread to close it.", db)
         elif response == "__session_list__":
           await _handle_session_list(
             channel, chat_id, project_dir, db, _sdk_session_id)
@@ -2471,6 +2529,19 @@ async def main_loop(
                 channel, chat_id, coding_agent, _sdk_session_id, btw_q))
             _btw_tasks.add(btw_task)
             btw_task.add_done_callback(_btw_tasks.discard)
+          elif response and response.startswith("__fork__:"):
+            # Open a fork mid-turn: spawned so the signal watcher keeps
+            # reacting to esc/stop and the main turn is never touched. The
+            # fork runs concurrently on its own SDK subprocess.
+            _spawn_fork(fork_mgr.open(
+              main_agent=coding_agent, anchor_msg_id=msg.message_id,
+              parent_sid=_sdk_session_id, project_dir=project_dir,
+              model=model, prompt=response.split(":", 1)[1]))
+          elif response == "__fork_close__":
+            await _send_response(
+              channel, chat_id,
+              "Send `/fork close` inside the fork's own thread to close it.",
+              db)
           elif response and response.startswith("__effort__:"):
             new_effort = response.split(":", 1)[1]
             ctx.effort = new_effort
@@ -2611,6 +2682,11 @@ async def main_loop(
             continue
           if not _is_user_message_event(msg):
             log.info("Skipping during turn: unsupported event=%s", msg.event_type)
+            continue
+          # /fork sub-thread routing during a main turn — route the message
+          # to its fork (concurrent, separate SDK client) instead of buffering
+          # it as a main-turn pending message. Mirrors the top-level loop.
+          if not msg.is_internal and _route_fork_message(msg):
             continue
           # Apply @mention filter so non-bot-directed chat doesn't get
           # pulled into the in-turn pending queue (mirrors the top-level
@@ -2780,6 +2856,8 @@ async def main_loop(
       await _heartbeat_task
     except asyncio.CancelledError:
       pass  # expected on shutdown cancel
+  # Stop any live forks first (frees their SDK subprocesses + scratch dirs).
+  await fork_mgr.shutdown()
   # Close SDK, event stream, and Lark API calls all concurrently
   loop = asyncio.get_event_loop()
   cleanup: list = [shell_manager.close(), coding_agent.stop(), channel.stop()]

@@ -108,6 +108,39 @@ def test_bare_btw_is_not_a_command():
   assert not handled
 
 
+def test_fork_with_prompt():
+  handled, resp = try_dispatch("/fork investigate the auth flow", _ctx())
+  assert handled
+  assert resp == "__fork__:investigate the auth flow"
+  # Opening a fork spawns a separate SDK client (not a MAIN-client restart),
+  # so it must be inline-safe to start concurrently during a running turn.
+  assert is_inline_safe(resp)
+
+
+def test_fork_multiline_prompt():
+  handled, resp = try_dispatch("/fork line one\nline two", _ctx())
+  assert handled
+  assert resp == "__fork__:line one\nline two"
+
+
+def test_fork_close():
+  from nemo.commands import is_fork_close
+  handled, resp = try_dispatch("/fork close", _ctx())
+  assert handled
+  assert resp == "__fork_close__"
+  assert is_inline_safe(resp)
+  assert is_fork_close("/fork close")
+  assert is_fork_close("  /Fork   close  ")
+  assert not is_fork_close("/fork closely look at this")
+
+
+def test_fork_no_arg_shows_usage():
+  handled, resp = try_dispatch("/fork", _ctx())
+  assert handled
+  assert resp is not None and not resp.startswith("__fork__:")
+  assert "Usage:" in resp
+
+
 def test_model_show_emits_picker_action():
   """Bare `/model` returns the picker action code — the main loop turns
   this into an interactive dropdown card. Old behaviour (text listing)

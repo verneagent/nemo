@@ -540,6 +540,102 @@ def test_active_esc_updates_card_without_cancel_message(tmp_path):
   )
 
 
+def test_fork_command_during_turn_opens_fork(tmp_path):
+  """A `/fork <prompt>` sent during a running turn is inline-dispatched to
+  ForkManager.open (fire-and-forget) — without restarting the main client or
+  blocking the turn. Validates the agent.py → ForkManager wiring."""
+  from nemo.channel import IncomingMessage
+
+  class _SpyForkManager:
+    def __init__(self, *_a, **_k):
+      self.opened = []
+      self.routed = []
+
+    def get(self, _thread_id):
+      return None  # no live fork → thread routing is a no-op here
+
+    def count(self):
+      return 0
+
+    async def open(self, **kwargs):
+      self.opened.append(kwargs)
+
+    def route(self, thread_id, prompt):
+      self.routed.append((thread_id, prompt))
+      return False
+
+    async def close(self, _thread_id):
+      return False
+
+    async def shutdown(self):
+      pass
+
+  spy = _SpyForkManager()
+
+  class _ForkCmdChannel(_QueuedChannel):
+    def __init__(self):
+      super().__init__("oc_test", [
+        IncomingMessage(event_type="im.message.receive_v1", chat_id="oc_test",
+                        sender_id="ou_user", message_id="om_work",
+                        msg_type="text", text="work on it", create_time="1"),
+        IncomingMessage(event_type="im.message.receive_v1", chat_id="oc_test",
+                        sender_id="ou_user", message_id="om_fork",
+                        msg_type="text", text="/fork investigate the bug",
+                        create_time="2"),
+        IncomingMessage(event_type="im.message.receive_v1", chat_id="oc_test",
+                        sender_id="ou_user", message_id="om_exit",
+                        msg_type="text", text="/exit", create_time="3"),
+      ])
+      self._n = 0
+
+    async def receive(self, timeout=300):
+      self._n += 1
+      if self._n == 2:  # let the main turn establish before /fork
+        await asyncio.sleep(0.05)
+      return await super().receive(timeout)
+
+    async def send_card(self, _chat_id, _card):
+      return "om_card"
+
+    async def update_card(self, card_id, _card):
+      return card_id
+
+  class _BlockingAgent(_FakeAgent):
+    def __init__(self):
+      self._interrupted = asyncio.Event()
+
+    async def interrupt(self):
+      self._interrupted.set()
+
+    async def run_turn(self, _prompt, on_event):
+      await asyncio.to_thread(
+        lambda: on_event(ProgressEvent(kind="tool", summary="Read", first=True)))
+      await self._interrupted.wait()
+      await asyncio.to_thread(
+        lambda: on_event(DoneEvent(cost=0.0, usage={"input_tokens": 1})))
+      return 0.0, {"input_tokens": 1}
+
+  channel = _ForkCmdChannel()
+
+  with mock.patch("nemo.agent.load_credentials", return_value={
+    "app_id": "app_id", "app_secret": "app_secret",
+    "email": "user@example.com",
+  }), \
+       mock.patch("nemo.agent.Database", _FakeDB), \
+       mock.patch("nemo.agent.LarkChannel", return_value=channel), \
+       mock.patch("nemo.agent.build_coding_agent", return_value=_BlockingAgent()), \
+       mock.patch("nemo.agent.ForkManager", return_value=spy), \
+       mock.patch("nemo.group_config.load_config", return_value={}), \
+       mock.patch("nemo.config.load_relay_config", return_value=("", "")), \
+       mock.patch("signal.signal"):
+    result = asyncio.run(main_loop("oc_test", str(tmp_path), "claude-opus-4-6"))
+
+  assert result == 0
+  assert len(spy.opened) == 1, f"expected one fork open, got {spy.opened}"
+  assert spy.opened[0]["prompt"] == "investigate the bug"
+  assert spy.opened[0]["anchor_msg_id"] == "om_fork"
+
+
 def test_pacing_hint_prepended_after_timeout(tmp_path):
   """After a TimeoutError the next turn's prompt is prefixed with a pacing hint;
   the hint is not applied to subsequent turns."""

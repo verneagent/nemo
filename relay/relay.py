@@ -385,6 +385,12 @@ def _parse_message(event: dict) -> tuple[dict, str, str | None] | None:
         reply["file_name"] = file_name
     if message.get("parent_id"):
         reply["parent_id"] = message["parent_id"]
+    # Lark stamps thread_id on every message that belongs to a thread (topic
+    # group or reply-in-thread). nemo routes /fork sub-threads by this id, so
+    # it must survive the relay (the daemon's direct-Lark path already keeps
+    # it; without this the relay path drops it and fork routing can't work).
+    if message.get("thread_id"):
+        reply["thread_id"] = message["thread_id"]
     if mentions:
         reply["mentions"] = mentions
 

@@ -36,6 +36,29 @@ def test_convert_text_message():
     assert ev.parent_id == "om_parent1"
 
 
+def test_convert_thread_id():
+    """A message that belongs to a Lark thread carries thread_id; the
+    converter must forward it so /fork sub-thread routing works on the
+    relay path (the direct-Lark path already keeps it)."""
+    msg = {
+        "text": "back in the fork thread",
+        "msg_type": "text",
+        "sender_id": "ou_user1",
+        "message_id": "om_msg9",
+        "create_time": "1700000099000",
+        "thread_id": "omt_fork_abc",
+    }
+    ev = _relay_msg_to_event(msg, "oc_chat1")
+    assert ev.thread_id == "omt_fork_abc"
+
+
+def test_convert_no_thread_id_defaults_empty():
+    """Top-level (non-threaded) messages have no thread_id."""
+    msg = {"text": "top level", "msg_type": "text", "sender_id": "ou_u"}
+    ev = _relay_msg_to_event(msg, "oc_chat1")
+    assert ev.thread_id == ""
+
+
 def test_convert_image_message():
     msg = {
         "text": "[image]",

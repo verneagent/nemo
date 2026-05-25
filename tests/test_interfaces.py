@@ -224,3 +224,77 @@ def test_agent_reset():
     await agent.reset("/tmp", "claude")
     assert agent.turns == []
   asyncio.run(_run())
+
+
+# ---------------------------------------------------------------------------
+# fork() — read-only forked sub-session (Claude-only)
+# ---------------------------------------------------------------------------
+
+def test_project_slug_matches_cli_rule():
+  """The CLI slug is realpath + every non-alphanumeric char → '-' (NOT a
+  naive '/'→'-'). _seed_fork_transcript and trailing_note depend on matching
+  it byte-for-byte. Pinned against a real observed slug."""
+  from nemo.claude_agent import _project_slug
+  # '.' and '_' both collapse to '-'; '/.' becomes '--'.
+  assert _project_slug("/Users/me/.foo_bar/baz") == "-Users-me--foo-bar-baz"
+  # Mirrors an actually-observed ~/.claude/projects entry.
+  assert (_project_slug("/Users/dinghaozeng/.supacode/repos/fived/legal-doc")
+          == "-Users-dinghaozeng--supacode-repos-fived-legal-doc")
+
+
+def test_base_agent_does_not_support_fork():
+  """Non-Claude adapters inherit the unsupported defaults."""
+  agent = FakeAgent()
+  assert agent.supports_fork() is False
+  async def _run():
+    assert await agent.fork("sess", "/proj", "claude") is None
+  asyncio.run(_run())
+
+
+def _make_fork_agent():
+  from nemo.claude_agent import ClaudeCodingAgent
+  a = ClaudeCodingAgent({}, "oc_test", None, FakeChannel(), read_only=True)
+  a._scratch_dir = "/tmp/nemo_fork_scratch_test"  # normally tempfile.mkdtemp
+  return a
+
+
+def test_claude_supports_fork():
+  from nemo.claude_agent import ClaudeCodingAgent
+  a = ClaudeCodingAgent({}, "oc_test", None, FakeChannel())
+  assert a.supports_fork() is True
+
+
+def test_fork_options_disallow_file_mutators_keep_investigative():
+  a = _make_fork_agent()
+  opts = a._build_fork_options("/Users/me/proj", "claude-x")
+  for t in ("Write", "Edit", "NotebookEdit", "Agent", "Skill"):
+    assert t in opts.disallowed_tools, f"{t} must be disallowed in a fork"
+  assert "Write" not in opts.allowed_tools
+  # Investigative tools stay so the fork can actually do work.
+  assert "Bash" in opts.allowed_tools
+  assert "Read" in opts.allowed_tools
+  assert "Grep" in opts.allowed_tools
+
+
+def test_fork_options_sandbox_and_scratch_cwd():
+  """The project must NOT be cwd (cwd is sandbox-writable); it lives outside
+  the workspace so the sandbox blocks writes to it while reads still work."""
+  a = _make_fork_agent()
+  opts = a._build_fork_options("/Users/me/proj", "claude-x")
+  assert opts.sandbox == {"enabled": True, "autoAllowBashIfSandboxed": True}
+  assert opts.cwd == a._scratch_dir
+  assert opts.cwd != "/Users/me/proj"
+  assert opts.permission_mode == "bypassPermissions"
+
+
+def test_fork_options_fork_session_only_from_parent():
+  """fork_session=True only while resuming the parent transcript; once the
+  fork's own session id is live we must not re-fork each turn/reconnect."""
+  a = _make_fork_agent()
+  a._fork_parent_id = "parent_sess"
+  forked = a._build_fork_options("/p", "m", resume="parent_sess")
+  assert forked.fork_session is True
+  assert forked.resume == "parent_sess"
+  cont = a._build_fork_options("/p", "m", resume="fork_own_sess")
+  assert cont.fork_session is False
+  assert cont.resume == "fork_own_sess"

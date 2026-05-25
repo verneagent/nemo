@@ -424,6 +424,30 @@ def reply_card(
   raise RuntimeError(f"Failed to reply card: {data}")
 
 
+def reply_card_in_thread(
+  token: str, message_id: str, card: JsonObject,
+) -> tuple[str, str]:
+  """Reply with a card in a thread, returning (message_id, thread_id).
+
+  Used by /fork to open a sub-thread anchored at the user's message: the
+  reply (with ``reply_in_thread=True``) starts/joins a thread, and Lark
+  returns the thread's id in the response. That ``thread_id`` is the routing
+  key for subsequent messages in the fork (every message in the thread
+  carries it). Raises if Lark rejects the reply.
+  """
+  url = f"{BASE_URL}/im/v1/messages/{message_id}/reply"
+  payload: JsonObject = {
+    "msg_type": "interactive",
+    "content": json.dumps(card),
+    "reply_in_thread": True,
+  }
+  data = _request(url, token, payload)
+  if data.get("code") == 0:
+    d = data["data"]
+    return d["message_id"], d.get("thread_id", "")
+  raise RuntimeError(f"Failed to reply card in thread: {data}")
+
+
 # ---------------------------------------------------------------------------
 # Chat tabs
 # ---------------------------------------------------------------------------

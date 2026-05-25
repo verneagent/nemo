@@ -256,6 +256,11 @@ def _bare_claude_agent():
   agent._model = ""
   agent._latest_session_id = ""
   agent._options = None
+  # Fork-mode attrs normally set by __init__ (bypassed here); start() reads
+  # them on the non-fork path too (all no-ops when _read_only is False).
+  agent._read_only = False
+  agent._scratch_dir = ""
+  agent._fork_parent_id = ""
   return agent
 
 

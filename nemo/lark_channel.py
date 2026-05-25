@@ -403,6 +403,23 @@ class LarkChannel(Channel):
         lark_api.reply_message, self._reply_anchor, text, True)
     return self._retry_on_auth_error(lark_api.send_text, chat_id, text)
 
+  def supports_threads(self) -> bool:
+    # Lark message threads work in group chats (and topic groups). p2p has no
+    # threads; degrade by reporting no support there so /fork declines cleanly
+    # instead of opening a thread that collapses into the main timeline.
+    return self._chat_mode in ("group", "topic")
+
+  async def send_card_in_thread(
+    self, anchor_message_id: str, card: JsonObject,
+  ) -> tuple[str, str]:
+    # reply_in_thread=True anchored at the user's /fork message opens (or
+    # joins) a sub-thread; Lark returns its thread_id, which becomes the
+    # fork's routing key. Unlike send_card this is independent of the shared
+    # _reply_anchor / topic state, so concurrent fork sends never collide
+    # with the main turn's threading.
+    return self._retry_on_auth_error(
+      lark_api.reply_card_in_thread, anchor_message_id, card)
+
   async def download_image(self, message_id: str, image_key: str) -> str:
     return lark_api.download_image(self.token, message_id, image_key)
 
