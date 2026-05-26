@@ -7,7 +7,7 @@ import os
 from unittest import mock
 
 from nemo.presets import (
-  Preset, _flatten_providers, _parse_api_key_env,
+  Preset, _flatten_providers, _parse_api_key,
   load_presets, preset_name_for_endpoint, resolve_preset,
 )
 
@@ -73,25 +73,49 @@ def test_endpoint_for_with_unset_env_returns_empty_key():
 # {env:VARNAME} apiKey parsing — secrets-in-config defence
 # ---------------------------------------------------------------------------
 
-def test_parse_api_key_env_accepts_env_syntax():
-  assert _parse_api_key_env("{env:DEEPSEEK_API_KEY}", where="t") == "DEEPSEEK_API_KEY"
+def test_parse_api_key_env_syntax():
+  # {env:VAR} → (env_name, "")
+  assert _parse_api_key("{env:DEEPSEEK_API_KEY}", where="t") == ("DEEPSEEK_API_KEY", "")
   # Whitespace around the syntax is fine — JSON-paste-from-docs path.
-  assert _parse_api_key_env("  {env:FOO}  ", where="t") == "FOO"
+  assert _parse_api_key("  {env:FOO}  ", where="t") == ("FOO", "")
 
 
-def test_parse_api_key_env_rejects_plain_string(caplog):
-  import logging
-  with caplog.at_level(logging.WARNING, logger="nemo.presets"):
-    out = _parse_api_key_env("sk-secret-literal", where="provider.kimi.anthropic.apiKey")
-  # Plain literals are rejected so keys can't accidentally land in
-  # the JSON file (and from there dotfile backups, git, etc).
-  assert out == ""
-  assert any("{env:VARNAME}" in r.getMessage() for r in caplog.records)
+def test_parse_api_key_accepts_literal():
+  # Literal keys are now allowed (~/.nemo/models.json is user-private) → ("", literal).
+  assert _parse_api_key("blacktree@", where="t") == ("", "blacktree@")
+  assert _parse_api_key("  sk-local  ", where="t") == ("", "sk-local")
 
 
-def test_parse_api_key_env_blank_or_missing_is_empty():
-  assert _parse_api_key_env("", where="t") == ""
-  assert _parse_api_key_env(None, where="t") == ""
+def test_parse_api_key_blank_or_missing_is_empty():
+  assert _parse_api_key("", where="t") == ("", "")
+  assert _parse_api_key(None, where="t") == ("", "")
+
+
+def test_endpoint_for_uses_literal_key():
+  # A literal apiKey is used directly (no env lookup); it wins over api_key_env.
+  p = Preset(name="x", api_key_literal="blacktree@",
+             anthropic_url="http://127.0.0.1:8000")
+  assert p.endpoint_for("claude").api_key == "blacktree@"
+
+
+def test_literal_key_flows_from_models_json(tmp_path):
+  # End-to-end: a self-hosted provider with a literal key + no /v1 on the
+  # anthropic base resolves to the exact endpoint the SDK will hit.
+  user = tmp_path / "models.json"
+  user.write_text(json.dumps({
+    "providers": {
+      "omlx": {
+        "anthropic": {"baseURL": "http://127.0.0.1:8000", "apiKey": "blacktree@"},
+        "models": {"Qwen3-Coder-Next-MLX-8bit": {}},
+      },
+    },
+  }))
+  p = resolve_preset("Qwen3-Coder-Next-MLX-8bit",
+                     builtin_path="/nonexistent", user_path=str(user))
+  assert p is not None and p.supports("claude")
+  ep = p.endpoint_for("claude")
+  assert ep.base_url == "http://127.0.0.1:8000"
+  assert ep.api_key == "blacktree@"
 
 
 # ---------------------------------------------------------------------------

@@ -85,12 +85,15 @@ class Preset:
   this as the unit of /model dispatch.
   """
   name: str
-  # Reading the key from env (vs accepting on the command line or in
-  # the JSON file) avoids leaking secrets into argv / ps / config
-  # dumps. Empty string means the model has no associated key — the
-  # active agent's default auth (e.g. an OAuth token from ChatGPT
-  # login for codex) takes over.
+  # `{env:VAR}` apiKeys keep secrets out of argv / ps / config dumps and are
+  # preferred for shared/remote providers. `api_key_env` is the VAR name.
   api_key_env: str = ""
+  # A literal apiKey written straight in models.json. Allowed because
+  # ~/.nemo/models.json is user-private and never committed (the package
+  # ships none) — convenient for local/self-hosted endpoints (e.g. an MLX
+  # server). Takes precedence over `api_key_env` in endpoint_for. Empty
+  # `api_key_env` + empty literal means no key (the agent's default auth).
+  api_key_literal: str = ""
   # Anthropic-protocol endpoint. Empty → not callable via --agent claude
   # (or via opencode against an anthropic/* model).
   anthropic_url: str = ""
@@ -136,7 +139,9 @@ class Preset:
     doesn't apply to ``agent`` — caller should pre-check ``supports``.
     """
     base = self.base_url_for(agent)
-    api_key = os.environ.get(self.api_key_env, "") if self.api_key_env else ""
+    # A literal key wins; otherwise resolve the env var at use-time.
+    api_key = self.api_key_literal or (
+      os.environ.get(self.api_key_env, "") if self.api_key_env else "")
     return EndpointConfig(base_url=base, api_key=api_key)
 
 
@@ -148,38 +153,41 @@ class Preset:
 _ENV_PATTERN = re.compile(r"^\{env:([A-Za-z_][A-Za-z0-9_]*)\}$")
 
 
-def _parse_api_key_env(raw: object, *, where: str) -> str:
-  """Extract the env var name from ``{env:VARNAME}``. Empty for missing/blank.
+def _parse_api_key(raw: object, *, where: str) -> tuple[str, str]:
+  """Parse an apiKey into ``(env_var_name, literal)`` — exactly one is set.
 
-  Plain-string keys are rejected so secrets can't accidentally land in
-  the JSON file (and from there in dotfile backups, git, etc).
+  ``{env:VARNAME}`` → (``VARNAME``, "") — resolved from the environment at
+  use-time (preferred for shared/remote secrets). Any other non-empty string
+  → ("", literal): a literal key, allowed because ~/.nemo/models.json is
+  user-private and uncommitted (handy for local/self-hosted endpoints).
+  Missing/blank/non-string → ("", "").
   """
   if raw is None or raw == "":
-    return ""
+    return "", ""
   if not isinstance(raw, str):
     log.warning("%s: apiKey must be a string, got %s — ignoring",
                 where, type(raw).__name__)
-    return ""
-  m = _ENV_PATTERN.match(raw.strip())
-  if not m:
-    log.warning("%s: apiKey must use {env:VARNAME} syntax, got %r — ignoring",
-                where, raw)
-    return ""
-  return m.group(1)
+    return "", ""
+  raw = raw.strip()
+  m = _ENV_PATTERN.match(raw)
+  if m:
+    return m.group(1), ""
+  return "", raw
 
 
-def _protocol_block(provider_data: dict, key: str) -> tuple[str, str]:
-  """Pull (baseURL, api_key_env) out of one provider's protocol section."""
+def _protocol_block(provider_data: dict, key: str) -> tuple[str, str, str]:
+  """Pull (baseURL, api_key_env, api_key_literal) out of one protocol section."""
   raw = provider_data.get(key)
   if not isinstance(raw, dict):
-    return "", ""
+    return "", "", ""
   base = raw.get("baseURL", "")
   if not isinstance(base, str):
     log.warning("provider.%s.baseURL must be a string, got %s",
                 key, type(base).__name__)
     base = ""
-  api_key_env = _parse_api_key_env(raw.get("apiKey"), where=f"provider.{key}.apiKey")
-  return base, api_key_env
+  api_key_env, api_key_literal = _parse_api_key(
+    raw.get("apiKey"), where=f"provider.{key}.apiKey")
+  return base, api_key_env, api_key_literal
 
 
 def _model_remote(model_data: object, protocol: str) -> str:
@@ -205,8 +213,8 @@ def _flatten_providers(providers: dict) -> dict[str, Preset]:
       log.warning("provider %r: expected object, got %s — skipping",
                   provider_name, type(pdata).__name__)
       continue
-    anthropic_url, anthropic_key_env = _protocol_block(pdata, "anthropic")
-    openai_url, openai_key_env = _protocol_block(pdata, "openai")
+    anthropic_url, anthropic_key_env, anthropic_key_lit = _protocol_block(pdata, "anthropic")
+    openai_url, openai_key_env, openai_key_lit = _protocol_block(pdata, "openai")
     if not anthropic_url and not openai_url:
       # Provider declares models but no protocol blocks — flattening
       # would produce Presets with empty URLs that supports() rejects
@@ -223,6 +231,7 @@ def _flatten_providers(providers: dict) -> dict[str, Preset]:
     # model exposes both, take anthropic's. This is a rare-enough edge
     # case that a hard error would be more annoying than useful.
     api_key_env = anthropic_key_env or openai_key_env
+    api_key_literal = anthropic_key_lit or openai_key_lit
 
     models = pdata.get("models", {})
     if not isinstance(models, dict):
@@ -236,6 +245,7 @@ def _flatten_providers(providers: dict) -> dict[str, Preset]:
       out[model_name] = Preset(
         name=str(model_name),
         api_key_env=api_key_env,
+        api_key_literal=api_key_literal,
         anthropic_url=anthropic_url,
         anthropic_remote=_model_remote(mdata, "anthropic") or model_name,
         openai_url=openai_url,
