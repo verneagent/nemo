@@ -42,13 +42,16 @@ declares the matching protocol block. A model's per-protocol ``remote``
 override falls back to the model id itself when omitted.
 
 Sources, in order of precedence (later overrides earlier):
-  1. ``nemo/models.json`` shipped inside the package (the previous
-     ``BUILTIN_PRESETS`` dict, externalised so adding a model doesn't
-     require a release).
-  2. ``~/.nemo/models.json`` user overrides — same schema, merged at
-     the provider level (a user-defined provider entry fully replaces
-     the package's entry for that name; entries the user doesn't touch
-     pass through unchanged).
+  1. ``nemo/models.json`` shipped inside the package. This ships EMPTY —
+     provider/model config (endpoints, API-key env, remote slugs) is
+     *deployment* config, not package code, so the published package carries
+     no presets and no opinionated endpoints.
+  2. ``~/.nemo/models.json`` — where presets actually live. Same schema,
+     merged at the provider level (a user-defined provider entry fully
+     replaces the base's entry for that name; entries it doesn't touch pass
+     through). Each deployment defines its own here; without it there are no
+     third-party presets (plain Anthropic model ids still work — they need no
+     preset).
 """
 
 from __future__ import annotations

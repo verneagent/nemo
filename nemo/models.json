@@ -1,29 +1,4 @@
 {
-  "providers": {
-    "deepseek": {
-      "anthropic": {
-        "baseURL": "https://api.deepseek.com/anthropic",
-        "apiKey": "{env:DEEPSEEK_API_KEY}"
-      },
-      "openai": {
-        "baseURL": "https://api.deepseek.com",
-        "apiKey": "{env:DEEPSEEK_API_KEY}"
-      },
-      "models": {
-        "deepseek-v4-pro": {
-          "anthropic": { "remote": "deepseek-v4-pro[1m]" }
-        },
-        "deepseek-v4-flash": {}
-      }
-    },
-    "kimi": {
-      "anthropic": {
-        "baseURL": "https://api.kimi.com/coding",
-        "apiKey": "{env:KIMI_API_KEY}"
-      },
-      "models": {
-        "kimi-for-coding": {}
-      }
-    }
-  }
+  "_comment": "Provider/model presets are deployment config, not package code. The package ships NO presets; define yours in ~/.nemo/models.json (same schema: providers.<name>.<anthropic|openai>.{baseURL,apiKey} + .models). See nemo/presets.py.",
+  "providers": {}
 }
