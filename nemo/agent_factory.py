@@ -3,8 +3,9 @@
 "Agent" here means the coding-agent runtime / harness — Claude Agent SDK,
 Codex CLI, or OpenCode — selected by the daemon's ``--agent`` flag and
 runtime ``/agent`` command. (This is intentionally distinct from "model
-provider" in nemo/models.json, where ``provider`` groups models that
-share the same upstream gateway like DeepSeek or Kimi.)
+provider" in the models.json schema — see nemo/presets.py; config lives in
+~/.nemo/models.json — where ``provider`` groups models that share the same
+upstream gateway like DeepSeek or Kimi.)
 """
 
 from __future__ import annotations

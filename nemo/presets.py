@@ -42,10 +42,12 @@ declares the matching protocol block. A model's per-protocol ``remote``
 override falls back to the model id itself when omitted.
 
 Sources, in order of precedence (later overrides earlier):
-  1. ``nemo/models.json`` shipped inside the package. This ships EMPTY —
-     provider/model config (endpoints, API-key env, remote slugs) is
-     *deployment* config, not package code, so the published package carries
-     no presets and no opinionated endpoints.
+  1. ``nemo/models.json`` — a default ``builtin_path`` hook that the package
+     does NOT ship (the file is absent → reads as ``{}``). Provider/model
+     config (endpoints, API-key env, remote slugs) is *deployment* config, not
+     package code, so the published package carries no presets and no
+     opinionated endpoints. (Drop a file here only if a fork wants to ship
+     defaults.)
   2. ``~/.nemo/models.json`` — where presets actually live. Same schema,
      merged at the provider level (a user-defined provider entry fully
      replaces the base's entry for that name; entries it doesn't touch pass
@@ -284,9 +286,10 @@ def load_presets(
 ) -> dict[str, Preset]:
   """Return the merged {model_name: Preset} table.
 
-  Reads ``nemo/models.json`` (package builtin) plus
-  ``~/.nemo/models.json`` (user overrides) and flattens the
-  provider-grouped schema into per-model ``Preset`` records.
+  Reads ``builtin_path`` (defaults to ``nemo/models.json``, which the package
+  doesn't ship → reads as ``{}``) plus ``~/.nemo/models.json`` (where presets
+  actually live) and flattens the provider-grouped schema into per-model
+  ``Preset`` records.
   """
   base_providers = _read_json(builtin_path)
   user_providers = _read_json(user_path)

@@ -208,8 +208,8 @@ def _write_base_models(tmp_path, name: str = "base.json") -> str:
 
 def test_package_builtin_ships_no_presets():
   # Provider/model config is deployment config (~/.nemo/models.json), not
-  # package code — the shipped nemo/models.json carries NO presets, so with
-  # no user override there are zero presets.
+  # package code — the package ships NO nemo/models.json at all, so with no
+  # user override there are zero presets (the missing builtin reads as {}).
   assert load_presets(user_path="/nonexistent/path") == {}
 
 

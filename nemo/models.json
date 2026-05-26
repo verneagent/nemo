@@ -1,4 +1,0 @@
-{
-  "_comment": "Provider/model presets are deployment config, not package code. The package ships NO presets; define yours in ~/.nemo/models.json (same schema: providers.<name>.<anthropic|openai>.{baseURL,apiKey} + .models). See nemo/presets.py.",
-  "providers": {}
-}
