@@ -39,30 +39,26 @@ class ForkSession:
   agent: CodingAgent
   root_msg_id: str          # the thread's root card (reply anchor)
   thread_id: str            # routing key — every message in the thread has it
+  chat_id: str              # parent chat (for the stop button's value)
   prompt0: str              # the opening /fork prompt (for the root card)
   lock: asyncio.Lock = field(default_factory=asyncio.Lock)
-
-
-def _fork_working_card(steps: list[cards.ThinkingStep], elapsed: int) -> JsonObject:
-  """Lean working indicator for a fork turn — no stop button (fork stop is
-  not wired for v1; build_turn_card's working phase always adds one)."""
-  last = ""
-  for s in reversed(steps):
-    if s.kind != "answer" and s.content:
-      last = s.content
-      break
-  body = last or "thinking…"
-  return cards.build_markdown_card(
-    body, title=f"🍴 fork · {elapsed}s", color="grey")
+  # Set by ForkManager.interrupt so the in-flight turn renders "stopped"
+  # instead of "done"; reset at the start of each turn.
+  interrupt_requested: bool = False
+  # The active turn's renderer (for interrupt to PATCH the card + read state);
+  # None between turns.
+  renderer: "_ForkRenderer | None" = None
 
 
 class _ForkRenderer:
   """Renders one fork turn's cards into the fork's sub-thread.
 
-  ``on_event`` is invoked on the fork's SDK thread, so every channel call is
-  marshalled onto the main loop via run_coroutine_threadsafe (mirrors the
-  main turn's ``_await_channel``). The first card is created as a threaded
-  reply anchored at the fork root; later updates PATCH it by id.
+  Uses the SAME ``build_turn_card`` as a main turn (full thinking timeline,
+  current tool, elapsed title) but with a FORK-SCOPED stop button — its action
+  is ``fork_stop:<thread_id>`` so a click interrupts this fork's turn, not the
+  main one. ``on_event`` runs on the fork's SDK thread, so channel calls are
+  marshalled onto the main loop via run_coroutine_threadsafe (mirrors the main
+  turn's ``_await_channel``).
   """
 
   def __init__(self, channel: Channel, sess: ForkSession,
@@ -73,6 +69,7 @@ class _ForkRenderer:
     self._steps: list[cards.ThinkingStep] = []
     self._card_id = ""
     self._start = time.time()
+    self._current_tool = ""
 
   @property
   def card_id(self) -> str:
@@ -82,16 +79,28 @@ class _ForkRenderer:
   def start(self) -> float:
     return self._start
 
+  def _elapsed(self) -> int:
+    return int(time.time() - self._start)
+
   def _await(self, coro: Awaitable[object]) -> object:
     return asyncio.run_coroutine_threadsafe(coro, self._loop).result()
+
+  def _progress_card(self, phase: str = "working") -> JsonObject:
+    return cards.build_turn_card(
+      phase, steps=self._steps, current_tool=self._current_tool,
+      elapsed=self._elapsed(), chat_id=self._sess.chat_id,
+      stop_action=f"fork_stop:{self._sess.thread_id}")
+
+  def stopped_card(self) -> JsonObject:
+    thinking = [s for s in self._steps if s.kind != "answer"]
+    return cards.build_turn_card("stopped", steps=thinking, elapsed=self._elapsed())
 
   def _ensure_card(self) -> None:
     if self._card_id:
       return
-    card = _fork_working_card(self._steps, int(time.time() - self._start))
     try:
       mid, _ = self._await(
-        self._ch.send_card_in_thread(self._sess.root_msg_id, card))
+        self._ch.send_card_in_thread(self._sess.root_msg_id, self._progress_card()))
       self._card_id = mid
     except Exception as e:
       log.warning("fork: failed to create working card: %s", e)
@@ -99,37 +108,53 @@ class _ForkRenderer:
   def _update_working(self) -> None:
     if not self._card_id:
       return
-    card = _fork_working_card(self._steps, int(time.time() - self._start))
     try:
-      self._card_id = self._await(self._ch.update_card(self._card_id, card))
+      self._card_id = self._await(
+        self._ch.update_card(self._card_id, self._progress_card()))
     except Exception as e:
       log.debug("fork: working card update failed: %s", e)
+
+  async def render_stopping(self) -> None:
+    """PATCH the working card to the 'stopping' state. Called from the main
+    loop (ForkManager.interrupt), so awaits the channel directly."""
+    if not self._card_id:
+      return
+    try:
+      await self._ch.update_card(self._card_id, self._progress_card("stopping"))
+    except Exception as e:
+      log.debug("fork: stopping-card patch failed: %s", e)
 
   def on_event(self, ev: TurnEvent) -> None:
     if isinstance(ev, ProgressEvent):
       self._steps.append(cards.ThinkingStep(ev.kind, ev.summary))
+      if ev.kind == "tool":
+        self._current_tool = ev.summary
       if ev.first:
         self._ensure_card()
       self._update_working()
     elif isinstance(ev, AnswerEvent):
       self._steps.append(cards.ThinkingStep("answer", ev.text))
     elif isinstance(ev, DoneEvent):
-      answers = [s.content for s in self._steps if s.kind == "answer"]
-      final = answers[-1] if answers else ""
       thinking = [s for s in self._steps if s.kind != "answer"]
-      done = cards.build_turn_card(
-        "done", body=final, steps=thinking,
-        elapsed=int(time.time() - self._start),
-        usage=ev.usage, session_id=ev.session_id)
+      if self._sess.interrupt_requested:
+        # Interrupted mid-turn — show "stopped" (matches the main-turn stop UX)
+        # rather than a "done" card for a turn the user cut short.
+        card = self.stopped_card()
+      else:
+        answers = [s.content for s in self._steps if s.kind == "answer"]
+        final = answers[-1] if answers else ""
+        card = cards.build_turn_card(
+          "done", body=final, steps=thinking, elapsed=self._elapsed(),
+          usage=ev.usage, session_id=ev.session_id)
       try:
         if self._card_id:
-          self._await(self._ch.update_card(self._card_id, done))
+          self._await(self._ch.update_card(self._card_id, card))
         else:
           # Pure text answer, no tools → no working card was created.
           self._await(
-            self._ch.send_card_in_thread(self._sess.root_msg_id, done))
+            self._ch.send_card_in_thread(self._sess.root_msg_id, card))
       except Exception as e:
-        log.warning("fork: failed to render done card: %s", e)
+        log.warning("fork: failed to render final card: %s", e)
     elif isinstance(ev, ErrorEvent):
       self._steps.append(cards.ThinkingStep("reasoning", f"⚠️ {ev.message}"))
       self._update_working()
@@ -219,7 +244,7 @@ class ForkManager:
 
     sess = ForkSession(
       agent=fork_agent, root_msg_id=root_id, thread_id=thread_id,
-      prompt0=prompt)
+      chat_id=self._chat_id, prompt0=prompt)
     self._forks[thread_id] = sess
     # Full ids (not truncated): correlating the Lark-assigned thread_id across
     # the open → follow-up → close round-trip needs the exact value.
@@ -236,6 +261,24 @@ class ForkManager:
     self._spawn_turn(sess, prompt)
     return True
 
+  async def interrupt(self, thread_id: str) -> bool:
+    """Interrupt this fork's in-flight turn (the fork-scoped Stop button).
+    PATCHes its card to 'stopping' and interrupts ONLY this fork's agent —
+    the main turn and other forks are untouched. No-op if the thread isn't a
+    live fork or has no turn running."""
+    sess = self._forks.get(thread_id)
+    if sess is None:
+      return False
+    log.info("fork interrupt: thread=%s", thread_id)
+    sess.interrupt_requested = True
+    if sess.renderer is not None:
+      await sess.renderer.render_stopping()
+    try:
+      await sess.agent.interrupt()
+    except Exception as e:
+      log.warning("fork interrupt failed: %s", e)
+    return True
+
   def _spawn_turn(self, sess: ForkSession, prompt: str) -> None:
     t = asyncio.create_task(self._run_turn(sess, prompt))
     self._tasks.add(t)
@@ -246,21 +289,35 @@ class ForkManager:
     # different forks + the main turn still run concurrently.
     async with sess.lock:
       log.info("fork turn start: thread=%s", sess.thread_id)
+      sess.interrupt_requested = False
       renderer = _ForkRenderer(self._ch, sess, self._loop)
+      sess.renderer = renderer
       try:
         await sess.agent.run_turn(prompt, renderer.on_event)
       except Exception as e:
-        log.warning("fork turn failed: %s", e)
-        card = cards.build_turn_card(
-          "error", body=f"⚠️ fork turn failed: {e}",
-          elapsed=int(time.time() - renderer.start))
-        try:
-          if renderer.card_id:
-            await self._ch.update_card(renderer.card_id, card)
-          else:
-            await self._ch.send_card_in_thread(sess.root_msg_id, card)
-        except Exception as e2:
-          log.warning("fork: failed to render error card: %s", e2)
+        if sess.interrupt_requested:
+          # Interrupt can surface as an exception (e.g. the agent aborts its
+          # turn) rather than a DoneEvent — render "stopped", not "error".
+          log.info("fork turn interrupted: thread=%s", sess.thread_id)
+          try:
+            if renderer.card_id:
+              await self._ch.update_card(renderer.card_id, renderer.stopped_card())
+          except Exception as e2:
+            log.debug("fork: stopped-card render failed: %s", e2)
+        else:
+          log.warning("fork turn failed: %s", e)
+          card = cards.build_turn_card(
+            "error", body=f"⚠️ fork turn failed: {e}",
+            elapsed=int(time.time() - renderer.start))
+          try:
+            if renderer.card_id:
+              await self._ch.update_card(renderer.card_id, card)
+            else:
+              await self._ch.send_card_in_thread(sess.root_msg_id, card)
+          except Exception as e2:
+            log.warning("fork: failed to render error card: %s", e2)
+      finally:
+        sess.renderer = None
 
   async def close(self, thread_id: str) -> bool:
     """Close a fork: stop its agent (frees the subprocess + scratch dir) and

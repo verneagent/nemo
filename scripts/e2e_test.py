@@ -2500,6 +2500,24 @@ def _inject_local_webhook(relay_url: str, vtok: str, message: dict) -> None:
   urllib.request.urlopen(req, timeout=10).read()
 
 
+def _inject_local_card_action(relay_url: str, vtok: str, chat_id: str,
+                              action: str) -> None:
+  """POST a card.action.trigger (button click) to a (local) relay /webhook."""
+  payload = {
+    "header": {"token": vtok, "event_type": "card.action.trigger",
+               "event_id": f"evt_act_{int(time.time()*1000)}"},
+    "event": {
+      "operator": {"open_id": OPERATOR_OPEN_ID},
+      "action": {"value": {"action": action, "chat_id": chat_id}},
+      "context": {"open_chat_id": chat_id},
+    },
+  }
+  req = urllib.request.Request(
+    f"{relay_url}/webhook", data=json.dumps(payload).encode(), method="POST")
+  req.add_header("Content-Type", "application/json")
+  urllib.request.urlopen(req, timeout=10).read()
+
+
 def run_fork_tests(chat_id: str, result: "E2EResult", agent: str = "claude",
                    verbose: bool = False) -> str:
   """Phase 13: /fork live round-trip through a LOCAL relay.
@@ -2593,6 +2611,19 @@ def run_fork_tests(chat_id: str, result: "E2EResult", agent: str = "claude",
       result.fail("T103 follow-up routes to fork",
                   "no 'fork route' — thread_id not forwarded or not routed")
       log.dump_tail(30, "T103")
+
+    # T105: fork-scoped Stop button — a fork_stop:<thread_id> card action
+    # routes to ForkManager.interrupt for THIS fork (relay card-action path).
+    print("  [T105] fork-scoped stop routes to interrupt...")
+    m_stop = log.mark()
+    _inject_local_card_action(relay_url, vtok, chat_id, f"fork_stop:{thread_id}")
+    if log.wait_for_since(
+        r"fork interrupt: thread=" + re.escape(thread_id), m_stop, timeout=20):
+      result.ok("T105 fork stop routes to interrupt", "interrupt invoked")
+    else:
+      result.fail("T105 fork stop routes to interrupt",
+                  "no 'fork interrupt' — stop button not routed")
+      log.dump_tail(30, "T105")
 
     # T104: /fork close (inside the thread) tears it down.
     print("  [T104] /fork close...")

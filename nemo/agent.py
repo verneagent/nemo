@@ -1460,6 +1460,17 @@ async def main_loop(
           )
           channel.push_back(synthetic)
           continue
+        if action_str.startswith("fork_stop:"):
+          # Fork-scoped Stop button — interrupt that fork's in-flight turn
+          # only (the main turn / other forks are untouched). Spawned so it
+          # never blocks the loop.
+          from .guests import is_authorized_sender
+          if operator_open_id and not is_authorized_sender(
+              reply.operator_id, operator_open_id, _member_roles):
+            log.info("Ignoring unauthorized fork stop by %s", reply.operator_id)
+            continue
+          _spawn_fork(fork_mgr.interrupt(action_str.split(":", 1)[1]))
+          continue
         log.info("Ignoring card action outside turn: %s", reply.action_value)
         continue
 
@@ -2645,6 +2656,18 @@ async def main_loop(
                 msg.operator_id, operator_open_id, _member_roles):
               signal_detected = "stop"
               return
+            if action.startswith("fork_stop:"):
+              # Fork-scoped Stop during a main turn — interrupt that fork's
+              # turn only; the main turn (this watcher) keeps running, so we do
+              # NOT set signal_detected. Spawned so it never blocks the watcher.
+              from .guests import is_authorized_sender
+              if operator_open_id and not is_authorized_sender(
+                  msg.operator_id, operator_open_id, _member_roles):
+                log.info("Ignoring unauthorized in-turn fork stop by %s",
+                         msg.operator_id)
+                continue
+              _spawn_fork(fork_mgr.interrupt(action.split(":", 1)[1]))
+              continue
             if action == "model_picker_submit":
               # Empty Submit click mid-turn — tell the user to pick a
               # model first so they're not left wondering why nothing

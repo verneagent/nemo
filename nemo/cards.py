@@ -332,8 +332,12 @@ def _note_element(text: str) -> JsonObject:
   }
 
 
-def _stop_button(chat_id: str = "") -> JsonObject:
-  """Build a Stop button inside a column_set (Card V2 compatible)."""
+def _stop_button(chat_id: str = "", action: str = "__stop__") -> JsonObject:
+  """Build a Stop button inside a column_set (Card V2 compatible).
+
+  ``action`` is the value the daemon routes on: ``__stop__`` for a main turn,
+  ``fork_stop:<thread_id>`` for a /fork sub-thread so the click interrupts that
+  fork's turn rather than the main one."""
   return {
     "tag": "column_set",
     "flex_mode": "none",
@@ -346,7 +350,7 @@ def _stop_button(chat_id: str = "") -> JsonObject:
         "tag": "button",
         "text": {"tag": "plain_text", "content": "Stop"},
         "type": "danger",
-        "value": {"action": "__stop__", "chat_id": chat_id},
+        "value": {"action": action, "chat_id": chat_id},
       }],
     }],
   }
@@ -497,6 +501,7 @@ def _working_elements(
   current_tool: str = "",
   include_stop_button: bool,
   chat_id: str = "",
+  stop_action: str = "__stop__",
   rate_limit_notice: str = "",
   compact_notice: str = "",
   answered_questions: list["AnsweredQuestion"] | None = None,
@@ -529,7 +534,7 @@ def _working_elements(
   if steps:
     elements.append(_collapsible_thinking(steps))
   if include_stop_button:
-    elements.append(_stop_button(chat_id))
+    elements.append(_stop_button(chat_id, stop_action))
   return elements
 
 
@@ -543,6 +548,7 @@ def build_turn_card(
   usage: JsonObject | None = None,
   chat_id: str = "",
   session_id: str = "",
+  stop_action: str = "__stop__",
   rate_limit_notice: str = "",
   compact_notice: str = "",
   answered_questions: list["AnsweredQuestion"] | None = None,
@@ -575,6 +581,7 @@ def build_turn_card(
     elements = _working_elements(
       steps=steps, current_tool=current_tool,
       include_stop_button=True, chat_id=chat_id,
+      stop_action=stop_action,
       rate_limit_notice=rate_limit_notice,
       compact_notice=compact_notice,
       answered_questions=answered_questions,

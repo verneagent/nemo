@@ -179,6 +179,90 @@ def test_decline_when_max_forks_reached():
   asyncio.run(_run())
 
 
+def test_interrupt_stops_in_flight_turn_renders_stopped():
+  """The fork-scoped Stop interrupts only this fork's turn: PATCHes its card
+  to Stopping → Stopped and calls the fork agent's interrupt()."""
+  async def _run():
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    class _BlockingFork:
+      def __init__(self):
+        self.interrupted = False
+
+      async def run_turn(self, prompt, on_event):
+        def e1():
+          on_event(ProgressEvent(kind="tool", summary="Read foo.py", first=True))
+        await asyncio.to_thread(e1)
+        started.set()
+        await release.wait()
+        # Real adapters emit a DoneEvent when an interrupt ends the turn.
+        def e2():
+          on_event(DoneEvent(cost=0.0, usage={}, session_id="fsid"))
+        await asyncio.to_thread(e2)
+        return 0.0, {}
+
+      async def interrupt(self):
+        self.interrupted = True
+        release.set()
+
+      async def stop(self):
+        pass
+
+    agent = _BlockingFork()
+
+    class _Main:
+      def supports_fork(self):
+        return True
+
+      async def fork(self, *_a):
+        return agent
+
+    ch = _ThreadChannel()
+    mgr = _mgr(ch, [])
+    await mgr.open(main_agent=_Main(), anchor_msg_id="om_f", parent_sid="p",
+                   project_dir="/p", model="m", prompt="go")
+    await asyncio.wait_for(started.wait(), 3)  # turn running, working card up
+    assert mgr.get("omt_1").renderer is not None
+
+    assert await mgr.interrupt("omt_1") is True
+    assert agent.interrupted is True
+    assert mgr.get("omt_1").interrupt_requested is True
+
+    await asyncio.gather(*list(mgr._tasks))
+    titles = [c.get("header", {}).get("title", {}).get("content")
+              for _, c in ch.updates]
+    assert "Stopping..." in titles, titles
+    assert "Stopped" in titles, titles
+
+    # interrupting an unknown thread is a no-op
+    assert await mgr.interrupt("omt_nope") is False
+  asyncio.run(_run())
+
+
+def test_fork_working_card_has_fork_scoped_stop_button():
+  """The fork's progress card carries a fork_stop:<thread_id> button so a
+  click interrupts THIS fork, not the main turn."""
+  async def _run():
+    ch = _ThreadChannel()
+    main = _FakeMainAgent()
+    mgr = _mgr(ch, [])
+    await mgr.open(main_agent=main, anchor_msg_id="om_f", parent_sid="p",
+                   project_dir="/p", model="m", prompt="go")
+    await asyncio.gather(*list(mgr._tasks))
+    # First card opened in the thread is the working card (build_turn_card).
+    _, card = ch.thread_cards[-1] if ch.thread_cards else (None, {})
+    buttons = [
+      e for col in card.get("body", {}).get("elements", [])
+      if col.get("tag") == "column_set"
+      for cc in col.get("columns", []) for e in cc.get("elements", [])
+      if e.get("tag") == "button"
+    ]
+    vals = [b.get("value", {}).get("action", "") for b in buttons]
+    assert any(v == "fork_stop:omt_1" for v in vals), vals
+  asyncio.run(_run())
+
+
 def test_shutdown_stops_all_forks():
   async def _run():
     ch = _ThreadChannel()
