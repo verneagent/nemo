@@ -175,8 +175,9 @@ class ForkManager:
     its own decline/status messages so the caller can fire-and-forget."""
     if not main_agent.supports_fork():
       await self._notify(
-        "`/fork` is Claude-only (it relies on session forking + the OS "
-        "sandbox). Switch with `/agent claude`.")
+        "`/fork` isn't supported by the current agent. It needs Claude or "
+        "Codex (session forking + a read-only sandbox) — switch with "
+        "`/agent claude` or `/agent codex`.")
       return
     if not self._ch.supports_threads():
       await self._notify(

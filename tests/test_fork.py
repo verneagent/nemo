@@ -144,7 +144,7 @@ def test_decline_when_agent_cannot_fork():
                    parent_sid="", project_dir="/p", model="m", prompt="x")
     assert mgr.count() == 0
     assert ch.thread_cards == []
-    assert notes and "Claude-only" in notes[0]
+    assert notes and "Claude or Codex" in notes[0]
   asyncio.run(_run())
 
 

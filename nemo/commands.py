@@ -360,7 +360,7 @@ def try_dispatch(text: str, ctx: AgentContext) -> tuple[bool, str | None]:
         "sub-thread. It shares the current conversation context and has "
         "tools (including Bash), but is sandboxed so it CANNOT modify "
         "project files. Multi-turn — just keep replying in the thread. "
-        "`/fork close` ends it. Claude agent only."
+        "`/fork close` ends it. Claude or Codex agent."
       )
     return True, f"__fork__:{arg}"
 
@@ -460,7 +460,7 @@ def try_dispatch(text: str, ctx: AgentContext) -> tuple[bool, str | None]:
       "| `/esc` | Cancel current operation |\n"
       "| `/esc <text>` | Cancel and send `<text>` as the next message |\n"
       "| `/btw <question>` | Read-only side question; ephemeral, never enters history, doesn't interrupt the turn (Claude only) |\n"
-      "| `/fork <prompt>` | Open a read-only branch in a sub-thread: shares context, has tools (incl. Bash), but sandboxed so it can't modify project files. Multi-turn; `/fork close` to end (Claude only) |\n"
+      "| `/fork <prompt>` | Open a read-only branch in a sub-thread: shares context, has tools (incl. Bash), but sandboxed so it can't modify project files. Multi-turn; `/fork close` to end (Claude/Codex) |\n"
       "| `/ping` | Status check |\n"
       "| `/cost` | Session API cost |\n"
       "| `/usage` | Plan usage limits |\n"

@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import datetime
+import glob
 import json
 import logging
 import os
+import time
+import uuid
 from pathlib import Path
 import shutil
 from asyncio.subprocess import Process
@@ -33,6 +37,72 @@ _CODEX_EFFORT_LEVELS = frozenset({"low", "medium", "high"})
 # so we clamp instead of rejecting.
 _CLAUDE_TO_CODEX_EFFORT = {"max": "high"}
 
+# Codex persists each thread as a rollout jsonl under here, keyed by thread id.
+_CODEX_SESSIONS = Path(os.path.expanduser("~/.codex/sessions"))
+
+# Prepended to a read-only fork's first turn. The Codex sandbox physically
+# blocks writes (sandboxMode=read-only), but telling the model up front saves
+# it from burning a turn discovering it can't write.
+_CODEX_FORK_DIRECTIVE = (
+  "FORK MODE — read-only branch. You are a forked side-conversation that "
+  "branched from the main session's context; it is ephemeral and nothing you "
+  "do is written back to the main conversation. The project at {project} is "
+  "STRICTLY READ-ONLY: you may read files, grep, and run read-only commands, "
+  "but you CANNOT modify any file (an OS sandbox blocks all writes — write "
+  "attempts will fail). Investigate and answer; do not attempt edits."
+)
+
+
+def _uuid7() -> str:
+  """Generate a UUIDv7 (time-ordered) — matches Codex's rollout id format so a
+  seeded copy lands in today's date dir and is resolvable by thread id."""
+  ms = int(time.time() * 1000)
+  b = bytearray(ms.to_bytes(6, "big") + os.urandom(10))
+  b[6] = (b[6] & 0x0F) | 0x70  # version 7
+  b[8] = (b[8] & 0x3F) | 0x80  # variant
+  return str(uuid.UUID(bytes=bytes(b)))
+
+
+def _find_codex_rollout(thread_id: str) -> str:
+  """Locate the rollout jsonl for a Codex thread id (scans the dated dirs)."""
+  if not thread_id:
+    return ""
+  hits = glob.glob(str(_CODEX_SESSIONS / "**" / f"*{thread_id}*.jsonl"),
+                   recursive=True)
+  return hits[0] if hits else ""
+
+
+def _seed_fork_rollout(parent_thread_id: str) -> tuple[str, str]:
+  """Copy a parent rollout to a new thread id so a fork can resume it without
+  mutating the parent (Codex resume APPENDS to the resumed file, so the fork
+  MUST own a private copy). Returns (new_thread_id, copied_path), or ("", "")
+  if the parent rollout isn't on disk (then the fork starts fresh).
+
+  This is the manual equivalent of Claude's fork_session=True: rewrite the
+  copy's session_meta.id to the new id and place it where Codex resolves it.
+  """
+  src = _find_codex_rollout(parent_thread_id)
+  if not src:
+    return "", ""
+  try:
+    lines = Path(src).read_text().splitlines()
+    if not lines:
+      return "", ""
+    newid = _uuid7()
+    meta = json.loads(lines[0])
+    if isinstance(meta.get("payload"), dict):
+      meta["payload"]["id"] = newid
+    lines[0] = json.dumps(meta)
+    now = datetime.datetime.now()
+    ddir = _CODEX_SESSIONS / f"{now:%Y}" / f"{now:%m}" / f"{now:%d}"
+    ddir.mkdir(parents=True, exist_ok=True)
+    dst = ddir / f"rollout-{now:%Y-%m-%dT%H-%M-%S}-{newid}.jsonl"
+    dst.write_text("\n".join(lines) + "\n")
+    return newid, str(dst)
+  except (OSError, ValueError, json.JSONDecodeError) as e:
+    log.warning("codex fork rollout seed failed (%s) — fork starts fresh", e)
+    return "", ""
+
 
 def _short(text: str, limit: int) -> str:
   """Truncate ``text`` to ``limit`` chars with an ellipsis when oversized."""
@@ -53,6 +123,7 @@ class CodexCodingAgent(CodingAgent):
     permission_mode: str = "bypassPermissions",
     system_prompt: str = "",
     endpoint: EndpointConfig | None = None,
+    read_only: bool = False,
   ):
     del credentials, chat_id, db, channel
     self._permission_mode = permission_mode
@@ -64,6 +135,12 @@ class CodexCodingAgent(CodingAgent):
     self._effort = ""
     self._proc: Process | None = None
     self._interrupted = False
+    # Read-only fork mode: runs the sidecar with sandboxMode=read-only so it
+    # cannot modify the project; resumes a private copy of the parent rollout
+    # (see fork()). _fork_rollout_path is that throwaway copy, removed on stop.
+    self._read_only = read_only
+    self._fork_note_pending = read_only
+    self._fork_rollout_path = ""
 
   def set_effort(self, effort: str) -> None:
     mapped = _CLAUDE_TO_CODEX_EFFORT.get(effort, effort)
@@ -196,10 +273,49 @@ class CodexCodingAgent(CodingAgent):
     self._model = model
     self._session_id = resume
 
+  def supports_fork(self) -> bool:
+    return True
+
+  async def fork(
+    self, parent_session_id: str, project_dir: str, model: str,
+  ) -> "CodingAgent | None":
+    """Spawn a started, read-only Codex fork — see CodingAgent.fork.
+
+    Branches the parent thread by copying its rollout to a private id (Codex
+    resume APPENDS, so a shared id would clobber the main session) and resuming
+    that copy; runs sandboxMode=read-only so it cannot modify the project.
+    Inherits this agent's endpoint / effort / system prompt. If the parent
+    rollout isn't on disk, the fork starts fresh (no branched context).
+    """
+    fork = CodexCodingAgent(
+      {}, "", None, None,
+      permission_mode="bypassPermissions",
+      system_prompt=self._system_prompt,
+      endpoint=self._endpoint,
+      read_only=True,
+    )
+    fork.set_effort(self._effort)
+    new_id, copied = _seed_fork_rollout(parent_session_id)
+    fork._fork_rollout_path = copied
+    await fork.start(project_dir, model, resume=new_id)
+    return fork
+
   async def stop(self) -> None:
     await self.interrupt()
+    if self._fork_rollout_path:
+      try:
+        os.remove(self._fork_rollout_path)
+      except OSError:
+        pass
+      self._fork_rollout_path = ""
 
   def _prepare_prompt(self, prompt: str) -> str:
+    # A read-only fork resumes a copied rollout (so _session_id is already
+    # set) — the system-prompt-injection branch below wouldn't fire. Prepend
+    # the fork directive once, on the fork's first turn.
+    if self._read_only and self._fork_note_pending:
+      self._fork_note_pending = False
+      return f"{_CODEX_FORK_DIRECTIVE.format(project=self._project_dir)}\n\n{prompt}"
     # Codex SDK has no system-prompt field, so inject custom instructions
     # by prepending to the first turn of a thread. Subsequent turns inherit
     # them via the persisted thread context.
@@ -222,6 +338,11 @@ class CodexCodingAgent(CodingAgent):
       args.extend(["--model", self._model])
     if self._effort:
       args.extend(["--effort", self._effort])
+    if self._read_only:
+      # Native Codex read-only sandbox: blocks all project writes while reads
+      # and read-only commands still work. No scratch-cwd trick needed (resume
+      # is keyed by rollout id, not cwd), so cwd stays the project.
+      args.extend(["--sandbox", "read-only"])
     if self._session_id:
       args.extend(["--resume", self._session_id])
     return args

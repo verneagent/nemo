@@ -5,6 +5,7 @@ import { Codex } from "@openai/codex-sdk";
 import { streamToStdout } from "./resume.mjs";
 
 const VALID_EFFORTS = new Set(["minimal", "low", "medium", "high", "xhigh"]);
+const VALID_SANDBOX = new Set(["read-only", "workspace-write", "danger-full-access"]);
 
 function parseArgs(rawArgs) {
   const options = {
@@ -12,6 +13,7 @@ function parseArgs(rawArgs) {
     model: "",
     resume: "",
     effort: "",
+    sandbox: "",
   };
   for (let i = 0; i < rawArgs.length; i += 1) {
     const arg = rawArgs[i];
@@ -27,6 +29,12 @@ function parseArgs(rawArgs) {
         throw new Error(`invalid --effort value: ${value}`);
       }
       options.effort = value;
+    } else if (arg === "--sandbox") {
+      const value = rawArgs[++i] ?? "";
+      if (value && !VALID_SANDBOX.has(value)) {
+        throw new Error(`invalid --sandbox value: ${value}`);
+      }
+      options.sandbox = value;
     } else {
       throw new Error(`unknown arg: ${arg}`);
     }
@@ -73,7 +81,9 @@ async function main() {
     model: options.model || undefined,
     modelReasoningEffort: options.effort || undefined,
     skipGitRepoCheck: true,
-    sandboxMode: "danger-full-access",
+    // Default full-access for normal turns; /fork passes --sandbox read-only
+    // so a forked branch physically cannot modify the project.
+    sandboxMode: options.sandbox || "danger-full-access",
     approvalPolicy: "never",
   };
   await streamToStdout(

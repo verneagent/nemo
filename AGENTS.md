@@ -15,6 +15,7 @@ Lark-connected coding agent daemon. Repo focus:
 - Preserve the one-card-per-turn model: turn cards evolve through PATCH instead of emitting a new card for each phase.
 - Keep turn execution event-driven. `run_turn()` should emit typed events and the main loop should react to them.
 - Stop/esc only interrupts the current turn — do not reset or restart the SDK client. Session and conversation context must be preserved (match CLI Escape behavior).
+- `/fork` (read-only, multi-turn sub-thread) is exposed via `CodingAgent.supports_fork()` / `fork()` and orchestrated by `nemo/fork.py`'s `ForkManager` (one read-only sub-agent + SDK subprocess per fork, routed by Lark `thread_id`). Supported on **Claude** (resume + `fork_session=True`, branching the transcript; read-only via bash sandbox with a scratch cwd so the project sits outside the writable workspace) and **Codex** (copy the parent rollout jsonl to a new thread id then resume the copy — Codex resume *appends*, so the fork needs a private copy; read-only via native `sandboxMode=read-only`, so cwd can stay the project). OpenCode is unsupported. Both keep full parent context but cannot modify project files.
 
 ## Runtime Notes
 

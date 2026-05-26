@@ -113,9 +113,9 @@ class CodingAgent(ABC):
 
     Forking branches the *current* conversation context into an
     independent, multi-turn, tool-enabled sub-session that is physically
-    unable to modify the project (see ``fork``). Only Claude supports it
-    (it relies on the SDK's ``fork_session`` + OS sandbox); Codex /
-    OpenCode inherit ``False``.
+    unable to modify the project (see ``fork``). Claude (SDK
+    ``fork_session`` + bash sandbox) and Codex (rollout-copy +
+    ``sandboxMode=read-only``) support it; OpenCode inherits ``False``.
     """
     return False
 

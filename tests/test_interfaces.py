@@ -298,3 +298,39 @@ def test_fork_options_fork_session_only_from_parent():
   cont = a._build_fork_options("/p", "m", resume="fork_own_sess")
   assert cont.fork_session is False
   assert cont.resume == "fork_own_sess"
+
+
+# --- Codex fork: rollout-copy + read-only sandbox ---
+
+def test_codex_supports_fork():
+  from nemo.codex_agent import CodexCodingAgent
+  a = CodexCodingAgent({}, "", None, None)
+  assert a.supports_fork() is True
+
+
+def test_codex_fork_command_uses_read_only_sandbox():
+  """A read-only fork passes --sandbox read-only; a normal codex turn does
+  not (it stays full-access). cwd is the project — Codex resume is keyed by
+  rollout id, and read-only blocks writes regardless of cwd."""
+  from nemo.codex_agent import CodexCodingAgent
+  fork = CodexCodingAgent({}, "", None, None, read_only=True)
+  fork._project_dir, fork._model, fork._session_id = "/Users/me/proj", "gpt-5.5", "fork_abc"
+  cmd = fork._build_command()
+  assert "--sandbox" in cmd and cmd[cmd.index("--sandbox") + 1] == "read-only"
+  assert cmd[cmd.index("--cwd") + 1] == "/Users/me/proj"
+
+  normal = CodexCodingAgent({}, "", None, None)
+  normal._project_dir, normal._model = "/p", "gpt-5.5"
+  assert "--sandbox" not in normal._build_command()
+
+
+def test_codex_fork_prompt_prepends_directive_once():
+  """The fork directive is injected on the fork's first turn only (the
+  resume-a-copy path skips the normal system-prompt injection)."""
+  from nemo.codex_agent import CodexCodingAgent
+  a = CodexCodingAgent({}, "", None, None, read_only=True)
+  a._project_dir, a._session_id = "/Users/me/proj", "fork_abc"
+  p1 = a._prepare_prompt("hello")
+  assert "FORK MODE" in p1 and "/Users/me/proj" in p1 and p1.endswith("hello")
+  p2 = a._prepare_prompt("again")
+  assert "FORK MODE" not in p2
