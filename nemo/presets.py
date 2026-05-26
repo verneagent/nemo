@@ -303,7 +303,24 @@ def resolve_preset(
   builtin_path: str | os.PathLike = _BUILTIN_PATH,
   user_path: str = _USER_OVERRIDE_PATH,
 ) -> Preset | None:
-  return load_presets(builtin_path=builtin_path, user_path=user_path).get(name)
+  """Resolve a preset by name, CASE-INSENSITIVELY.
+
+  The match ignores case but the returned ``Preset`` keeps its original-case
+  name/remote, so the exact model id still reaches the upstream server. Needed
+  because callers normalise case differently (``is_model_compatible``
+  lowercases the model name) while a model's key in models.json can be
+  mixed-case (e.g. ``Qwen3-Coder-Next-MLX-8bit``) — a case-sensitive lookup
+  silently missed those and reported the model "not available" for the agent.
+  """
+  presets = load_presets(builtin_path=builtin_path, user_path=user_path)
+  exact = presets.get(name)
+  if exact is not None:
+    return exact
+  folded = name.casefold()
+  for key, preset in presets.items():
+    if key.casefold() == folded:
+      return preset
+  return None
 
 
 def preset_name_for_endpoint(

@@ -282,6 +282,32 @@ def test_resolve_preset_returns_none_for_unknown(tmp_path):
   ) is None
 
 
+def test_resolve_preset_is_case_insensitive(tmp_path):
+  # Regression: a mixed-case model key (e.g. Qwen3-Coder-Next-MLX-8bit) was
+  # silently missed because is_model_compatible lowercases the name before
+  # lookup, so /model reported it "not available for claude". The match must
+  # ignore case while the returned preset keeps its original-case name/remote
+  # (so the upstream server still gets the exact id).
+  user = tmp_path / "models.json"
+  user.write_text(json.dumps({
+    "providers": {
+      "omlx": {
+        "anthropic": {"baseURL": "http://localhost:8000/v1",
+                      "apiKey": "{env:OMLX_KEY}"},
+        "models": {"Qwen3-Coder-Next-MLX-8bit": {}},
+      },
+    },
+  }))
+  kw = {"builtin_path": "/nonexistent/builtin", "user_path": str(user)}
+  exact = resolve_preset("Qwen3-Coder-Next-MLX-8bit", **kw)
+  lower = resolve_preset("qwen3-coder-next-mlx-8bit", **kw)  # is_model_compatible's form
+  assert exact is not None and lower is not None
+  # Same preset, original-case name/remote preserved (server gets exact id).
+  assert exact.name == lower.name == "Qwen3-Coder-Next-MLX-8bit"
+  assert lower.anthropic_remote == "Qwen3-Coder-Next-MLX-8bit"
+  assert lower.supports("claude") is True
+
+
 # ---------------------------------------------------------------------------
 # preset_name_for_endpoint — inverse mapping used by /restart and /upgrade
 # ---------------------------------------------------------------------------
