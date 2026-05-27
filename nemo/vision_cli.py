@@ -7,10 +7,10 @@ default) and prints a plain-text description to stdout, so any coding agent —
 vision-capable or not — can "look at" the media by running this command and
 reading its output.
 
-Config via environment:
-  NEMO_VISION_API_KEY   (required) bearer key for the endpoint
-  NEMO_VISION_BASE_URL  endpoint base (default: DashScope compatible-mode)
-  NEMO_VISION_MODEL     model name (default: qwen3.5-35b-a3b)
+Config via environment (Alibaba Cloud Bailian / 百炼 inference platform):
+  BAILIAN_API_KEY   (required) bearer key for the endpoint
+  BAILIAN_BASE_URL  endpoint base (default: DashScope compatible-mode)
+  BAILIAN_MODEL     model name (default: qwen3-vl-flash)
 """
 
 from __future__ import annotations
@@ -61,11 +61,11 @@ def _media_block(path: str) -> JsonObject:
 
 def describe(path: str, question: str) -> str:
   """Send the media + question to the endpoint and return its text answer."""
-  key = os.environ.get("NEMO_VISION_API_KEY", "").strip()
+  key = os.environ.get("BAILIAN_API_KEY", "").strip()
   if not key:
-    raise SystemExit("nemo-vision: NEMO_VISION_API_KEY is not set")
-  base = os.environ.get("NEMO_VISION_BASE_URL", _DEFAULT_BASE_URL).rstrip("/")
-  model = os.environ.get("NEMO_VISION_MODEL", _DEFAULT_MODEL)
+    raise SystemExit("nemo-vision: BAILIAN_API_KEY is not set")
+  base = os.environ.get("BAILIAN_BASE_URL", _DEFAULT_BASE_URL).rstrip("/")
+  model = os.environ.get("BAILIAN_MODEL", _DEFAULT_MODEL)
   payload: JsonObject = {
     "model": model,
     "messages": [{

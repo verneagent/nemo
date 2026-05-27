@@ -360,7 +360,7 @@ class CodexCodingAgent(CodingAgent):
       "CODEX_API_KEY",
       # nemo-vision shell tool reads these to describe video the model can't
       # see natively; the codex sidecar env is a whitelist, so forward them.
-      "NEMO_VISION_API_KEY", "NEMO_VISION_BASE_URL", "NEMO_VISION_MODEL",
+      "BAILIAN_API_KEY", "BAILIAN_BASE_URL", "BAILIAN_MODEL",
       "http_proxy", "https_proxy", "all_proxy",
     )
     for key in passthrough:

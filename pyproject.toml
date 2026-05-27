@@ -27,6 +27,7 @@ Repository = "https://github.com/verneagent/nemo"
 [project.scripts]
 nemo = "nemo.__main__:main"
 nemo-send = "nemo.send:main"
+nemo-vision = "nemo.vision_cli:main"
 
 [tool.setuptools.packages.find]
 include = ["nemo*"]
