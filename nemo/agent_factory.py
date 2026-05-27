@@ -33,6 +33,7 @@ __all__ = [
   "default_model_for_agent",
   "is_model_compatible",
   "model_catalog_for_agent",
+  "model_has_vision",
 ]
 
 _DEFAULT_MODEL_BY_AGENT: dict[AgentKind, str] = {
@@ -194,6 +195,30 @@ def is_model_compatible(
     agent,
     project_dir,
   ).all_names()
+
+
+# Substring hints for models that natively accept image input. Matching is
+# case-insensitive on the model name. Anything that doesn't match (deepseek,
+# kimi, local coder models, …) is treated as text-only — media enrichment then
+# attaches a nemo-vision hint so the model can still "see" via the shell tool.
+# Defaulting unknown models to "no vision" keeps non-vision presets from
+# silently going blind to images; the only cost is a redundant hint for an
+# unlisted vision model.
+_VISION_MODEL_HINTS = ("claude", "opus", "sonnet", "haiku", "gpt")
+
+
+def model_has_vision(agent: AgentKind, model: str) -> bool:
+  """Whether ``model`` can natively see images.
+
+  When True, ``[image: …]`` markers need no nemo-vision hint (the agent reads
+  the image itself — Claude via ``Read``, Codex via ``view_image``). When
+  False, the channel points the model at ``nemo-vision`` instead. ``agent`` is
+  accepted for symmetry with the other capability helpers and possible
+  per-agent rules; the decision is currently by model name alone.
+  """
+  _ = agent
+  folded = model.casefold()
+  return any(hint in folded for hint in _VISION_MODEL_HINTS)
 
 
 def build_coding_agent(

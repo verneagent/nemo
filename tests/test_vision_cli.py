@@ -2,7 +2,24 @@
 
 import pytest
 
+from nemo.agent_factory import model_has_vision
 from nemo.vision_cli import _media_block, _extract_content
+
+
+@pytest.mark.parametrize("model", [
+  "claude-opus-4-7", "claude-sonnet-4-6", "claude-haiku-4-5", "opusplan",
+  "gpt-5.5", "gpt-5.3-codex", "anthropic/claude-opus-4-7",
+])
+def test_vision_models_need_no_hint(model):
+  assert model_has_vision("claude", model) is True
+
+
+@pytest.mark.parametrize("model", [
+  "deepseek-v4-pro", "deepseek-v4-flash", "kimi-for-coding",
+  "Qwen3-Coder-Next-MLX-8bit",
+])
+def test_text_only_models_get_routed_to_nemo_vision(model):
+  assert model_has_vision("claude", model) is False
 
 
 def _write(tmp_path, name: str) -> str:

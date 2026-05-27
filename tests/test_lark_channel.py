@@ -102,6 +102,40 @@ def test_post_with_image_no_msg_type_check(mock_dl):
   assert "/tmp/img.png" in msg.text
 
 
+@mock.patch("nemo.status_tab.update_status")
+def test_update_status_refreshes_vision_capability(mock_status):
+  """update_status is the chokepoint that keeps _model_sees_images current as
+  the model changes (startup, /model, /agent)."""
+  ch = LarkChannel.__new__(LarkChannel)
+  ch.chat_id = "oc_x"
+  ch.credentials = {"app_id": "a", "app_secret": "s"}
+  with mock.patch("nemo.lark_channel.lark_auth.get_token", return_value="t"):
+    asyncio.run(ch.update_status("claude-opus-4-7", "idle", "claude"))
+    assert ch._model_sees_images is True
+    asyncio.run(ch.update_status("deepseek-v4-pro", "idle", "claude"))
+    assert ch._model_sees_images is False
+
+
+@mock.patch("nemo.lark_channel.lark_api.download_image", return_value="/tmp/img.png")
+def test_image_no_vision_adds_nemo_vision_hint(mock_dl):
+  """A model without native vision gets pointed at nemo-vision (and away from
+  Read) for the image it just received."""
+  ev = _make_event(msg_type="image", image_key="ik_1", text="")
+  msg = _to_incoming(ev, token=TOKEN, model_sees_images=False)
+  assert "[image: /tmp/img.png]" in msg.text
+  assert "nemo-vision" in msg.text
+  assert "Read tool" in msg.text
+
+
+@mock.patch("nemo.lark_channel.lark_api.download_image", return_value="/tmp/img.png")
+def test_image_with_vision_has_no_hint(mock_dl):
+  """A vision-capable model (default) sees the image itself — no hint."""
+  ev = _make_event(msg_type="image", image_key="ik_1", text="")
+  msg = _to_incoming(ev, token=TOKEN, model_sees_images=True)
+  assert "[image: /tmp/img.png]" in msg.text
+  assert "nemo-vision" not in msg.text
+
+
 @mock.patch("nemo.lark_channel.lark_api.download_image",
             side_effect=["/tmp/a.png", "/tmp/b.png"])
 def test_multiple_image_keys(mock_dl):

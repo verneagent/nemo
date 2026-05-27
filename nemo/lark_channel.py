@@ -25,6 +25,7 @@ def _to_incoming(
   event: LarkEvent,
   token: str = "",
   parent_lookup: ParentLookup | None = None,
+  model_sees_images: bool = True,
 ) -> IncomingMessage:
   text = event.text
   msg_type = event.msg_type
@@ -66,6 +67,7 @@ def _to_incoming(
   # Skip "media" (video) messages: their image_key is just the video
   # thumbnail, already represented by the [video: ...] marker above.
   if event.image_key and event.message_id and token and msg_type != "media":
+    any_image = False
     for img_key in event.image_key.split(","):
       img_key = img_key.strip()
       if not img_key:
@@ -77,9 +79,19 @@ def _to_incoming(
           text = text.replace("[image]", f"[image: {path}]", 1)
         else:
           text = f"{text}\n[image: {path}]" if text else f"[image: {path}]"
+        any_image = True
         log.info("Downloaded image: %s -> %s", img_key, path)
       except Exception as e:
         log.warning("Image download failed (%s): %s", img_key, e)
+    # A text-only model can't see the image it just received, and calling
+    # Read on it would feed image blocks its endpoint rejects. Point it at
+    # nemo-vision instead. Vision models (Claude/Codex/…) skip this.
+    if any_image and not model_sees_images:
+      text = (
+        f"{text}\n(This model cannot see images directly. To read any "
+        f"[image: ...] path above, run the shell command: nemo-vision "
+        f'"the-image-path" "the question to ask about it" — it prints a '
+        f"text description. Do not use the Read tool on these images.)")
 
   # Enrich: fetch reply parent context.
   # Prefer the parent_lookup callback (nemo's own DB) first — Lark's
@@ -264,6 +276,10 @@ def _expand_merge_forward(token: str, message_id: str) -> str:
 class LarkChannel(Channel):
   """Channel implementation backed by Lark IM APIs and event streams."""
 
+  # Class-level default so receive() is safe even when a test builds the
+  # channel via __new__ (bypassing __init__). update_status keeps it current.
+  _model_sees_images: bool = True
+
   def __init__(self, chat_id: str):
     from .channel import TurnCardCtx
     self.chat_id = chat_id
@@ -284,6 +300,11 @@ class LarkChannel(Channel):
     # Latest inbound message_id seen on self.chat_id. Used as the reply
     # anchor for thread-scoped sends in topic chats.
     self._reply_anchor: str = ""
+    # Whether the active model can natively see images. Updated by
+    # update_status (called at startup and on every /model or /agent
+    # switch). When False, incoming [image: ...] markers get a nemo-vision
+    # hint so a text-only model (deepseek, kimi, …) isn't blind to images.
+    self._model_sees_images: bool = True
 
   @property
   def token(self) -> str:
@@ -322,7 +343,8 @@ class LarkChannel(Channel):
     if event is None:
       return None
     incoming = _to_incoming(
-      event, token=self.token, parent_lookup=self.parent_lookup)
+      event, token=self.token, parent_lookup=self.parent_lookup,
+      model_sees_images=self._model_sees_images)
     # Remember the latest inbound message on our chat so topic-mode
     # sends can thread back to it. Only update for events that carry a
     # real message id on our chat (skip _stop sentinels and events
@@ -499,6 +521,11 @@ class LarkChannel(Channel):
 
   async def update_status(self, model: str, state: str, agent: str = "") -> None:
     from . import status_tab
+    from .agent_factory import model_has_vision
+    # Status updates fire at startup and after every /model or /agent switch
+    # and always carry the live (model, agent) — so this is the one chokepoint
+    # to refresh whether the active model can see images.
+    self._model_sees_images = model_has_vision(agent, model)
     status_tab.update_status(self.token, self.chat_id, model, state, agent)
 
   async def send_heartbeat(self, model: str) -> None:
