@@ -219,9 +219,18 @@ def model_media_vision(agent: AgentKind, model: str) -> MediaVision:
   (view_image) ingest images natively, none ingest video, and OpenCode's
   default is typically a frontier model — so assume image-yes / video-no.
   """
-  _ = agent
-  from .presets import resolve_preset
+  from .presets import load_presets, resolve_preset
   preset = resolve_preset(model)
+  if preset is None:
+    # After a preset /model switch the live model is the resolved remote id
+    # (e.g. "deepseek-v4-pro[1m]"), not the preset name — resolve_preset only
+    # matches names, so map the remote id back to its preset here. Without
+    # this a text-only preset reads as a vision model and gets no nemo-vision
+    # hint.
+    for candidate in load_presets().values():
+      if candidate.remote_for(agent) == model:
+        preset = candidate
+        break
   if preset is not None:
     return MediaVision(image=preset.sees_image, video=preset.sees_video)
   return MediaVision(image=True, video=False)

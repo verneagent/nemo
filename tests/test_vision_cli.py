@@ -71,11 +71,25 @@ def test_helper_unavailable_when_env_ref_unset(tmp_path):
 
 def test_media_vision_builtin_model_sees_image_not_video():
   # A non-preset is the agent's own built-in model (Claude/Codex): sees images
-  # natively, never video. Patch resolve_preset so the result is independent
-  # of any ambient ~/.nemo/models.json.
-  with mock.patch("nemo.presets.resolve_preset", return_value=None):
+  # natively, never video. Patch resolve_preset + load_presets so the result is
+  # independent of any ambient ~/.nemo/models.json.
+  with mock.patch("nemo.presets.resolve_preset", return_value=None), \
+       mock.patch("nemo.presets.load_presets", return_value={}):
     assert model_media_vision("claude", "claude-opus-4-7") == MediaVision(True, False)
     assert model_media_vision("codex", "gpt-5.5") == MediaVision(True, False)
+
+
+def test_media_vision_resolves_preset_by_remote_id():
+  # After a preset /model switch the live model is the resolved remote id
+  # (e.g. deepseek-v4-pro[1m]), not the preset name. Capability must still
+  # resolve — else a text-only preset reads as a vision model and loses its
+  # nemo-vision hint.
+  ds = Preset(name="deepseek-v4-pro", anthropic_url="https://x",
+              anthropic_remote="deepseek-v4-pro[1m]")  # sees_* default False
+  with mock.patch("nemo.presets.resolve_preset", return_value=None), \
+       mock.patch("nemo.presets.load_presets",
+                  return_value={"deepseek-v4-pro": ds}):
+    assert model_media_vision("claude", "deepseek-v4-pro[1m]") == MediaVision(False, False)
 
 
 def test_media_vision_preset_uses_declared_flags():
