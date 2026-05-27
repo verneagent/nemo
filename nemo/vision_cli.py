@@ -106,6 +106,14 @@ def load_config(path: str = _CONFIG_PATH) -> tuple[str, str, str]:
   return base_url.rstrip("/"), _resolve_key(raw.get("apiKey")), model_id
 
 
+def helper_available(path: str = _CONFIG_PATH) -> bool:
+  """Whether a usable API key resolves, i.e. running nemo-vision would have
+  credentials. Some machines have no vision helper configured (no vision.json
+  and no $BAILIAN_API_KEY); callers gate the [image:]/[video:] hints on this so
+  the agent isn't told to run a tool that can't work."""
+  return bool(load_config(path)[1])
+
+
 def describe(path: str, question: str) -> str:
   """Send the media + question to the endpoint and return its text answer."""
   base, key, model = load_config()

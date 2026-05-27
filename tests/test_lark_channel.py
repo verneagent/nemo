@@ -188,6 +188,26 @@ def test_media_video_capable_model_gets_bare_marker(mock_dl):
   assert "nemo-vision" not in msg.text
 
 
+@mock.patch("nemo.lark_channel.lark_api.download_file", return_value="/tmp/v.mp4")
+def test_media_no_vision_helper_gives_bare_marker(mock_dl):
+  """No vision helper configured on this machine → don't tell the agent to run
+  nemo-vision (it would just fail); emit the bare [video: path] marker."""
+  ev = _make_event(msg_type="media", file_key="fk_v", file_name="clip.mp4",
+                   text="")
+  msg = _to_incoming(ev, token=TOKEN, model_sees_video=False, vision_helper=False)
+  assert "[video: /tmp/v.mp4]" in msg.text
+  assert "nemo-vision" not in msg.text
+
+
+@mock.patch("nemo.lark_channel.lark_api.download_image", return_value="/tmp/img.png")
+def test_image_no_vision_helper_no_hint(mock_dl):
+  """Text-only model + no vision helper → bare [image: path], no hint."""
+  ev = _make_event(msg_type="image", image_key="ik_1", text="")
+  msg = _to_incoming(ev, token=TOKEN, model_sees_images=False, vision_helper=False)
+  assert "[image: /tmp/img.png]" in msg.text
+  assert "nemo-vision" not in msg.text
+
+
 @mock.patch("nemo.lark_channel.lark_api.download_image", return_value="/tmp/thumb.png")
 @mock.patch("nemo.lark_channel.lark_api.download_file", return_value="/tmp/v.mp4")
 def test_media_skips_thumbnail_image(mock_file, mock_img):

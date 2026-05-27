@@ -17,6 +17,7 @@ from .lark import auth as lark_auth
 from .lark.events import LarkEvent, LarkEventStream
 from .relay_events import RelayEventStream
 from .types import JsonObject
+from . import vision_cli
 
 ParentLookup = Callable[[str], str | None]
 
@@ -27,6 +28,7 @@ def _to_incoming(
   parent_lookup: ParentLookup | None = None,
   model_sees_images: bool = True,
   model_sees_video: bool = False,
+  vision_helper: bool = True,
 ) -> IncomingMessage:
   text = event.text
   msg_type = event.msg_type
@@ -53,9 +55,11 @@ def _to_incoming(
       path = lark_api.download_file(
         token, event.message_id, event.file_key, name)
       marker = f"[video: {path}]"
-      # A model that can't see video (every coding agent today) gets pointed
-      # at nemo-vision; a video-capable model just gets the bare marker.
-      if model_sees_video:
+      # Point at nemo-vision only when the model can't see video (every coding
+      # agent today) AND a vision helper is actually configured. A
+      # video-capable model — or a machine with no helper — gets the bare
+      # marker (nothing useful to suggest).
+      if model_sees_video or not vision_helper:
         block = marker
       else:
         block = (
@@ -91,8 +95,9 @@ def _to_incoming(
         log.warning("Image download failed (%s): %s", img_key, e)
     # A text-only model can't see the image it just received, and calling
     # Read on it would feed image blocks its endpoint rejects. Point it at
-    # nemo-vision instead. Vision models (Claude/Codex/…) skip this.
-    if any_image and not model_sees_images:
+    # nemo-vision instead — but only if a vision helper is configured.
+    # Vision models (Claude/Codex/…) skip this.
+    if any_image and not model_sees_images and vision_helper:
       text = (
         f"{text}\n(This model cannot see images directly. To read any "
         f"[image: ...] path above, run the shell command: nemo-vision "
@@ -354,10 +359,15 @@ class LarkChannel(Channel):
     event = await self._events.next_message(timeout=timeout)
     if event is None:
       return None
+    # Only probe the vision helper when the event actually carries media —
+    # avoids a config read on every plain-text message.
+    has_media = event.msg_type == "media" or bool(event.image_key)
+    vision_helper = vision_cli.helper_available() if has_media else True
     incoming = _to_incoming(
       event, token=self.token, parent_lookup=self.parent_lookup,
       model_sees_images=self._model_sees_images,
-      model_sees_video=self._model_sees_video)
+      model_sees_video=self._model_sees_video,
+      vision_helper=vision_helper)
     # Remember the latest inbound message on our chat so topic-mode
     # sends can thread back to it. Only update for events that carry a
     # real message id on our chat (skip _stop sentinels and events

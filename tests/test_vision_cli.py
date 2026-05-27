@@ -9,7 +9,8 @@ import pytest
 from nemo.agent_factory import MediaVision, model_media_vision
 from nemo.presets import Preset
 from nemo.vision_cli import (
-  _DEFAULT_BASE_URL, _DEFAULT_MODEL, _media_block, _extract_content, load_config,
+  _DEFAULT_BASE_URL, _DEFAULT_MODEL, _media_block, _extract_content,
+  helper_available, load_config,
 )
 
 
@@ -49,6 +50,23 @@ def test_load_config_missing_file_uses_defaults(tmp_path):
     base, key, model = load_config(str(tmp_path / "nope.json"))
   assert (base, model) == (_DEFAULT_BASE_URL, _DEFAULT_MODEL)
   assert key == "sk-b"
+
+
+def test_helper_available_true_when_key_resolves(tmp_path):
+  cfg = _write_cfg(tmp_path, {"apiKey": "sk-literal"})
+  assert helper_available(cfg) is True
+
+
+def test_helper_unavailable_when_no_file_and_no_env(tmp_path):
+  missing = str(tmp_path / "nope.json")
+  with mock.patch.dict(os.environ, {}, clear=True):  # no BAILIAN_API_KEY
+    assert helper_available(missing) is False
+
+
+def test_helper_unavailable_when_env_ref_unset(tmp_path):
+  cfg = _write_cfg(tmp_path, {"apiKey": "{env:UNSET_VISION_KEY}"})
+  with mock.patch.dict(os.environ, {}, clear=True):
+    assert helper_available(cfg) is False
 
 
 def test_media_vision_builtin_model_sees_image_not_video():
