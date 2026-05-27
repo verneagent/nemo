@@ -357,10 +357,11 @@ class RelayTestCase(unittest.TestCase):
     self.assertEqual(r["image_key"], "img_a,img_b")
 
   def test_post_with_embedded_video(self):
-    """A video embedded in a post (the common 'video + caption' send) is
-    forwarded as a media message — file_key + caption — so the daemon
-    downloads it. Regression: the post parser used to drop the media element
-    and forward only the caption, leaving the daemon blind to the video."""
+    """A video embedded in a post (the common 'video + caption' send): the
+    parser faithfully keeps msg_type=post, marks the video's position with a
+    [video] placeholder, and forwards file_key — mirroring [image]/image_key.
+    The daemon resolves the placeholder + downloads. Regression: the parser
+    used to drop the media element and forward only the caption."""
     post_content = json.dumps({
       "content": [
         [{"tag": "media", "file_key": "fk_postvid", "file_name": "clip.mp4"},
@@ -378,10 +379,10 @@ class RelayTestCase(unittest.TestCase):
       },
     })
     r = self._get("/replies/chat:oc_postvid_eq?since=")["replies"][0]
-    self.assertEqual(r["msg_type"], "media")     # so the daemon downloads it
+    self.assertEqual(r["msg_type"], "post")       # faithful — not rewritten
     self.assertEqual(r["file_key"], "fk_postvid")
     self.assertEqual(r["file_name"], "clip.mp4")
-    self.assertEqual(r["text"], "看看这个视频")    # caption preserved
+    self.assertEqual(r["text"], "[video]\n看看这个视频")  # placeholder + caption
     self.assertNotIn("image_key", r)
 
   def test_post_locale_keyed(self):

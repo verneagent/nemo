@@ -351,21 +351,19 @@ def _parse_message(event: dict) -> tuple[dict, str, str | None] | None:
                     parts.append("[image]")
                     image_keys.append(elem["image_key"])
                 elif elem.get("tag") == "media" and elem.get("file_key"):
-                    # Video embedded in a post (the common "video + caption"
-                    # send). Captured here, forwarded as a media message below.
+                    # Video embedded in a post. Mark its position with a
+                    # [video] placeholder and forward the file_key, mirroring
+                    # how [image] elements forward image_key — msg_type stays
+                    # "post" and the daemon resolves the placeholder.
+                    parts.append("[video]")
                     video_key = elem["file_key"]
                     video_name = elem.get("file_name", "")
+        text = "\n".join(parts) or "[post]"
+        if image_keys:
+            image_key = ",".join(image_keys)
         if video_key:
-            # Forward as a video so the daemon's media handler downloads it
-            # (msg_type post has no download path); keep the caption as text.
             file_key = video_key
             file_name = video_name
-            msg_type = "media"
-            text = "\n".join(parts)
-        else:
-            text = "\n".join(parts) or "[post]"
-            if image_keys:
-                image_key = ",".join(image_keys)
     elif msg_type == "sticker":
         file_key = content.get("file_key", "")
         text = "[sticker]"

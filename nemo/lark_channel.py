@@ -22,6 +22,17 @@ from . import vision_cli
 ParentLookup = Callable[[str], str | None]
 
 
+def _video_block(path: str, model_sees_video: bool, vision_helper: bool) -> str:
+  """The ``[video: path]`` marker, plus a nemo-vision hint unless the model
+  can see video natively (none do today) or no vision helper is configured."""
+  marker = f"[video: {path}]"
+  if model_sees_video or not vision_helper:
+    return marker
+  return (
+    f'{marker}\n(To understand this video, run the shell command: nemo-vision '
+    f'"{path}" "the question to ask about it" — it prints a text description.)')
+
+
 def _to_incoming(
   event: LarkEvent,
   token: str = "",
@@ -45,32 +56,28 @@ def _to_incoming(
       log.warning("File download failed: %s", e)
       text = f"[file download failed: {event.file_name or event.file_key}]"
 
-  # Enrich: download video ("media" message). No coding agent sees video
-  # natively (Claude's Read / Codex's view_image are image-only), so emit a
-  # [video: path] marker plus a hint to run `nemo-vision` — the shell tool that
-  # turns the file into a text description via a multimodal model.
-  if msg_type == "media" and event.file_key and event.message_id and token:
+  # Enrich: download video — either a standalone "media" message or a video
+  # embedded in a post (the relay marks the latter with a [video] placeholder
+  # + the video file_key, keeping msg_type "post"). No coding agent sees video
+  # natively (Claude's Read / Codex's view_image are image-only), so the
+  # [video: path] marker carries a nemo-vision hint when a helper is set.
+  video_in_post = "[video]" in text
+  if event.file_key and event.message_id and token and (
+      msg_type == "media" or video_in_post):
     try:
       name = event.file_name or f"{event.file_key}.mp4"
       path = lark_api.download_file(
         token, event.message_id, event.file_key, name)
-      marker = f"[video: {path}]"
-      # Point at nemo-vision only when the model can't see video (every coding
-      # agent today) AND a vision helper is actually configured. A
-      # video-capable model — or a machine with no helper — gets the bare
-      # marker (nothing useful to suggest).
-      if model_sees_video or not vision_helper:
-        block = marker
+      block = _video_block(path, model_sees_video, vision_helper)
+      if video_in_post:
+        text = text.replace("[video]", block, 1)
       else:
-        block = (
-          f'{marker}\n(To understand this video, run the shell command: '
-          f'nemo-vision "{path}" "the question to ask about it" — it prints '
-          f'a text description.)')
-      text = block if not text else f"{text}\n{block}"
+        text = block if not text else f"{text}\n{block}"
       log.info("Downloaded video: %s -> %s", name, path)
     except Exception as e:
       log.warning("Video download failed: %s", e)
-      text = f"[video download failed: {event.file_name or event.file_key}]"
+      fail = f"[video download failed: {event.file_name or event.file_key}]"
+      text = text.replace("[video]", fail, 1) if video_in_post else fail
 
   # Enrich: download images (pure image or inline in post)
   # Relay may send multiple keys comma-separated for post messages.

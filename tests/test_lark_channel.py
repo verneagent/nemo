@@ -208,6 +208,30 @@ def test_image_no_vision_helper_no_hint(mock_dl):
   assert "nemo-vision" not in msg.text
 
 
+@mock.patch("nemo.lark_channel.lark_api.download_file", return_value="/tmp/v.mp4")
+def test_post_embedded_video_resolves_placeholder(mock_dl):
+  """Video embedded in a post: msg_type=post + file_key + a [video]
+  placeholder (relay convention). The daemon downloads it and fills the
+  placeholder in place (not appended), preserving the caption."""
+  ev = _make_event(msg_type="post", file_key="fk_v", file_name="clip.mp4",
+                   text="[video]\n看看这个视频")
+  msg = _to_incoming(ev, token=TOKEN)  # defaults: sees_video=False, helper=True
+  mock_dl.assert_called_once_with(TOKEN, "om_msg1", "fk_v", "clip.mp4")
+  assert "[video: /tmp/v.mp4]" in msg.text
+  assert "看看这个视频" in msg.text       # caption preserved
+  assert "[video]\n" not in msg.text      # bare placeholder replaced in place
+  assert "nemo-vision" in msg.text        # no-vision model + helper → hint
+
+
+@mock.patch("nemo.lark_channel.lark_api.download_file", return_value="/tmp/v.mp4")
+def test_post_embedded_video_no_helper_bare_marker(mock_dl):
+  ev = _make_event(msg_type="post", file_key="fk_v", file_name="clip.mp4",
+                   text="[video]\n看看")
+  msg = _to_incoming(ev, token=TOKEN, vision_helper=False)
+  assert "[video: /tmp/v.mp4]" in msg.text
+  assert "nemo-vision" not in msg.text
+
+
 @mock.patch("nemo.lark_channel.lark_api.download_image", return_value="/tmp/thumb.png")
 @mock.patch("nemo.lark_channel.lark_api.download_file", return_value="/tmp/v.mp4")
 def test_media_skips_thumbnail_image(mock_file, mock_img):
