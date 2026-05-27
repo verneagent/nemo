@@ -41,9 +41,31 @@ def _to_incoming(
       log.warning("File download failed: %s", e)
       text = f"[file download failed: {event.file_name or event.file_key}]"
 
+  # Enrich: download video ("media" message). No coding agent sees video
+  # natively (Claude's Read / Codex's view_image are image-only), so emit a
+  # [video: path] marker plus a hint to run `nemo-vision` — the shell tool that
+  # turns the file into a text description via a multimodal model.
+  if msg_type == "media" and event.file_key and event.message_id and token:
+    try:
+      name = event.file_name or f"{event.file_key}.mp4"
+      path = lark_api.download_file(
+        token, event.message_id, event.file_key, name)
+      marker = f"[video: {path}]"
+      hint = (
+        f'(To understand this video, run the shell command: nemo-vision '
+        f'"{path}" "the question to ask about it" — it prints a text '
+        f'description.)')
+      text = f"{marker}\n{hint}" if not text else f"{text}\n{marker}\n{hint}"
+      log.info("Downloaded video: %s -> %s", name, path)
+    except Exception as e:
+      log.warning("Video download failed: %s", e)
+      text = f"[video download failed: {event.file_name or event.file_key}]"
+
   # Enrich: download images (pure image or inline in post)
-  # Relay may send multiple keys comma-separated for post messages
-  if event.image_key and event.message_id and token:
+  # Relay may send multiple keys comma-separated for post messages.
+  # Skip "media" (video) messages: their image_key is just the video
+  # thumbnail, already represented by the [video: ...] marker above.
+  if event.image_key and event.message_id and token and msg_type != "media":
     for img_key in event.image_key.split(","):
       img_key = img_key.strip()
       if not img_key:

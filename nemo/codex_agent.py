@@ -358,6 +358,9 @@ class CodexCodingAgent(CodingAgent):
     passthrough = (
       "OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_API_BASE",
       "CODEX_API_KEY",
+      # nemo-vision shell tool reads these to describe video the model can't
+      # see natively; the codex sidecar env is a whitelist, so forward them.
+      "NEMO_VISION_API_KEY", "NEMO_VISION_BASE_URL", "NEMO_VISION_MODEL",
       "http_proxy", "https_proxy", "all_proxy",
     )
     for key in passthrough:

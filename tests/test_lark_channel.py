@@ -115,6 +115,62 @@ def test_multiple_image_keys(mock_dl):
 
 
 # ---------------------------------------------------------------------------
+# Video ("media") enrichment
+# ---------------------------------------------------------------------------
+
+@mock.patch("nemo.lark_channel.lark_api.download_file", return_value="/tmp/v.mp4")
+def test_media_event_emits_video_marker_and_hint(mock_dl):
+  """A Lark video (media) message downloads the file and emits a [video: path]
+  marker plus a hint to run nemo-vision (no agent sees video natively)."""
+  ev = _make_event(msg_type="media", file_key="fk_v", file_name="clip.mp4",
+                   text="")
+  msg = _to_incoming(ev, token=TOKEN)
+  mock_dl.assert_called_once_with(TOKEN, "om_msg1", "fk_v", "clip.mp4")
+  assert "[video: /tmp/v.mp4]" in msg.text
+  assert "nemo-vision" in msg.text
+
+
+@mock.patch("nemo.lark_channel.lark_api.download_file", return_value="/tmp/v.mp4")
+def test_media_event_appends_when_text_present(mock_dl):
+  ev = _make_event(msg_type="media", file_key="fk_v", file_name="clip.mp4",
+                   text="看一下这个视频")
+  msg = _to_incoming(ev, token=TOKEN)
+  assert msg.text.startswith("看一下这个视频")
+  assert "[video: /tmp/v.mp4]" in msg.text
+
+
+@mock.patch("nemo.lark_channel.lark_api.download_image", return_value="/tmp/thumb.png")
+@mock.patch("nemo.lark_channel.lark_api.download_file", return_value="/tmp/v.mp4")
+def test_media_skips_thumbnail_image(mock_file, mock_img):
+  """A media message carries image_key (the video thumbnail). Only the video
+  is downloaded; the thumbnail image must not produce a stray [image:] marker."""
+  ev = _make_event(msg_type="media", file_key="fk_v", file_name="clip.mp4",
+                   image_key="thumb_key", text="")
+  msg = _to_incoming(ev, token=TOKEN)
+  mock_file.assert_called_once()
+  mock_img.assert_not_called()
+  assert "[image:" not in msg.text
+  assert "[video: /tmp/v.mp4]" in msg.text
+
+
+@mock.patch("nemo.lark_channel.lark_api.download_file", return_value="/tmp/fk_v.mp4")
+def test_media_without_filename_defaults_mp4(mock_dl):
+  ev = _make_event(msg_type="media", file_key="fk_v", file_name="", text="")
+  _to_incoming(ev, token=TOKEN)
+  mock_dl.assert_called_once_with(TOKEN, "om_msg1", "fk_v", "fk_v.mp4")
+
+
+@mock.patch("nemo.lark_channel.lark_api.download_file",
+            side_effect=RuntimeError("network"))
+def test_media_download_failure_graceful(mock_dl):
+  ev = _make_event(msg_type="media", file_key="fk_v", file_name="clip.mp4",
+                   text="")
+  msg = _to_incoming(ev, token=TOKEN)
+  assert "failed" in msg.text.lower() or "clip.mp4" in msg.text
+  # Should not raise.
+
+
+# ---------------------------------------------------------------------------
 # Reply (parent_id) enrichment
 # ---------------------------------------------------------------------------
 
