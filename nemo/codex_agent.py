@@ -358,9 +358,10 @@ class CodexCodingAgent(CodingAgent):
     passthrough = (
       "OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_API_BASE",
       "CODEX_API_KEY",
-      # nemo-vision shell tool reads these to describe video the model can't
-      # see natively; the codex sidecar env is a whitelist, so forward them.
-      "BAILIAN_API_KEY", "BAILIAN_BASE_URL", "BAILIAN_MODEL",
+      # nemo-vision reads ~/.nemo/vision.json from disk but resolves its
+      # apiKey from $BAILIAN_API_KEY; the codex sidecar env is a whitelist,
+      # so forward the key (base/model come from the file).
+      "BAILIAN_API_KEY",
       "http_proxy", "https_proxy", "all_proxy",
     )
     for key in passthrough:

@@ -1,12 +1,54 @@
 """Tests for nemo.vision_cli content-block selection and response parsing."""
 
+import json
+import os
 from unittest import mock
 
 import pytest
 
 from nemo.agent_factory import MediaVision, model_media_vision
 from nemo.presets import Preset
-from nemo.vision_cli import _media_block, _extract_content
+from nemo.vision_cli import (
+  _DEFAULT_BASE_URL, _DEFAULT_MODEL, _media_block, _extract_content, load_config,
+)
+
+
+def _write_cfg(tmp_path, obj) -> str:
+  p = tmp_path / "vision.json"
+  p.write_text(json.dumps(obj))
+  return str(p)
+
+
+def test_load_config_reads_all_fields(tmp_path):
+  cfg = _write_cfg(tmp_path, {
+    "baseURL": "https://x/v1/", "apiKey": "sk-literal", "model": "m1"})
+  base, key, model = load_config(cfg)
+  assert base == "https://x/v1"   # trailing slash trimmed
+  assert key == "sk-literal"
+  assert model == "m1"
+
+
+def test_load_config_apikey_env_ref(tmp_path):
+  cfg = _write_cfg(tmp_path, {"apiKey": "{env:MY_VISION_KEY}"})
+  with mock.patch.dict(os.environ, {"MY_VISION_KEY": "sk-env"}, clear=False):
+    base, key, model = load_config(cfg)
+  assert key == "sk-env"
+  assert (base, model) == (_DEFAULT_BASE_URL, _DEFAULT_MODEL)  # defaults fill gaps
+
+
+def test_load_config_absent_apikey_falls_back_to_bailian_env(tmp_path):
+  cfg = _write_cfg(tmp_path, {"model": "m2"})  # no apiKey field
+  with mock.patch.dict(os.environ, {"BAILIAN_API_KEY": "sk-bailian"}, clear=False):
+    _, key, model = load_config(cfg)
+  assert key == "sk-bailian"
+  assert model == "m2"
+
+
+def test_load_config_missing_file_uses_defaults(tmp_path):
+  with mock.patch.dict(os.environ, {"BAILIAN_API_KEY": "sk-b"}, clear=False):
+    base, key, model = load_config(str(tmp_path / "nope.json"))
+  assert (base, model) == (_DEFAULT_BASE_URL, _DEFAULT_MODEL)
+  assert key == "sk-b"
 
 
 def test_media_vision_builtin_model_sees_image_not_video():

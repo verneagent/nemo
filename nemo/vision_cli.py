@@ -7,10 +7,20 @@ default) and prints a plain-text description to stdout, so any coding agent —
 vision-capable or not — can "look at" the media by running this command and
 reading its output.
 
-Config via environment (Alibaba Cloud Bailian / 百炼 inference platform):
-  BAILIAN_API_KEY   (required) bearer key for the endpoint
-  BAILIAN_BASE_URL  endpoint base (default: DashScope compatible-mode)
-  BAILIAN_MODEL     model name (default: qwen3-vl-flash)
+Config lives in ``~/.nemo/vision.json`` (same home as ``models.json``)::
+
+    {
+      "baseURL": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+      "apiKey":  "{env:BAILIAN_API_KEY}",
+      "model":   "qwen3-vl-flash"
+    }
+
+All fields are optional — missing ``baseURL`` / ``model`` fall back to the
+defaults below. ``apiKey`` follows the models.json convention: ``{env:VAR}``
+reads the secret from the environment (so it stays out of the file), any other
+non-empty string is a literal key, and an absent ``apiKey`` falls back to
+``$BAILIAN_API_KEY``. The endpoint is any OpenAI-compatible multimodal chat API
+(Alibaba Cloud Bailian / 百炼 by default).
 """
 
 from __future__ import annotations
@@ -18,16 +28,21 @@ from __future__ import annotations
 import base64
 import json
 import os
+import re
 import sys
 import urllib.error
 import urllib.request
 
 from .types import JsonObject, JsonValue
 
+_CONFIG_PATH = "~/.nemo/vision.json"
 _DEFAULT_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 _DEFAULT_MODEL = "qwen3-vl-flash"
 _DEFAULT_QUESTION = "详细描述这个媒体文件的内容。"
 _TIMEOUT_S = 300
+
+# Mirrors presets.py: an apiKey of "{env:VARNAME}" resolves from the env.
+_ENV_REF = re.compile(r"^\{env:([A-Za-z_][A-Za-z0-9_]*)\}$")
 
 # Mime by extension. Video and image are the only content types the endpoint
 # accepts; everything else is rejected up-front rather than sent and 400'd.
@@ -59,13 +74,45 @@ def _media_block(path: str) -> JsonObject:
     f"(want image or video)")
 
 
+def _resolve_key(raw: JsonValue) -> str:
+  """Resolve an apiKey value from vision.json.
+
+  ``{env:VAR}`` reads ``$VAR``; any other non-empty string is a literal key;
+  an absent/blank value falls back to ``$BAILIAN_API_KEY``.
+  """
+  if isinstance(raw, str) and raw.strip():
+    token = raw.strip()
+    m = _ENV_REF.match(token)
+    return os.environ.get(m.group(1), "").strip() if m else token
+  return os.environ.get("BAILIAN_API_KEY", "").strip()
+
+
+def load_config(path: str = _CONFIG_PATH) -> tuple[str, str, str]:
+  """Read (base_url, api_key, model) from vision.json, filling defaults."""
+  raw: JsonObject = {}
+  try:
+    with open(os.path.expanduser(path), encoding="utf-8") as fh:
+      loaded = json.load(fh)
+    if isinstance(loaded, dict):
+      raw = loaded
+  except FileNotFoundError:
+    pass
+  except (OSError, json.JSONDecodeError) as exc:
+    raise SystemExit(f"nemo-vision: cannot read {path}: {exc}")
+  base = raw.get("baseURL")
+  model = raw.get("model")
+  base_url = base.strip() if isinstance(base, str) and base.strip() else _DEFAULT_BASE_URL
+  model_id = model.strip() if isinstance(model, str) and model.strip() else _DEFAULT_MODEL
+  return base_url.rstrip("/"), _resolve_key(raw.get("apiKey")), model_id
+
+
 def describe(path: str, question: str) -> str:
   """Send the media + question to the endpoint and return its text answer."""
-  key = os.environ.get("BAILIAN_API_KEY", "").strip()
+  base, key, model = load_config()
   if not key:
-    raise SystemExit("nemo-vision: BAILIAN_API_KEY is not set")
-  base = os.environ.get("BAILIAN_BASE_URL", _DEFAULT_BASE_URL).rstrip("/")
-  model = os.environ.get("BAILIAN_MODEL", _DEFAULT_MODEL)
+    raise SystemExit(
+      "nemo-vision: no API key — set apiKey in ~/.nemo/vision.json "
+      "or export $BAILIAN_API_KEY")
   payload: JsonObject = {
     "model": model,
     "messages": [{
