@@ -1,25 +1,34 @@
 """Tests for nemo.vision_cli content-block selection and response parsing."""
 
+from unittest import mock
+
 import pytest
 
-from nemo.agent_factory import model_has_vision
+from nemo.agent_factory import MediaVision, model_media_vision
+from nemo.presets import Preset
 from nemo.vision_cli import _media_block, _extract_content
 
 
-@pytest.mark.parametrize("model", [
-  "claude-opus-4-7", "claude-sonnet-4-6", "claude-haiku-4-5", "opusplan",
-  "gpt-5.5", "gpt-5.3-codex", "anthropic/claude-opus-4-7",
-])
-def test_vision_models_need_no_hint(model):
-  assert model_has_vision("claude", model) is True
+def test_media_vision_builtin_model_sees_image_not_video():
+  # A non-preset is the agent's own built-in model (Claude/Codex): sees images
+  # natively, never video. Patch resolve_preset so the result is independent
+  # of any ambient ~/.nemo/models.json.
+  with mock.patch("nemo.presets.resolve_preset", return_value=None):
+    assert model_media_vision("claude", "claude-opus-4-7") == MediaVision(True, False)
+    assert model_media_vision("codex", "gpt-5.5") == MediaVision(True, False)
 
 
-@pytest.mark.parametrize("model", [
-  "deepseek-v4-pro", "deepseek-v4-flash", "kimi-for-coding",
-  "Qwen3-Coder-Next-MLX-8bit",
-])
-def test_text_only_models_get_routed_to_nemo_vision(model):
-  assert model_has_vision("claude", model) is False
+def test_media_vision_preset_uses_declared_flags():
+  vl = Preset(name="qwen-vl", openai_url="https://x", sees_image=True, sees_video=True)
+  with mock.patch("nemo.presets.resolve_preset", return_value=vl):
+    assert model_media_vision("codex", "qwen-vl") == MediaVision(True, True)
+
+
+def test_media_vision_text_preset_is_routed_to_nemo_vision():
+  # deepseek/kimi: a preset with no vision block defaults to text-only.
+  text = Preset(name="deepseek-v4-pro", anthropic_url="https://x")
+  with mock.patch("nemo.presets.resolve_preset", return_value=text):
+    assert model_media_vision("claude", "deepseek-v4-pro") == MediaVision(False, False)
 
 
 def _write(tmp_path, name: str) -> str:

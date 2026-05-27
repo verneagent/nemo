@@ -5,6 +5,7 @@ import json
 import urllib.error
 from unittest import mock
 
+from nemo.agent_factory import MediaVision
 from nemo.channel import IncomingMessage
 from nemo.lark.events import LarkEvent, LarkEventStream
 from nemo.lark_channel import LarkChannel, _to_incoming, _extract_message_text
@@ -104,16 +105,20 @@ def test_post_with_image_no_msg_type_check(mock_dl):
 
 @mock.patch("nemo.status_tab.update_status")
 def test_update_status_refreshes_vision_capability(mock_status):
-  """update_status is the chokepoint that keeps _model_sees_images current as
-  the model changes (startup, /model, /agent)."""
+  """update_status is the chokepoint that copies the model's media capability
+  onto the channel (refreshed at startup and on every /model or /agent
+  switch). Patch model_media_vision so the test doesn't depend on models.json."""
   ch = LarkChannel.__new__(LarkChannel)
   ch.chat_id = "oc_x"
   ch.credentials = {"app_id": "a", "app_secret": "s"}
-  with mock.patch("nemo.lark_channel.lark_auth.get_token", return_value="t"):
-    asyncio.run(ch.update_status("claude-opus-4-7", "idle", "claude"))
-    assert ch._model_sees_images is True
-    asyncio.run(ch.update_status("deepseek-v4-pro", "idle", "claude"))
-    assert ch._model_sees_images is False
+  with mock.patch("nemo.lark_channel.lark_auth.get_token", return_value="t"), \
+       mock.patch("nemo.agent_factory.model_media_vision") as mv:
+    mv.return_value = MediaVision(image=True, video=False)
+    asyncio.run(ch.update_status("vision-model", "idle", "claude"))
+    assert (ch._model_sees_images, ch._model_sees_video) == (True, False)
+    mv.return_value = MediaVision(image=False, video=False)
+    asyncio.run(ch.update_status("text-model", "idle", "claude"))
+    assert (ch._model_sees_images, ch._model_sees_video) == (False, False)
 
 
 @mock.patch("nemo.lark_channel.lark_api.download_image", return_value="/tmp/img.png")
@@ -171,6 +176,16 @@ def test_media_event_appends_when_text_present(mock_dl):
   msg = _to_incoming(ev, token=TOKEN)
   assert msg.text.startswith("看一下这个视频")
   assert "[video: /tmp/v.mp4]" in msg.text
+
+
+@mock.patch("nemo.lark_channel.lark_api.download_file", return_value="/tmp/v.mp4")
+def test_media_video_capable_model_gets_bare_marker(mock_dl):
+  """A video-capable model gets just the [video: path] marker, no hint."""
+  ev = _make_event(msg_type="media", file_key="fk_v", file_name="clip.mp4",
+                   text="")
+  msg = _to_incoming(ev, token=TOKEN, model_sees_video=True)
+  assert "[video: /tmp/v.mp4]" in msg.text
+  assert "nemo-vision" not in msg.text
 
 
 @mock.patch("nemo.lark_channel.lark_api.download_image", return_value="/tmp/thumb.png")

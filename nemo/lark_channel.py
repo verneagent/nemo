@@ -26,6 +26,7 @@ def _to_incoming(
   token: str = "",
   parent_lookup: ParentLookup | None = None,
   model_sees_images: bool = True,
+  model_sees_video: bool = False,
 ) -> IncomingMessage:
   text = event.text
   msg_type = event.msg_type
@@ -52,11 +53,16 @@ def _to_incoming(
       path = lark_api.download_file(
         token, event.message_id, event.file_key, name)
       marker = f"[video: {path}]"
-      hint = (
-        f'(To understand this video, run the shell command: nemo-vision '
-        f'"{path}" "the question to ask about it" — it prints a text '
-        f'description.)')
-      text = f"{marker}\n{hint}" if not text else f"{text}\n{marker}\n{hint}"
+      # A model that can't see video (every coding agent today) gets pointed
+      # at nemo-vision; a video-capable model just gets the bare marker.
+      if model_sees_video:
+        block = marker
+      else:
+        block = (
+          f'{marker}\n(To understand this video, run the shell command: '
+          f'nemo-vision "{path}" "the question to ask about it" — it prints '
+          f'a text description.)')
+      text = block if not text else f"{text}\n{block}"
       log.info("Downloaded video: %s -> %s", name, path)
     except Exception as e:
       log.warning("Video download failed: %s", e)
@@ -276,9 +282,12 @@ def _expand_merge_forward(token: str, message_id: str) -> str:
 class LarkChannel(Channel):
   """Channel implementation backed by Lark IM APIs and event streams."""
 
-  # Class-level default so receive() is safe even when a test builds the
-  # channel via __new__ (bypassing __init__). update_status keeps it current.
+  # Class-level defaults so receive() is safe even when a test builds the
+  # channel via __new__ (bypassing __init__). update_status keeps them
+  # current. image True / video False = "native agent model sees images, not
+  # video" — the common case before the first status refresh.
   _model_sees_images: bool = True
+  _model_sees_video: bool = False
 
   def __init__(self, chat_id: str):
     from .channel import TurnCardCtx
@@ -300,11 +309,14 @@ class LarkChannel(Channel):
     # Latest inbound message_id seen on self.chat_id. Used as the reply
     # anchor for thread-scoped sends in topic chats.
     self._reply_anchor: str = ""
-    # Whether the active model can natively see images. Updated by
-    # update_status (called at startup and on every /model or /agent
-    # switch). When False, incoming [image: ...] markers get a nemo-vision
-    # hint so a text-only model (deepseek, kimi, …) isn't blind to images.
+    # Whether the active model can natively see image / video input. Updated
+    # by update_status (called at startup and on every /model or /agent
+    # switch). When False, the matching [image:]/[video:] marker gets a
+    # nemo-vision hint so the model isn't blind to that medium. No coding
+    # agent ingests video today, so video stays False until a preset or a
+    # future harness declares otherwise.
     self._model_sees_images: bool = True
+    self._model_sees_video: bool = False
 
   @property
   def token(self) -> str:
@@ -344,7 +356,8 @@ class LarkChannel(Channel):
       return None
     incoming = _to_incoming(
       event, token=self.token, parent_lookup=self.parent_lookup,
-      model_sees_images=self._model_sees_images)
+      model_sees_images=self._model_sees_images,
+      model_sees_video=self._model_sees_video)
     # Remember the latest inbound message on our chat so topic-mode
     # sends can thread back to it. Only update for events that carry a
     # real message id on our chat (skip _stop sentinels and events
@@ -521,11 +534,13 @@ class LarkChannel(Channel):
 
   async def update_status(self, model: str, state: str, agent: str = "") -> None:
     from . import status_tab
-    from .agent_factory import model_has_vision
+    from .agent_factory import model_media_vision
     # Status updates fire at startup and after every /model or /agent switch
     # and always carry the live (model, agent) — so this is the one chokepoint
-    # to refresh whether the active model can see images.
-    self._model_sees_images = model_has_vision(agent, model)
+    # to refresh whether the active model can see image / video input.
+    vision = model_media_vision(agent, model)
+    self._model_sees_images = vision.image
+    self._model_sees_video = vision.video
     status_tab.update_status(self.token, self.chat_id, model, state, agent)
 
   async def send_heartbeat(self, model: str) -> None:

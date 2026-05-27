@@ -33,7 +33,8 @@ __all__ = [
   "default_model_for_agent",
   "is_model_compatible",
   "model_catalog_for_agent",
-  "model_has_vision",
+  "MediaVision",
+  "model_media_vision",
 ]
 
 _DEFAULT_MODEL_BY_AGENT: dict[AgentKind, str] = {
@@ -197,28 +198,33 @@ def is_model_compatible(
   ).all_names()
 
 
-# Substring hints for models that natively accept image input. Matching is
-# case-insensitive on the model name. Anything that doesn't match (deepseek,
-# kimi, local coder models, …) is treated as text-only — media enrichment then
-# attaches a nemo-vision hint so the model can still "see" via the shell tool.
-# Defaulting unknown models to "no vision" keeps non-vision presets from
-# silently going blind to images; the only cost is a redundant hint for an
-# unlisted vision model.
-_VISION_MODEL_HINTS = ("claude", "opus", "sonnet", "haiku", "gpt")
+@dataclass(frozen=True)
+class MediaVision:
+  """Which media inputs a model can natively see.
+
+  ``image`` and ``video`` are independent: Claude/Codex see images (via Read /
+  view_image) but not video; a text-only model (deepseek/kimi) sees neither; a
+  multimodal preset may see both. A False axis means the corresponding
+  ``[image:]`` / ``[video:]`` marker is routed to the nemo-vision shell tool.
+  """
+  image: bool = False
+  video: bool = False
 
 
-def model_has_vision(agent: AgentKind, model: str) -> bool:
-  """Whether ``model`` can natively see images.
+def model_media_vision(agent: AgentKind, model: str) -> MediaVision:
+  """Native media support for ``model`` under ``agent``.
 
-  When True, ``[image: …]`` markers need no nemo-vision hint (the agent reads
-  the image itself — Claude via ``Read``, Codex via ``view_image``). When
-  False, the channel points the model at ``nemo-vision`` instead. ``agent`` is
-  accepted for symmetry with the other capability helpers and possible
-  per-agent rules; the decision is currently by model name alone.
+  Presets declare it in models.json's ``vision`` block (default text-only).
+  A non-preset is the agent's own built-in model: Claude (Read) and Codex
+  (view_image) ingest images natively, none ingest video, and OpenCode's
+  default is typically a frontier model — so assume image-yes / video-no.
   """
   _ = agent
-  folded = model.casefold()
-  return any(hint in folded for hint in _VISION_MODEL_HINTS)
+  from .presets import resolve_preset
+  preset = resolve_preset(model)
+  if preset is not None:
+    return MediaVision(image=preset.sees_image, video=preset.sees_video)
+  return MediaVision(image=True, video=False)
 
 
 def build_coding_agent(

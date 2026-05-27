@@ -41,6 +41,22 @@ A model is **callable under a given agent kind** iff its parent provider
 declares the matching protocol block. A model's per-protocol ``remote``
 override falls back to the model id itself when omitted.
 
+An optional ``vision`` block declares the native media input the model
+accepts — ``{ "image": bool, "video": bool }`` — so incoming media that the
+model can't see gets routed to the ``nemo-vision`` shell tool instead. It may
+sit at the provider level (a default for its models) and/or per-model (a
+field-by-field override). Omitted entirely → text-only (image+video False),
+which is the right default for coding presets like deepseek/kimi::
+
+        "qwen": {
+          "openai": { "baseURL": "…", "apiKey": "{env:DASHSCOPE_API_KEY}" },
+          "vision": { "image": true, "video": false },
+          "models": {
+            "qwen-vl-max": { "vision": { "image": true, "video": true } },
+            "qwen-text":   { "vision": { "image": false } }
+          }
+        }
+
 Sources, in order of precedence (later overrides earlier):
   1. ``nemo/models.json`` — a default ``builtin_path`` hook that the package
      does NOT ship (the file is absent → reads as ``{}``). Provider/model
@@ -102,6 +118,12 @@ class Preset:
   # (or via opencode against an openai/* model).
   openai_url: str = ""
   openai_remote: str = ""
+  # Native media input the model accepts, from the `vision` block. Drives
+  # whether incoming [image:]/[video:] markers need a nemo-vision hint.
+  # Third-party presets default to text-only (False/False) — declare the
+  # block to opt a VL model out of the hint.
+  sees_image: bool = False
+  sees_video: bool = False
 
   def supports(self, agent: str) -> bool:
     if agent == "claude":
@@ -205,6 +227,29 @@ def _model_remote(model_data: object, protocol: str) -> str:
   return remote
 
 
+def _parse_vision(
+  raw: object, default_image: bool, default_video: bool,
+) -> tuple[bool, bool]:
+  """Parse a ``vision`` block into ``(sees_image, sees_video)``.
+
+  Missing block → inherit the passed defaults (provider default for a model,
+  ``False`` for a provider). Each field falls back to its default when absent
+  or non-boolean, so a model can override just ``image`` and keep the
+  provider's ``video``.
+  """
+  if not isinstance(raw, dict):
+    return default_image, default_video
+  image = raw.get("image", default_image)
+  video = raw.get("video", default_video)
+  if not isinstance(image, bool):
+    log.warning("vision.image must be a bool, got %s", type(image).__name__)
+    image = default_image
+  if not isinstance(video, bool):
+    log.warning("vision.video must be a bool, got %s", type(video).__name__)
+    video = default_video
+  return image, video
+
+
 def _flatten_providers(providers: dict) -> dict[str, Preset]:
   """Expand provider-grouped JSON into a flat {model_name: Preset} table."""
   out: dict[str, Preset] = {}
@@ -232,6 +277,9 @@ def _flatten_providers(providers: dict) -> dict[str, Preset]:
     # case that a hard error would be more annoying than useful.
     api_key_env = anthropic_key_env or openai_key_env
     api_key_literal = anthropic_key_lit or openai_key_lit
+    # Provider-level media defaults (text-only unless declared); a model's
+    # own `vision` block overrides field-by-field.
+    prov_image, prov_video = _parse_vision(pdata.get("vision"), False, False)
 
     models = pdata.get("models", {})
     if not isinstance(models, dict):
@@ -242,6 +290,9 @@ def _flatten_providers(providers: dict) -> dict[str, Preset]:
       if model_name in out:
         log.warning("model %r appears under multiple providers; later entry wins",
                     model_name)
+      sees_image, sees_video = _parse_vision(
+        mdata.get("vision") if isinstance(mdata, dict) else None,
+        prov_image, prov_video)
       out[model_name] = Preset(
         name=str(model_name),
         api_key_env=api_key_env,
@@ -250,6 +301,8 @@ def _flatten_providers(providers: dict) -> dict[str, Preset]:
         anthropic_remote=_model_remote(mdata, "anthropic") or model_name,
         openai_url=openai_url,
         openai_remote=_model_remote(mdata, "openai") or model_name,
+        sees_image=sees_image,
+        sees_video=sees_video,
       )
   return out
 

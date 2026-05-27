@@ -118,6 +118,34 @@ def test_literal_key_flows_from_models_json(tmp_path):
   assert ep.api_key == "blacktree@"
 
 
+def test_vision_block_provider_default_and_model_override(tmp_path):
+  # Provider-level vision is the default; a model's own block overrides it
+  # field-by-field; an undeclared provider/model is text-only.
+  user = tmp_path / "models.json"
+  user.write_text(json.dumps({
+    "providers": {
+      "qwen": {
+        "openai": {"baseURL": "https://q", "apiKey": "k"},
+        "vision": {"image": True, "video": False},
+        "models": {
+          "qwen-text": {},                                  # inherits provider
+          "qwen-vl-max": {"vision": {"video": True}},        # override video only
+          "qwen-blind": {"vision": {"image": False}},        # override image only
+        },
+      },
+      "deepseek": {
+        "anthropic": {"baseURL": "https://d", "apiKey": "k"},
+        "models": {"deepseek-v4-pro": {}},                   # no vision → text-only
+      },
+    },
+  }))
+  presets = load_presets(builtin_path="/nonexistent", user_path=str(user))
+  assert (presets["qwen-text"].sees_image, presets["qwen-text"].sees_video) == (True, False)
+  assert (presets["qwen-vl-max"].sees_image, presets["qwen-vl-max"].sees_video) == (True, True)
+  assert (presets["qwen-blind"].sees_image, presets["qwen-blind"].sees_video) == (False, False)
+  assert (presets["deepseek-v4-pro"].sees_image, presets["deepseek-v4-pro"].sees_video) == (False, False)
+
+
 # ---------------------------------------------------------------------------
 # Flattening: provider-grouped JSON → flat {name: Preset}
 # ---------------------------------------------------------------------------
