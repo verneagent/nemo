@@ -88,6 +88,23 @@ def test_convert_file_message():
     assert ev.file_name == "readme.txt"
 
 
+def test_convert_media_message():
+    """Video: msg_type + file_key + file_name must survive the relay→event
+    conversion so the daemon's [video: path] download branch can fire."""
+    msg = {
+        "text": "[video: clip.mp4]",
+        "msg_type": "media",
+        "file_key": "fk_vid",
+        "file_name": "clip.mp4",
+        "sender_id": "ou_user4",
+        "create_time": "1700000003000",
+    }
+    ev = _relay_msg_to_event(msg, "oc_chat1")
+    assert ev.msg_type == "media"
+    assert ev.file_key == "fk_vid"
+    assert ev.file_name == "clip.mp4"
+
+
 def test_convert_post_message():
     msg = {
         "text": "rich text\nwith lines",

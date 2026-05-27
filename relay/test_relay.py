@@ -265,6 +265,28 @@ class RelayTestCase(unittest.TestCase):
     self.assertEqual(r["file_key"], "fk_abc")
     self.assertEqual(r["file_name"], "doc.pdf")
 
+  def test_media_message(self):
+    """Video (media) → file_key + file_name forwarded so the daemon can
+    download it. Regression: previously fell to the unknown-type else and
+    dropped file_key, so the daemon never saw the video."""
+    self._webhook({
+      "header": {"token": "tok1", "event_type": "im.message.receive_v1",
+                 "event_id": "evt_media_eq"},
+      "event": {
+        "message": {"chat_id": "oc_media_eq", "message_type": "media",
+                     "content": '{"file_key":"fk_vid","file_name":"clip.mp4","image_key":"thumb_xyz"}',
+                     "create_time": "22500", "message_id": "msg_media_eq"},
+        "sender": {"sender_type": "user", "sender_id": {"open_id": "ou_m"}},
+      },
+    })
+    r = self._get("/replies/chat:oc_media_eq?since=")["replies"][0]
+    self.assertEqual(r["msg_type"], "media")
+    self.assertEqual(r["file_key"], "fk_vid")
+    self.assertEqual(r["file_name"], "clip.mp4")
+    self.assertEqual(r["text"], "[video: clip.mp4]")
+    # The thumbnail image_key is deliberately NOT forwarded (daemon ignores it).
+    self.assertNotIn("image_key", r)
+
   def test_sticker_message(self):
     """Worker: sticker → text='[sticker]', file_key set."""
     self._webhook({

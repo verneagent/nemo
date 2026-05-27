@@ -354,6 +354,14 @@ def _parse_message(event: dict) -> tuple[dict, str, str | None] | None:
     elif msg_type == "sticker":
         file_key = content.get("file_key", "")
         text = "[sticker]"
+    elif msg_type == "media":
+        # Video. Forward file_key/file_name so the daemon can download it;
+        # the daemon re-derives the [video: path] marker after download. The
+        # content also carries image_key (a thumbnail) which the daemon
+        # deliberately ignores, so we don't forward it.
+        file_key = content.get("file_key", "")
+        file_name = content.get("file_name", "")
+        text = f"[video: {file_name or 'video'}]"
     elif msg_type == "merge_forward":
         text = "[merge_forward]"
     else:
