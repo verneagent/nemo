@@ -356,6 +356,34 @@ class RelayTestCase(unittest.TestCase):
     self.assertEqual(r["text"], "line one\n[image]\nline two\n[image]")
     self.assertEqual(r["image_key"], "img_a,img_b")
 
+  def test_post_with_embedded_video(self):
+    """A video embedded in a post (the common 'video + caption' send) is
+    forwarded as a media message — file_key + caption — so the daemon
+    downloads it. Regression: the post parser used to drop the media element
+    and forward only the caption, leaving the daemon blind to the video."""
+    post_content = json.dumps({
+      "content": [
+        [{"tag": "media", "file_key": "fk_postvid", "file_name": "clip.mp4"},
+         {"text": "看看这个视频"}],
+      ]
+    })
+    self._webhook({
+      "header": {"token": "tok1", "event_type": "im.message.receive_v1",
+                 "event_id": "evt_postvid_eq"},
+      "event": {
+        "message": {"chat_id": "oc_postvid_eq", "message_type": "post",
+                     "content": post_content, "create_time": "26500",
+                     "message_id": "msg_postvid_eq"},
+        "sender": {"sender_type": "user", "sender_id": {"open_id": "ou_pv"}},
+      },
+    })
+    r = self._get("/replies/chat:oc_postvid_eq?since=")["replies"][0]
+    self.assertEqual(r["msg_type"], "media")     # so the daemon downloads it
+    self.assertEqual(r["file_key"], "fk_postvid")
+    self.assertEqual(r["file_name"], "clip.mp4")
+    self.assertEqual(r["text"], "看看这个视频")    # caption preserved
+    self.assertNotIn("image_key", r)
+
   def test_post_locale_keyed(self):
     """Worker: locale-keyed post {en_us: {content: [...]}}."""
     post_content = json.dumps({

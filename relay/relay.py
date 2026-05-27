@@ -339,6 +339,8 @@ def _parse_message(event: dict) -> tuple[dict, str, str | None] | None:
                 paragraphs = []
         parts = []
         image_keys = []
+        video_key = ""
+        video_name = ""
         for para in paragraphs:
             if not isinstance(para, list):
                 continue
@@ -348,9 +350,22 @@ def _parse_message(event: dict) -> tuple[dict, str, str | None] | None:
                 elif elem.get("tag") == "img" and elem.get("image_key"):
                     parts.append("[image]")
                     image_keys.append(elem["image_key"])
-        text = "\n".join(parts) or "[post]"
-        if image_keys:
-            image_key = ",".join(image_keys)
+                elif elem.get("tag") == "media" and elem.get("file_key"):
+                    # Video embedded in a post (the common "video + caption"
+                    # send). Captured here, forwarded as a media message below.
+                    video_key = elem["file_key"]
+                    video_name = elem.get("file_name", "")
+        if video_key:
+            # Forward as a video so the daemon's media handler downloads it
+            # (msg_type post has no download path); keep the caption as text.
+            file_key = video_key
+            file_name = video_name
+            msg_type = "media"
+            text = "\n".join(parts)
+        else:
+            text = "\n".join(parts) or "[post]"
+            if image_keys:
+                image_key = ",".join(image_keys)
     elif msg_type == "sticker":
         file_key = content.get("file_key", "")
         text = "[sticker]"
