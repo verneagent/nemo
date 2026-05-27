@@ -409,6 +409,10 @@ def _btw_claude_agent():
   agent._chat_id = "chat-1"
   agent._system_prompt = ""
   agent._endpoint = EndpointConfig()
+  # Fork-mode attrs _build_env reads (a /btw side question runs with the main
+  # agent's config — not a fork, so no reply-thread file).
+  agent._read_only = False
+  agent._scratch_dir = ""
   return agent
 
 
@@ -535,3 +539,43 @@ def test_side_question_closes_generator_in_task(monkeypatch):
   answer = asyncio.run(agent.side_question("q", "sess"))
   assert closed["v"] is True, "generator was not explicitly aclose()d"
   assert "btw failed" not in answer
+
+
+def test_fork_build_env_exports_reply_thread_file(tmp_path):
+  """A read-only fork exports NEMO_REPLY_THREAD_FILE so nemo-send can reply
+  into the fork's sub-thread; a non-fork agent does not."""
+  from nemo.claude_agent import ClaudeCodingAgent
+  from nemo.coding_agent import EndpointConfig
+
+  agent = ClaudeCodingAgent.__new__(ClaudeCodingAgent)
+  agent._chat_id = "oc_chat"
+  agent._endpoint = EndpointConfig()
+  agent._read_only = True
+  agent._scratch_dir = str(tmp_path / "scratch")
+  os.makedirs(agent._scratch_dir, exist_ok=True)
+
+  env = agent._build_env(str(tmp_path), "model-x")
+  expected = os.path.join(agent._scratch_dir, ".nemo_reply_thread")
+  assert env["NEMO_REPLY_THREAD_FILE"] == expected
+
+  # Non-fork (main) agent: no thread file → nemo-send posts to the chat root.
+  agent._read_only = False
+  assert "NEMO_REPLY_THREAD_FILE" not in agent._build_env(str(tmp_path), "model-x")
+
+
+def test_fork_bind_reply_anchor_writes_file(tmp_path):
+  """bind_reply_anchor persists the anchor where _build_env points nemo-send."""
+  import asyncio
+  from nemo.claude_agent import ClaudeCodingAgent
+
+  agent = ClaudeCodingAgent.__new__(ClaudeCodingAgent)
+  agent._scratch_dir = str(tmp_path / "scratch")
+  os.makedirs(agent._scratch_dir, exist_ok=True)
+
+  asyncio.run(agent.bind_reply_anchor("om_anchor_1"))
+  with open(os.path.join(agent._scratch_dir, ".nemo_reply_thread")) as f:
+    assert f.read() == "om_anchor_1"
+
+  # No scratch dir (not a fork) → no-op, no crash.
+  agent._scratch_dir = ""
+  asyncio.run(agent.bind_reply_anchor("om_x"))

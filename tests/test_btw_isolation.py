@@ -48,6 +48,9 @@ def _btw_claude_agent():
   agent._chat_id = "chat-iso"
   agent._system_prompt = ""
   agent._endpoint = EndpointConfig()
+  # Fork-mode attrs _build_env reads (a /btw side question is not a fork).
+  agent._read_only = False
+  agent._scratch_dir = ""
   return agent
 
 

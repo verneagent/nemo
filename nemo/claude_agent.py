@@ -595,6 +595,28 @@ class ClaudeCodingAgent(CodingAgent):
     )
     return fork
 
+  def _reply_anchor_path(self) -> str:
+    """Path of the fork's reply-anchor handoff file (in the scratch dir).
+    Shared by _build_env (exports it to nemo-send) and bind_reply_anchor
+    (writes it). Empty when this agent has no scratch dir (not a fork)."""
+    if not self._scratch_dir:
+      return ""
+    return os.path.join(self._scratch_dir, ".nemo_reply_thread")
+
+  async def bind_reply_anchor(self, anchor_msg_id: str) -> None:
+    """Record the fork's sub-thread anchor so `nemo-send image/file` replies
+    into the thread (see CodingAgent.bind_reply_anchor). Writes the anchor to
+    the scratch-dir file that _build_env exported as NEMO_REPLY_THREAD_FILE.
+    No-op without a scratch dir (i.e. not a read-only fork)."""
+    path = self._reply_anchor_path()
+    if not path:
+      return
+    try:
+      with open(path, "w", encoding="utf-8") as f:
+        f.write(anchor_msg_id)
+    except OSError as e:
+      log.warning("fork: failed to write reply anchor %s: %s", path, e)
+
   async def stop(self) -> None:
     await self._sdk.close_client()
     if self._sdk_started:
@@ -654,6 +676,13 @@ class ClaudeCodingAgent(CodingAgent):
       "CLAUDE_ENABLE_STREAM_WATCHDOG": "1",
       "CLAUDE_STREAM_IDLE_TIMEOUT_MS": "90000",
     }
+    # Read-only fork: media from `nemo-send` must land in the fork's Lark
+    # sub-thread, not the main chat. The thread doesn't exist yet (it's created
+    # after this subprocess starts), so we point nemo-send at a file in the
+    # scratch dir; bind_reply_anchor fills it with the thread anchor once Lark
+    # assigns the thread. stop()'s rmtree of the scratch dir reaps it.
+    if self._read_only and self._scratch_dir:
+      env["NEMO_REPLY_THREAD_FILE"] = self._reply_anchor_path()
     for key in ("http_proxy", "https_proxy", "all_proxy"):
       val = os.environ.get(key)
       if val:

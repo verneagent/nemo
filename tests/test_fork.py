@@ -15,6 +15,10 @@ class _FakeForkAgent:
   def __init__(self):
     self.turns = []
     self.stopped = False
+    self.reply_anchor = None
+
+  async def bind_reply_anchor(self, anchor_msg_id):
+    self.reply_anchor = anchor_msg_id
 
   async def run_turn(self, prompt, on_event):
     self.turns.append(prompt)
@@ -91,6 +95,9 @@ def test_open_creates_thread_and_runs_first_turn():
     # Registered by the thread_id Lark returned (omt_1).
     assert mgr.get("omt_1") is not None
     assert mgr.count() == 1
+    # Fork agent bound to the thread's root msg id (om_t1) so its nemo-send
+    # media replies land in the sub-thread, not the main chat.
+    assert main.fork_agents[0].reply_anchor == "om_t1"
     # First turn ran with the opening prompt.
     await asyncio.gather(*list(mgr._tasks))
     assert main.fork_agents[0].turns == ["investigate the auth flow"]
@@ -201,6 +208,9 @@ def test_interrupt_stops_in_flight_turn_renders_stopped():
           on_event(DoneEvent(cost=0.0, usage={}, session_id="fsid"))
         await asyncio.to_thread(e2)
         return 0.0, {}
+
+      async def bind_reply_anchor(self, anchor_msg_id):
+        pass
 
       async def interrupt(self):
         self.interrupted = True

@@ -143,3 +143,15 @@ class CodingAgent(ABC):
     """
     del sdk_session_id
     return ""
+
+  async def bind_reply_anchor(self, anchor_msg_id: str) -> None:
+    """Bind a Lark message id as the anchor for out-of-band media sends.
+
+    A `/fork` runs in a Lark sub-thread, so its `nemo-send image/file` must
+    reply into that thread, not the main chat. The thread is created AFTER the
+    fork's SDK subprocess starts (its env is already frozen), so the anchor is
+    handed over here once Lark assigns the thread. Only the read-only fork
+    adapter (Claude) wires this; everything else inherits the no-op (the main
+    conversation posts media to the chat root, and Codex/OpenCode forks don't
+    route nemo-send into a thread)."""
+    del anchor_msg_id

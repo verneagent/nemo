@@ -424,6 +424,46 @@ def reply_card(
   raise RuntimeError(f"Failed to reply card: {data}")
 
 
+def reply_image(
+  token: str, message_id: str, image_key: str,
+  reply_in_thread: bool = False,
+) -> str:
+  """Reply to a message with an image. Returns message_id.
+
+  See ``reply_message`` for ``reply_in_thread`` semantics — used so a fork's
+  ``nemo-send image`` lands in the fork's sub-thread instead of the main chat.
+  """
+  url = f"{BASE_URL}/im/v1/messages/{message_id}/reply"
+  payload: JsonObject = {
+    "msg_type": "image",
+    "content": json.dumps({"image_key": image_key}),
+  }
+  if reply_in_thread:
+    payload["reply_in_thread"] = True
+  data = _request(url, token, payload)
+  if data.get("code") == 0:
+    return data["data"]["message_id"]
+  raise RuntimeError(f"Failed to reply image: {data}")
+
+
+def reply_file(
+  token: str, message_id: str, file_key: str,
+  reply_in_thread: bool = False,
+) -> str:
+  """Reply to a message with a file. Returns message_id. See ``reply_image``."""
+  url = f"{BASE_URL}/im/v1/messages/{message_id}/reply"
+  payload: JsonObject = {
+    "msg_type": "file",
+    "content": json.dumps({"file_key": file_key}),
+  }
+  if reply_in_thread:
+    payload["reply_in_thread"] = True
+  data = _request(url, token, payload)
+  if data.get("code") == 0:
+    return data["data"]["message_id"]
+  raise RuntimeError(f"Failed to reply file: {data}")
+
+
 def reply_card_in_thread(
   token: str, message_id: str, card: JsonObject,
 ) -> tuple[str, str]:

@@ -242,6 +242,11 @@ class ForkManager:
         "⚠️ Lark didn't return a thread id; fork not started.")
       return
 
+    # Hand the thread anchor to the fork agent BEFORE its first turn runs, so
+    # any `nemo-send image/file` the agent issues replies into this sub-thread
+    # instead of the main chat.
+    await fork_agent.bind_reply_anchor(root_id)
+
     sess = ForkSession(
       agent=fork_agent, root_msg_id=root_id, thread_id=thread_id,
       chat_id=self._chat_id, prompt0=prompt)

@@ -262,6 +262,59 @@ def test_reply_card_failure():
       pass
 
 
+def test_reply_image_in_thread_payload():
+  """reply_image(reply_in_thread=True) hits the reply endpoint with the image
+  key and the reply_in_thread flag — this is how a fork's nemo-send lands in
+  its sub-thread."""
+  data = {"code": 0, "data": {"message_id": "om_ri1"}}
+  with mock.patch(
+    "urllib.request.urlopen", return_value=_mock_response(data)
+  ) as mock_open:
+    msg_id = api.reply_image("tok", "om_anchor", "img_key_z", reply_in_thread=True)
+  assert msg_id == "om_ri1"
+  req = mock_open.call_args[0][0]
+  assert req.full_url.endswith("/im/v1/messages/om_anchor/reply")
+  body = json.loads(req.data)
+  assert body["msg_type"] == "image"
+  assert json.loads(body["content"]) == {"image_key": "img_key_z"}
+  assert body["reply_in_thread"] is True
+
+
+def test_reply_image_failure():
+  data = {"code": 99, "msg": "fail"}
+  with mock.patch("urllib.request.urlopen", return_value=_mock_response(data)):
+    try:
+      api.reply_image("tok", "om_anchor", "img_key_z")
+      assert False, "Should raise"
+    except RuntimeError:
+      pass
+
+
+def test_reply_file_in_thread_payload():
+  data = {"code": 0, "data": {"message_id": "om_rf1"}}
+  with mock.patch(
+    "urllib.request.urlopen", return_value=_mock_response(data)
+  ) as mock_open:
+    msg_id = api.reply_file("tok", "om_anchor", "fk_z", reply_in_thread=True)
+  assert msg_id == "om_rf1"
+  req = mock_open.call_args[0][0]
+  assert req.full_url.endswith("/im/v1/messages/om_anchor/reply")
+  body = json.loads(req.data)
+  assert body["msg_type"] == "file"
+  assert json.loads(body["content"]) == {"file_key": "fk_z"}
+  assert body["reply_in_thread"] is True
+
+
+def test_reply_file_failure():
+  data = {"code": 99, "msg": "fail"}
+  with mock.patch("urllib.request.urlopen", return_value=_mock_response(data)):
+    try:
+      api.reply_file("tok", "om_anchor", "fk_z")
+      assert False, "Should raise"
+    except RuntimeError:
+      pass
+
+
 # ---------------------------------------------------------------------------
 # Chat tabs
 # ---------------------------------------------------------------------------
