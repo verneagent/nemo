@@ -403,11 +403,27 @@ def test_ws_loop_passes_proxy_none(monkeypatch):
 # These tests start a real relay server and verify end-to-end behavior.
 
 def _start_relay_server():
-    """Start the relay test server in background, return (loop, runner)."""
+    """Start the relay test server in background, return (loop, runner).
+
+    The relay module lives at ``<repo>/relay/relay.py``. Older revisions of
+    this helper hard-coded ``/private/tmp/claude/nemo-relay`` (a long-gone
+    deploy dir on one machine), which made every integration test ERROR with
+    ``module 'relay' has no attribute '_init_db'`` on any other checkout —
+    Python would fall back to the project's ``relay/`` namespace package
+    (no ``__init__.py``) which exposes no module-level symbols. Resolve the
+    real source dir relative to this test file so it works anywhere.
+    """
     import sys
-    sys.path.insert(0, "/private/tmp/claude/nemo-relay")
+    from pathlib import Path
+    relay_src = str(Path(__file__).resolve().parents[1] / "relay")
+    if relay_src not in sys.path:
+        sys.path.insert(0, relay_src)
+    # Place the test DB under tmp_path-equivalent so the test doesn't fight
+    # production paths or another concurrent run.
+    import tempfile
+    db_path = os.path.join(tempfile.gettempdir(), "nemo_test_relay_events.db")
     os.environ["RELAY_PORT"] = "19802"
-    os.environ["RELAY_DB"] = "/private/tmp/claude/test_relay_events.db"
+    os.environ["RELAY_DB"] = db_path
     os.environ["RELAY_API_KEY"] = "test-key"
     os.environ["VERIFY_TOKENS"] = "tok1"
 
@@ -415,8 +431,8 @@ def _start_relay_server():
     import relay as relay_mod
     importlib.reload(relay_mod)
 
-    if os.path.exists("/private/tmp/claude/test_relay_events.db"):
-        os.remove("/private/tmp/claude/test_relay_events.db")
+    if os.path.exists(db_path):
+        os.remove(db_path)
     relay_mod._init_db()
 
     loop = asyncio.new_event_loop()
