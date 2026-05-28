@@ -23,6 +23,53 @@ def test_canonical_usage_sums_total():
   }
 
 
+def test_normalize_claude_usage_corrects_omlx_inclusive_input():
+  # omlx#1487 (v0.3.8-0.3.12): the Anthropic shim returns input_tokens
+  # INCLUSIVE of cache_read + cache_creation. Detect via exact equality and
+  # subtract — real Anthropic essentially never has new-uncached input that
+  # matches the cached prefix sum.
+  out = normalize_claude_usage({
+    "input_tokens": 65619,
+    "cache_read_input_tokens": 63488,
+    "cache_creation_input_tokens": 2131,
+    "output_tokens": 58,
+  })
+  # Heuristic clamps i to 0; total now reflects real prompt + output.
+  assert out == {
+    "input_tokens": 0,
+    "cache_read_input_tokens": 63488,
+    "cache_creation_input_tokens": 2131,
+    "output_tokens": 58,
+    "total_tokens": 65677,
+  }
+
+
+def test_normalize_claude_usage_leaves_real_anthropic_alone():
+  # Real Anthropic shape: tiny input_tokens (just the new user message),
+  # large cache_read / cache_creation. Must NOT trigger the heuristic.
+  out = normalize_claude_usage({
+    "input_tokens": 3,
+    "cache_read_input_tokens": 9442,
+    "cache_creation_input_tokens": 15010,
+    "output_tokens": 5,
+  })
+  assert out["input_tokens"] == 3  # untouched
+  assert out["total_tokens"] == 24460
+
+
+def test_normalize_claude_usage_no_cache_unchanged():
+  # cr + cw == 0 — heuristic must not fire even if input_tokens happens to
+  # also be 0 (degenerate equality 0 == 0 must be ignored).
+  out = normalize_claude_usage({
+    "input_tokens": 0,
+    "cache_read_input_tokens": 0,
+    "cache_creation_input_tokens": 0,
+    "output_tokens": 5,
+  })
+  assert out["input_tokens"] == 0
+  assert out["total_tokens"] == 5
+
+
 def test_normalize_claude_usage_drops_extras_and_adds_total():
   # Claude's native ResultMessage.usage carries cache + bookkeeping keys; only
   # the canonical five survive, and total_tokens is computed.

@@ -66,14 +66,38 @@ def normalize_claude_usage(usage: JsonObject) -> JsonObject:
   cache_creation_input_tokens / output_tokens) line up directly; we just drop
   the extras (server_tool_use, service_tier, …) and add total_tokens. An empty
   usage stays empty so the card omits the line entirely.
+
+  Inclusive-style upstream workaround — jundot/omlx#1487 (v0.3.8 through at
+  least v0.3.12): omlx's Anthropic shim reports ``input_tokens`` INCLUSIVE of
+  ``cache_read_input_tokens + cache_creation_input_tokens``, violating
+  Anthropic's disjoint-triple contract. Without correction the canonical
+  ``i`` and ``total_tokens`` end up roughly 2× the real values. Detect via
+  exact equality (real Anthropic essentially never has new-uncached input
+  that precisely matches the cached prefix sum — a typical Claude turn has
+  ``input_tokens`` ≈ tens while ``cache_read`` ≈ tens of thousands) and
+  subtract. Remove once omlx ships the fix.
   """
   if not usage:
     return {}
+  raw_input = _usage_int(usage, "input_tokens")
+  cache_read = _usage_int(usage, "cache_read_input_tokens")
+  cache_creation = _usage_int(usage, "cache_creation_input_tokens")
+  output_tokens = _usage_int(usage, "output_tokens")
+  cache_sum = cache_read + cache_creation
+  if cache_sum > 0 and raw_input == cache_sum:
+    log.info(
+      "Inclusive-usage upstream detected (omlx#1487 shape): "
+      "raw_input=%d == cache_read+cache_creation=%d+%d — clamping i to 0",
+      raw_input, cache_read, cache_creation,
+    )
+    input_tokens = 0
+  else:
+    input_tokens = raw_input
   return canonical_usage(
-    input_tokens=_usage_int(usage, "input_tokens"),
-    cache_read=_usage_int(usage, "cache_read_input_tokens"),
-    cache_creation=_usage_int(usage, "cache_creation_input_tokens"),
-    output_tokens=_usage_int(usage, "output_tokens"),
+    input_tokens=input_tokens,
+    cache_read=cache_read,
+    cache_creation=cache_creation,
+    output_tokens=output_tokens,
   )
 
 # SDK #788 — stale TaskNotification leak.
