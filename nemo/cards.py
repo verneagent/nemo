@@ -85,12 +85,12 @@ def _usage_text(usage: JsonObject) -> str:
       return int(value)
     return 0
 
-  # Compact labels (the grey note line is tight). cw is omitted when 0 —
-  # Codex never has cache-creation tokens, so on every Codex turn it would be
-  # pure noise. The other fields stay even at 0 so the layout is predictable.
+  # Compact labels (the grey note line is tight). The four buckets already
+  # carry all the signal — i / cr / cw / o are disjoint per Anthropic's
+  # contract, so their sum is just arithmetic and not informative on its own.
+  # cw is omitted when 0 (Codex never has it; would be pure noise every turn).
   cw = _n("cache_creation_input_tokens")
   parts = [
-    f"total {_n('total_tokens'):,}",
     f"i {_n('input_tokens'):,}",
     f"cr {_n('cache_read_input_tokens'):,}",
   ]

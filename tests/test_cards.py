@@ -31,18 +31,20 @@ def test_elapsed_text():
 
 def test_usage_text():
   assert _usage_text({}) == ""
-  # Compact labels: total / i / cr / cw / o, separated by " · ".
+  # The four disjoint buckets — i / cr / cw / o — separated by " · ".
+  # No "total" segment: the four are disjoint per Anthropic's contract, so
+  # their sum is just arithmetic and not informative on its own.
   assert _usage_text({
     "input_tokens": 1000,
     "cache_read_input_tokens": 200,
     "cache_creation_input_tokens": 50,
     "output_tokens": 80,
     "total_tokens": 1330,
-  }) == "total 1,330 · i 1,000 · cr 200 · cw 50 · o 80"
+  }) == "i 1,000 · cr 200 · cw 50 · o 80"
   # cw is omitted when zero (Codex never has it) — the other fields stay so
   # the layout is predictable across adapters.
   assert _usage_text({"input_tokens": 1000, "output_tokens": 200}) == (
-    "total 0 · i 1,000 · cr 0 · o 200"
+    "i 1,000 · cr 0 · o 200"
   )
 
 
@@ -494,8 +496,9 @@ def test_done_card_with_usage():
   footer = [e for e in card["body"]["elements"] if e.get("text_size") == "notation"][0]
   text = footer["content"]
   assert "1m 30s" in text
-  # Per-turn breakdown: total / i / cr / o (cw omitted because it's 0 here).
-  assert "total 6,500" in text
+  # Per-turn breakdown: i / cr / o (cw omitted because it's 0 here; total
+  # omitted entirely — see _usage_text docstring).
+  assert "total" not in text
   assert "i 5,000" in text
   assert "cr 1,200" in text
   assert "o 300" in text
