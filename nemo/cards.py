@@ -1040,6 +1040,132 @@ def build_model_switched_card(
   }
 
 
+def build_agent_picker_card(
+  options: list[tuple[str, str]],
+  *,
+  current_agent: str,
+  current_model: str,
+  chat_id: str = "",
+  info: str = "",
+  hint: str = "",
+) -> JsonObject:
+  """Build the interactive `/agent` picker card.
+
+  Mirrors ``build_model_picker_card`` exactly: a Lark V2 ``form`` with a
+  ``select_static`` dropdown of the three CodingAgent kinds plus a
+  ``form_action_type: "submit"`` button. Option values carry the
+  ``agent_switch:<name>`` discriminator so the daemon's card.action handler
+  can route the form-submit back to the agent-switch flow without colliding
+  with ``model_switch:`` (or any other) prefix.
+
+  Same V2 / ``<font>`` constraints as the model picker — ``info`` goes
+  through plain markdown (multi-line allowed), ``hint`` through the grey
+  note element (single line, no raw HTML).
+  """
+  select_options = [
+    {
+      "text": {"tag": "plain_text", "content": label},
+      "value": f"agent_switch:{agent_name}",
+    }
+    for label, agent_name in options
+  ]
+  summary = (
+    f"Current agent: **{current_agent}** "
+    f"(model **{current_model}**)"
+  )
+  form_elements: list[JsonObject] = [
+    {
+      "tag": "select_static",
+      "name": "agent",
+      "placeholder": {"tag": "plain_text", "content": "Pick an agent..."},
+      "options": select_options,
+    },
+    # Same exact submit-button shape as the model picker — see that card's
+    # docstring for why ``form_action_type``, the button ``name`` and the
+    # direct-child placement all matter for Lark to fire the callback.
+    {
+      "tag": "button",
+      "text": {"tag": "plain_text", "content": "Submit"},
+      "type": "primary",
+      "form_action_type": "submit",
+      "name": "submit",
+      "value": {"action": "agent_picker_submit", "chat_id": chat_id},
+    },
+  ]
+  elements: list[JsonObject] = [
+    {"tag": "markdown", "content": summary},
+    {
+      "tag": "form",
+      "name": "agent_picker_form",
+      "elements": form_elements,
+    },
+  ]
+  if info:
+    elements.append({"tag": "markdown", "content": info})
+  if hint:
+    elements.append(_note_element(hint))
+  return {
+    "schema": "2.0",
+    "config": {"update_multi": True},
+    "header": {
+      "title": {"tag": "plain_text", "content": "Switch Agent"},
+      "template": "blue",
+    },
+    "body": {"direction": "vertical", "elements": elements},
+  }
+
+
+def build_agent_switched_card(
+  *,
+  agent: str,
+  model: str,
+  ok: bool = True,
+  attempted: str = "",
+  reason: str = "",
+  info: str = "",
+) -> JsonObject:
+  """Build the locked, post-submit replacement for the /agent picker.
+
+  After the user submits the picker we PATCH the card into this static
+  form — no dropdown, no Submit button — so the same picker can't be
+  re-submitted with a now-stale selection. ``ok=False`` is used for
+  unknown-agent rejections (the only invalid case for /agent, since the
+  three valid kinds are fixed by ``agent_factory``).
+  """
+  if ok:
+    header_title = "✅ Agent Switched"
+    template = "green"
+    lines = [
+      f"**Agent:** {_escape_md(agent)}",
+      f"**Model:** {_escape_md(model)}",
+    ]
+  else:
+    header_title = "⚠️ Agent Not Switched"
+    template = "orange"
+    lines = []
+    if attempted:
+      lines.append(f"Couldn't switch to **{_escape_md(attempted)}**.")
+    if reason:
+      lines.append(_escape_md(reason))
+    lines.append(f"**Current agent:** {_escape_md(agent)}")
+    lines.append(f"**Current model:** {_escape_md(model)}")
+  elements: list[JsonObject] = [
+    {"tag": "markdown", "content": "\n".join(lines)},
+  ]
+  if info:
+    elements.append({"tag": "markdown", "content": info})
+  elements.append(_note_element("Run `/agent` for a fresh picker."))
+  return {
+    "schema": "2.0",
+    "config": {"update_multi": True},
+    "header": {
+      "title": {"tag": "plain_text", "content": header_title},
+      "template": template,
+    },
+    "body": {"direction": "vertical", "elements": elements},
+  }
+
+
 def build_form_input(title: str, placeholder: str = "",
                      chat_id: str = "") -> JsonObject:
   """Build a card with text input."""

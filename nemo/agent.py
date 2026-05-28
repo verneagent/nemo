@@ -1032,6 +1032,88 @@ async def _lock_model_picker(
     log.warning("Picker confirm-lock update failed: %s", exc)
 
 
+def _agent_picker_options() -> list[tuple[str, str]]:
+  """Flatten the CodingAgent kinds into ``(display_label, agent_name)``
+  pairs for the picker dropdown.
+
+  The set is fixed by ``agent_factory.AgentKind``; we hard-code the order
+  (claude, codex, opencode) so the picker is stable across daemons and
+  doesn't depend on dict iteration order. Labels carry each agent's
+  default model so the user can see what the switch will land on without
+  reading the catalog separately.
+  """
+  from .agent_factory import default_model_for_agent
+  agents: tuple[AgentKind, ...] = ("claude", "codex", "opencode")
+  return [(f"{name} (default: {default_model_for_agent(name)})", name)
+          for name in agents]
+
+
+async def _send_agent_picker(
+  channel: LarkChannel,
+  chat_id: str,
+  ctx: commands.AgentContext,
+  db: Database,
+) -> None:
+  """Send the interactive `/agent` picker card — mirrors `_send_model_picker`."""
+  options = _agent_picker_options()
+  info = (
+    "Switching resets the model to that agent's default and keeps each "
+    "agent's last session id separately, so flipping back resumes the "
+    "prior conversation."
+  )
+  hint = "Pick an agent and click Submit. Or type `/agent NAME` directly."
+  card = cards.build_agent_picker_card(
+    options,
+    current_agent=ctx.agent,
+    current_model=ctx.model,
+    chat_id=chat_id,
+    info=info,
+    hint=hint,
+  )
+  try:
+    msg_id = await channel.send_card(chat_id, card)
+    db.record_sent(msg_id, text="Switch Agent", chat_id=chat_id)
+    _register_msg(msg_id, chat_id)
+  except Exception as e:
+    log.error("Agent picker send failed: %s", e)
+    await _send_response(
+      channel, chat_id,
+      f"Current agent: **{ctx.agent}** (model **{ctx.model}**)\n\n"
+      f"Available: `claude`, `codex`, `opencode`. {info}\n\n"
+      f"Usage: `/agent NAME`",
+      db,
+    )
+
+
+async def _lock_agent_picker(
+  channel: LarkChannel,
+  picker_msg_id: str,
+  *,
+  agent: str,
+  model: str,
+  ok: bool = True,
+  attempted: str = "",
+  reason: str = "",
+) -> None:
+  """PATCH a submitted /agent picker into its locked confirmation state.
+
+  Same role as ``_lock_model_picker``: removes the dropdown + Submit
+  button so the picker can't be re-submitted, and shows the resulting
+  agent + model. No-op when there is no picker card id to lock (e.g.
+  the submit came from /agent <name> typed directly).
+  """
+  if not picker_msg_id:
+    return
+  try:
+    card = cards.build_agent_switched_card(
+      agent=agent, model=model, ok=ok, attempted=attempted, reason=reason)
+    await channel.update_card(picker_msg_id, card)
+    log.info("Locked /agent picker %s (ok=%s agent=%s model=%s)",
+             picker_msg_id, ok, agent, model)
+  except Exception as exc:
+    log.warning("Agent picker confirm-lock update failed: %s", exc)
+
+
 # ---------------------------------------------------------------------------
 # Main loop
 # ---------------------------------------------------------------------------
@@ -1342,6 +1424,9 @@ async def main_loop(
   # a locked "now on agent/model" state (dropdown + Submit removed) so
   # the picker can't be re-submitted with a now-stale model list.
   _pending_picker_msg_id = ""
+  # Same role for the /agent picker — stored on form-submit, consumed by
+  # the __agent__: handler after the switch lands (success or failure).
+  _pending_agent_picker_msg_id = ""
 
   def handle_sig(_sig, _frame):
     nonlocal running
@@ -1453,6 +1538,77 @@ async def main_loop(
             event_type="im.message.receive_v1",
             msg_type="text",
             text=f"/model {model_name}",
+            sender_id=reply.operator_id or operator_open_id,
+            is_internal=True,
+            action_value={},
+            action_tag="",
+          )
+          channel.push_back(synthetic)
+          continue
+        if action_str == "agent_picker_submit":
+          # Same shape as model_picker_submit — Lark falls back to the
+          # button's own action value when form_value carries no selection.
+          await _send_response(
+            channel, chat_id,
+            "Pick an agent from the dropdown before submitting.", db,
+          )
+          continue
+        if action_str.startswith("agent_switch:"):
+          # `/agent` picker form submitted. The select_static's value carries
+          # the ``agent_switch:<name>`` prefix; the relay passes the single-
+          # field form_value through as the action string (same path as
+          # model_switch).
+          agent_name = action_str.split(":", 1)[1].strip()
+          if not agent_name:
+            await _send_response(
+              channel, chat_id,
+              "Pick an agent from the dropdown before submitting.", db,
+            )
+            continue
+          from .guests import is_authorized_sender
+          if operator_open_id and not is_authorized_sender(
+              reply.operator_id, operator_open_id, _member_roles):
+            log.info(
+              "Ignoring unauthorized agent picker submit by %s",
+              reply.operator_id,
+            )
+            continue
+          valid_agents = ("claude", "codex", "opencode")
+          if agent_name not in valid_agents:
+            # Should be unreachable (the dropdown only offers valid kinds),
+            # but defend in case the wire delivers something weird.
+            await _lock_agent_picker(
+              channel, reply.message_id, agent=agent, model=model,
+              ok=False, attempted=agent_name,
+              reason=f"Unknown agent `{agent_name}`.",
+            )
+            await _send_response(
+              channel, chat_id,
+              f"Unknown agent **{agent_name}**.", db,
+            )
+            continue
+          if agent_name == agent:
+            # No-op switch: lock the card to its confirmation state and tell
+            # the user, instead of routing through the __agent__: handler
+            # (which is skipped by commands.py when arg == ctx.agent and
+            # would leave the picker live).
+            await _lock_agent_picker(
+              channel, reply.message_id, agent=agent, model=model, ok=True)
+            await _send_response(
+              channel, chat_id, f"Already on agent **{agent}**.", db)
+            continue
+          # Synthesise an internal ``/agent <name>`` so the existing /agent
+          # dispatch handles the real switch (SDK rebuild, default-model
+          # reset, context-note response). is_internal=True bypasses
+          # sender/mention filters since the click already came from an
+          # authorized operator. Stash the picker card id so the __agent__
+          # handler can lock the card once the switch lands.
+          _pending_agent_picker_msg_id = reply.message_id
+          synthetic = dataclasses.replace(
+            reply,
+            event_type="im.message.receive_v1",
+            msg_type="text",
+            text=f"/agent {agent_name}",
             sender_id=reply.operator_id or operator_open_id,
             is_internal=True,
             action_value={},
@@ -1623,6 +1779,10 @@ async def main_loop(
           await _send_model_picker(
             channel, chat_id, project_dir, ctx, db,
           )
+        elif response == "__agent_picker__":
+          # `/agent` (no args) — same shape as the model picker, routed
+          # through agent_switch:<name> on submit.
+          await _send_agent_picker(channel, chat_id, ctx, db)
         elif response and response.startswith("__model__:"):
           new_model = response.split(":", 1)[1]
           # Resolve against the preset registry first. A preset name
@@ -1784,6 +1944,11 @@ async def main_loop(
               f"Daemon is in a broken state — restart it.",
               db,
             )
+            await _lock_agent_picker(
+              channel, _pending_agent_picker_msg_id,
+              agent=agent, model=model, ok=False, attempted=new_agent,
+              reason=f"Starting **{new_agent}** failed: {exc}")
+            _pending_agent_picker_msg_id = ""
             await _clear_ack()
             continue
           await channel.update_status(model, "idle", agent)
@@ -1812,6 +1977,10 @@ async def main_loop(
             f"Use `/model <name>` to pick a different one.",
             db,
           )
+          await _lock_agent_picker(
+            channel, _pending_agent_picker_msg_id,
+            agent=agent, model=model, ok=True)
+          _pending_agent_picker_msg_id = ""
         elif response and response.startswith("__effort__:"):
           new_effort = response.split(":", 1)[1]
           ctx.effort = new_effort
@@ -2530,6 +2699,10 @@ async def main_loop(
             await _send_model_picker(
               channel, chat_id, project_dir, ctx, db,
             )
+          elif response == "__agent_picker__":
+            # Same reasoning as __model_picker__: only displays the dropdown;
+            # submit's actual switch is queued behind the in-flight turn.
+            await _send_agent_picker(channel, chat_id, ctx, db)
           elif response and response.startswith("__btw__:"):
             # During a running turn, run the side question in the
             # background so the signal watcher keeps reacting to

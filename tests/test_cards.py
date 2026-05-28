@@ -6,6 +6,7 @@ from nemo.cards import (
   ToolRecord, ThinkingStep, build_turn_card, build_card, build_markdown_card,
   build_form_select, build_form_input, build_ask_user_question_card,
   build_model_picker_card, build_model_switched_card, build_shell_card,
+  build_agent_picker_card, build_agent_switched_card,
   tool_use_summary, _elapsed_title, _elapsed_text, _usage_text,
   _collapsible_thinking,
 )
@@ -826,6 +827,78 @@ def test_model_switched_card_keeps_available_catalog():
   blob = json.dumps(card, ensure_ascii=False)
   assert "claude-opus-4-7" in blob and "claude-sonnet-4-6" in blob
   # The catalog stays as plain markdown; the card is still locked (no form).
+  assert "select_static" not in blob and "form_action_type" not in blob
+
+
+# ---------------------------------------------------------------------------
+# build_agent_picker_card / build_agent_switched_card
+# ---------------------------------------------------------------------------
+
+def test_agent_picker_card_structure():
+  """Mirrors test_model_picker_card_structure: options carry the
+  ``agent_switch:<name>`` discriminator, submit button uses
+  ``form_action_type: "submit"`` with action ``agent_picker_submit``."""
+  options = [
+    ("claude (default: claude-opus-4-7)", "claude"),
+    ("codex (default: gpt-5.5)", "codex"),
+    ("opencode (default: default)", "opencode"),
+  ]
+  card = build_agent_picker_card(
+    options,
+    current_agent="claude",
+    current_model="claude-opus-4-7",
+    chat_id="oc_abc",
+  )
+  assert card["schema"] == "2.0"
+  assert card["header"]["title"]["content"] == "Switch Agent"
+
+  elements = card["body"]["elements"]
+  summary = _find_element(elements, "markdown")
+  assert "claude" in summary["content"]
+  assert "claude-opus-4-7" in summary["content"]
+
+  form = _find_element(elements, "form")
+  assert form["name"] == "agent_picker_form"
+  form_elements = form["elements"]
+
+  select = _find_element(form_elements, "select_static")
+  assert select["name"] == "agent"
+  values = [opt["value"] for opt in select["options"]]
+  assert values == [
+    "agent_switch:claude",
+    "agent_switch:codex",
+    "agent_switch:opencode",
+  ]
+
+  button = _find_element(form_elements, "button")
+  # Same V2 form-submit shape as the model picker — see that test's docstring.
+  assert button["form_action_type"] == "submit"
+  assert "action_type" not in button
+  assert button["name"] == "submit"
+  assert button["value"] == {"action": "agent_picker_submit", "chat_id": "oc_abc"}
+
+
+def test_agent_switched_card_ok_has_no_form():
+  card = build_agent_switched_card(agent="codex", model="gpt-5.5", ok=True)
+  blob = json.dumps(card, ensure_ascii=False)
+  assert card["header"]["template"] == "green"
+  assert "Switched" in card["header"]["title"]["content"]
+  assert "codex" in blob
+  # Locked: no interactive elements.
+  assert "select_static" not in blob
+  assert "form_action_type" not in blob
+
+
+def test_agent_switched_card_error_state():
+  card = build_agent_switched_card(
+    agent="claude", model="claude-opus-4-7", ok=False,
+    attempted="bogus", reason="Unknown agent `bogus`.",
+  )
+  blob = json.dumps(card, ensure_ascii=False)
+  assert card["header"]["template"] == "orange"
+  assert "Not Switched" in card["header"]["title"]["content"]
+  assert "bogus" in blob
+  # Still locked — no form survives the error state either.
   assert "select_static" not in blob and "form_action_type" not in blob
 
 

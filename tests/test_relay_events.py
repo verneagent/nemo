@@ -209,6 +209,25 @@ def test_convert_form_action_for_model_picker_keeps_prefix():
     assert ev.message_id == "om_picker_xyz"
 
 
+def test_convert_form_action_for_agent_picker_keeps_prefix():
+    """Same wire-format guarantee as the model picker: the relay pushes
+    ``agent_switch:<name>`` form_value as the reply text and the
+    converter lands it in action_value['action'] unchanged so the
+    daemon's ``startswith("agent_switch:")`` routing fires."""
+    msg = {
+        "text": "agent_switch:codex",
+        "msg_type": "form_action",
+        "sender_id": "ou_picker_clicker",
+        "create_time": "1700000020000",
+        "message_id": "om_agent_picker_xyz",
+    }
+    ev = _relay_msg_to_event(msg, "oc_chat1")
+    assert ev.event_type == "card.action.trigger"
+    assert ev.action_value == {"action": "agent_switch:codex"}
+    assert ev.operator_id == "ou_picker_clicker"
+    assert ev.message_id == "om_agent_picker_xyz"
+
+
 def test_convert_input_action():
     msg = {
         "text": "user input text",

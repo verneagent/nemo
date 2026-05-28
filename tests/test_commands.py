@@ -171,18 +171,21 @@ def test_model_typo_rejected():
   assert "sonnet" in resp  # available list included
 
 
-def test_agent_show_lists_options():
+def test_agent_show_emits_picker_action():
+  """Bare `/agent` returns the picker action code — the main loop turns
+  this into an interactive dropdown card (mirrors `/model` no-arg)."""
   ctx = _ctx()
   ctx.agent = "claude"
   ctx.model = "claude-opus-4-7"
   handled, resp = try_dispatch("/agent", ctx)
   assert handled
-  assert resp is not None
-  # Lists all three options + names current.
-  assert "claude" in resp
-  assert "codex" in resp
-  assert "opencode" in resp
-  assert "claude-opus-4-7" in resp
+  assert resp == "__agent_picker__"
+
+
+def test_agent_picker_is_inline_safe():
+  """The picker card is purely UI — sending it during an active turn is
+  fine; only the form-submit triggers a switch (which IS NEEDS_SDK)."""
+  assert is_inline_safe("__agent_picker__") is True
 
 
 def test_agent_switch_emits_action_with_default_model():

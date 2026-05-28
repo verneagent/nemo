@@ -292,14 +292,11 @@ def try_dispatch(text: str, ctx: AgentContext) -> tuple[bool, str | None]:
         return True, f"Already on agent **{ctx.agent}**."
       default_model = default_model_for_agent(arg)  # type: ignore[arg-type]
       return True, f"__agent__:{arg}:{default_model}"
-    return True, (
-      f"Current agent: **{ctx.agent}** (model **{ctx.model}**)\n\n"
-      f"Available: `claude`, `codex`, `opencode`. "
-      f"Switching resets the model to that agent's default and "
-      f"keeps each agent's last session id separately, so flipping "
-      f"back resumes the prior conversation.\n\n"
-      f"Usage: `/agent <name>`"
-    )
+    # No argument — emit an interactive picker card (mirrors /model). The main
+    # loop builds the option list and sends the actual card; here we only
+    # signal the action so the picker stays in sync with whatever the
+    # registry exposes at click time.
+    return True, "__agent_picker__"
 
   # /effort
   if t.startswith("/effort"):

@@ -1471,6 +1471,79 @@ def test_model_picker_submit_unauthorized_is_ignored(tmp_path):
   assert agent.reset_calls == [], agent.reset_calls
 
 
+def test_agent_picker_submit_switches_agent(tmp_path):
+  """Clicking Submit on the `/agent` picker fires a card.action.trigger
+  with action='agent_switch:<name>'. The main loop must synthesise an
+  internal /agent <name>, push it back, and run the regular /agent
+  dispatch on the next iteration so build_coding_agent is rebuilt with
+  the picked kind and the picker card is locked."""
+  from nemo.channel import IncomingMessage
+
+  class _ReplayChannel(_QueuedChannel):
+    def __init__(self, *a, **kw):
+      super().__init__(*a, **kw)
+      self.update_card_calls: list[tuple[str, object]] = []
+
+    def push_back(self, message):
+      self._messages.insert(0, message)
+
+    async def update_card(self, card_id, card):
+      self.update_card_calls.append((card_id, card))
+      return card_id
+
+  builds: list[str] = []
+
+  def _build(kind, *a, **kw):
+    del a, kw
+    builds.append(kind)
+    return _FakeAgent()
+
+  queued = _ReplayChannel("oc_test", [
+    IncomingMessage(
+      event_type="card.action.trigger",
+      chat_id="oc_test",
+      operator_id="ou_user",
+      sender_id="ou_user",
+      message_id="om_agent_picker_card",
+      action_value={"action": "agent_switch:codex", "chat_id": "oc_test"},
+      create_time="1",
+    ),
+    IncomingMessage(
+      event_type="im.message.receive_v1", chat_id="oc_test",
+      sender_id="ou_user", message_id="om_exit", msg_type="text",
+      text="/exit", create_time="2",
+    ),
+  ])
+
+  with mock.patch("nemo.agent.load_credentials", return_value={
+    "app_id": "app_id", "app_secret": "app_secret",
+    "email": "user@example.com",
+  }), \
+       mock.patch("nemo.agent.Database", _FakeDB), \
+       mock.patch("nemo.agent.LarkChannel", return_value=queued), \
+       mock.patch("nemo.agent.build_coding_agent", side_effect=_build), \
+       mock.patch("nemo.agent._send_response", new=mock.AsyncMock()), \
+       mock.patch("nemo.group_config.load_config", return_value={}), \
+       mock.patch("nemo.config.load_relay_config", return_value=("", "")), \
+       mock.patch("signal.signal"):
+    rc = asyncio.run(
+      main_loop("oc_test", str(tmp_path), "claude-opus-4-7", agent="claude"))
+
+  assert rc == 0
+  # build_coding_agent should have been called once at startup for claude
+  # AND again for the synthesised /agent codex switch.
+  assert "claude" in builds and "codex" in builds, builds
+  # The picker card must have been locked to a confirmation state — same
+  # message_id the click came from, no form survives the lock.
+  locks = [c for c in queued.update_card_calls if c[0] == "om_agent_picker_card"]
+  assert locks, queued.update_card_calls
+  locked_card = locks[-1][1]
+  import json as _json
+  blob = _json.dumps(locked_card, ensure_ascii=False)
+  assert "select_static" not in blob and "form_action_type" not in blob
+  assert "codex" in blob
+
+
 def test_codex_agent_rejects_claude_model_switch(tmp_path):
   from nemo.channel import IncomingMessage
 
