@@ -10,7 +10,37 @@ from nemo.turn import (
   run_turn, ProgressEvent, AnswerEvent,
   TaskStartedEvent, TaskDoneEvent, DoneEvent, ErrorEvent,
   RateLimitNoticeEvent, CompactNoticeEvent, TurnEvent,
+  canonical_usage, normalize_claude_usage,
 )
+
+
+def test_canonical_usage_sums_total():
+  assert canonical_usage(
+    input_tokens=10, cache_read=20, cache_creation=5, output_tokens=3,
+  ) == {
+    "input_tokens": 10, "cache_read_input_tokens": 20,
+    "cache_creation_input_tokens": 5, "output_tokens": 3, "total_tokens": 38,
+  }
+
+
+def test_normalize_claude_usage_drops_extras_and_adds_total():
+  # Claude's native ResultMessage.usage carries cache + bookkeeping keys; only
+  # the canonical five survive, and total_tokens is computed.
+  out = normalize_claude_usage({
+    "input_tokens": 3,
+    "cache_creation_input_tokens": 15010,
+    "cache_read_input_tokens": 9442,
+    "output_tokens": 5,
+    "server_tool_use": {"web_search_requests": 0},
+    "service_tier": "standard",
+  })
+  assert out == {
+    "input_tokens": 3, "cache_read_input_tokens": 9442,
+    "cache_creation_input_tokens": 15010, "output_tokens": 5,
+    "total_tokens": 24460,
+  }
+  # Empty usage stays empty so the card omits the line.
+  assert normalize_claude_usage({}) == {}
 
 
 # ---------------------------------------------------------------------------
@@ -125,6 +155,7 @@ def test_text_only_turn():
       cost, usage = await run_turn(client, "say hello", events.append)
       assert cost == 0.02
       assert usage["input_tokens"] == 200
+      assert usage["total_tokens"] == 200  # canonical: total computed from parts
   asyncio.run(_run())
   assert any(isinstance(e, AnswerEvent) and e.text == "Hello world" for e in events)
   assert any(isinstance(e, DoneEvent) for e in events)

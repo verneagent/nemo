@@ -67,14 +67,37 @@ def _elapsed_text(elapsed: int) -> str:
 
 
 def _usage_text(usage: JsonObject) -> str:
-  parts = []
-  inp = usage.get("input_tokens")
-  out = usage.get("output_tokens")
-  if inp:
-    parts.append(f"in: {inp:,}")
-  if out:
-    parts.append(f"out: {out:,}")
-  return " | ".join(parts)
+  """One-line PER-TURN token breakdown shown on the done card.
+
+  Reads the unified schema every adapter normalizes into (turn.canonical_usage)
+  so Claude / Codex / OpenCode show the same five figures with the same meaning
+  — all per-turn, none session-cumulative. Returns "" only when no usage was
+  reported (the card then omits the line).
+  """
+  if not usage:
+    return ""
+
+  def _n(key: str) -> int:
+    value = usage.get(key)
+    if isinstance(value, bool):
+      return 0
+    if isinstance(value, (int, float)):
+      return int(value)
+    return 0
+
+  # Compact labels (the grey note line is tight). cw is omitted when 0 —
+  # Codex never has cache-creation tokens, so on every Codex turn it would be
+  # pure noise. The other fields stay even at 0 so the layout is predictable.
+  cw = _n("cache_creation_input_tokens")
+  parts = [
+    f"total {_n('total_tokens'):,}",
+    f"i {_n('input_tokens'):,}",
+    f"cr {_n('cache_read_input_tokens'):,}",
+  ]
+  if cw:
+    parts.append(f"cw {cw:,}")
+  parts.append(f"o {_n('output_tokens'):,}")
+  return " · ".join(parts)
 
 
 # ---------------------------------------------------------------------------

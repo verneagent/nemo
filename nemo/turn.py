@@ -16,6 +16,66 @@ from .types import JsonObject, TurnClient
 
 log = logging.getLogger(__name__)
 
+
+def _usage_int(usage: JsonObject, key: str) -> int:
+  """Read a token count from a raw usage dict, coercing to a non-negative int."""
+  value = usage.get(key)
+  if isinstance(value, bool):  # bool is an int subclass — reject it explicitly
+    return 0
+  if isinstance(value, (int, float)):
+    return max(0, int(value))
+  return 0
+
+
+def canonical_usage(
+  *,
+  input_tokens: int,
+  cache_read: int,
+  cache_creation: int,
+  output_tokens: int,
+) -> JsonObject:
+  """Build the unified PER-TURN usage dict that turn cards and /context read.
+
+  Every CodingAgent adapter normalizes its native usage into this one schema
+  so Claude, Codex and OpenCode report the SAME thing:
+    - ``input_tokens``            new (uncached) input this turn
+    - ``cache_read_input_tokens`` cached input reused this turn
+    - ``cache_creation_input_tokens`` cache written this turn (Claude only)
+    - ``output_tokens``           output this turn
+    - ``total_tokens``            sum of the four above
+
+  All figures are PER-TURN. This matters because Codex's SDK reports
+  ``turn.completed.usage`` as the SESSION-CUMULATIVE total, so its adapter
+  must difference successive totals before calling this — otherwise the card
+  showed an ever-growing "in" while Claude showed a single turn (the bug this
+  schema fixes).
+  """
+  return {
+    "input_tokens": input_tokens,
+    "cache_read_input_tokens": cache_read,
+    "cache_creation_input_tokens": cache_creation,
+    "output_tokens": output_tokens,
+    "total_tokens": input_tokens + cache_read + cache_creation + output_tokens,
+  }
+
+
+def normalize_claude_usage(usage: JsonObject) -> JsonObject:
+  """Map Claude's ResultMessage.usage (already per-turn) into canonical form.
+
+  Claude's native keys (input_tokens / cache_read_input_tokens /
+  cache_creation_input_tokens / output_tokens) line up directly; we just drop
+  the extras (server_tool_use, service_tier, …) and add total_tokens. An empty
+  usage stays empty so the card omits the line entirely.
+  """
+  if not usage:
+    return {}
+  return canonical_usage(
+    input_tokens=_usage_int(usage, "input_tokens"),
+    cache_read=_usage_int(usage, "cache_read_input_tokens"),
+    cache_creation=_usage_int(usage, "cache_creation_input_tokens"),
+    output_tokens=_usage_int(usage, "output_tokens"),
+  )
+
 # SDK #788 — stale TaskNotification leak.
 #
 # A background task spawned in an earlier turn can complete *after* that
@@ -610,7 +670,10 @@ async def run_turn(
   )
 
   total_cost = result.cost
-  total_usage: JsonObject = result.usage or {}
+  # Normalize Claude's per-turn usage into the canonical schema (see
+  # canonical_usage) so the done card and /context read the same shape across
+  # all adapters.
+  total_usage: JsonObject = normalize_claude_usage(result.usage or {})
 
   # Trailing thinking compensation: if the turn ended on a thinking-only
   # tail shown as a ProgressEvent, surface it as the answer.

@@ -90,6 +90,18 @@ def test_build_coding_agent_returns_expected_class():
   assert isinstance(agent, OpenCodeCodingAgent)
 
 
+def test_opencode_normalize_usage_to_canonical():
+  agent = OpenCodeCodingAgent({}, "oc_1", _DummyDB(), _DummyChannel())
+  # Sidecar input_tokens INCLUDES the cached read, so new-uncached = 1000-200.
+  assert agent._normalize_usage({
+    "input_tokens": 1000, "output_tokens": 80, "cached_input_tokens": 200,
+  }) == {
+    "input_tokens": 800, "cache_read_input_tokens": 200,
+    "cache_creation_input_tokens": 0, "output_tokens": 80, "total_tokens": 1080,
+  }
+  assert agent._normalize_usage({}) == {}
+
+
 def test_opencode_build_command_new_session():
   agent = OpenCodeCodingAgent({}, "oc_1", _DummyDB(), _DummyChannel())
   agent._project_dir = "/tmp/project"
@@ -205,8 +217,11 @@ def test_opencode_run_turn_maps_events():
     assert events[3].session_id == "sess-1"
     assert "NEMO_OPENCODE_SYSTEM_PROMPT" in captured_env
     assert cost == 0.25
-    assert usage["input_tokens"] == 10
-    assert usage["cached_input_tokens"] == 2
+    # Usage is normalized to the canonical schema: sidecar input (10) includes
+    # the cached read (2), so new-uncached in = 8, cache_r = 2, total = 15.
+    assert usage["input_tokens"] == 8
+    assert usage["cache_read_input_tokens"] == 2
+    assert usage["total_tokens"] == 15
 
   asyncio.run(_run())
 

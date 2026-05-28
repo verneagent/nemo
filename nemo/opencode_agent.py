@@ -15,7 +15,9 @@ from typing import Callable
 from .channel import Channel
 from .coding_agent import CodingAgent, EndpointConfig
 from .db import Database
-from .turn import AnswerEvent, DoneEvent, ErrorEvent, ProgressEvent, TurnEvent
+from .turn import (
+  AnswerEvent, DoneEvent, ErrorEvent, ProgressEvent, TurnEvent, canonical_usage,
+)
 from .types import JsonObject
 
 log = logging.getLogger(__name__)
@@ -159,7 +161,7 @@ class OpenCodeCodingAgent(CodingAgent):
           self._session_id = str(event.get("session_id", "") or "")
           continue
         if event_type == "turn.completed":
-          usage = self._coerce_json_object(event.get("usage"))
+          usage = self._normalize_usage(self._coerce_json_object(event.get("usage")))
           event_cost = event.get("cost")
           if isinstance(event_cost, int | float):
             cost = float(event_cost)
@@ -345,6 +347,34 @@ class OpenCodeCodingAgent(CodingAgent):
     if isinstance(value, dict):
       return value
     return {}
+
+  def _normalize_usage(self, raw: JsonObject) -> JsonObject:
+    """Map the sidecar's per-turn usage into the canonical schema.
+
+    The sidecar emits {input_tokens, output_tokens, cached_input_tokens} where
+    (per the AI SDK) input_tokens INCLUDES the cached read, so new-uncached
+    input is input_tokens − cached_input_tokens. OpenCode reports per-turn (no
+    cumulative-resume issue like Codex) and has no cache-creation count.
+    """
+    if not raw:
+      return {}
+
+    def _i(key: str) -> int:
+      value = raw.get(key)
+      if isinstance(value, bool):
+        return 0
+      if isinstance(value, (int, float)):
+        return max(0, int(value))
+      return 0
+
+    inp = _i("input_tokens")
+    cached = _i("cached_input_tokens")
+    return canonical_usage(
+      input_tokens=max(0, inp - cached),
+      cache_read=cached,
+      cache_creation=0,
+      output_tokens=_i("output_tokens"),
+    )
 
   def _item_summary(self, item: JsonObject) -> str:
     item_type = str(item.get("type", ""))

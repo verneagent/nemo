@@ -352,7 +352,9 @@ def test_codex_run_turn_maps_events():
       cost, usage = await agent.run_turn("fix it", events.append)
 
     assert cost == 0.0
+    # Fresh thread: cumulative == this turn, so the per-turn delta equals it.
     assert usage["input_tokens"] == 10
+    assert usage["total_tokens"] == 15
     assert agent._session_id == "sess-1"
     assert isinstance(events[0], ProgressEvent)
     assert events[0].first is True
@@ -363,6 +365,99 @@ def test_codex_run_turn_maps_events():
     assert isinstance(events[3], DoneEvent)
     assert proc.stdin.writes == [b"fix it"]
     assert proc.stdin.closed is True
+
+  asyncio.run(_run())
+
+
+def _codex_runtime_patches():
+  """The mock.patch context every run_turn test reuses (sidecar + subprocess)."""
+  return (
+    mock.patch("shutil.which", side_effect=lambda name: f"/usr/bin/{name}"),
+    mock.patch("nemo.codex_agent._SIDE_CAR_SCRIPT", Path("/tmp/run_turn.mjs")),
+    mock.patch("nemo.codex_agent._SIDE_CAR_PACKAGE", Path("/tmp/package.json")),
+    mock.patch.object(Path, "is_file", return_value=True),
+  )
+
+
+def test_codex_usage_is_per_turn_not_cumulative():
+  # Codex reports turn.completed.usage as a SESSION-CUMULATIVE total. The
+  # adapter must difference successive totals so each card shows THAT turn's
+  # cost (matching Claude), not an ever-growing running total.
+  async def _run():
+    proc1 = _FakeProc([
+      b'{"type":"thread.started","thread_id":"sess-1"}\n',
+      b'{"type":"item.completed","item":{"type":"agent_message","text":"one"}}\n',
+      b'{"type":"turn.completed","usage":{"input_tokens":100,"cached_input_tokens":30,"output_tokens":10}}\n',
+    ])
+    proc2 = _FakeProc([
+      b'{"type":"item.completed","item":{"type":"agent_message","text":"two"}}\n',
+      b'{"type":"turn.completed","usage":{"input_tokens":250,"cached_input_tokens":80,"output_tokens":25}}\n',
+    ])
+    agent = CodexCodingAgent({}, "oc_1", _DummyDB(), _DummyChannel())
+    await agent.start("/tmp/project", "gpt-5-codex")
+
+    w, s, p, f = _codex_runtime_patches()
+    with w, s, p, f, \
+         mock.patch("asyncio.create_subprocess_exec", side_effect=[proc1, proc2]):
+      _, usage1 = await agent.run_turn("first", lambda e: None)
+      _, usage2 = await agent.run_turn("second", lambda e: None)
+
+    # Turn 1 (cumulative == first turn): in = 100-30, cache_r = 30, out = 10.
+    assert usage1 == {
+      "input_tokens": 70, "cache_read_input_tokens": 30,
+      "cache_creation_input_tokens": 0, "output_tokens": 10, "total_tokens": 110,
+    }
+    # Turn 2 is the DELTA of the cumulative totals (150/50/15), NOT raw 250/80/25.
+    assert usage2 == {
+      "input_tokens": 100, "cache_read_input_tokens": 50,
+      "cache_creation_input_tokens": 0, "output_tokens": 15, "total_tokens": 165,
+    }
+
+  asyncio.run(_run())
+
+
+def test_codex_usage_baseline_seeded_from_rollout(tmp_path):
+  # On resume the in-memory baseline is gone; recover the cumulative total from
+  # the LAST token_count record in the rollout so the first turn isn't reported
+  # as the whole session.
+  from nemo.codex_agent import _read_codex_cumulative
+  rollout = tmp_path / "rollout.jsonl"
+  rollout.write_text(
+    '{"payload":{"type":"token_count","info":{"total_token_usage":'
+    '{"input_tokens":100,"cached_input_tokens":20,"output_tokens":5}}}}\n'
+    '{"payload":{"type":"token_count","info":{"total_token_usage":'
+    '{"input_tokens":250,"cached_input_tokens":60,"output_tokens":18}}}}\n'
+  )
+  with mock.patch("nemo.codex_agent._find_codex_rollout", return_value=str(rollout)):
+    baseline = _read_codex_cumulative("sess-x")
+  assert baseline == {"input_tokens": 250, "cached_input_tokens": 60, "output_tokens": 18}
+
+
+def test_codex_first_turn_after_resume_diffs_seeded_baseline(tmp_path):
+  async def _run():
+    rollout = tmp_path / "rollout.jsonl"
+    rollout.write_text(
+      '{"payload":{"type":"token_count","info":{"total_token_usage":'
+      '{"input_tokens":200,"cached_input_tokens":50,"output_tokens":20}}}}\n'
+    )
+    proc = _FakeProc([
+      b'{"type":"item.completed","item":{"type":"agent_message","text":"hi"}}\n',
+      b'{"type":"turn.completed","usage":{"input_tokens":260,"cached_input_tokens":70,"output_tokens":28}}\n',
+    ])
+    agent = CodexCodingAgent({}, "oc_1", _DummyDB(), _DummyChannel())
+    with mock.patch("nemo.codex_agent._find_codex_rollout", return_value=str(rollout)):
+      await agent.start("/tmp/project", "gpt-5-codex", resume="sess-x")
+
+    w, s, p, f = _codex_runtime_patches()
+    with w, s, p, f, \
+         mock.patch("asyncio.create_subprocess_exec", return_value=proc):
+      _, usage = await agent.run_turn("next", lambda e: None)
+
+    # Delta vs seeded {200,50,20}: in=(260-200)-(70-50)=40, cache_r=20, out=8.
+    assert usage == {
+      "input_tokens": 40, "cache_read_input_tokens": 20,
+      "cache_creation_input_tokens": 0, "output_tokens": 8, "total_tokens": 68,
+    }
 
   asyncio.run(_run())
 

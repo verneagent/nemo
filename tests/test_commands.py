@@ -427,6 +427,28 @@ def test_tokens_reports_last_usage_snapshot():
   assert is_inline_safe(resp)
 
 
+def test_tokens_reads_canonical_cache_read_key():
+  # The canonical schema (turn.canonical_usage) reports cache reads under
+  # cache_read_input_tokens; /context must read that, not just the legacy key.
+  ctx = _ctx()
+  ctx.record_context_usage({
+    "input_tokens": 800,
+    "cache_read_input_tokens": 1200,
+    "cache_creation_input_tokens": 0,
+    "output_tokens": 90,
+    "total_tokens": 2090,
+  }, updated_at=0)
+
+  handled, resp = try_dispatch("/tokens", ctx)
+
+  assert handled
+  assert resp is not None
+  assert "2,090 tokens" in resp  # current = total_tokens (per-turn footprint)
+  assert "Cached input: 1,200" in resp
+  assert "Last output: 90" in resp
+  assert is_inline_safe(resp)
+
+
 def test_tokens_prefers_total_tokens_when_present():
   ctx = _ctx()
   ctx.record_context_usage({

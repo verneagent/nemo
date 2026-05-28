@@ -18,7 +18,9 @@ from typing import Callable
 from .channel import Channel
 from .coding_agent import CodingAgent, EndpointConfig
 from .db import Database
-from .turn import AnswerEvent, DoneEvent, ErrorEvent, ProgressEvent, TurnEvent
+from .turn import (
+  AnswerEvent, DoneEvent, ErrorEvent, ProgressEvent, TurnEvent, canonical_usage,
+)
 from .types import JsonObject
 
 log = logging.getLogger(__name__)
@@ -70,6 +72,62 @@ def _find_codex_rollout(thread_id: str) -> str:
   hits = glob.glob(str(_CODEX_SESSIONS / "**" / f"*{thread_id}*.jsonl"),
                    recursive=True)
   return hits[0] if hits else ""
+
+
+def _find_total_token_usage(obj: object) -> JsonObject | None:
+  """Return the nested ``total_token_usage`` dict from a rollout record."""
+  if isinstance(obj, dict):
+    found = obj.get("total_token_usage")
+    if isinstance(found, dict):
+      return found
+    for value in obj.values():
+      hit = _find_total_token_usage(value)
+      if hit is not None:
+        return hit
+  elif isinstance(obj, list):
+    for value in obj:
+      hit = _find_total_token_usage(value)
+      if hit is not None:
+        return hit
+  return None
+
+
+def _read_codex_cumulative(thread_id: str) -> dict[str, int]:
+  """Seed the per-turn differencing baseline after a resume/restart.
+
+  Codex's ``turn.completed.usage`` is SESSION-CUMULATIVE (it maps to the
+  rollout's ``total_token_usage``), so per-turn counts come from differencing
+  successive totals on the live ``CodexCodingAgent`` instance. When a fresh
+  daemon resumes an existing thread that in-memory baseline is gone — recover
+  it from the last ``token_count`` record in the rollout so the first
+  post-resume turn isn't reported as the entire session so far. Returns the
+  cumulative {input_tokens, cached_input_tokens, output_tokens} or {} when the
+  rollout has no token usage yet (fresh thread).
+  """
+  path = _find_codex_rollout(thread_id)
+  if not path:
+    return {}
+  baseline: dict[str, int] = {}
+  try:
+    for line in Path(path).read_text().splitlines():
+      if "total_token_usage" not in line:
+        continue
+      try:
+        record = json.loads(line)
+      except json.JSONDecodeError:
+        continue
+      total = _find_total_token_usage(record)
+      if total is None:
+        continue
+      baseline = {
+        "input_tokens": int(total.get("input_tokens", 0) or 0),
+        "cached_input_tokens": int(total.get("cached_input_tokens", 0) or 0),
+        "output_tokens": int(total.get("output_tokens", 0) or 0),
+      }  # keep the LAST record's totals
+  except OSError as e:
+    log.warning("codex usage baseline read failed (%s) — baseline reset", e)
+    return {}
+  return baseline
 
 
 def _seed_fork_rollout(parent_thread_id: str) -> tuple[str, str]:
@@ -135,6 +193,10 @@ class CodexCodingAgent(CodingAgent):
     self._effort = ""
     self._proc: Process | None = None
     self._interrupted = False
+    # Codex reports usage as a SESSION-CUMULATIVE total each turn, so we keep
+    # the previous cumulative here and emit the per-turn delta (seeded from the
+    # rollout on resume — see _read_codex_cumulative).
+    self._cum_usage: dict[str, int] = {}
     # Read-only fork mode: runs the sidecar with sandboxMode=read-only so it
     # cannot modify the project; resumes a private copy of the parent rollout
     # (see fork()). _fork_rollout_path is that throwaway copy, removed on stop.
@@ -154,6 +216,9 @@ class CodexCodingAgent(CodingAgent):
     self._project_dir = project_dir
     self._model = model
     self._session_id = resume
+    # Resuming an existing thread: recover the cumulative baseline so the first
+    # turn's per-turn delta is correct. A fresh thread has no rollout yet → {}.
+    self._cum_usage = _read_codex_cumulative(resume) if resume else {}
 
   async def run_turn(
     self,
@@ -210,7 +275,7 @@ class CodexCodingAgent(CodingAgent):
           self._session_id = str(event.get("thread_id", "") or "")
           continue
         if event_type == "turn.completed":
-          usage = self._coerce_json_object(event.get("usage"))
+          usage = self._per_turn_usage(self._coerce_json_object(event.get("usage")))
           continue
         if event_type == "turn.failed":
           error = self._coerce_json_object(event.get("error"))
@@ -272,6 +337,7 @@ class CodexCodingAgent(CodingAgent):
     self._project_dir = project_dir
     self._model = model
     self._session_id = resume
+    self._cum_usage = _read_codex_cumulative(resume) if resume else {}
 
   def supports_fork(self) -> bool:
     return True
@@ -308,6 +374,39 @@ class CodexCodingAgent(CodingAgent):
       except OSError:
         pass
       self._fork_rollout_path = ""
+
+  def _per_turn_usage(self, cumulative: JsonObject) -> JsonObject:
+    """Difference Codex's session-cumulative usage into a per-turn canonical dict.
+
+    ``turn.completed.usage`` is the running total since the thread started, so
+    the per-turn cost is (this total − previous total). Codex folds cached
+    tokens INTO input_tokens (not a sibling), so the new-uncached input is
+    ``input_tokens − cached_input_tokens``; Codex has no cache-creation concept.
+    """
+    def _i(key: str) -> int:
+      value = cumulative.get(key)
+      if isinstance(value, bool):
+        return 0
+      if isinstance(value, (int, float)):
+        return max(0, int(value))
+      return 0
+
+    current = {
+      "input_tokens": _i("input_tokens"),
+      "cached_input_tokens": _i("cached_input_tokens"),
+      "output_tokens": _i("output_tokens"),
+    }
+    prev = self._cum_usage
+    delta_in = max(0, current["input_tokens"] - prev.get("input_tokens", 0))
+    delta_cached = max(0, current["cached_input_tokens"] - prev.get("cached_input_tokens", 0))
+    delta_out = max(0, current["output_tokens"] - prev.get("output_tokens", 0))
+    self._cum_usage = current
+    return canonical_usage(
+      input_tokens=max(0, delta_in - delta_cached),  # codex input includes cached
+      cache_read=delta_cached,
+      cache_creation=0,  # codex doesn't report cache-creation tokens
+      output_tokens=delta_out,
+    )
 
   def _prepare_prompt(self, prompt: str) -> str:
     # A read-only fork resumes a copied rollout (so _session_id is already

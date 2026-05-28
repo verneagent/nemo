@@ -201,7 +201,10 @@ def _format_token_snapshot(ctx: AgentContext) -> str:
 
   input_tokens = _int_value(ctx.context_usage.get("input_tokens"))
   output_tokens = _int_value(ctx.context_usage.get("output_tokens"))
-  cached_tokens = _int_value(ctx.context_usage.get("cached_input_tokens"))
+  # Canonical schema (turn.canonical_usage) reports cache reads as
+  # cache_read_input_tokens; fall back to the legacy codex key for old snapshots.
+  cached_tokens = (_int_value(ctx.context_usage.get("cache_read_input_tokens"))
+                   or _int_value(ctx.context_usage.get("cached_input_tokens")))
   total_tokens = _int_value(ctx.context_usage.get("total_tokens"))
   current_tokens = total_tokens or input_tokens
   context_window = _int_value(ctx.context_usage.get("context_window"))

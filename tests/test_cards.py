@@ -30,8 +30,19 @@ def test_elapsed_text():
 
 def test_usage_text():
   assert _usage_text({}) == ""
-  assert _usage_text({"input_tokens": 1000}) == "in: 1,000"
-  assert _usage_text({"input_tokens": 1000, "output_tokens": 200}) == "in: 1,000 | out: 200"
+  # Compact labels: total / i / cr / cw / o, separated by " · ".
+  assert _usage_text({
+    "input_tokens": 1000,
+    "cache_read_input_tokens": 200,
+    "cache_creation_input_tokens": 50,
+    "output_tokens": 80,
+    "total_tokens": 1330,
+  }) == "total 1,330 · i 1,000 · cr 200 · cw 50 · o 80"
+  # cw is omitted when zero (Codex never has it) — the other fields stay so
+  # the layout is predictable across adapters.
+  assert _usage_text({"input_tokens": 1000, "output_tokens": 200}) == (
+    "total 0 · i 1,000 · cr 0 · o 200"
+  )
 
 
 def test_shell_card_running_has_abort_button():
@@ -471,13 +482,23 @@ def test_done_card_basic():
 def test_done_card_with_usage():
   card = build_turn_card(
     "done", body="Result.", elapsed=90,
-    usage={"input_tokens": 5000, "output_tokens": 300},
+    usage={
+      "input_tokens": 5000,
+      "cache_read_input_tokens": 1200,
+      "cache_creation_input_tokens": 0,
+      "output_tokens": 300,
+      "total_tokens": 6500,
+    },
   )
   footer = [e for e in card["body"]["elements"] if e.get("text_size") == "notation"][0]
   text = footer["content"]
   assert "1m 30s" in text
-  assert "5,000" in text
-  assert "300" in text
+  # Per-turn breakdown: total / i / cr / o (cw omitted because it's 0 here).
+  assert "total 6,500" in text
+  assert "i 5,000" in text
+  assert "cr 1,200" in text
+  assert "o 300" in text
+  assert "cw" not in text
 
 
 def test_done_card_with_steps():
