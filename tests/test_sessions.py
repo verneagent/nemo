@@ -19,7 +19,9 @@ def _write_jsonl(path: str, events: list[dict]) -> None:
 
 def _claude_session(home: str, project_dir: str, uuid: str,
                     events: list[dict]) -> str:
-  encoded = os.path.abspath(project_dir).replace("/", "-").replace(".", "-")
+  # Mirror the CLI's slug exactly (realpath + every non-alnum → "-"); on
+  # macOS tmp_path is symlinked, so abspath would diverge from realpath.
+  encoded = sessions.claude_project_slug(project_dir)
   path = os.path.join(home, ".claude", "projects", encoded, f"{uuid}.jsonl")
   _write_jsonl(path, events)
   return path
@@ -81,6 +83,26 @@ def test_list_claude_sessions_handles_hidden_path_segments(tmp_path):
   assert len(out) == 1
   assert out[0].uuid == "d65dfbbf-7c71-49cd-9761-06844d0a189f"
   assert out[0].first_user_text == "Look at this bug"
+
+
+def test_list_claude_sessions_handles_spaces_in_path(tmp_path):
+  # Claude CLI encodes spaces in the cwd to ``-`` (e.g. macOS
+  # "Application Support"). The folder lookup must do the same or
+  # /session list finds nothing for projects under such paths.
+  home = str(tmp_path / "home")
+  project = str(tmp_path / "Application Support" / "Muxy" / "vm-min-dur")
+  os.makedirs(project, exist_ok=True)
+  _claude_session(home, project, "5c0ffee0-0000-0000-0000-000000000000", [
+    {"type": "user", "message": {
+      "role": "user",
+      "content": "Hello from a spaced path",
+    }},
+  ])
+  with mock.patch.dict(os.environ, {"HOME": home}):
+    out = sessions.list_claude_sessions(project)
+  assert len(out) == 1, out
+  assert out[0].uuid == "5c0ffee0-0000-0000-0000-000000000000"
+  assert out[0].first_user_text == "Hello from a spaced path"
 
 
 def test_list_claude_sessions_handles_block_content(tmp_path):

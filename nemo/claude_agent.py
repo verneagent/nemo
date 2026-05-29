@@ -14,6 +14,7 @@ from .coding_agent import CodingAgent, EndpointConfig
 from .db import Database
 from .permissions import build_ask_user_question_handler, build_permission_handler
 from .sdk_thread import SDKThread
+from .sessions import claude_project_slug
 from .turn import CompactStartedEvent, TurnEvent
 from .types import JsonObject
 
@@ -109,19 +110,10 @@ _BTW_TIMEOUT = 120
 _BTW_MAX_TURNS = 6
 
 
-def _project_slug(project_dir: str) -> str:
-  """Replicate the Claude CLI's project-dir → transcript-dir slug.
-
-  The CLI does NOT do a naive ``path.replace("/", "-")``: it resolves the
-  realpath (so ``/var`` → ``/private/var`` on macOS) and replaces EVERY
-  non-alphanumeric char with ``-`` (so ``_`` and ``.`` collapse to ``-``
-  too — ``foo_bar`` → ``foo-bar``, ``.supacode`` → ``-supacode``). Getting
-  this exactly right matters: ``_seed_fork_transcript`` copies a parent
-  transcript into a fork's slug dir, and the CLI only finds it if the slug
-  matches byte-for-byte. (A naive replace also silently broke trailing_note's
-  size nudge for any project path containing ``_``/``.``/a symlink.)
-  """
-  return re.sub(r"[^a-zA-Z0-9]", "-", os.path.realpath(project_dir))
+# The Claude CLI's project-dir → transcript-dir slug. ``_seed_fork_transcript``
+# copies a parent transcript into a fork's slug dir, and the CLI only finds it
+# if the slug matches byte-for-byte; see ``claude_project_slug`` for the rule.
+_project_slug = claude_project_slug
 
 
 def _session_jsonl_path(project_dir: str, sdk_session_id: str) -> str:

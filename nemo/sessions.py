@@ -81,16 +81,25 @@ class SessionDetailResult:
 # Path encoding
 # ---------------------------------------------------------------------------
 
-def _claude_project_dir(project_dir: str) -> str:
-  """Map a project_dir to the Claude CLI's storage folder.
+def claude_project_slug(project_dir: str) -> str:
+  """Replicate the Claude CLI's project-dir → transcript-dir slug.
 
-  Claude CLI's heuristic: replace every path separator and ``.`` in the
-  absolute cwd with ``-``, which for absolute paths starts the result
-  with ``-``.
+  The CLI resolves the realpath (so ``/var`` → ``/private/var`` on macOS,
+  and symlinked worktrees resolve to their real location) and replaces
+  EVERY non-alphanumeric char with ``-`` — ``/``, ``.``, ``_``, and spaces
+  (e.g. macOS "Application Support") all collapse to ``-``. Getting this
+  exactly right matters: glob below only finds a project's sessions if the
+  slug matches the folder the CLI created byte-for-byte. A naive
+  ``replace("/", "-")`` silently broke listing for any path containing a
+  space, ``_``, ``.``, or a symlink.
   """
-  abs_dir = os.path.abspath(project_dir)
-  encoded = abs_dir.replace("/", "-").replace(".", "-")
-  return os.path.expanduser(f"~/.claude/projects/{encoded}")
+  return re.sub(r"[^a-zA-Z0-9]", "-", os.path.realpath(project_dir))
+
+
+def _claude_project_dir(project_dir: str) -> str:
+  """Map a project_dir to the Claude CLI's local storage folder."""
+  return os.path.expanduser(
+    f"~/.claude/projects/{claude_project_slug(project_dir)}")
 
 
 _NOISE_TAG_RE = re.compile(
