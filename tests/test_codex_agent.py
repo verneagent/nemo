@@ -69,7 +69,7 @@ class _FakeProc:
 
 
 def test_default_model_for_agent():
-  assert default_model_for_agent("claude") == "claude-opus-4-7"
+  assert default_model_for_agent("claude") == "claude-opus-4-8"
   # Codex default must work for both ChatGPT subscribers and API users —
   # the codex-specialized (-codex) slugs are API-only.
   assert default_model_for_agent("codex") == "gpt-5.5"
