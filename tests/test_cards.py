@@ -330,6 +330,26 @@ def test_working_card_with_steps():
   assert "Thinking (1)" in elements[1]["header"]["title"]["content"]
 
 
+def test_working_card_status_notice_banner():
+  card = build_turn_card(
+    "working", status_notice="📖 Reading the recalled session transcript…")
+  elements = card["body"]["elements"]
+  banner = elements[0]
+  assert banner["tag"] == "markdown"
+  assert "Reading the recalled session transcript" in banner["content"]
+  # Blue informational colour, distinct from rate-limit orange / compact grey.
+  assert "color='blue'" in banner["content"]
+
+
+def test_done_card_ignores_status_notice():
+  # status_notice is a live working-phase hint; the done card must not
+  # carry it (the banner is transient and cleared once progress streams).
+  card = build_turn_card(
+    "done", body="result", status_notice="should not appear", elapsed=3)
+  import json
+  assert "should not appear" not in json.dumps(card, ensure_ascii=False)
+
+
 def test_working_card_escalating_title():
   card = build_turn_card("working", elapsed=100)
   assert "incredibly" in card["header"]["title"]["content"].lower()

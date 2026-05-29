@@ -648,7 +648,8 @@ async def _handle_session_recall(
     ),
   }.get(info.agent, "")
   prompt = (
-    f"[Nemo recall] The user asked you to recall a past coding session "
+    _RECALL_PROMPT_PREFIX
+    + f"The user asked you to recall a past coding session "
     f"in this project. Its JSONL transcript lives at:\n\n"
     f"  {info.path}\n\n"
     f"Session metadata: agent `{info.agent}`, uuid "
@@ -787,6 +788,14 @@ async def _handle_session_purge(
   )
   await _send_response(
     channel, chat_id, _format_session_delete_result("purge", result), db)
+
+
+# Marker prefixing the synthetic prompt that `/session recall` injects.
+# Shared so the turn loop can recognise a recall turn (its first SDK token
+# can take a while — resume + reading the past transcript) and surface a
+# placeholder working card up front instead of leaving the user staring at
+# the recall ack during the silence.
+_RECALL_PROMPT_PREFIX = "[Nemo recall] "
 
 
 # When an SDK turn times out the underlying CLI/agent is usually choking on a
@@ -2349,6 +2358,11 @@ async def main_loop(
       # explained as it happens rather than buried after the user expands
       # thinking.
       _turn_compact_notice = ""
+      # Live "what's happening now" banner for a silent pre-first-token
+      # stretch (currently: a recall turn reading the past transcript).
+      # Set up front before the SDK starts streaming and cleared on the
+      # first real progress event so it doesn't linger as stale.
+      _turn_status_notice = ""
 
       async def _update_interrupt_card(phase: str) -> None:
         nonlocal _turn_card_id, _turn_interrupt_phase
@@ -2439,6 +2453,7 @@ async def main_loop(
           steps=_turn_steps,
           elapsed=elapsed,
           chat_id=chat_id,
+          status_notice=_turn_status_notice,
           rate_limit_notice=_turn_rate_limit_notice,
           compact_notice=_turn_compact_notice,
           **ctx_kwargs,
@@ -2471,11 +2486,16 @@ async def main_loop(
         # _on_event calls have finished. No lock needed.
         nonlocal _turn_card_id, _sdk_session_id, _turn_current_tool
         nonlocal _turn_rate_limit_notice, _turn_compact_notice
+        nonlocal _turn_status_notice
 
         if isinstance(event, ProgressEvent):
           _turn_steps.append(cards.ThinkingStep(event.kind, event.summary))
           _turn_current_tool = event.summary if event.kind == "tool" else _turn_current_tool
           if event.first:
+            # Real output is streaming now — drop the pre-first-token
+            # placeholder banner (e.g. the recall "reading transcript" hint)
+            # so it doesn't linger behind the live progress.
+            _turn_status_notice = ""
             _ensure_card()
           _update_working(current_tool=_turn_current_tool if event.kind == "tool" else None)
 
@@ -2577,6 +2597,37 @@ async def main_loop(
               _await_channel(_send_response(channel, chat_id, final_text, db))
           ctx.total_cost += event.cost
           ctx.record_context_usage(event.usage)
+
+      # A recall turn's first SDK token can take a long time (resume +
+      # reading the past transcript); until then only non-progress
+      # SystemMessages arrive, so the working card would otherwise not
+      # appear until first-token — ~80s in practice — leaving the user on
+      # the recall ack. Send the working card up front with a blue status
+      # banner so the silence is explained as it happens. The first real
+      # ProgressEvent clears the banner (see _on_event) and reuses this
+      # card (_ensure_card no-ops once _turn_card_id is set). Done on the
+      # main loop with a direct await — unlike _ensure_card (built for the
+      # SDK thread, which would deadlock on run_coroutine_threadsafe here).
+      if user_message.startswith(_RECALL_PROMPT_PREFIX) and not _turn_card_id:
+        _turn_status_notice = (
+          "📖 Reading the recalled session transcript… the first turn can "
+          "take a while before output starts.")
+        try:
+          await _clear_ack()
+          card = cards.build_turn_card(
+            "working",
+            elapsed=int(time.time() - _turn_start),
+            chat_id=chat_id,
+            status_notice=_turn_status_notice,
+            answered_questions=list(channel.turn_ctx.answered_questions),
+            pending_question=channel.turn_ctx.pending_question,
+          )
+          _turn_card_id = await channel.send_card(chat_id, card)
+          db.set_working(session_id, _turn_card_id)
+          _register_msg(_turn_card_id, chat_id)
+          channel.turn_ctx.turn_card_id = _turn_card_id
+        except Exception as e:
+          log.warning("Failed to send recall placeholder card: %s", e)
 
       if _pending_shell_contexts:
         log.info(

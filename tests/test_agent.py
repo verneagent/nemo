@@ -7,6 +7,7 @@ import urllib.error
 from unittest import mock
 
 from nemo.agent import (
+  _RECALL_PROMPT_PREFIX,
   _format_rate_limit_notice,
   _in_turn_filtered_out,
   _interrupt_and_drain,
@@ -703,6 +704,94 @@ def test_pacing_hint_prepended_after_timeout(tmp_path):
   # Any later prompt must not carry the hint — one-shot semantics.
   for later in agent.prompts[2:]:
     assert not later.startswith("[Nemo 系统提示]"), later
+
+
+def test_recall_turn_shows_placeholder_card_before_first_token(tmp_path):
+  """A recall turn surfaces a working card with a blue status banner up
+  front, before the SDK streams its first token, so the (often long)
+  resume + transcript-read silence is explained instead of leaving the
+  user on the recall ack. The banner clears once real progress streams."""
+  import json
+
+  banner_marker = "Reading the recalled session transcript"
+
+  class _RecallChannel(_QueuedChannel):
+    def __init__(self, chat_id, messages):
+      super().__init__(chat_id, messages)
+      self.sent_cards: list[object] = []
+      self.updated_cards: list[object] = []
+
+    async def send_card(self, _chat_id, card):
+      self.sent_cards.append(card)
+      return "om_card"
+
+    async def update_card(self, card_id, card):
+      self.updated_cards.append(card)
+      return card_id
+
+  class _RecallAgent(_FakeAgent):
+    def __init__(self):
+      self.sent_at_entry: int | None = None
+
+    def trailing_note(self, _sdk_session_id):
+      return ""
+
+    async def run_turn(self, _prompt, on_event):
+      # Snapshot what the user can already see at the instant the SDK turn
+      # begins — i.e. before any progress streams. The placeholder must be
+      # among these.
+      self.sent_at_entry = len(channel.sent_cards)
+
+      def _emit():
+        # First real progress only after the (here-simulated) wait.
+        on_event(ProgressEvent(kind="tool", summary="Read: past.jsonl", first=True))
+        on_event(AnswerEvent("Recovered: was fixing the parser."))
+        on_event(DoneEvent(cost=0.0, usage={}))
+      await asyncio.to_thread(_emit)
+      return 0.0, {}
+
+  agent = _RecallAgent()
+  channel = _RecallChannel("oc_test", [
+    IncomingMessage(
+      event_type="im.message.receive_v1", chat_id="oc_test",
+      sender_id="", message_id="recall_abc_1", msg_type="text",
+      text=_RECALL_PROMPT_PREFIX + "The user asked you to recall a past "
+      "coding session in this project.", create_time="1", is_internal=True,
+    ),
+    IncomingMessage(
+      event_type="im.message.receive_v1", chat_id="oc_test",
+      sender_id="ou_user", message_id="om_exit", msg_type="text",
+      text="/exit", create_time="2",
+    ),
+  ])
+
+  with mock.patch("nemo.agent.load_credentials", return_value={
+    "app_id": "app_id",
+    "app_secret": "app_secret",
+    "email": "user@example.com",
+  }), \
+       mock.patch("nemo.agent.Database", _FakeDB), \
+       mock.patch("nemo.agent.LarkChannel", return_value=channel), \
+       mock.patch("nemo.agent.build_coding_agent", return_value=agent), \
+       mock.patch("nemo.group_config.load_config", return_value={}), \
+       mock.patch("nemo.config.load_relay_config", return_value=("", "")), \
+       mock.patch("signal.signal"):
+    result = asyncio.run(main_loop("oc_test", str(tmp_path), "claude-opus-4-6"))
+
+  assert result == 0
+  # The placeholder card was visible BEFORE the SDK produced any event.
+  assert agent.sent_at_entry is not None and agent.sent_at_entry >= 1
+  pre_turn = channel.sent_cards[:agent.sent_at_entry]
+  assert any(
+    banner_marker in json.dumps(c, ensure_ascii=False) for c in pre_turn), pre_turn
+  # Banner uses the blue informational colour.
+  placeholder = next(
+    c for c in pre_turn if banner_marker in json.dumps(c, ensure_ascii=False))
+  assert "blue" in json.dumps(placeholder, ensure_ascii=False)
+  # Once real progress streamed, the banner is gone from every later update
+  # (working refresh + done card) — it doesn't linger as stale.
+  for card in channel.updated_cards:
+    assert banner_marker not in json.dumps(card, ensure_ascii=False), card
 
 
 def test_shell_bang_context_injected_next_turn_double_bang_not_injected(tmp_path):

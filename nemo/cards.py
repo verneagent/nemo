@@ -525,6 +525,7 @@ def _working_elements(
   include_stop_button: bool,
   chat_id: str = "",
   stop_action: str = "__stop__",
+  status_notice: str = "",
   rate_limit_notice: str = "",
   compact_notice: str = "",
   answered_questions: list["AnsweredQuestion"] | None = None,
@@ -532,6 +533,16 @@ def _working_elements(
 ) -> list[JsonObject]:
   """Build the shared body for working/stopping/stopped phases."""
   elements: list[JsonObject] = []
+  if status_notice:
+    # Live "what's happening right now" hint, shown above the timeline so
+    # an otherwise-silent stretch (e.g. a recall turn reading a transcript
+    # before first-token) doesn't look like the daemon has stalled. Blue
+    # reads as in-progress info, distinct from rate-limit's orange warning
+    # and compact's grey. Callers clear it once real progress streams.
+    elements.append({
+      "tag": "markdown",
+      "content": f"<font color='blue'>{status_notice}</font>",
+    })
   if rate_limit_notice:
     elements.append({
       "tag": "markdown",
@@ -572,6 +583,7 @@ def build_turn_card(
   chat_id: str = "",
   session_id: str = "",
   stop_action: str = "__stop__",
+  status_notice: str = "",
   rate_limit_notice: str = "",
   compact_notice: str = "",
   answered_questions: list["AnsweredQuestion"] | None = None,
@@ -582,6 +594,11 @@ def build_turn_card(
   phase: "working" | "stopping" | "stopped" | "done" | "error"
   body:  for done/error — final response or error message
   steps: unified thinking timeline (text + tool entries in order)
+  status_notice: short blue banner shown above the working state as a
+    live "what's happening now" hint (only rendered in working/stopping/
+    stopped). Used to explain a silent stretch before first-token — e.g. a
+    recall turn reading a past transcript. Callers clear it once real
+    progress streams so it doesn't linger as stale.
   rate_limit_notice: short banner shown above the working state to flag
     upstream rate-limit pressure (only rendered in working/stopping/stopped).
   compact_notice: short banner explaining a context-compaction pause —
@@ -605,6 +622,7 @@ def build_turn_card(
       steps=steps, current_tool=current_tool,
       include_stop_button=True, chat_id=chat_id,
       stop_action=stop_action,
+      status_notice=status_notice,
       rate_limit_notice=rate_limit_notice,
       compact_notice=compact_notice,
       answered_questions=answered_questions,
@@ -620,6 +638,7 @@ def build_turn_card(
     elements = _working_elements(
       steps=steps, current_tool=current_tool,
       include_stop_button=False,
+      status_notice=status_notice,
       rate_limit_notice=rate_limit_notice,
       compact_notice=compact_notice,
       answered_questions=answered_questions,
@@ -634,6 +653,7 @@ def build_turn_card(
     elements = _working_elements(
       steps=steps, current_tool=current_tool,
       include_stop_button=False,
+      status_notice=status_notice,
       rate_limit_notice=rate_limit_notice,
       compact_notice=compact_notice,
       answered_questions=answered_questions,
