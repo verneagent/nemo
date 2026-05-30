@@ -16,6 +16,32 @@ from ..types import JsonObject
 BASE_URL = "https://open.larksuite.com/open-apis"
 
 
+class HTTPErrorWithBody(urllib.error.HTTPError):
+  """An HTTPError whose response body has already been consumed.
+
+  ``urllib`` lets you read an error body only once, and ``_request`` reads
+  it to attempt JSON parsing. When the body isn't JSON — e.g. an edge /
+  CDN / WAF 403 in front of Lark, which returns no application-layer
+  ``code`` — we re-raise this subclass carrying the decoded body and the
+  request id so auth-error callers can LOG *why* instead of just the bare
+  status code. Subclassing HTTPError keeps ``except urllib.error.HTTPError``
+  callers working unchanged.
+  """
+
+  def __init__(self, orig: urllib.error.HTTPError, body: str) -> None:
+    super().__init__(orig.filename, orig.code, orig.msg, orig.headers, None)
+    self.body_text = body
+    hdrs = orig.headers
+    get = hdrs.get if hdrs is not None else (lambda *_a, **_k: "")
+    self.request_id = get("X-Request-Id") or get("x-request-id") or ""
+    self.server = get("Server") or ""
+
+  def read(self, *_args: object, **_kwargs: object) -> bytes:
+    # The underlying stream was already drained upstream; serve the cached
+    # copy so a second reader doesn't get an empty body.
+    return self.body_text.encode("utf-8", "replace")
+
+
 def _request(url: str, token: str, payload: JsonObject | None = None,
              method: str = "GET", timeout: int = 30) -> JsonObject:
   """Make an authenticated request to Lark API."""
@@ -31,10 +57,13 @@ def _request(url: str, token: str, payload: JsonObject | None = None,
     with urllib.request.urlopen(req, timeout=timeout) as resp:
       return json.loads(resp.read())
   except urllib.error.HTTPError as e:
+    raw = e.read()
     try:
-      return json.loads(e.read())
+      return json.loads(raw)
     except Exception:
-      raise e
+      # Non-JSON error body (edge/gateway 403, HTML, empty). Preserve it on
+      # the exception so the caller's log can explain the failure.
+      raise HTTPErrorWithBody(e, raw.decode("utf-8", "replace")) from e
 
 
 # ---------------------------------------------------------------------------

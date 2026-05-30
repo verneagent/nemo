@@ -596,6 +596,38 @@ def test_update_card_falls_back_to_new_card_when_refresh_fails():
   assert new_id == "om_new"
 
 
+def test_update_card_logs_edge_body_on_403():
+  """The 403 fallback logs the edge response (body + request id + Server) so
+  a transient CDN/WAF 403 is distinguishable from a real permission error."""
+  import io
+  from email.message import Message
+  from nemo.lark import api
+
+  ch = _build_topic_channel()
+  ch._chat_mode = "group"
+
+  hdrs = Message()
+  hdrs["X-Request-Id"] = "req-xyz"
+  hdrs["Server"] = "volc-dcdn"
+  orig = urllib.error.HTTPError(
+    "https://x/url", 403, "Forbidden", hdrs, io.BytesIO(b"<html>forbidden</html>"))
+  err = api.HTTPErrorWithBody(orig, "<html>forbidden</html>")
+
+  with mock.patch("nemo.lark_channel.lark_auth.get_token", return_value="t"), \
+       mock.patch("nemo.lark_channel.lark_auth.invalidate"), \
+       mock.patch("nemo.lark_channel.lark_api.update_card", side_effect=err), \
+       mock.patch("nemo.lark_channel.lark_api.send_card", return_value="om_new"), \
+       mock.patch("nemo.lark_channel.log.warning") as warn:
+    new_id = asyncio.run(ch.update_card("om_old", {"title": "x"}))
+
+  assert new_id == "om_new"
+  warn.assert_called_once()
+  rendered = warn.call_args.args[0] % warn.call_args.args[1:]
+  assert "req-xyz" in rendered
+  assert "volc-dcdn" in rendered
+  assert "forbidden" in rendered
+
+
 def test_update_card_topic_fallback_replies_to_failed_card():
   """In topic chats the fallback card must reply to the failed message,
   not to self._reply_anchor (which may have drifted)."""

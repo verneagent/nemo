@@ -462,7 +462,17 @@ class LarkChannel(Channel):
       # the new id so callers can retarget subsequent updates in the turn.
       if e.code not in (401, 403):
         raise
-      log.warning("update_card failed after refresh (HTTP %d) — sending as new card", e.code)
+      # Log the edge/gateway response (body + request id + Server) so we can
+      # tell a transient CDN/WAF 403 apart from a real Lark permission error
+      # next time. lark_api wraps non-JSON error bodies in HTTPErrorWithBody;
+      # a plain HTTPError (no body captured) just logs the status.
+      log.warning(
+        "update_card failed after refresh (HTTP %d) — sending as new card; "
+        "lark_request_id=%s server=%s body=%s",
+        e.code,
+        getattr(e, "request_id", "") or "?",
+        getattr(e, "server", "") or "?",
+        (getattr(e, "body_text", "") or "")[:300] or "(none/non-JSON)")
       # In topic chats, reply to the failed card (not self._reply_anchor,
       # which may have drifted to a newer inbound message) so the fallback
       # stays in the same thread as the original.

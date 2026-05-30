@@ -1,9 +1,50 @@
 """Tests for nemo.lark.api."""
 
+import io
 import json
+import urllib.error
+from email.message import Message
 from unittest import mock
 
 from nemo.lark import api
+
+
+def _http_error(code: int, body: bytes, headers: dict | None = None
+                ) -> urllib.error.HTTPError:
+  hdrs = Message()
+  for k, v in (headers or {}).items():
+    hdrs[k] = v
+  return urllib.error.HTTPError(
+    "https://example.com/api", code, "Forbidden", hdrs, io.BytesIO(body))
+
+
+def test_request_wraps_non_json_error_body():
+  """A non-JSON error body (edge/CDN/WAF 403) is re-raised as
+  HTTPErrorWithBody carrying the body + request id, so callers can log why."""
+  err = _http_error(403, b"<html>403 Forbidden</html>",
+                    {"X-Request-Id": "req-abc", "Server": "volc-dcdn"})
+  with mock.patch("urllib.request.urlopen", side_effect=err):
+    try:
+      api._request("https://example.com/api", "tok", {"k": "v"}, method="PATCH")
+      assert False, "should raise"
+    except api.HTTPErrorWithBody as e:
+      assert isinstance(e, urllib.error.HTTPError)  # callers' except still works
+      assert e.code == 403
+      assert "403 Forbidden" in e.body_text
+      assert e.request_id == "req-abc"
+      assert e.server == "volc-dcdn"
+      # Body is re-readable (the raw stream was already drained upstream).
+      assert b"403 Forbidden" in e.read()
+
+
+def test_request_returns_json_error_body_unchanged():
+  """A JSON error body (Lark application-layer error) is still returned as a
+  dict — only non-JSON bodies become HTTPErrorWithBody."""
+  body = json.dumps({"code": 99991663, "msg": "token expired"}).encode()
+  err = _http_error(400, body)
+  with mock.patch("urllib.request.urlopen", side_effect=err):
+    result = api._request("https://example.com/api", "tok")
+  assert result["code"] == 99991663
 
 
 def _mock_response(data: dict, status: int = 200):
