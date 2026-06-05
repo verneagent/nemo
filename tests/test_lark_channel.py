@@ -558,6 +558,27 @@ def _make_http_error(code: int) -> urllib.error.HTTPError:
     "https://test/url", code, "Forbidden", hdrs=None, fp=None)  # type: ignore[arg-type]
 
 
+def _make_edge_403(request_id: str = "") -> urllib.error.HTTPError:
+  """A 403 as returned by the edge/CDN (e.g. volc-dcdn): non-JSON body, and
+  by default no Lark X-Request-Id — the signal that it never reached Lark."""
+  import io
+  from email.message import Message
+  from nemo.lark import api
+  hdrs = Message()
+  hdrs["Server"] = "volc-dcdn"
+  if request_id:
+    hdrs["X-Request-Id"] = request_id
+  orig = urllib.error.HTTPError(
+    "https://x/url", 403, "Forbidden", hdrs,
+    io.BytesIO(b"<html>forbidden</html>"))
+  return api.HTTPErrorWithBody(orig, "<html>forbidden</html>")
+
+
+async def _async_noop(*_a: object, **_k: object) -> None:
+  """Stand-in for asyncio.sleep so backoff retries don't slow tests."""
+  return None
+
+
 def test_update_card_retries_on_http_403():
   """HTTP 403 should invalidate token and retry once with fresh token."""
   ch = _build_topic_channel()
@@ -587,6 +608,7 @@ def test_update_card_falls_back_to_new_card_when_refresh_fails():
 
   with mock.patch("nemo.lark_channel.lark_auth.get_token", return_value="t"), \
        mock.patch("nemo.lark_channel.lark_auth.invalidate"), \
+       mock.patch("nemo.lark_channel.asyncio.sleep", new=_async_noop), \
        mock.patch("nemo.lark_channel.lark_api.update_card",
                   side_effect=_make_http_error(403)), \
        mock.patch("nemo.lark_channel.lark_api.send_card",
@@ -628,6 +650,56 @@ def test_update_card_logs_edge_body_on_403():
   assert "forbidden" in rendered
 
 
+def test_update_card_edge_403_retries_same_card_no_new_card():
+  """A transient edge/CDN 403 (no Lark X-Request-Id) must retry the SAME
+  message id and, once the gateway clears, keep editing in place — NOT spawn
+  a duplicate card. This is the volc-dcdn blip that split turns into new cards.
+  """
+  ch = _build_topic_channel()
+  ch._chat_mode = "group"
+  calls = 0
+
+  def fake_update(_token, _msg_id, _card):
+    nonlocal calls
+    calls += 1
+    if calls <= 2:  # blip blocks the first two attempts, then clears
+      raise _make_edge_403()
+
+  with mock.patch("nemo.lark_channel.lark_auth.get_token", return_value="t"), \
+       mock.patch("nemo.lark_channel.lark_auth.invalidate"), \
+       mock.patch("nemo.lark_channel.asyncio.sleep", new=_async_noop), \
+       mock.patch("nemo.lark_channel.lark_api.update_card",
+                  side_effect=fake_update), \
+       mock.patch("nemo.lark_channel.lark_api.send_card") as mock_send, \
+       mock.patch("nemo.lark_channel.lark_api.reply_card") as mock_reply:
+    new_id = asyncio.run(ch.update_card("om_orig", {"title": "x"}))
+
+  assert new_id == "om_orig"        # same card retained
+  mock_send.assert_not_called()     # no duplicate card
+  mock_reply.assert_not_called()
+
+
+def test_update_card_genuine_lark_403_skips_retry_and_falls_back():
+  """A 403 carrying a real Lark X-Request-Id is a genuine rejection (e.g.
+  message too old / permission lost): fall back to a new card immediately,
+  without burning the edge-403 retry window."""
+  ch = _build_topic_channel()
+  ch._chat_mode = "group"
+
+  with mock.patch("nemo.lark_channel.lark_auth.get_token", return_value="t"), \
+       mock.patch("nemo.lark_channel.lark_auth.invalidate"), \
+       mock.patch("nemo.lark_channel.asyncio.sleep") as mock_sleep, \
+       mock.patch("nemo.lark_channel.lark_api.update_card",
+                  side_effect=_make_edge_403(request_id="req-real")), \
+       mock.patch("nemo.lark_channel.lark_api.send_card",
+                  return_value="om_new") as mock_send:
+    new_id = asyncio.run(ch.update_card("om_old", {"title": "x"}))
+
+  assert new_id == "om_new"
+  mock_send.assert_called_once()
+  mock_sleep.assert_not_called()    # no retry window for a genuine Lark 403
+
+
 def test_update_card_topic_fallback_replies_to_failed_card():
   """In topic chats the fallback card must reply to the failed message,
   not to self._reply_anchor (which may have drifted)."""
@@ -636,6 +708,7 @@ def test_update_card_topic_fallback_replies_to_failed_card():
 
   with mock.patch("nemo.lark_channel.lark_auth.get_token", return_value="t"), \
        mock.patch("nemo.lark_channel.lark_auth.invalidate"), \
+       mock.patch("nemo.lark_channel.asyncio.sleep", new=_async_noop), \
        mock.patch("nemo.lark_channel.lark_api.update_card",
                   side_effect=_make_http_error(403)), \
        mock.patch("nemo.lark_channel.lark_api.reply_card",

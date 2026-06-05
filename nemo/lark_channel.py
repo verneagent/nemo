@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -20,6 +21,12 @@ from .types import JsonObject
 from . import vision_cli
 
 ParentLookup = Callable[[str], str | None]
+
+# Backoff (seconds) for retrying a card PATCH against the SAME message id when
+# an edge/CDN/WAF 403 (no Lark X-Request-Id) blocks it. The observed volc-dcdn
+# blips lasted ~14s; this window rides through them so a transient gateway
+# error never permanently splits a turn into a duplicate card.
+EDGE_403_BACKOFF = (1.0, 2.0, 4.0, 8.0)
 
 
 def _video_block(path: str, model_sees_video: bool, vision_helper: bool) -> str:
@@ -462,6 +469,27 @@ class LarkChannel(Channel):
       # the new id so callers can retarget subsequent updates in the turn.
       if e.code not in (401, 403):
         raise
+      # A 403 carrying no Lark X-Request-Id never reached Lark's application
+      # layer — it's an edge/CDN/WAF block (e.g. volc-dcdn), which is transient
+      # and editable-on-retry. Neither a token refresh nor a brand-new card
+      # fixes it, and falling back to a new card permanently splits the turn.
+      # Retry the SAME message id across EDGE_403_BACKOFF before giving up; only
+      # a genuine Lark 403 (real request id) or an exhausted window falls
+      # through to the duplicate-card fallback below.
+      if e.code == 403 and not (getattr(e, "request_id", "") or ""):
+        for delay in EDGE_403_BACKOFF:
+          await asyncio.sleep(delay)
+          try:
+            self._retry_on_auth_error(lark_api.update_card, message_id, card)
+            return message_id
+          except urllib.error.HTTPError as retry_err:
+            if retry_err.code not in (401, 403):
+              raise
+            e = retry_err
+            # Edge cleared but Lark genuinely rejects the edit — stop retrying.
+            if getattr(retry_err, "request_id", "") or "":
+              break
+            # else: still a transient edge 403, keep riding the window out.
       # Log the edge/gateway response (body + request id + Server) so we can
       # tell a transient CDN/WAF 403 apart from a real Lark permission error
       # next time. lark_api wraps non-JSON error bodies in HTTPErrorWithBody;
