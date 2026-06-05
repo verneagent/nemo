@@ -40,7 +40,7 @@ _EFFORT_PREFIX: dict[str, str] = {
 }
 
 
-def _build_agent_prompt(system_prompt: str) -> str:
+def _build_agent_prompt(system_prompt: str, vision_note: str = "") -> str:
   prompt = (
     "You are running inside Nemo, a Lark-connected coding agent daemon. "
     "Users interact with you through Lark mobile app. "
@@ -64,6 +64,8 @@ def _build_agent_prompt(system_prompt: str) -> str:
     "  nemo-send image /path/to/screenshot.png\n"
     "  nemo-send file /path/to/document.pdf"
   )
+  if vision_note:
+    prompt = f"{prompt}\n\n{vision_note}"
   if system_prompt:
     return f"{prompt}\n\n{system_prompt}"
   return prompt
@@ -259,7 +261,12 @@ class OpenCodeCodingAgent(CodingAgent):
     env = os.environ.copy()
     env["NEMO_CHAT_ID"] = self._chat_id
     env["NEMO_DB"] = _db_path(self._project_dir)
-    env["NEMO_OPENCODE_SYSTEM_PROMPT"] = _build_agent_prompt(self._system_prompt)
+    from .agent_factory import model_media_vision
+    from . import vision_cli
+    vision_note = vision_cli.standing_hint(
+      model_media_vision("opencode", self._model).image)
+    env["NEMO_OPENCODE_SYSTEM_PROMPT"] = _build_agent_prompt(
+      self._system_prompt, vision_note)
 
     # OpenCode is multi-provider — a single base_url is ambiguous. Dispatch
     # by the model's `provider/` prefix:

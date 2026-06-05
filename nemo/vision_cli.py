@@ -114,6 +114,28 @@ def helper_available(path: str = _CONFIG_PATH) -> bool:
   return bool(load_config(path)[1])
 
 
+def standing_hint(model_sees_images: bool, path: str = _CONFIG_PATH) -> str:
+  """The standing nemo-vision capability note for the SYSTEM PROMPT, or '' if it
+  doesn't apply. Returns text only for a text-only model (can't see images)
+  with a vision helper configured.
+
+  This belongs in the system prompt — emitted once per session and refreshed on
+  each reconnect (so it tracks /model switches) — NOT appended to every user
+  message. The per-attachment [image:]/[video:] hints in the channel layer stay
+  separate: they point at a specific downloaded path and only fire when media
+  is actually attached. This note covers the other case — an image the agent
+  fetches mid-task (a URL, a scraped page, a screenshot it generated), where
+  nothing rides in on the Lark message to advertise the helper."""
+  if model_sees_images or not helper_available(path):
+    return ""
+  return (
+    "You cannot see images or video directly. For ANY local image or video "
+    "file you obtain during a task — downloaded, fetched from a URL, scraped "
+    "from a page, or screenshotted — get a text description by running the "
+    'shell command: nemo-vision "the-file-path" "the question to ask about '
+    'it". Do not use the Read tool on image or video files.')
+
+
 def describe(path: str, question: str) -> str:
   """Send the media + question to the endpoint and return its text answer."""
   base, key, model = load_config()

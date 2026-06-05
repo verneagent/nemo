@@ -50,16 +50,6 @@ def _to_incoming(
 ) -> IncomingMessage:
   text = event.text
   msg_type = event.msg_type
-  # Whether this message carried media we enriched with a path. Drives the
-  # standing nemo-vision hint below: media-carrying messages already get a
-  # specific hint, so the standing one only fires on text/URL-only messages.
-  any_image = False
-  any_video = False
-  # Host slash commands (/model, /clear, /ping, …) are consumed by the daemon,
-  # never the agent — appending an agent-facing hint corrupts arg parsing
-  # (e.g. `/model` reads the trailing hint as the model name). Detect them on
-  # the raw text so the standing vision hint below skips them.
-  is_command = (event.text or "").lstrip().startswith("/")
 
   # Enrich: download files and embed path in text
   if msg_type == "file" and event.file_key and event.message_id and token:
@@ -90,7 +80,6 @@ def _to_incoming(
         text = text.replace("[video]", block, 1)
       else:
         text = block if not text else f"{text}\n{block}"
-      any_video = True
       log.info("Downloaded video: %s -> %s", name, path)
     except Exception as e:
       log.warning("Video download failed: %s", e)
@@ -102,6 +91,7 @@ def _to_incoming(
   # Skip "media" (video) messages: their image_key is just the video
   # thumbnail, already represented by the [video: ...] marker above.
   if event.image_key and event.message_id and token and msg_type != "media":
+    any_image = False
     for img_key in event.image_key.split(","):
       img_key = img_key.strip()
       if not img_key:
@@ -166,26 +156,6 @@ def _to_incoming(
       text = _expand_merge_forward(token, event.message_id) or text
     except Exception as e:
       log.warning("Failed to expand merge_forward: %s", e)
-
-  # Standing nemo-vision capability for text-only models. The per-image/video
-  # hints above only fire when the *Lark message* carries an attachment — so a
-  # text-only model that fetches an image mid-task (a URL, a scraped page, a
-  # screenshot it generated) never learns the helper exists and goes blind.
-  # On any non-media message to an image-blind model with a helper configured,
-  # advertise nemo-vision as a standing tool so it's always discoverable.
-  if (
-    text
-    and not is_command
-    and not (any_image or any_video)
-    and not model_sees_images
-    and vision_helper
-  ):
-    text = (
-      f"{text}\n(You cannot see images directly. For ANY local image or video "
-      f"file you obtain during this task — downloaded, fetched from a URL, "
-      f"scraped from a page, or screenshotted — run the shell command: "
-      f'nemo-vision "the-file-path" "the question to ask about it" — it prints '
-      f"a text description. Do not use the Read tool on image/video files.)")
 
   return IncomingMessage(
     event_type=event.event_type,
@@ -403,12 +373,12 @@ class LarkChannel(Channel):
     event = await self._events.next_message(timeout=timeout)
     if event is None:
       return None
-    # Probe the vision helper when the event carries media OR the active model
-    # is image-blind (it may fetch an image mid-task and need the standing
-    # nemo-vision hint). Vision models on plain text skip the config read.
+    # Only probe the vision helper when the event actually carries media —
+    # avoids a config read on every plain-text message. The standing
+    # nemo-vision note for text-only models lives in the system prompt
+    # (see vision_cli.standing_hint), not in per-message enrichment.
     has_media = event.msg_type == "media" or bool(event.image_key)
-    need_helper = has_media or not self._model_sees_images
-    vision_helper = vision_cli.helper_available() if need_helper else True
+    vision_helper = vision_cli.helper_available() if has_media else True
     incoming = _to_incoming(
       event, token=self.token, parent_lookup=self.parent_lookup,
       model_sees_images=self._model_sees_images,

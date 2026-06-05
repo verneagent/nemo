@@ -648,6 +648,15 @@ class ClaudeCodingAgent(CodingAgent):
       "  nemo-send image /path/to/screenshot.png\n"
       "  nemo-send file /path/to/document.pdf"
     )
+    # Standing nemo-vision note for text-only models (deepseek/kimi). Computed
+    # from the live model so it refreshes on each reconnect / /model switch;
+    # empty for vision models or when no helper is configured.
+    from .agent_factory import model_media_vision
+    from . import vision_cli
+    vision_note = vision_cli.standing_hint(
+      model_media_vision("claude", self._model).image)
+    if vision_note:
+      agent_prompt = f"{agent_prompt}\n\n{vision_note}"
     if self._system_prompt:
       agent_prompt = f"{agent_prompt}\n\n{self._system_prompt}"
     return agent_prompt

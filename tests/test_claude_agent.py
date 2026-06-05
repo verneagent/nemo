@@ -579,3 +579,35 @@ def test_fork_bind_reply_anchor_writes_file(tmp_path):
   # No scratch dir (not a fork) → no-op, no crash.
   agent._scratch_dir = ""
   asyncio.run(agent.bind_reply_anchor("om_x"))
+
+
+def test_build_agent_prompt_adds_vision_note_for_textonly_model():
+  """A text-only model (deepseek/kimi) with a vision helper gets the standing
+  nemo-vision note in its SYSTEM PROMPT — once, not per message."""
+  from unittest import mock
+  from nemo.agent_factory import MediaVision
+  from nemo.claude_agent import ClaudeCodingAgent
+  agent = ClaudeCodingAgent.__new__(ClaudeCodingAgent)
+  agent._model = "deepseek-v4-pro[1m]"
+  agent._system_prompt = ""
+  with mock.patch("nemo.agent_factory.model_media_vision",
+                  return_value=MediaVision(image=False, video=False)), \
+       mock.patch("nemo.vision_cli.helper_available", return_value=True):
+    prompt = agent._build_agent_prompt()
+  assert "nemo-vision" in prompt
+  assert "running inside Nemo" in prompt  # base prompt still present
+
+
+def test_build_agent_prompt_no_vision_note_for_vision_model():
+  """A vision-capable model (Claude's own) gets no note — it sees images."""
+  from unittest import mock
+  from nemo.agent_factory import MediaVision
+  from nemo.claude_agent import ClaudeCodingAgent
+  agent = ClaudeCodingAgent.__new__(ClaudeCodingAgent)
+  agent._model = "claude-opus-4-7"
+  agent._system_prompt = ""
+  with mock.patch("nemo.agent_factory.model_media_vision",
+                  return_value=MediaVision(image=True, video=False)), \
+       mock.patch("nemo.vision_cli.helper_available", return_value=True):
+    prompt = agent._build_agent_prompt()
+  assert "nemo-vision" not in prompt

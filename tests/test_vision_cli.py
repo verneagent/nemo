@@ -10,7 +10,7 @@ from nemo.agent_factory import MediaVision, model_media_vision
 from nemo.presets import Preset
 from nemo.vision_cli import (
   _DEFAULT_BASE_URL, _DEFAULT_MODEL, _media_block, _extract_content,
-  helper_available, load_config,
+  helper_available, load_config, standing_hint,
 )
 
 
@@ -151,3 +151,28 @@ def test_extract_content_ok():
 def test_extract_content_malformed(body):
   with pytest.raises(SystemExit):
     _extract_content(body)
+
+
+# ---------------------------------------------------------------------------
+# standing_hint — the system-prompt nemo-vision note for text-only models
+# ---------------------------------------------------------------------------
+
+def test_standing_hint_textonly_with_helper():
+  """Text-only model + helper configured → a note pointing at nemo-vision and
+  away from the Read tool."""
+  with mock.patch("nemo.vision_cli.helper_available", return_value=True):
+    note = standing_hint(model_sees_images=False)
+  assert "nemo-vision" in note
+  assert "Read tool" in note
+
+
+def test_standing_hint_vision_model_empty():
+  """A model that sees images natively needs no note, even with a helper."""
+  with mock.patch("nemo.vision_cli.helper_available", return_value=True):
+    assert standing_hint(model_sees_images=True) == ""
+
+
+def test_standing_hint_no_helper_empty():
+  """No vision helper configured → no note (don't advertise a dead tool)."""
+  with mock.patch("nemo.vision_cli.helper_available", return_value=False):
+    assert standing_hint(model_sees_images=False) == ""
