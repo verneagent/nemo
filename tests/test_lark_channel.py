@@ -223,6 +223,17 @@ def test_textonly_model_gets_standing_vision_hint_on_plain_text():
   assert msg.text.startswith("看一下 https://archive.is/xxx 的封面图")
 
 
+def test_slash_command_gets_no_standing_vision_hint():
+  """Regression: the standing hint must NOT be appended to host slash commands
+  (/model, /clear, …). Appending it corrupts arg parsing — `/model` would read
+  the trailing hint as the model name and 'switch to You...'."""
+  for cmd in ("/model", "/model deepseek-v4-pro", "/clear", "/ping"):
+    ev = _make_event(msg_type="text", text=cmd)
+    msg = _to_incoming(ev, token=TOKEN, model_sees_images=False)
+    assert msg.text == cmd, f"{cmd!r} was enriched: {msg.text!r}"
+    assert "nemo-vision" not in msg.text
+
+
 def test_vision_model_no_standing_hint_on_plain_text():
   """A vision-capable model sees images itself — no standing hint, no clutter."""
   ev = _make_event(msg_type="text", text="看一下这个链接")

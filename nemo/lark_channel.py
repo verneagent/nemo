@@ -55,6 +55,11 @@ def _to_incoming(
   # specific hint, so the standing one only fires on text/URL-only messages.
   any_image = False
   any_video = False
+  # Host slash commands (/model, /clear, /ping, …) are consumed by the daemon,
+  # never the agent — appending an agent-facing hint corrupts arg parsing
+  # (e.g. `/model` reads the trailing hint as the model name). Detect them on
+  # the raw text so the standing vision hint below skips them.
+  is_command = (event.text or "").lstrip().startswith("/")
 
   # Enrich: download files and embed path in text
   if msg_type == "file" and event.file_key and event.message_id and token:
@@ -170,6 +175,7 @@ def _to_incoming(
   # advertise nemo-vision as a standing tool so it's always discoverable.
   if (
     text
+    and not is_command
     and not (any_image or any_video)
     and not model_sees_images
     and vision_helper
