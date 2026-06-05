@@ -208,6 +208,65 @@ def test_image_no_vision_helper_no_hint(mock_dl):
   assert "nemo-vision" not in msg.text
 
 
+# ---------------------------------------------------------------------------
+# Standing nemo-vision hint (text/URL message, no Lark attachment)
+# ---------------------------------------------------------------------------
+
+def test_textonly_model_gets_standing_vision_hint_on_plain_text():
+  """A text/URL-only message to a text-only model must advertise nemo-vision as
+  a standing tool, so it can describe an image it fetches mid-task (a URL, a
+  scraped page) even though nothing was attached to the Lark message."""
+  ev = _make_event(msg_type="text", text="看一下 https://archive.is/xxx 的封面图")
+  msg = _to_incoming(ev, token=TOKEN, model_sees_images=False)
+  assert "nemo-vision" in msg.text
+  assert "fetched from a URL" in msg.text          # the standing-hint wording
+  assert msg.text.startswith("看一下 https://archive.is/xxx 的封面图")
+
+
+def test_vision_model_no_standing_hint_on_plain_text():
+  """A vision-capable model sees images itself — no standing hint, no clutter."""
+  ev = _make_event(msg_type="text", text="看一下这个链接")
+  msg = _to_incoming(ev, token=TOKEN, model_sees_images=True)
+  assert "nemo-vision" not in msg.text
+
+
+def test_textonly_model_no_standing_hint_without_helper():
+  """Text-only model but no vision helper configured → don't advertise a tool
+  that would just fail."""
+  ev = _make_event(msg_type="text", text="看一下这个链接")
+  msg = _to_incoming(ev, token=TOKEN, model_sees_images=False, vision_helper=False)
+  assert "nemo-vision" not in msg.text
+
+
+def test_empty_text_no_standing_hint():
+  """No user text → nothing to attach a standing hint to."""
+  ev = _make_event(msg_type="text", text="")
+  msg = _to_incoming(ev, token=TOKEN, model_sees_images=False)
+  assert "nemo-vision" not in msg.text
+
+
+@mock.patch("nemo.lark_channel.lark_api.download_image", return_value="/tmp/img.png")
+def test_attached_image_gets_specific_hint_not_standing(mock_dl):
+  """When the message DOES carry an image, only the specific per-image hint
+  fires — the standing (URL/fetch) wording must not double up."""
+  ev = _make_event(msg_type="image", image_key="ik_1", text="看这张")
+  msg = _to_incoming(ev, token=TOKEN, model_sees_images=False)
+  assert "nemo-vision" in msg.text
+  assert "fetched from a URL" not in msg.text       # standing hint suppressed
+  assert msg.text.count("nemo-vision") == 1         # no duplication
+
+
+@mock.patch("nemo.lark_channel.lark_api.download_file", return_value="/tmp/v.mp4")
+def test_attached_video_suppresses_standing_hint(mock_dl):
+  """A video-carrying message keeps its per-video hint and skips the standing
+  one (any_video guards it)."""
+  ev = _make_event(msg_type="media", file_key="fk_v", file_name="clip.mp4",
+                   text="看这个视频")
+  msg = _to_incoming(ev, token=TOKEN, model_sees_images=False)
+  assert "nemo-vision" in msg.text
+  assert "fetched from a URL" not in msg.text
+
+
 @mock.patch("nemo.lark_channel.lark_api.download_file", return_value="/tmp/v.mp4")
 def test_post_embedded_video_resolves_placeholder(mock_dl):
   """Video embedded in a post: msg_type=post + file_key + a [video]
@@ -412,6 +471,48 @@ def test_push_back_round_trip_preserves_is_internal():
   assert received.is_internal is True
   assert received.text == "[Nemo recall] summarize this transcript"
   assert received.message_id == "recall_abc"
+
+
+def test_receive_probes_helper_for_textonly_model_on_plain_text():
+  """receive() must probe the vision helper for an image-blind model even on a
+  plain-text message, so the standing nemo-vision hint can fire when the agent
+  later fetches an image — not only when a Lark attachment is present."""
+  ch = LarkChannel.__new__(LarkChannel)
+  ch.chat_id = "oc_x"
+  ch.credentials = {"app_id": "cli_x", "app_secret": "s"}
+  ch.parent_lookup = None
+  ch._chat_mode = ""
+  ch._reply_anchor = ""
+  ch._model_sees_images = False
+  ch._model_sees_video = False
+  ch._events = LarkEventStream("cli_x", "s")
+  ch._events.push_back(_make_event(msg_type="text", text="看一下 https://a/b"))
+  with mock.patch("nemo.lark_channel.lark_auth.get_token", return_value="t"), \
+       mock.patch("nemo.lark_channel.vision_cli.helper_available",
+                  return_value=True) as helper:
+    received = asyncio.run(ch.receive(timeout=1))
+  helper.assert_called_once()                    # probed despite no attachment
+  assert received is not None
+  assert "nemo-vision" in received.text
+
+
+def test_receive_skips_helper_probe_for_vision_model_on_plain_text():
+  """A vision model on plain text still skips the config read (the optimization
+  the original gate protected)."""
+  ch = LarkChannel.__new__(LarkChannel)
+  ch.chat_id = "oc_x"
+  ch.credentials = {"app_id": "cli_x", "app_secret": "s"}
+  ch.parent_lookup = None
+  ch._chat_mode = ""
+  ch._reply_anchor = ""
+  ch._model_sees_images = True
+  ch._model_sees_video = False
+  ch._events = LarkEventStream("cli_x", "s")
+  ch._events.push_back(_make_event(msg_type="text", text="hi"))
+  with mock.patch("nemo.lark_channel.lark_auth.get_token", return_value="t"), \
+       mock.patch("nemo.lark_channel.vision_cli.helper_available") as helper:
+    asyncio.run(ch.receive(timeout=1))
+  helper.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
