@@ -530,6 +530,84 @@ def session_detail(
   return SessionDetailResult(detail=_read_session_detail(matches[0]))
 
 
+# ---------------------------------------------------------------------------
+# Recall digest cache
+# ---------------------------------------------------------------------------
+#
+# `/session recall` summarises a past transcript via a throwaway read-only
+# session (see CodingAgent.digest_transcript). A finished session's JSONL is
+# immutable, so the summary is a pure function of (path, mtime, size): cache
+# it keyed by uuid and re-validate against the live file. Repeat recalls of
+# the same session then cost nothing (no second sub-session). The first line
+# of the cache file is a ``<!-- mtime=… size=… -->`` stamp; a mismatch (the
+# session was appended to, e.g. it's still the current one) invalidates it.
+
+_DIGEST_STAMP_RE = re.compile(r"^<!-- mtime=([\d.]+) size=(\d+) -->\n")
+
+
+def _digest_cache_dir() -> str:
+  return os.path.expanduser("~/.nemo/digests")
+
+
+def _digest_cache_path(uuid: str) -> str:
+  return os.path.join(_digest_cache_dir(), f"{uuid}.md")
+
+
+def _current_stat(path: str) -> tuple[float, int]:
+  """Live (mtime, size) for ``path``; (0.0, 0) if it can't be stat'd."""
+  try:
+    st = os.stat(path)
+  except OSError:
+    return (0.0, 0)
+  return (st.st_mtime, st.st_size)
+
+
+def read_cached_digest(info: SessionInfo) -> str:
+  """Return the cached recall digest for ``info`` if still fresh, else "".
+
+  Fresh = the cache file's ``mtime``/``size`` stamp matches the transcript
+  on disk right now. Any mismatch / missing file / parse failure returns ""
+  so the caller recomputes.
+  """
+  path = _digest_cache_path(info.uuid)
+  try:
+    with open(path, encoding="utf-8") as f:
+      blob = f.read()
+  except OSError:
+    return ""
+  m = _DIGEST_STAMP_RE.match(blob)
+  if not m:
+    return ""
+  cached_mtime, cached_size = float(m.group(1)), int(m.group(2))
+  live_mtime, live_size = _current_stat(info.path)
+  if live_size == 0 or cached_size != live_size:
+    return ""
+  # mtime can wobble at sub-second precision across filesystems; compare
+  # with a small tolerance and lean on size as the real guard.
+  if abs(cached_mtime - live_mtime) > 1.0:
+    return ""
+  return blob[m.end():]
+
+
+def write_cached_digest(info: SessionInfo, digest: str) -> None:
+  """Persist ``digest`` for ``info``, stamped with the transcript's current
+  mtime/size. Best-effort — a cache write failure is never fatal to recall.
+  """
+  if not digest.strip():
+    return
+  mtime, size = _current_stat(info.path)
+  if size == 0:
+    return
+  path = _digest_cache_path(info.uuid)
+  try:
+    os.makedirs(_digest_cache_dir(), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+      f.write(f"<!-- mtime={mtime} size={size} -->\n")
+      f.write(digest)
+  except OSError:
+    pass
+
+
 def _delete_session_files(candidates: Iterable[SessionInfo]) -> SessionDeleteResult:
   result = SessionDeleteResult()
   for session in candidates:
@@ -539,6 +617,11 @@ def _delete_session_files(candidates: Iterable[SessionInfo]) -> SessionDeleteRes
       result.failures.append(SessionDeleteFailure(session=session, error=str(e)))
     else:
       result.deleted.append(session)
+      # Drop any cached recall digest so it can't outlive its transcript.
+      try:
+        os.remove(_digest_cache_path(session.uuid))
+      except OSError:
+        pass
   return result
 
 

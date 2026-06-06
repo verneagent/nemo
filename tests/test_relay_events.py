@@ -228,6 +228,27 @@ def test_convert_form_action_for_agent_picker_keeps_prefix():
     assert ev.message_id == "om_agent_picker_xyz"
 
 
+def test_convert_form_action_for_session_picker_keeps_prefix():
+    """Same wire-format guarantee for the /session recall picker: the relay
+    pushes the ``session_recall:<uuid>`` form_value as the reply text and the
+    converter lands it in action_value['action'] unchanged so the daemon's
+    ``startswith("session_recall:")`` routing fires. The picker card's own
+    message_id rides along so the daemon can lock it after recall starts."""
+    msg = {
+        "text": "session_recall:01fe69c7-5793-4ad7-9ba6-7d1aa1e01f90",
+        "msg_type": "form_action",
+        "sender_id": "ou_picker_clicker",
+        "create_time": "1700000020000",
+        "message_id": "om_session_picker_xyz",
+    }
+    ev = _relay_msg_to_event(msg, "oc_chat1")
+    assert ev.event_type == "card.action.trigger"
+    assert ev.action_value == {
+        "action": "session_recall:01fe69c7-5793-4ad7-9ba6-7d1aa1e01f90"}
+    assert ev.operator_id == "ou_picker_clicker"
+    assert ev.message_id == "om_session_picker_xyz"
+
+
 def test_convert_input_action():
     msg = {
         "text": "user input text",

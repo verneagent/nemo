@@ -92,25 +92,30 @@ def test_sdk_driving_primitives_are_isolated():
   ]
   assert query_importers == ["nemo/claude_agent.py"], (
     "Top-level claude_agent_sdk.query() may only be used by "
-    f"nemo/claude_agent.py's isolated side_question; importers: {query_importers}"
+    "nemo/claude_agent.py's isolated one-shot worker; "
+    f"importers: {query_importers}"
   )
 
-  # (c) In claude_agent.py every `query(...)` call must sit inside
-  #     side_question, and side_question must keep the isolation markers
-  #     (worker thread + fresh asyncio.run loop). This catches someone
-  #     moving the call back onto the host loop or dropping the wrapper.
+  # (c) In claude_agent.py every `query(...)` call must sit inside the
+  #     shared isolation worker ``_run_oneshot_query`` (the single owner
+  #     of the SDK's one-shot lifecycle, used by side_question AND
+  #     digest_transcript), and that worker must keep the isolation
+  #     markers (worker thread + fresh asyncio.run loop). This catches
+  #     someone moving the call back onto the host loop or dropping the
+  #     wrapper.
   ca = _NEMO / "claude_agent.py"
-  tree = ast.parse(ca.read_text())
-  side_q = next(
+  src = ca.read_text()
+  tree = ast.parse(src)
+  worker = next(
     (
       n
       for n in ast.walk(tree)
-      if isinstance(n, ast.AsyncFunctionDef) and n.name == "side_question"
+      if isinstance(n, ast.AsyncFunctionDef) and n.name == "_run_oneshot_query"
     ),
     None,
   )
-  assert side_q is not None, "side_question not found in claude_agent.py"
-  lo, hi = side_q.lineno, side_q.end_lineno
+  assert worker is not None, "_run_oneshot_query not found in claude_agent.py"
+  lo, hi = worker.lineno, worker.end_lineno
 
   query_calls = [
     n.lineno
@@ -122,18 +127,35 @@ def test_sdk_driving_primitives_are_isolated():
   assert query_calls, "expected a query() call in claude_agent.py"
   outside = [ln for ln in query_calls if not (lo <= ln <= hi)]
   assert not outside, (
-    f"query() called outside side_question at lines {outside} — it must "
+    f"query() called outside _run_oneshot_query at lines {outside} — it must "
     "run only inside the isolated worker"
   )
 
-  body_src = ast.get_source_segment(ca.read_text(), side_q) or ""
+  body_src = ast.get_source_segment(src, worker) or ""
   assert "asyncio.to_thread(" in body_src, (
-    "side_question lost its worker-thread isolation (asyncio.to_thread) — "
-    "driving the SDK on the host loop crashes the daemon"
+    "_run_oneshot_query lost its worker-thread isolation (asyncio.to_thread) "
+    "— driving the SDK on the host loop crashes the daemon"
   )
   assert "asyncio.run(" in body_src, (
-    "side_question lost its dedicated worker loop (asyncio.run) — the SDK's "
-    "anyio scopes must not share the host loop"
+    "_run_oneshot_query lost its dedicated worker loop (asyncio.run) — the "
+    "SDK's anyio scopes must not share the host loop"
+  )
+
+  # And the only two callers of the worker stay the read-only one-shots.
+  callers = {
+    n.name
+    for n in ast.walk(tree)
+    if isinstance(n, ast.AsyncFunctionDef)
+    and any(
+      isinstance(c, ast.Call)
+      and isinstance(c.func, ast.Attribute)
+      and c.func.attr == "_run_oneshot_query"
+      for c in ast.walk(n)
+    )
+  }
+  assert callers == {"side_question", "digest_transcript"}, (
+    "the isolated one-shot worker must only drive side_question / "
+    f"digest_transcript; callers: {sorted(callers)}"
   )
 
 

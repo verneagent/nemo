@@ -1186,6 +1186,111 @@ def build_agent_switched_card(
   }
 
 
+def build_session_picker_card(
+  options: list[tuple[str, str]],
+  *,
+  chat_id: str = "",
+  info: str = "",
+  hint: str = "",
+) -> JsonObject:
+  """Build the interactive `/session recall` picker card.
+
+  Mirrors ``build_model_picker_card`` / ``build_agent_picker_card``: a Lark
+  V2 ``form`` with a ``select_static`` dropdown of past sessions plus a
+  ``form_action_type: "submit"`` button. Each option value carries the
+  ``session_recall:<uuid>`` discriminator so the daemon's card.action
+  handler routes the form-submit straight into the recall flow without
+  colliding with the model/agent picker prefixes.
+
+  ``options`` is ``(display_label, uuid)`` pairs in dropdown order. Same
+  V2 / ``<font>`` constraints as the other pickers — ``info`` is plain
+  markdown (multi-line allowed); ``hint`` is the grey single-line note.
+  """
+  select_options = [
+    {
+      "text": {"tag": "plain_text", "content": label},
+      "value": f"session_recall:{uuid}",
+    }
+    for label, uuid in options
+  ]
+  form_elements: list[JsonObject] = [
+    {
+      "tag": "select_static",
+      "name": "session",
+      "placeholder": {"tag": "plain_text", "content": "Pick a session..."},
+      "options": select_options,
+    },
+    # Same submit-button shape as the model/agent pickers — see
+    # build_model_picker_card for why form_action_type, the button name,
+    # and the direct-child placement all matter for Lark to fire the callback.
+    {
+      "tag": "button",
+      "text": {"tag": "plain_text", "content": "Recall"},
+      "type": "primary",
+      "form_action_type": "submit",
+      "name": "submit",
+      "value": {"action": "session_recall_submit", "chat_id": chat_id},
+    },
+  ]
+  elements: list[JsonObject] = [
+    {"tag": "markdown", "content": "Pick a past session to recall."},
+    {
+      "tag": "form",
+      "name": "session_picker_form",
+      "elements": form_elements,
+    },
+  ]
+  if info:
+    elements.append({"tag": "markdown", "content": info})
+  if hint:
+    elements.append(_note_element(hint))
+  return {
+    "schema": "2.0",
+    "config": {"update_multi": True},
+    "header": {
+      "title": {"tag": "plain_text", "content": "Recall Session"},
+      "template": "blue",
+    },
+    "body": {"direction": "vertical", "elements": elements},
+  }
+
+
+def build_session_recalled_card(
+  *,
+  uuid: str,
+  agent: str = "",
+  model: str = "",
+) -> JsonObject:
+  """Build the locked, post-submit replacement for the /session recall picker.
+
+  After the user submits we PATCH the picker into this static card — no
+  dropdown, no Submit button — so the same pick can't be re-submitted.
+  Recall itself is read-only (the actual summary arrives as a separate
+  turn), so this is purely a "you picked X, recalling now" confirmation.
+  """
+  lines = [f"📖 Recalling session **{_escape_md(uuid[:8])}**…"]
+  meta_bits = []
+  if agent:
+    meta_bits.append(f"**Agent:** {_escape_md(agent)}")
+  if model:
+    meta_bits.append(f"**Model:** {_escape_md(model)}")
+  if meta_bits:
+    lines.append(" · ".join(meta_bits))
+  elements: list[JsonObject] = [
+    {"tag": "markdown", "content": "\n".join(lines)},
+    _note_element("Run `/session recall` for a fresh picker."),
+  ]
+  return {
+    "schema": "2.0",
+    "config": {"update_multi": True},
+    "header": {
+      "title": {"tag": "plain_text", "content": "Recall Session"},
+      "template": "green",
+    },
+    "body": {"direction": "vertical", "elements": elements},
+  }
+
+
 def build_form_input(title: str, placeholder: str = "",
                      chat_id: str = "") -> JsonObject:
   """Build a card with text input."""

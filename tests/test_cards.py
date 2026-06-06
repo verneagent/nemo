@@ -7,6 +7,7 @@ from nemo.cards import (
   build_form_select, build_form_input, build_ask_user_question_card,
   build_model_picker_card, build_model_switched_card, build_shell_card,
   build_agent_picker_card, build_agent_switched_card,
+  build_session_picker_card, build_session_recalled_card,
   tool_use_summary, _elapsed_title, _elapsed_text, _usage_text,
   _collapsible_thinking,
 )
@@ -1289,3 +1290,50 @@ def test_turn_card_multi_select_answer_renders_as_list():
       assert "a, c" in el["content"]
       return
   raise AssertionError("expected multi-select answer rendered as 'a, c'")
+
+
+# ---------------------------------------------------------------------------
+# build_session_picker_card / build_session_recalled_card
+# ---------------------------------------------------------------------------
+
+def test_session_picker_card_structure():
+  """Recall picker mirrors the model/agent pickers: a Lark V2 form whose
+  select options carry the ``session_recall:<uuid>`` discriminator and a
+  named submit button with the empty-selection fallback action."""
+  options = [
+    ("01fe69c7 · claude · 2h · fix the bug", "01fe69c7-aaaa"),
+    ("bbbbbbbb · codex · 1d · add feature", "bbbbbbbb-cccc"),
+  ]
+  card = build_session_picker_card(options, chat_id="oc_abc")
+  assert card["schema"] == "2.0"
+  assert card["header"]["title"]["content"] == "Recall Session"
+
+  form = _find_element(card["body"]["elements"], "form")
+  assert form["name"] == "session_picker_form"
+  select = _find_element(form["elements"], "select_static")
+  assert select["name"] == "session"
+  assert [o["value"] for o in select["options"]] == [
+    "session_recall:01fe69c7-aaaa",
+    "session_recall:bbbbbbbb-cccc",
+  ]
+
+  button = _find_element(form["elements"], "button")
+  assert button["form_action_type"] == "submit"
+  assert "action_type" not in button
+  assert button["name"] == "submit"
+  assert button["value"] == {"action": "session_recall_submit", "chat_id": "oc_abc"}
+  # The submit button must be a direct form child (a nested column_set would
+  # stop Lark treating it as the form's submit trigger).
+  assert not any(e.get("tag") == "column_set" for e in form["elements"])
+
+
+def test_session_recalled_card_has_no_form():
+  """The locked post-submit card drops the dropdown + button so the same
+  pick can't be re-submitted."""
+  card = build_session_recalled_card(
+    uuid="01fe69c7-aaaa", agent="claude", model="claude-opus-4-7")
+  blob = json.dumps(card, ensure_ascii=False)
+  assert "select_static" not in blob
+  assert "form_action_type" not in blob
+  assert "01fe69c7" in blob
+  assert "claude-opus-4-7" in blob

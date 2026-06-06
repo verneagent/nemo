@@ -611,3 +611,108 @@ def test_build_agent_prompt_no_vision_note_for_vision_model():
        mock.patch("nemo.vision_cli.helper_available", return_value=True):
     prompt = agent._build_agent_prompt()
   assert "nemo-vision" not in prompt
+
+
+# ---------------------------------------------------------------------------
+# digest_transcript / shared one-shot query helper (mocked SDK)
+# ---------------------------------------------------------------------------
+
+import asyncio
+import sys
+import types
+from unittest import mock
+
+from nemo.claude_agent import ClaudeCodingAgent
+
+
+class _FakeText:
+  def __init__(self, text):
+    self.text = text
+
+
+class _FakeAssistant:
+  def __init__(self, content):
+    self.content = content
+
+
+class _FakeResult:
+  def __init__(self, subtype="success", is_error=False):
+    self.subtype = subtype
+    self.is_error = is_error
+
+
+def _fake_sdk(script):
+  """A stand-in ``claude_agent_sdk`` whose ``query`` yields ``script``.
+
+  The one-shot helper does ``from claude_agent_sdk import (AssistantMessage,
+  ResultMessage, TextBlock, query)`` and ``isinstance``-checks against those
+  classes, so the fake exposes the same names and yields instances of them.
+  """
+  mod = types.ModuleType("claude_agent_sdk")
+  mod.AssistantMessage = _FakeAssistant
+  mod.TextBlock = _FakeText
+  mod.ResultMessage = _FakeResult
+
+  class _Opts:
+    def __init__(self, **kw):
+      self.kw = kw
+
+  mod.ClaudeAgentOptions = _Opts
+
+  def query(prompt, options):
+    del prompt, options
+
+    async def _gen():
+      for m in script:
+        yield m
+
+    return _gen()
+
+  mod.query = query
+  return mod
+
+
+def _digest_agent(tmp_path):
+  agent = ClaudeCodingAgent(
+    {"app_id": "a", "app_secret": "b"}, "oc", mock.MagicMock(), mock.MagicMock())
+  agent._project_dir = str(tmp_path)
+  agent._model = "claude-opus-4-7"
+  return agent
+
+
+def test_digest_transcript_returns_summary(tmp_path, monkeypatch):
+  agent = _digest_agent(tmp_path)
+  script = [
+    _FakeAssistant([_FakeText("### Working on\n- the parser")]),
+    _FakeResult(),
+  ]
+  monkeypatch.setitem(sys.modules, "claude_agent_sdk", _fake_sdk(script))
+  out = asyncio.run(agent.digest_transcript("/tmp/t.jsonl", "hint"))
+  assert out == "### Working on\n- the parser"
+
+
+def test_digest_transcript_empty_result_returns_blank(tmp_path, monkeypatch):
+  agent = _digest_agent(tmp_path)
+  monkeypatch.setitem(sys.modules, "claude_agent_sdk", _fake_sdk([_FakeResult()]))
+  assert asyncio.run(agent.digest_transcript("/tmp/t.jsonl", "hint")) == ""
+
+
+def test_digest_transcript_unsupported_without_project_or_model(tmp_path, monkeypatch):
+  agent = _digest_agent(tmp_path)
+  agent._model = ""
+  # No SDK should even be touched — returns "" up front.
+  monkeypatch.setitem(sys.modules, "claude_agent_sdk", _fake_sdk([]))
+  assert asyncio.run(agent.digest_transcript("/tmp/t.jsonl", "hint")) == ""
+
+
+def test_side_question_still_collects_text_via_shared_helper(tmp_path, monkeypatch):
+  """Guards the side_question refactor onto the shared one-shot helper."""
+  agent = _digest_agent(tmp_path)
+  monkeypatch.setattr(agent, "_build_agent_prompt", lambda: "sys prompt")
+  script = [
+    _FakeAssistant([_FakeText("the answer")]),
+    _FakeResult(),
+  ]
+  monkeypatch.setitem(sys.modules, "claude_agent_sdk", _fake_sdk(script))
+  out = asyncio.run(agent.side_question("what?", ""))
+  assert out == "the answer"

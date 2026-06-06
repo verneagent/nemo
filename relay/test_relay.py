@@ -851,6 +851,66 @@ class RelayTestCase(unittest.TestCase):
     self.assertIn("toast", result)
     self.assertNotIn("card", result)
 
+  def test_form_action_session_recall_with_and_without_value(self):
+    """The /session recall picker submits a single-field form whose value
+    is ``session_recall:<uuid>``. Cover both Lark V2 form-submit shapes:
+    with the button ``value`` present, and with it DROPPED (only
+    ``form_value`` + ``context`` survive) — the relay must route both via
+    the ``open_chat_id`` / ``open_message_id`` context fallback."""
+    # (a) value present
+    self._webhook({
+      "header": {"token": "tok1", "event_type": "card.action.trigger"},
+      "event": {
+        "action": {
+          "value": {"chat_id": "oc_recall_a"},
+          "form_value": {"session": "session_recall:uuid-aaaa"},
+        },
+        "operator": {"open_id": "ou_op"},
+      },
+    })
+    r = [x for x in self._get("/replies/chat:oc_recall_a?since=")["replies"]
+         if x["msg_type"] == "form_action"]
+    self.assertEqual(len(r), 1)
+    self.assertEqual(r[0]["text"], "session_recall:uuid-aaaa")
+
+    # (b) button value dropped — context fallback carries chat + message id
+    self._webhook({
+      "header": {"token": "tok1", "event_type": "card.action.trigger"},
+      "event": {
+        "action": {
+          "form_value": {"session": "session_recall:uuid-bbbb"},
+          "tag": "button",
+        },
+        "operator": {"open_id": "ou_op"},
+        "context": {
+          "open_chat_id": "oc_recall_b",
+          "open_message_id": "om_session_picker",
+        },
+      },
+    })
+    r = [x for x in self._get("/replies/chat:oc_recall_b?since=")["replies"]
+         if x["msg_type"] == "form_action"]
+    self.assertEqual(len(r), 1)
+    self.assertEqual(r[0]["text"], "session_recall:uuid-bbbb")
+    self.assertEqual(r[0]["message_id"], "om_session_picker")
+
+  def test_card_action_skips_confirm_card_for_session_recall_prefix(self):
+    """``session_recall:*`` is bot-owned: the daemon PATCHes the picker
+    into its locked state, so the relay must suppress the generic
+    Confirmed/Selected card (toast only)."""
+    result = self._webhook({
+      "header": {"token": "tok1", "event_type": "card.action.trigger"},
+      "event": {
+        "action": {
+          "value": {"chat_id": "oc_recall_pref"},
+          "form_value": {"session": "session_recall:uuid-cccc"},
+        },
+        "operator": {"open_id": "ou_op"},
+      },
+    })
+    self.assertIn("toast", result)
+    self.assertNotIn("card", result)
+
   def test_select_action(self):
     """Worker extractActionInfo: action.option → select_action."""
     self._webhook({

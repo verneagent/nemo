@@ -590,23 +590,61 @@ def _format_session_previews(s) -> str:
   return "\n".join(parts)
 
 
+def _transcript_format_hint(agent: str) -> str:
+  """The on-disk JSONL event shape for a given agent's transcript.
+
+  Shared by the digest sub-session (``digest_transcript``) and the inline
+  fallback recall prompt so both describe the file the same way.
+  """
+  return {
+    "claude": (
+      "One JSON event per line. ``type:\"user\"`` carries the user "
+      "prompt at ``message.content`` (string or list of "
+      "``{type:\"text\",text:...}`` blocks). ``type:\"assistant\"`` "
+      "carries the model reply with ``message.model`` and the same "
+      "content shape. Tool uses appear as ``tool_use`` / "
+      "``tool_result`` blocks — skim them, don't quote verbatim."
+    ),
+    "codex": (
+      "One JSON event per line. The first event is ``session_meta`` "
+      "(payload.cwd, payload.model). Real turns are "
+      "``type:\"response_item\"`` with ``payload.role`` of user/"
+      "assistant and ``payload.content[].text`` or ``input_text``. "
+      "The first user message is usually injected AGENTS.md "
+      "boilerplate — skip past it."
+    ),
+  }.get(agent, "")
+
+
 async def _handle_session_recall(
   channel: LarkChannel,
   chat_id: str,
   project_dir: str,
   target: str,
+  coding_agent: CodingAgent,
+  db: Database,
 ) -> str:
-  """Resolve ``target`` to a past session file and ask the live agent
-  to read it. Returns an ack/error string to send to the user.
+  """Resolve ``target`` to a past session and recall it into context.
 
-  Recall is deliberately LLM-driven rather than Python-side digest
-  extraction. The agent has Read tool access, so handing it the JSONL
-  path lets it skim/seek/tail at whatever granularity its own context
-  budget allows, and pick out the kind of structured info (tool calls,
-  file paths, decisions) that a one-size-fits-all digest can't.
+  Two paths, picked at runtime:
 
-  This does NOT touch ``_sdk_session_id``. SDK resume across endpoints
-  replays thinking-block signatures and 400s — see db.py.
+  - **Digest** (preferred): a throwaway, context-free read-only session
+    reads the full transcript and returns a compact summary
+    (``coding_agent.digest_transcript``). Only that summary — plus a
+    pointer to the transcript for on-demand detail — is injected into the
+    live agent's context, so recall costs the working session a few
+    hundred tokens instead of a pile of raw JSONL. The summary is cached
+    by session uuid (transcripts are immutable once ended), so repeat
+    recalls are free.
+  - **Inline fallback**: when the agent can't run a blank side session
+    (Codex / OpenCode, or the digest came back empty) the live agent is
+    handed the path and asked to Read it itself — the original behavior.
+
+  Returns an ERROR/usage string for the caller to send (no match,
+  ambiguous, …), or "" on success (this function sends its own progress
+  ack and injects the recall turn). Never touches ``_sdk_session_id`` —
+  SDK resume across endpoints replays thinking-block signatures and 400s
+  (see db.py).
   """
   from . import sessions as _sessions
   from .channel import IncomingMessage
@@ -629,41 +667,66 @@ async def _handle_session_recall(
   size_kb = max(1, size // 1024)
   import datetime as _dt
   when = _dt.datetime.fromtimestamp(info.mtime).strftime("%Y-%m-%d %H:%M")
-  format_hint = {
-    "claude": (
-      "One JSON event per line. ``type:\"user\"`` carries the user "
-      "prompt at ``message.content`` (string or list of "
-      "``{type:\"text\",text:...}`` blocks). ``type:\"assistant\"`` "
-      "carries the model reply with ``message.model`` and the same "
-      "content shape. Tool uses appear as ``tool_use`` / "
-      "``tool_result`` blocks — skim them, don't quote verbatim."
-    ),
-    "codex": (
-      "One JSON event per line. The first event is ``session_meta`` "
-      "(payload.cwd, payload.model). Real turns are "
-      "``type:\"response_item\"`` with ``payload.role`` of user/"
-      "assistant and ``payload.content[].text`` or ``input_text``. "
-      "The first user message is usually injected AGENTS.md "
-      "boilerplate — skip past it."
-    ),
-  }.get(info.agent, "")
-  prompt = (
-    _RECALL_PROMPT_PREFIX
-    + f"The user asked you to recall a past coding session "
-    f"in this project. Its JSONL transcript lives at:\n\n"
-    f"  {info.path}\n\n"
-    f"Session metadata: agent `{info.agent}`, uuid "
-    f"`{info.uuid[:8]}`, model `{info.model or 'unknown'}`, last "
-    f"activity {when}, file size ~{size_kb}KB.\n\n"
-    f"Format: {format_hint}\n\n"
-    f"Use your Read tool to skim it — for large files prefer the "
-    f"tail (most recent turns are usually more relevant than the "
-    f"opening setup). Figure out: what was being worked on, what got "
-    f"decided, and any pending threads. Hold the gist in working "
-    f"memory; the user may refer back to it. Reply with a short "
-    f"summary (a few bullet points) of what you recovered. Do NOT "
-    f"re-execute any actions described in the past session."
+  fmt_hint = _transcript_format_hint(info.agent)
+
+  # Progress ack up front: producing the digest can take a while on a
+  # large transcript (the sub-session reads it in chunks), so don't leave
+  # the user staring at silence between the click/command and the recall
+  # turn's placeholder card.
+  await _send_response(
+    channel, chat_id,
+    f"📖 Recalling session `{info.uuid[:8]}` ({info.agent}, ~{size_kb}KB)…",
+    db,
   )
+
+  # Digest path: cache → blank sub-session. A "" digest (unsupported agent,
+  # empty/failed run) drops us to the inline fallback below.
+  summary = _sessions.read_cached_digest(info)
+  if not summary:
+    try:
+      summary = await coding_agent.digest_transcript(info.path, fmt_hint)
+    except Exception as exc:  # never let a recall digest crash the loop
+      log.warning("digest_transcript raised during recall: %s", exc)
+      summary = ""
+    if summary:
+      _sessions.write_cached_digest(info, summary)
+
+  meta = (
+    f"agent `{info.agent}`, uuid `{info.uuid[:8]}`, model "
+    f"`{info.model or 'unknown'}`, last activity {when}, ~{size_kb}KB"
+  )
+  if summary:
+    prompt = (
+      _RECALL_PROMPT_PREFIX
+      + "The user asked you to recall a past coding session in this "
+      f"project ({meta}). A separate read-only pass already read the full "
+      "transcript and produced this summary:\n\n"
+      "---\n"
+      f"{summary}\n"
+      "---\n\n"
+      f"The full transcript is at {info.path} if you need a specific "
+      "detail the summary doesn't cover — Read just the relevant slice "
+      "(prefer the tail), don't load it all. Hold the gist in working "
+      "memory; the user may refer back to it. Reply with a short "
+      "confirmation of what you recovered (lean on the summary above). "
+      "Do NOT re-execute any actions described in the past session."
+    )
+  else:
+    prompt = (
+      _RECALL_PROMPT_PREFIX
+      + "The user asked you to recall a past coding session in this "
+      "project. Its JSONL transcript lives at:\n\n"
+      f"  {info.path}\n\n"
+      f"Session metadata: {meta}.\n\n"
+      f"Format: {fmt_hint}\n\n"
+      "Use your Read tool to skim it — for large files prefer the tail "
+      "(most recent turns are usually more relevant than the opening "
+      "setup). Figure out: what was being worked on, what got decided, "
+      "and any pending threads. Hold the gist in working memory; the user "
+      "may refer back to it. Reply with a short summary (a few bullet "
+      "points) of what you recovered. Do NOT re-execute any actions "
+      "described in the past session."
+    )
   recall_msg = IncomingMessage(
     event_type="im.message.receive_v1",
     chat_id=chat_id,
@@ -675,10 +738,7 @@ async def _handle_session_recall(
     is_internal=True,
   )
   channel.push_back(recall_msg)
-  return (
-    f"📖 Asking the agent to recall session `{info.uuid[:8]}` "
-    f"({info.agent}, ~{size_kb}KB)…"
-  )
+  return ""
 
 
 async def _handle_btw(
@@ -1121,6 +1181,99 @@ async def _lock_agent_picker(
              picker_msg_id, ok, agent, model)
   except Exception as exc:
     log.warning("Agent picker confirm-lock update failed: %s", exc)
+
+
+# Lark caps select labels well above this, but a dropdown of 80-char rows is
+# unreadable on mobile — trim the preview so each row stays scannable.
+_SESSION_PICKER_LIMIT = 25
+
+
+def _session_picker_options(
+  project_dir: str, current_sdk_session_id: str = "",
+) -> list[tuple[str, str]]:
+  """Flatten past sessions into ``(display_label, uuid)`` pairs, newest
+  first, for the recall dropdown.
+
+  Each label is a compact one-liner — ``<uuid8> · <agent> · <age> ·
+  <first-prompt preview>`` — so the operator can recognise a session
+  without `/session list`. The current session (if any) is tagged.
+  """
+  from . import sessions as _sessions
+  now = time.time()
+  out: list[tuple[str, str]] = []
+  for s in _sessions.list_sessions(project_dir)[:_SESSION_PICKER_LIMIT]:
+    age = max(0, int(now - s.mtime))
+    if age < 3600:
+      when = f"{age // 60}m"
+    elif age < 86400:
+      when = f"{age // 3600}h"
+    else:
+      when = f"{age // 86400}d"
+    preview = (s.first_user_text or "").replace("\n", " ").strip()[:40]
+    marker = " ←current" if s.uuid == current_sdk_session_id else ""
+    label = f"{s.uuid[:8]} · {s.agent} · {when}{marker}"
+    if preview:
+      label = f"{label} · {preview}"
+    out.append((label, s.uuid))
+  return out
+
+
+async def _send_session_picker(
+  channel: LarkChannel,
+  chat_id: str,
+  project_dir: str,
+  db: Database,
+  current_sdk_session_id: str = "",
+) -> None:
+  """Send the interactive `/session recall` picker card.
+
+  Falls back to the plain-text `/session list` when there are no sessions
+  to pick (so the user still gets a useful answer instead of an empty
+  dropdown)."""
+  options = _session_picker_options(project_dir, current_sdk_session_id)
+  if not options:
+    await _send_response(
+      channel, chat_id,
+      f"No past sessions found in `{project_dir}`.",
+      db,
+    )
+    return
+  hint = "Pick a session and click Recall. Or type `/session recall UUID`."
+  card = cards.build_session_picker_card(options, chat_id=chat_id, hint=hint)
+  try:
+    msg_id = await channel.send_card(chat_id, card)
+    db.record_sent(msg_id, text="Recall Session", chat_id=chat_id)
+    _register_msg(msg_id, chat_id)
+  except Exception as e:
+    log.error("Session picker send failed: %s", e)
+    await _send_response(
+      channel, chat_id,
+      "Couldn't render the session picker. Use `/session list` then "
+      "`/session recall UUID`.",
+      db,
+    )
+
+
+async def _lock_session_picker(
+  channel: LarkChannel,
+  picker_msg_id: str,
+  *,
+  uuid: str,
+  agent: str = "",
+  model: str = "",
+) -> None:
+  """PATCH a submitted /session recall picker into its locked state.
+
+  Removes the dropdown + button so the same pick can't be re-submitted.
+  No-op without a card id (e.g. the recall was typed directly)."""
+  if not picker_msg_id:
+    return
+  try:
+    card = cards.build_session_recalled_card(uuid=uuid, agent=agent, model=model)
+    await channel.update_card(picker_msg_id, card)
+    log.info("Locked /session recall picker %s (uuid=%s)", picker_msg_id, uuid[:8])
+  except Exception as exc:
+    log.warning("Session picker confirm-lock update failed: %s", exc)
 
 
 # ---------------------------------------------------------------------------
@@ -1625,6 +1778,35 @@ async def main_loop(
           )
           channel.push_back(synthetic)
           continue
+        if action_str == "session_recall_submit":
+          # Recall clicked with nothing picked — Lark fell back to the
+          # button's own value because form_value carried no selection.
+          await _send_response(
+            channel, chat_id,
+            "Pick a session from the dropdown before clicking Recall.", db,
+          )
+          continue
+        if action_str.startswith("session_recall:"):
+          # `/session recall` picker submitted. The select value carries the
+          # ``session_recall:<uuid>`` discriminator. Recall is read-only (it
+          # summarises a local transcript and injects a turn) so — like the
+          # `/session recall <uuid>` text command — it is NOT privilege-gated.
+          session_uuid = action_str.split(":", 1)[1].strip()
+          if not session_uuid:
+            await _send_response(
+              channel, chat_id,
+              "Pick a session from the dropdown before clicking Recall.", db,
+            )
+            continue
+          # Lock the picker so the dropdown can't be re-submitted, then run
+          # the recall (the uuid came from our own dropdown, so it resolves).
+          await _lock_session_picker(
+            channel, reply.message_id, uuid=session_uuid)
+          err = await _handle_session_recall(
+            channel, chat_id, project_dir, session_uuid, coding_agent, db)
+          if err:
+            await _send_response(channel, chat_id, err, db)
+          continue
         if action_str.startswith("fork_stop:"):
           # Fork-scoped Stop button — interrupt that fork's in-flight turn
           # only (the main turn / other forks are untouched). Spawned so it
@@ -1792,6 +1974,12 @@ async def main_loop(
           # `/agent` (no args) — same shape as the model picker, routed
           # through agent_switch:<name> on submit.
           await _send_agent_picker(channel, chat_id, ctx, db)
+        elif response == "__session_picker__":
+          # `/session recall` (no uuid) — dropdown of past sessions; the
+          # recall fires when the user submits (session_recall:<uuid> card
+          # action handled at the top of this loop).
+          await _send_session_picker(
+            channel, chat_id, project_dir, db, _sdk_session_id)
         elif response and response.startswith("__model__:"):
           new_model = response.split(":", 1)[1]
           # Resolve against the preset registry first. A preset name
@@ -2294,15 +2482,15 @@ async def main_loop(
             channel, chat_id, project_dir, target, _sdk_session_id, db)
         elif response and response.startswith("__session_recall__:"):
           target = response.split(":", 1)[1]
-          # Recall injects the session's text contents as a synthetic
-          # user message that the running agent processes on the next
-          # turn — no SDK resume (would 400 across endpoints, see the
-          # per-endpoint isolation comment in db.py). Returns the
-          # confirmation/error text to show.
-          ack = await _handle_session_recall(
-            channel, chat_id, project_dir, target)
-          if ack:
-            await _send_response(channel, chat_id, ack, db)
+          # Recall summarises the past session (digest sub-session, or the
+          # agent reads it inline) and injects the result as a synthetic
+          # user message processed on the next turn — no SDK resume (would
+          # 400 across endpoints, see the per-endpoint isolation comment in
+          # db.py). Sends its own progress ack; returns only error text.
+          err = await _handle_session_recall(
+            channel, chat_id, project_dir, target, coding_agent, db)
+          if err:
+            await _send_response(channel, chat_id, err, db)
         elif response and response.startswith("__session_rm__:"):
           target = response.split(":", 1)[1]
           await _handle_session_rm(channel, chat_id, project_dir, target, db)
@@ -2754,6 +2942,12 @@ async def main_loop(
             # Same reasoning as __model_picker__: only displays the dropdown;
             # submit's actual switch is queued behind the in-flight turn.
             await _send_agent_picker(channel, chat_id, ctx, db)
+          elif response == "__session_picker__":
+            # Same reasoning: only displays the dropdown; the recall fires
+            # when the user submits (queued behind the in-flight turn by the
+            # in-turn card.action handler below).
+            await _send_session_picker(
+              channel, chat_id, project_dir, db, _sdk_session_id)
           elif response and response.startswith("__btw__:"):
             # During a running turn, run the side question in the
             # background so the signal watcher keeps reacting to
@@ -2925,6 +3119,20 @@ async def main_loop(
               if autoesc:
                 signal_detected = "autoesc"
                 return
+              continue
+            if action == "session_recall_submit":
+              await _send_response(
+                channel, chat_id,
+                "Pick a session from the dropdown before clicking Recall.", db,
+              )
+              continue
+            if action.startswith("session_recall:"):
+              # Recall picker submitted mid-turn. Defer it: append the
+              # original card.action event so _merge_pending requeues it and
+              # the top-level handler runs the recall after this turn (recall
+              # needs no SDK restart — it just injects a fresh turn).
+              if action.split(":", 1)[1].strip():
+                _pending_msgs.append(msg)
               continue
             continue
           if not _is_user_message_event(msg):

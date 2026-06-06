@@ -69,6 +69,23 @@ def test_session_purge_command_with_and_without_target():
   assert resp == "__session_purge__:"
 
 
+def test_session_recall_command_with_uuid():
+  handled, resp = try_dispatch("/session recall abc123", _ctx())
+  assert handled
+  assert resp == "__session_recall__:abc123"
+  # Recall doesn't restart the SDK (it injects an internal turn), so it
+  # stays inline-safe.
+  assert is_inline_safe(resp)
+
+
+def test_session_recall_no_arg_emits_picker():
+  for cmd in ("/session recall", "/session recall   "):
+    handled, resp = try_dispatch(cmd, _ctx())
+    assert handled, cmd
+    assert resp == "__session_picker__", f"{cmd!r} → {resp!r}"
+    assert is_inline_safe(resp)
+
+
 def test_session_info_command_with_and_without_target():
   handled, resp = try_dispatch("/session info abc123", _ctx())
   assert handled

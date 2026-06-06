@@ -1,6 +1,7 @@
 """Tests for nemo.agent main loop behavior."""
 
 import asyncio
+import os
 import shlex
 import sys
 import urllib.error
@@ -2718,3 +2719,181 @@ def test_interrupt_and_drain_forces_cancel_when_interrupt_raises():
     return status
 
   assert asyncio.run(_scenario()) == "forced"
+
+
+def _recall_creds():
+  return {"app_id": "app_id", "app_secret": "app_secret",
+          "email": "user@example.com"}
+
+
+class _RecallReplayChannel(_QueuedChannel):
+  """Records (without replaying) push_back'd messages and update_card calls,
+  so a recall submit can be asserted without spinning the injected turn."""
+
+  def __init__(self, *a, **kw):
+    super().__init__(*a, **kw)
+    self.pushed = []
+    self.update_card_calls = []
+
+  def push_back(self, message):
+    self.pushed.append(message)
+
+  async def update_card(self, card_id, card):
+    self.update_card_calls.append((card_id, card))
+    return card_id
+
+
+def _recall_submit_msgs(uuid):
+  return [
+    IncomingMessage(
+      event_type="card.action.trigger", chat_id="oc_test",
+      operator_id="ou_user", sender_id="ou_user",
+      message_id="om_session_picker",
+      action_value={"action": f"session_recall:{uuid}", "chat_id": "oc_test"},
+      create_time="1"),
+    IncomingMessage(
+      event_type="im.message.receive_v1", chat_id="oc_test",
+      sender_id="ou_user", message_id="om_exit", msg_type="text",
+      text="/exit", create_time="2"),
+  ]
+
+
+def _run_recall_loop(tmp_path, agent, queued):
+  with mock.patch.dict(os.environ, {"HOME": str(tmp_path / "home")}), \
+       mock.patch("nemo.agent.load_credentials", return_value=_recall_creds()), \
+       mock.patch("nemo.agent.Database", _FakeDB), \
+       mock.patch("nemo.agent.LarkChannel", return_value=queued), \
+       mock.patch("nemo.agent.build_coding_agent", return_value=agent), \
+       mock.patch("nemo.agent._send_response", new=mock.AsyncMock()), \
+       mock.patch("nemo.group_config.load_config", return_value={}), \
+       mock.patch("nemo.config.load_relay_config", return_value=("", "")), \
+       mock.patch("signal.signal"):
+    return asyncio.run(
+      main_loop("oc_test", str(tmp_path), "claude-opus-4-7", agent="claude"))
+
+
+def test_session_picker_submit_recalls_with_digest(tmp_path):
+  """Submitting the /session recall picker fires a card.action.trigger with
+  action='session_recall:<uuid>'. The daemon must run the digest sub-session,
+  inject ONLY the compact summary (+ a pointer to the transcript) into the
+  live agent's context, and lock the picker card."""
+  from nemo import sessions
+
+  transcript = tmp_path / "rollout.jsonl"
+  transcript.write_text(
+    '{"type":"user","message":{"role":"user","content":"hi"}}\n')
+  uuid = "01fe69c7-5793-4ad7-9ba6-7d1aa1e01f90"
+  info = sessions.SessionInfo(
+    uuid=uuid, agent="claude", path=str(transcript),
+    mtime=transcript.stat().st_mtime, first_user_text="hi",
+    model="claude-opus-4-7")
+
+  class _DigestAgent(_FakeAgent):
+    def __init__(self):
+      super().__init__()
+      self.digest_calls = []
+
+    async def digest_transcript(self, path, fmt_hint):
+      self.digest_calls.append((path, fmt_hint))
+      return "### Working on\n- fixing the parser"
+
+  agent = _DigestAgent()
+  queued = _RecallReplayChannel("oc_test", _recall_submit_msgs(uuid))
+
+  with mock.patch("nemo.sessions.list_sessions", return_value=[info]):
+    rc = _run_recall_loop(tmp_path, agent, queued)
+
+  assert rc == 0
+  assert agent.digest_calls == [(str(transcript), mock.ANY)]
+  assert queued.pushed, "recall must inject an internal turn"
+  injected = queued.pushed[0]
+  assert injected.is_internal
+  assert injected.text.startswith(_RECALL_PROMPT_PREFIX)
+  # The compact summary is carried in (NOT raw JSONL), plus the on-demand
+  # read pointer to the transcript path.
+  assert "### Working on" in injected.text
+  assert str(transcript) in injected.text
+  # And the picker card is locked to a no-form confirmation.
+  locks = [c for c in queued.update_card_calls if c[0] == "om_session_picker"]
+  assert locks, queued.update_card_calls
+  import json as _json
+  assert "select_static" not in _json.dumps(locks[-1][1], ensure_ascii=False)
+
+
+def test_session_recall_falls_back_to_inline_when_no_digest(tmp_path):
+  """When the agent can't digest (returns ""), recall falls back to handing
+  the live agent the path to read itself — the original behavior."""
+  from nemo import sessions
+
+  transcript = tmp_path / "rollout.jsonl"
+  transcript.write_text(
+    '{"type":"user","message":{"role":"user","content":"hi"}}\n')
+  uuid = "01fe69c7-5793-4ad7-9ba6-7d1aa1e01f90"
+  info = sessions.SessionInfo(
+    uuid=uuid, agent="claude", path=str(transcript),
+    mtime=transcript.stat().st_mtime, first_user_text="hi", model="m")
+
+  class _NoDigestAgent(_FakeAgent):
+    async def digest_transcript(self, path, fmt_hint):
+      return ""
+
+  agent = _NoDigestAgent()
+  queued = _RecallReplayChannel("oc_test", _recall_submit_msgs(uuid))
+
+  with mock.patch("nemo.sessions.list_sessions", return_value=[info]):
+    rc = _run_recall_loop(tmp_path, agent, queued)
+
+  assert rc == 0
+  assert queued.pushed
+  injected = queued.pushed[0]
+  assert injected.text.startswith(_RECALL_PROMPT_PREFIX)
+  assert str(transcript) in injected.text
+  # Inline prompt tells the agent to read the file itself.
+  assert "Use your Read tool" in injected.text
+  assert "### Working on" not in injected.text
+
+
+def test_session_picker_no_arg_sends_picker_card(tmp_path):
+  """`/session recall` with no uuid emits the dropdown picker card."""
+  from nemo import sessions
+
+  transcript = tmp_path / "rollout.jsonl"
+  transcript.write_text(
+    '{"type":"user","message":{"role":"user","content":"hi"}}\n')
+  info = sessions.SessionInfo(
+    uuid="01fe69c7-5793-4ad7-9ba6-7d1aa1e01f90", agent="claude",
+    path=str(transcript), mtime=transcript.stat().st_mtime,
+    first_user_text="fix the bug", model="m")
+
+  sent_cards = []
+
+  class _CardChannel(_RecallReplayChannel):
+    async def send_card(self, chat_id, card):
+      sent_cards.append(card)
+      return "om_picker_sent"
+
+  agent = _FakeAgent()
+  queued = _CardChannel("oc_test", [
+    IncomingMessage(
+      event_type="im.message.receive_v1", chat_id="oc_test",
+      sender_id="ou_user", message_id="om1", msg_type="text",
+      text="/session recall", create_time="1"),
+    IncomingMessage(
+      event_type="im.message.receive_v1", chat_id="oc_test",
+      sender_id="ou_user", message_id="om_exit", msg_type="text",
+      text="/exit", create_time="2"),
+  ])
+
+  with mock.patch("nemo.sessions.list_sessions", return_value=[info]):
+    rc = _run_recall_loop(tmp_path, agent, queued)
+
+  assert rc == 0
+  import json as _json
+  picker = next(
+    (c for c in sent_cards
+     if c.get("header", {}).get("title", {}).get("content") == "Recall Session"),
+    None)
+  assert picker is not None, sent_cards
+  blob = _json.dumps(picker, ensure_ascii=False)
+  assert "session_recall:01fe69c7-5793-4ad7-9ba6-7d1aa1e01f90" in blob
+  assert "session_picker_form" in blob

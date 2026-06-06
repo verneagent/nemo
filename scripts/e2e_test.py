@@ -1667,6 +1667,92 @@ def run_picker_tests(pid: int, chat_id: str, result: E2EResult) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Phase 7d: /session recall picker (dropdown + relay suppression)
+# ---------------------------------------------------------------------------
+
+def run_recall_picker_tests(pid: int, chat_id: str, result: E2EResult) -> None:
+  """Phase 7d: the `/session recall` (no-arg) dropdown picker.
+
+  Covers the NO-SDK wire bits unique to the recall picker. The actual
+  submit→digest→recall chain is unit-tested (it spins a real SDK
+  sub-session, too slow/flaky for the live suite); the form-submit wire
+  mechanism itself is identical to the /model picker (Phase 7c) and is
+  also covered at all three layers by the unit tests. Here we verify:
+    1. `/session recall` with no uuid renders a "Recall Session" card
+       (or the text fallback when the project has no past sessions).
+    2. The relay suppresses the generic "Selected:" card for the
+       ``session_recall:`` prefix (BOT_OWNED_CARD_PREFIXES), so the
+       daemon's own lock PATCH isn't flashed over.
+  """
+  print(f"{Colors.BOLD}Phase 7d: /session recall Picker{Colors.RESET}")
+
+  # --- TR0: bare /session recall emits the picker (or text fallback) ---
+  from nemo import sessions as _sessions
+  has_sessions = bool(_sessions.list_sessions(PROJECT_DIR))
+  ts = str(int(time.time() * 1000))
+  send_msg("/session recall", chat_id)
+  if has_sessions:
+    picker, elapsed = wait_for_interactive_title(
+      chat_id, after=ts, title_prefix="Recall Session", timeout=15)
+    if picker:
+      result.ok("TR0 recall picker card", f"{elapsed:.1f}s")
+    else:
+      result.fail("TR0 recall picker card",
+                  "no 'Recall Session' card within 15s (sessions exist)")
+  else:
+    result.ok("TR0 recall picker card",
+              "no past sessions for project — text fallback path (skipped)")
+
+  # --- TR1: relay is toast-only for session_recall:* (no ugly card) ---
+  # The repo relay.py adds session_recall:* to BOT_OWNED_CARD_PREFIXES
+  # (covered deterministically by relay/test_relay.py). This live check
+  # hits the CONFIGURED remote relay, which may predate the change — same
+  # deploy-lag caveat AGENTS.md documents for --fork. A stale remote relay
+  # is a SKIP (deploy pending), not a code failure: recall still works,
+  # the picker just briefly flashes "Selected:" until the daemon's lock
+  # PATCH lands. Redeploy /opt/nemo-relay/relay.py to clear it.
+  cfg = _load_config()
+  relay_url = cfg.get("relay_url", "").rstrip("/")
+  verify_token = cfg.get("relay_verify_token", "")
+  smoke_chat = f"oc_smoke_recall_{int(time.time())}"
+  smoke_payload = json.dumps({
+    "header": {"token": verify_token, "event_type": "card.action.trigger"},
+    "event": {
+      "action": {
+        "form_value": {"session": "session_recall:uuid-smoke"},
+        "tag": "button",
+      },
+      "operator": {"open_id": OPERATOR_OPEN_ID},
+      "context": {
+        "open_chat_id": smoke_chat,
+        "open_message_id": "om_smoke_recall",
+      },
+    },
+  }).encode()
+  req = urllib.request.Request(
+    f"{relay_url}/webhook", data=smoke_payload, method="POST")
+  req.add_header("Content-Type", "application/json")
+  try:
+    smoke_resp = json.loads(urllib.request.urlopen(req, timeout=5).read())
+  except Exception as e:
+    result.fail("TR1 no ugly 'Selected:' card",
+                f"relay webhook smoke failed: {e}")
+  else:
+    if "card" in smoke_resp:
+      result.skip("TR1 no ugly 'Selected:' card",
+                  "remote relay predates session_recall:* suppression — "
+                  "redeploy relay.py (repo code verified by relay/test_relay.py)")
+    elif "toast" not in smoke_resp:
+      result.fail("TR1 no ugly 'Selected:' card",
+                  f"relay returned neither toast nor card: {smoke_resp}")
+    else:
+      result.ok("TR1 no ugly 'Selected:' card",
+                "relay toast-only for session_recall:* (BOT_OWNED_CARD_PREFIXES)")
+
+  print()
+
+
+# ---------------------------------------------------------------------------
 # Phase 8: Dual-Instance (same dir, two groups)
 # ---------------------------------------------------------------------------
 
@@ -2677,6 +2763,8 @@ def main():
                       help="Run only AskUserQuestion flow test (Phase 7b)")
   parser.add_argument("--picker", action="store_true",
                       help="Run only /model picker form-submit test (Phase 7c)")
+  parser.add_argument("--recall-picker", action="store_true",
+                      help="Run only /session recall picker test (Phase 7d)")
   parser.add_argument("--dual", action="store_true",
                       help="Run only dual-instance test (Phase 8)")
   parser.add_argument("--media", action="store_true",
@@ -2696,7 +2784,7 @@ def main():
   chat_id = args.chat_id.strip()
   result = E2EResult()
   single_phase = (args.stress or args.project or args.perm
-                  or args.askq or args.picker
+                  or args.askq or args.picker or args.recall_picker
                   or args.dual or args.media or args.topic
                   or args.shell or args.switch or args.fork)
   run_all = not single_phase
@@ -2763,6 +2851,8 @@ def main():
     print(f"  Mode: AskUserQuestion flow only")
   elif args.picker:
     print(f"  Mode: /model picker flow only")
+  elif args.recall_picker:
+    print(f"  Mode: /session recall picker flow only")
   elif args.dual:
     print(f"  Mode: dual-instance test only")
   elif args.media:
@@ -3073,6 +3163,14 @@ def main():
     elif args.picker:
       try:
         run_picker_tests(pid, chat_id, result)
+      finally:
+        send_msg("/exit", chat_id)
+        if not wait_for_exit(pid, timeout=35):
+          kill_nemo(pid)
+
+    elif args.recall_picker:
+      try:
+        run_recall_picker_tests(pid, chat_id, result)
       finally:
         send_msg("/exit", chat_id)
         if not wait_for_exit(pid, timeout=35):

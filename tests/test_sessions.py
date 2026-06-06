@@ -532,3 +532,72 @@ def test_purge_sessions_without_target_keeps_current(tmp_path):
   ]
   assert os.path.exists(current_path)
   assert not os.path.exists(old_path)
+
+
+# ---------------------------------------------------------------------------
+# Recall digest cache
+# ---------------------------------------------------------------------------
+
+def _session_info(path: str, uuid: str) -> sessions.SessionInfo:
+  st = os.stat(path)
+  return sessions.SessionInfo(
+    uuid=uuid, agent="claude", path=path, mtime=st.st_mtime,
+    first_user_text="hi", model="claude-opus-4-7",
+  )
+
+
+def test_digest_cache_round_trip(tmp_path):
+  home = str(tmp_path / "home")
+  transcript = str(tmp_path / "t.jsonl")
+  _write_jsonl(transcript, [{"type": "user", "message": {
+    "role": "user", "content": "hello"}}])
+  info = _session_info(transcript, "uuid-1")
+  with mock.patch.dict(os.environ, {"HOME": home}):
+    assert sessions.read_cached_digest(info) == ""  # cold
+    sessions.write_cached_digest(info, "### Working on\n- the thing")
+    assert sessions.read_cached_digest(info) == "### Working on\n- the thing"
+
+
+def test_digest_cache_invalidated_when_transcript_changes(tmp_path):
+  home = str(tmp_path / "home")
+  transcript = str(tmp_path / "t.jsonl")
+  _write_jsonl(transcript, [{"type": "user", "message": {
+    "role": "user", "content": "hello"}}])
+  info = _session_info(transcript, "uuid-2")
+  with mock.patch.dict(os.environ, {"HOME": home}):
+    sessions.write_cached_digest(info, "old summary")
+    assert sessions.read_cached_digest(info) == "old summary"
+    # Append to the transcript → size changes → cache is stale.
+    with open(transcript, "a", encoding="utf-8") as f:
+      f.write(json.dumps({"type": "assistant", "message": {
+        "model": "m", "content": [{"type": "text", "text": "more"}]}}) + "\n")
+    # The cached SessionInfo still has the OLD stat, but read validates
+    # against the LIVE file, so the size mismatch invalidates the cache.
+    assert sessions.read_cached_digest(info) == ""
+
+
+def test_digest_cache_empty_not_written(tmp_path):
+  home = str(tmp_path / "home")
+  transcript = str(tmp_path / "t.jsonl")
+  _write_jsonl(transcript, [{"type": "user", "message": {
+    "role": "user", "content": "hi"}}])
+  info = _session_info(transcript, "uuid-3")
+  with mock.patch.dict(os.environ, {"HOME": home}):
+    sessions.write_cached_digest(info, "   \n  ")  # blank → skipped
+    assert not os.path.exists(sessions._digest_cache_path("uuid-3"))
+
+
+def test_delete_session_drops_cached_digest(tmp_path):
+  home = str(tmp_path / "home")
+  project = str(tmp_path / "project")
+  os.makedirs(project, exist_ok=True)
+  path = _claude_session(home, project, "cccccccc-0000-0000-0000-000000000000", [
+    {"type": "user", "message": {"role": "user", "content": "x"}},
+  ])
+  info = _session_info(path, "cccccccc-0000-0000-0000-000000000000")
+  with mock.patch.dict(os.environ, {"HOME": home}):
+    sessions.write_cached_digest(info, "summary to be orphaned")
+    cache = sessions._digest_cache_path("cccccccc-0000-0000-0000-000000000000")
+    assert os.path.exists(cache)
+    sessions.remove_session(project, "cccccccc")
+    assert not os.path.exists(cache)

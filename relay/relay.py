@@ -534,7 +534,14 @@ async def _handle_card_action(event: dict) -> tuple[int, dict]:
     # <action_text>" card would replace the picker, flashing
     # "Selected: model_switch:claude-opus-4-7" over the bot's actual
     # confirmation.
-    BOT_OWNED_CARD_PREFIXES = ("askq:", "model_switch:", "model_picker_submit")
+    # ``session_recall:`` / ``session_recall_submit`` belong to the
+    # /session recall picker, which the daemon PATCHes to a locked
+    # confirmation once the pick lands — same multi-step ownership as the
+    # model picker, so suppress the generic "Selected:" flash here.
+    BOT_OWNED_CARD_PREFIXES = (
+      "askq:", "model_switch:", "model_picker_submit",
+      "session_recall:", "session_recall_submit",
+    )
     if action_text.startswith(BOT_OWNED_CARD_PREFIXES):
         return 200, {
             "toast": {"type": toast_type, "content": f"{toast_verb}: {action_text}"},

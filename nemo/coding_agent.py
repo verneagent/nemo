@@ -108,6 +108,26 @@ class CodingAgent(ABC):
     del question, sdk_session_id
     return ""
 
+  async def digest_transcript(self, transcript_path: str, fmt_hint: str) -> str:
+    """Summarise a past session transcript in a FRESH, context-free session.
+
+    Used by ``/session recall``: instead of handing the *live* agent the
+    raw JSONL path and letting it read chunks into its own working context
+    (verbose, non-deterministic, pollutes the conversation), a throwaway
+    read-only session reads the transcript and returns a compact structured
+    summary. Only that summary enters the main agent's context; the caller
+    still hands it the path so it can Read specific slices on demand.
+
+    ``transcript_path`` is the absolute path to the JSONL. ``fmt_hint``
+    describes the on-disk event shape (it depends on which agent *wrote*
+    the transcript, not on this agent). Returns the summary text, or ""
+    when this adapter can't run a blank side session (the caller then
+    falls back to the inline "read the file yourself" recall). Default is
+    unsupported, so Codex / OpenCode inherit the no-op.
+    """
+    del transcript_path, fmt_hint
+    return ""
+
   def supports_fork(self) -> bool:
     """True if this adapter can spawn a read-only forked sub-session.
 
