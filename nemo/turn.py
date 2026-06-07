@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from dataclasses import dataclass
 from typing import Callable
 
@@ -216,6 +217,50 @@ def _looks_like_non_retryable_api_error(
     return False
   lowered = text.lower()
   return any(sig in lowered for sig in _NON_RETRYABLE_ERROR_SIGNALS)
+
+
+# Leaked tool-call markup.
+#
+# The model emitted an Anthropic function-call invocation as PLAIN TEXT —
+# `<invoke name="...">...</invoke>` — instead of a structured tool_use block.
+# The SDK only ever executes structured tool_use, so the intended tool never
+# runs; when this is the turn's FINAL message the turn ends early and the raw
+# markup would otherwise be rendered as a bogus "Done ✓" answer.
+#
+# Observed on Opus after auto-compaction in long, screenshot-heavy tool loops,
+# e.g. the final message of a simulator-driving turn was the bare text:
+#   court
+#   <invoke name="Read">
+#   <parameter name="file_path">/tmp/vf_agent.png</parameter>
+#   </invoke>
+# — so the screenshot was never read and the turn died with that markup as the
+# card body. We can't make the tool run from here, but we MUST NOT present the
+# markup as a successful answer; we wrap it in an explicit anomaly notice.
+#
+# Precision: require BOTH a `<invoke name=` opener and a matching `</invoke>`
+# closer, and bail if the text contains a ``` fence (the model is then
+# *displaying* the syntax in a code block — e.g. explaining tool-call format —
+# not emitting a call). The `antml:` namespace variant is matched too.
+_LEAKED_INVOKE_OPEN_RE = re.compile(r"<(?:antml:)?invoke\s+name\s*=", re.IGNORECASE)
+_LEAKED_INVOKE_CLOSE_RE = re.compile(r"</(?:antml:)?invoke>", re.IGNORECASE)
+
+_LEAKED_TOOL_CALL_NOTICE = (
+  "⚠️ 模型把一个工具调用写成了纯文本（`<invoke …>`），该工具并未真正执行，"
+  "本轮动作未完成。下面是模型的原始输出：\n\n"
+)
+
+
+def _looks_like_leaked_tool_call(text: str) -> bool:
+  """True when an assistant TEXT block is actually an unparsed tool call.
+
+  See the module note above. False (intentionally) when the markup sits inside
+  a ``` fence, since that is the model showing the syntax rather than invoking
+  it — the observed real leaks arrive as bare, un-fenced text.
+  """
+  if not text or "```" in text:
+    return False
+  return bool(_LEAKED_INVOKE_OPEN_RE.search(text)) and bool(
+    _LEAKED_INVOKE_CLOSE_RE.search(text))
 
 # If receive_response() yields nothing for this long, assume the turn is stuck.
 # SDK docs: "If no ResultMessage is received, the iterator continues indefinitely."
@@ -576,8 +621,18 @@ async def _single_turn(
           parent = getattr(message, "parent_tool_use_id", None)
           if parent and pending_tasks:
             task_id = next(iter(pending_tasks))
+          # Guard: the model wrote a tool call as plain text (tool never ran).
+          # Wrap it in an anomaly notice so the Done card doesn't claim success.
+          if _looks_like_leaked_tool_call(text):
+            log.warning(
+              "Leaked tool-call markup in AssistantMessage text "
+              "(model wrote <invoke> as text — tool NOT executed): %r",
+              text[:200])
+            answer_text = _LEAKED_TOOL_CALL_NOTICE + "```\n" + text + "\n```"
+          else:
+            answer_text = text
           on_event(AnswerEvent(
-            text=text, task_id=task_id,
+            text=answer_text, task_id=task_id,
             pending_tasks=len(pending_tasks),
           ))
           last_emitted = "answer"

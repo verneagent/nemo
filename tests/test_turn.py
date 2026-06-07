@@ -485,6 +485,83 @@ def test_transient_api_error_detector_no_false_positive_on_user_topic():
   assert "ECONNRESET" in answers[0]
 
 
+def test_leaked_tool_call_markup_is_flagged_not_shown_as_answer():
+  """Opus glitch: the model emits a tool call as PLAIN TEXT — the tool never
+  runs and the bare `<invoke …>` markup would otherwise render as a bogus
+  "Done ✓" answer. The guard must wrap it in an anomaly notice instead.
+
+  Reproduces the exact observed leak (chat oc_fac92663… session e51a4341):
+  the final message of a simulator-driving turn was `court\\n<invoke
+  name="Read">…</invoke>`, so the screenshot was never read.
+  """
+  leaked = (
+    'court\n<invoke name="Read">\n'
+    '<parameter name="file_path">/tmp/vf_agent.png</parameter>\n</invoke>'
+  )
+  messages = [
+    FakeAssistantMessage(content=[FakeTextBlock(text=leaked)]),
+    FakeResultMessage(total_cost_usd=0.0),
+  ]
+  events: list = []
+
+  async def _run():
+    with mock.patch.dict("sys.modules", _sdk_modules()):
+      await run_turn(FakeClient(messages), "怎么样了", events.append)
+
+  asyncio.run(_run())
+  answers = [e for e in events if isinstance(e, AnswerEvent)]
+  assert len(answers) == 1
+  body = answers[0].text
+  # Must NOT be presented verbatim as if it were a real answer.
+  assert body != leaked
+  # The anomaly notice (with the warning marker) must be present, and the raw
+  # markup preserved for debugging — fenced so the channel renders it literally.
+  assert "⚠️" in body and "未完成" in body
+  assert "```" in body and leaked in body
+  # The turn still completes (we don't crash or reconnect — it's a model glitch,
+  # not a transport failure).
+  assert any(isinstance(e, DoneEvent) for e in events)
+
+
+def test_leaked_tool_call_guard_no_false_positive_on_fenced_explanation():
+  """A model legitimately *explaining* the tool-call format inside a code
+  fence must pass through untouched — the guard only fires on bare leaks."""
+  explanation = (
+    "To call a tool you emit a structured block like this:\n\n"
+    '```\n<invoke name="Read">\n'
+    '<parameter name="file_path">/x.py</parameter>\n</invoke>\n```\n\n'
+    "The SDK parses that into a tool_use block."
+  )
+  messages = [
+    FakeAssistantMessage(content=[FakeTextBlock(text=explanation)]),
+    FakeResultMessage(total_cost_usd=0.0),
+  ]
+  events: list = []
+
+  async def _run():
+    with mock.patch.dict("sys.modules", _sdk_modules()):
+      await run_turn(FakeClient(messages), "how do tool calls work?",
+                     events.append)
+
+  asyncio.run(_run())
+  answers = [e for e in events if isinstance(e, AnswerEvent)]
+  assert len(answers) == 1
+  assert answers[0].text == explanation  # untouched
+  assert "⚠️" not in answers[0].text
+
+
+def test_leaked_tool_call_guard_ignores_incomplete_fragment():
+  """Prose that merely names `<invoke` without a closing `</invoke>` is not a
+  balanced invocation and must not trip the guard."""
+  from nemo.turn import _looks_like_leaked_tool_call
+  assert not _looks_like_leaked_tool_call(
+    "The <invoke name= opener starts an Anthropic tool call.")
+  assert not _looks_like_leaked_tool_call("just a normal answer")
+  # Bare, balanced, un-fenced markup IS a leak.
+  assert _looks_like_leaked_tool_call(
+    '<invoke name="ui_tap"><parameter name="x">1</parameter></invoke>')
+
+
 def test_clean_real_turn_preserves_freshly_promoted_stales():
   """Regression: pending_tasks promoted to stale at ResultMessage must
   survive the "clean real turn" drop path.
