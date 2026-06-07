@@ -1718,8 +1718,11 @@ def run_recall_picker_tests(pid: int, chat_id: str, result: E2EResult) -> None:
   smoke_payload = json.dumps({
     "header": {"token": verify_token, "event_type": "card.action.trigger"},
     "event": {
+      # A picker row's Recall button is a plain (non-form) button — the
+      # discriminator rides in action.value.action.
       "action": {
-        "form_value": {"session": "session_recall:uuid-smoke"},
+        "value": {"action": "session_recall:uuid-smoke",
+                  "chat_id": smoke_chat},
         "tag": "button",
       },
       "operator": {"open_id": OPERATOR_OPEN_ID},

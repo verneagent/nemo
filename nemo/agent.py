@@ -1183,20 +1183,22 @@ async def _lock_agent_picker(
     log.warning("Agent picker confirm-lock update failed: %s", exc)
 
 
-# Lark caps select labels well above this, but a dropdown of 80-char rows is
-# unreadable on mobile — trim the preview so each row stays scannable.
-_SESSION_PICKER_LIMIT = 25
+# Each session is its own card block (markdown + Recall button), so cap the
+# count to keep the card from getting absurdly tall on mobile.
+_SESSION_PICKER_LIMIT = 12
 
 
 def _session_picker_options(
   project_dir: str, current_sdk_session_id: str = "",
 ) -> list[tuple[str, str]]:
-  """Flatten past sessions into ``(display_label, uuid)`` pairs, newest
-  first, for the recall dropdown.
+  """Flatten past sessions into ``(description_markdown, uuid)`` pairs,
+  newest first, for the recall picker.
 
-  Each label is a compact one-liner — ``<uuid8> · <agent> · <age> ·
-  <first-prompt preview>`` — so the operator can recognise a session
-  without `/session list`. The current session (if any) is tagged.
+  Each description is a two-line markdown block — a bold meta line
+  (``<uuid8> · <agent> · <model> · <age>`` + a current-session tag) and
+  the first user prompt as a preview — so the operator can recognise a
+  session at a glance without `/session list`. The card renders one
+  Recall button under each block.
   """
   from . import sessions as _sessions
   now = time.time()
@@ -1204,17 +1206,23 @@ def _session_picker_options(
   for s in _sessions.list_sessions(project_dir)[:_SESSION_PICKER_LIMIT]:
     age = max(0, int(now - s.mtime))
     if age < 3600:
-      when = f"{age // 60}m"
+      when = f"{age // 60}m ago"
     elif age < 86400:
-      when = f"{age // 3600}h"
+      when = f"{age // 3600}h ago"
     else:
-      when = f"{age // 86400}d"
-    preview = (s.first_user_text or "").replace("\n", " ").strip()[:40]
-    marker = " ←current" if s.uuid == current_sdk_session_id else ""
-    label = f"{s.uuid[:8]} · {s.agent} · {when}{marker}"
+      when = f"{age // 86400}d ago"
+    bits = [f"`{s.uuid[:8]}`", s.agent]
+    if s.model:
+      bits.append(s.model)
+    bits.append(when)
+    meta = " · ".join(bits)
+    if s.uuid == current_sdk_session_id:
+      meta += " · _(current)_"
+    preview = (s.first_user_text or "").replace("\n", " ").strip()[:120]
+    description = f"**{meta}**"
     if preview:
-      label = f"{label} · {preview}"
-    out.append((label, s.uuid))
+      description = f"{description}\n{preview}"
+    out.append((description, s.uuid))
   return out
 
 
@@ -1229,7 +1237,7 @@ async def _send_session_picker(
 
   Falls back to the plain-text `/session list` when there are no sessions
   to pick (so the user still gets a useful answer instead of an empty
-  dropdown)."""
+  list)."""
   options = _session_picker_options(project_dir, current_sdk_session_id)
   if not options:
     await _send_response(
@@ -1264,8 +1272,9 @@ async def _lock_session_picker(
 ) -> None:
   """PATCH a submitted /session recall picker into its locked state.
 
-  Removes the dropdown + button so the same pick can't be re-submitted.
-  No-op without a card id (e.g. the recall was typed directly)."""
+  Collapses the per-session list + Recall buttons to a single confirmation
+  so the same pick can't be re-clicked. No-op without a card id (e.g. the
+  recall was typed directly)."""
   if not picker_msg_id:
     return
   try:
@@ -1778,34 +1787,23 @@ async def main_loop(
           )
           channel.push_back(synthetic)
           continue
-        if action_str == "session_recall_submit":
-          # Recall clicked with nothing picked — Lark fell back to the
-          # button's own value because form_value carried no selection.
-          await _send_response(
-            channel, chat_id,
-            "Pick a session from the dropdown before clicking Recall.", db,
-          )
-          continue
         if action_str.startswith("session_recall:"):
-          # `/session recall` picker submitted. The select value carries the
-          # ``session_recall:<uuid>`` discriminator. Recall is read-only (it
-          # summarises a local transcript and injects a turn) so — like the
-          # `/session recall <uuid>` text command — it is NOT privilege-gated.
+          # A `/session recall` picker row's Recall button was clicked. The
+          # button value carries the ``session_recall:<uuid>`` discriminator.
+          # Recall is read-only (it summarises a local transcript and injects
+          # a turn) so — like the `/session recall <uuid>` text command — it
+          # is NOT privilege-gated.
           session_uuid = action_str.split(":", 1)[1].strip()
-          if not session_uuid:
-            await _send_response(
-              channel, chat_id,
-              "Pick a session from the dropdown before clicking Recall.", db,
-            )
-            continue
-          # Lock the picker so the dropdown can't be re-submitted, then run
-          # the recall (the uuid came from our own dropdown, so it resolves).
-          await _lock_session_picker(
-            channel, reply.message_id, uuid=session_uuid)
-          err = await _handle_session_recall(
-            channel, chat_id, project_dir, session_uuid, coding_agent, db)
-          if err:
-            await _send_response(channel, chat_id, err, db)
+          if session_uuid:
+            # Lock the picker (collapse the session list to a confirmation),
+            # then run the recall — the uuid came from our own card so it
+            # resolves.
+            await _lock_session_picker(
+              channel, reply.message_id, uuid=session_uuid)
+            err = await _handle_session_recall(
+              channel, chat_id, project_dir, session_uuid, coding_agent, db)
+            if err:
+              await _send_response(channel, chat_id, err, db)
           continue
         if action_str.startswith("fork_stop:"):
           # Fork-scoped Stop button — interrupt that fork's in-flight turn
@@ -1975,9 +1973,9 @@ async def main_loop(
           # through agent_switch:<name> on submit.
           await _send_agent_picker(channel, chat_id, ctx, db)
         elif response == "__session_picker__":
-          # `/session recall` (no uuid) — dropdown of past sessions; the
-          # recall fires when the user submits (session_recall:<uuid> card
-          # action handled at the top of this loop).
+          # `/session recall` (no uuid) — one Recall button per past
+          # session; the recall fires when a button is clicked
+          # (session_recall:<uuid> card action handled at the top of this loop).
           await _send_session_picker(
             channel, chat_id, project_dir, db, _sdk_session_id)
         elif response and response.startswith("__model__:"):
@@ -2943,9 +2941,9 @@ async def main_loop(
             # submit's actual switch is queued behind the in-flight turn.
             await _send_agent_picker(channel, chat_id, ctx, db)
           elif response == "__session_picker__":
-            # Same reasoning: only displays the dropdown; the recall fires
-            # when the user submits (queued behind the in-flight turn by the
-            # in-turn card.action handler below).
+            # Same reasoning: only displays the session list; the recall fires
+            # when a Recall button is clicked (queued behind the in-flight turn
+            # by the in-turn card.action handler below).
             await _send_session_picker(
               channel, chat_id, project_dir, db, _sdk_session_id)
           elif response and response.startswith("__btw__:"):
@@ -3120,16 +3118,10 @@ async def main_loop(
                 signal_detected = "autoesc"
                 return
               continue
-            if action == "session_recall_submit":
-              await _send_response(
-                channel, chat_id,
-                "Pick a session from the dropdown before clicking Recall.", db,
-              )
-              continue
             if action.startswith("session_recall:"):
-              # Recall picker submitted mid-turn. Defer it: append the
-              # original card.action event so _merge_pending requeues it and
-              # the top-level handler runs the recall after this turn (recall
+              # Recall button clicked mid-turn. Defer it: append the original
+              # card.action event so _merge_pending requeues it and the
+              # top-level handler runs the recall after this turn (recall
               # needs no SDK restart — it just injects a fresh turn).
               if action.split(":", 1)[1].strip():
                 _pending_msgs.append(msg)

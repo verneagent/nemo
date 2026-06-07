@@ -851,47 +851,30 @@ class RelayTestCase(unittest.TestCase):
     self.assertIn("toast", result)
     self.assertNotIn("card", result)
 
-  def test_form_action_session_recall_with_and_without_value(self):
-    """The /session recall picker submits a single-field form whose value
-    is ``session_recall:<uuid>``. Cover both Lark V2 form-submit shapes:
-    with the button ``value`` present, and with it DROPPED (only
-    ``form_value`` + ``context`` survive) — the relay must route both via
-    the ``open_chat_id`` / ``open_message_id`` context fallback."""
-    # (a) value present
+  def test_button_action_session_recall_routes_with_card_id(self):
+    """Each /session recall picker row is a PLAIN button (not a form): the
+    click carries ``action.value`` with the ``session_recall:<uuid>``
+    discriminator + chat_id, and the card's own message_id rides along via
+    context so the daemon can lock the picker after recall starts."""
     self._webhook({
       "header": {"token": "tok1", "event_type": "card.action.trigger"},
       "event": {
         "action": {
-          "value": {"chat_id": "oc_recall_a"},
-          "form_value": {"session": "session_recall:uuid-aaaa"},
-        },
-        "operator": {"open_id": "ou_op"},
-      },
-    })
-    r = [x for x in self._get("/replies/chat:oc_recall_a?since=")["replies"]
-         if x["msg_type"] == "form_action"]
-    self.assertEqual(len(r), 1)
-    self.assertEqual(r[0]["text"], "session_recall:uuid-aaaa")
-
-    # (b) button value dropped — context fallback carries chat + message id
-    self._webhook({
-      "header": {"token": "tok1", "event_type": "card.action.trigger"},
-      "event": {
-        "action": {
-          "form_value": {"session": "session_recall:uuid-bbbb"},
+          "value": {"action": "session_recall:uuid-aaaa",
+                    "chat_id": "oc_recall_a"},
           "tag": "button",
         },
         "operator": {"open_id": "ou_op"},
         "context": {
-          "open_chat_id": "oc_recall_b",
+          "open_chat_id": "oc_recall_a",
           "open_message_id": "om_session_picker",
         },
       },
     })
-    r = [x for x in self._get("/replies/chat:oc_recall_b?since=")["replies"]
-         if x["msg_type"] == "form_action"]
+    r = [x for x in self._get("/replies/chat:oc_recall_a?since=")["replies"]
+         if x["msg_type"] == "button_action"]
     self.assertEqual(len(r), 1)
-    self.assertEqual(r[0]["text"], "session_recall:uuid-bbbb")
+    self.assertEqual(r[0]["text"], "session_recall:uuid-aaaa")
     self.assertEqual(r[0]["message_id"], "om_session_picker")
 
   def test_card_action_skips_confirm_card_for_session_recall_prefix(self):
@@ -902,8 +885,9 @@ class RelayTestCase(unittest.TestCase):
       "header": {"token": "tok1", "event_type": "card.action.trigger"},
       "event": {
         "action": {
-          "value": {"chat_id": "oc_recall_pref"},
-          "form_value": {"session": "session_recall:uuid-cccc"},
+          "value": {"action": "session_recall:uuid-cccc",
+                    "chat_id": "oc_recall_pref"},
+          "tag": "button",
         },
         "operator": {"open_id": "ou_op"},
       },

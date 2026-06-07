@@ -1297,34 +1297,43 @@ def test_turn_card_multi_select_answer_renders_as_list():
 # ---------------------------------------------------------------------------
 
 def test_session_picker_card_structure():
-  """Recall picker mirrors the model/agent pickers: a Lark V2 form whose
-  select options carry the ``session_recall:<uuid>`` discriminator and a
-  named submit button with the empty-selection fallback action."""
+  """Feishu has no radio group, so the recall picker renders one block per
+  session — a multi-line markdown description + a dedicated Recall button
+  (plain card.action, not a form submit). Each button's value carries the
+  ``session_recall:<uuid>`` discriminator the daemon routes on, and the
+  full per-session text stays visible (not collapsed into a dropdown)."""
   options = [
-    ("01fe69c7 · claude · 2h · fix the bug", "01fe69c7-aaaa"),
-    ("bbbbbbbb · codex · 1d · add feature", "bbbbbbbb-cccc"),
+    ("**`01fe69c7` · claude · opus-4-7 · 2h ago**\nfix the bug", "01fe69c7-aaaa"),
+    ("**`bbbbbbbb` · codex · gpt-5 · 1d ago**\nadd feature", "bbbbbbbb-cccc"),
   ]
   card = build_session_picker_card(options, chat_id="oc_abc")
   assert card["schema"] == "2.0"
   assert card["header"]["title"]["content"] == "Recall Session"
 
-  form = _find_element(card["body"]["elements"], "form")
-  assert form["name"] == "session_picker_form"
-  select = _find_element(form["elements"], "select_static")
-  assert select["name"] == "session"
-  assert [o["value"] for o in select["options"]] == [
+  elements = card["body"]["elements"]
+  # No form / dropdown — the whole point of the radio-style redesign.
+  blob = json.dumps(elements, ensure_ascii=False)
+  assert "form" not in blob and "select_static" not in blob
+
+  # Each session's full description is present as markdown (multi-line).
+  md_blob = "\n".join(
+    e.get("content", "") for e in elements if e.get("tag") == "markdown")
+  assert "fix the bug" in md_blob and "add feature" in md_blob
+  assert "opus-4-7" in md_blob  # model visible, not just a one-liner
+
+  # One Recall button per session, each carrying its uuid discriminator.
+  buttons = [
+    btn
+    for el in elements if el.get("tag") == "column_set"
+    for col in el["columns"]
+    for btn in col["elements"] if btn.get("tag") == "button"
+  ]
+  assert [b["value"]["action"] for b in buttons] == [
     "session_recall:01fe69c7-aaaa",
     "session_recall:bbbbbbbb-cccc",
   ]
-
-  button = _find_element(form["elements"], "button")
-  assert button["form_action_type"] == "submit"
-  assert "action_type" not in button
-  assert button["name"] == "submit"
-  assert button["value"] == {"action": "session_recall_submit", "chat_id": "oc_abc"}
-  # The submit button must be a direct form child (a nested column_set would
-  # stop Lark treating it as the form's submit trigger).
-  assert not any(e.get("tag") == "column_set" for e in form["elements"])
+  assert all(b["text"]["content"] == "Recall" for b in buttons)
+  assert all(b["value"]["chat_id"] == "oc_abc" for b in buttons)
 
 
 def test_session_recalled_card_has_no_form():

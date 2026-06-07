@@ -2895,5 +2895,8 @@ def test_session_picker_no_arg_sends_picker_card(tmp_path):
     None)
   assert picker is not None, sent_cards
   blob = _json.dumps(picker, ensure_ascii=False)
+  # Per-session Recall button carrying the uuid discriminator; the full
+  # first-prompt preview is shown (radio-style rows, no dropdown/form).
   assert "session_recall:01fe69c7-5793-4ad7-9ba6-7d1aa1e01f90" in blob
-  assert "session_picker_form" in blob
+  assert "fix the bug" in blob
+  assert "select_static" not in blob

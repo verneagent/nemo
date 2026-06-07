@@ -1195,51 +1195,35 @@ def build_session_picker_card(
 ) -> JsonObject:
   """Build the interactive `/session recall` picker card.
 
-  Mirrors ``build_model_picker_card`` / ``build_agent_picker_card``: a Lark
-  V2 ``form`` with a ``select_static`` dropdown of past sessions plus a
-  ``form_action_type: "submit"`` button. Each option value carries the
-  ``session_recall:<uuid>`` discriminator so the daemon's card.action
-  handler routes the form-submit straight into the recall flow without
-  colliding with the model/agent picker prefixes.
+  Feishu Card V2 has no radio-group component, and a ``select_static``
+  dropdown collapses each session to a single cramped line. So instead of
+  a form, each session is rendered as its own block — a multi-line
+  markdown description followed by a dedicated **Recall** button — giving
+  the user the full per-session detail (uuid · agent · model · age +
+  prompt preview) before picking one. Clicking a button fires a plain
+  ``card.action.trigger`` whose ``value.action`` is
+  ``session_recall:<uuid>`` — the same discriminator the daemon already
+  routes on (relay button_action → action_value['action']), so no separate
+  submit step is needed. ``session_recall:`` is in the relay's
+  BOT_OWNED_CARD_PREFIXES, so the click is toast-only (no "Selected:"
+  flash) while the daemon PATCHes this card to its locked state.
 
-  ``options`` is ``(display_label, uuid)`` pairs in dropdown order. Same
-  V2 / ``<font>`` constraints as the other pickers — ``info`` is plain
-  markdown (multi-line allowed); ``hint`` is the grey single-line note.
+  ``options`` is ``(description_markdown, uuid)`` pairs, newest first;
+  ``description_markdown`` is the multi-line block shown above each
+  button. Same V2 / ``<font>`` constraints as the other cards — ``info``
+  is plain markdown (multi-line allowed); ``hint`` is the grey one-line note.
   """
-  select_options = [
-    {
-      "text": {"tag": "plain_text", "content": label},
-      "value": f"session_recall:{uuid}",
-    }
-    for label, uuid in options
-  ]
-  form_elements: list[JsonObject] = [
-    {
-      "tag": "select_static",
-      "name": "session",
-      "placeholder": {"tag": "plain_text", "content": "Pick a session..."},
-      "options": select_options,
-    },
-    # Same submit-button shape as the model/agent pickers — see
-    # build_model_picker_card for why form_action_type, the button name,
-    # and the direct-child placement all matter for Lark to fire the callback.
-    {
-      "tag": "button",
-      "text": {"tag": "plain_text", "content": "Recall"},
-      "type": "primary",
-      "form_action_type": "submit",
-      "name": "submit",
-      "value": {"action": "session_recall_submit", "chat_id": chat_id},
-    },
-  ]
   elements: list[JsonObject] = [
-    {"tag": "markdown", "content": "Pick a past session to recall."},
-    {
-      "tag": "form",
-      "name": "session_picker_form",
-      "elements": form_elements,
-    },
+    {"tag": "markdown", "content": "Pick a past session to recall:"},
   ]
+  for idx, (description, uuid) in enumerate(options):
+    if idx > 0:
+      elements.append({"tag": "hr"})
+    elements.append({"tag": "markdown", "content": description})
+    # One Recall button per session — a plain (non-form) button so the
+    # click itself recalls; value.action carries the routing discriminator.
+    elements.append(_buttons_row(
+      [("Recall", f"session_recall:{uuid}", "primary")], chat_id))
   if info:
     elements.append({"tag": "markdown", "content": info})
   if hint:

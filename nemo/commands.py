@@ -477,7 +477,7 @@ def try_dispatch(text: str, ctx: AgentContext) -> tuple[bool, str | None]:
       "| `/diag` | Run diagnostics |\n"
       "| `/session list` | List past sessions in this project |\n"
       "| `/session info [uuid]` | Show session metadata plus first and last messages |\n"
-      "| `/session recall [uuid]` | Recall a past session (no uuid → pick from a dropdown) |\n"
+      "| `/session recall [uuid]` | Recall a past session (no uuid → pick from a list) |\n"
       "| `/session rm <uuid>` | Remove one past session |\n"
       "| `/session purge [uuid]` | Remove sessions older than uuid, or all except current |\n"
       "| `/exit` | Stop agent, keep group |\n"
@@ -588,7 +588,7 @@ def try_dispatch(text: str, ctx: AgentContext) -> tuple[bool, str | None]:
         return True, f"__session_info__:{target}"
       if sub == "recall":
         # With a uuid: recall it directly. Without: emit an interactive
-        # session picker card (dropdown → Submit recalls the pick), routed
+        # session picker card (one Recall button per session), routed
         # through the session_recall:<uuid> card action on submit.
         if len(parts) >= 3 and parts[2].strip():
           return True, f"__session_recall__:{parts[2].strip()}"
@@ -604,7 +604,7 @@ def try_dispatch(text: str, ctx: AgentContext) -> tuple[bool, str | None]:
       "|---|---|\n"
       "| `/session list` | List past sessions in this project (Claude + Codex) |\n"
       "| `/session info [uuid]` | Show session metadata plus first and last messages |\n"
-      "| `/session recall [uuid]` | Recall a past session (no uuid → pick from a dropdown) |\n"
+      "| `/session recall [uuid]` | Recall a past session (no uuid → pick from a list) |\n"
       "| `/session rm <uuid>` | Remove one past session |\n"
       "| `/session purge [uuid]` | Remove sessions older than uuid, or all except current |"
     )
