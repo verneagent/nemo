@@ -649,6 +649,101 @@ def test_progress_timeout_fires_on_systemmessage_storm(monkeypatch):
     "progress-timeout abort must surface as ErrorEvent"
 
 
+def test_watchdog_defers_while_prompt_awaits_user(monkeypatch):
+  """A pending AskUserQuestion/permission prompt must not trip the watchdog.
+
+  Regression: while an interactive prompt is awaiting the user, the SDK is
+  blocked inside its can_use_tool callback and emits no messages. That
+  silence used to exhaust PROGRESS_TIMEOUT and force a reconnect, which tore
+  down the in-flight question and re-asked it — discarding whatever the user
+  had already selected (observed: a multi-select that "took three tries").
+  With ``is_paused`` reporting True the watchdog stands down, and the turn
+  completes normally once the user answers and the message stream resumes.
+  """
+  from nemo import turn as turn_module
+
+  # Shrink so the silent (paused) stretch spans several watchdog ticks fast.
+  monkeypatch.setattr(turn_module, "PROGRESS_TIMEOUT", 0.3)
+  monkeypatch.setattr(turn_module, "HEARTBEAT_TIMEOUT", 5)
+
+  paused = {"v": True}
+
+  # Stay silent well past PROGRESS_TIMEOUT (simulating the SDK blocked in
+  # can_use_tool), then "the user answers": clear the pause and yield.
+  async def blocked_then_answer():
+    await asyncio.sleep(1.0)
+    paused["v"] = False
+    yield FakeResultMessage(total_cost_usd=0.05)
+
+  gen = blocked_then_answer()
+
+  class PausedClient:
+    async def query(self, prompt):
+      pass
+
+    def receive_response(self):
+      return gen
+
+    async def stop_task(self, task_id):
+      pass
+
+  events: list = []
+
+  async def _run():
+    with mock.patch.dict("sys.modules", _sdk_modules()):
+      return await run_turn(
+        PausedClient(), "ask the user", events.append,
+        is_paused=lambda: paused["v"])
+
+  cost, _usage = asyncio.run(_run())
+
+  # No TimeoutError raised, the answer was consumed, and the turn finished.
+  assert cost == 0.05
+  assert any(isinstance(e, DoneEvent) for e in events)
+  assert not any(isinstance(e, ErrorEvent) for e in events), \
+    "watchdog must not fire while a prompt is awaiting the user"
+
+
+def test_watchdog_still_fires_when_not_paused(monkeypatch):
+  """Sanity: the same silent stall WITHOUT a pending prompt still times out.
+
+  Guards against is_paused accidentally disabling the watchdog for genuine
+  hangs — only an actually-pending prompt (is_paused True) should defer it.
+  """
+  from nemo import turn as turn_module
+
+  monkeypatch.setattr(turn_module, "PROGRESS_TIMEOUT", 0.3)
+  monkeypatch.setattr(turn_module, "HEARTBEAT_TIMEOUT", 5)
+
+  async def never_answers():
+    await asyncio.sleep(5.0)
+    yield FakeResultMessage()
+
+  gen = never_answers()
+
+  class HungClient:
+    async def query(self, prompt):
+      pass
+
+    def receive_response(self):
+      return gen
+
+    async def stop_task(self, task_id):
+      pass
+
+  events: list = []
+
+  async def _run():
+    with mock.patch.dict("sys.modules", _sdk_modules()):
+      # is_paused present but always False — a real hang, not a prompt.
+      await run_turn(
+        HungClient(), "do work", events.append, is_paused=lambda: False)
+
+  with pytest.raises(TimeoutError):
+    asyncio.run(_run())
+  assert any(isinstance(e, ErrorEvent) for e in events)
+
+
 def test_reset_clears_stale_tasks_on_claude_adapter():
   """ClaudeCodingAgent.reset() must clear self._stale_tasks.
 

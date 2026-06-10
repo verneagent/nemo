@@ -116,7 +116,7 @@ def test_run_turn_resumes_latest_session_after_done_event():
   captured: dict[str, object] = {}
 
   async def fake_rwrc(prompt, on_event, stale_tasks=None, options=None,
-                       options_factory=None, max_attempts=3):
+                       options_factory=None, max_attempts=3, is_paused=None):
     captured["options"] = options
     captured["options_factory"] = options_factory
     # Simulate the SDK reporting a session id at end of turn.
@@ -168,7 +168,7 @@ def test_run_turn_factory_uses_initial_resume_before_first_done_event():
   captured: dict[str, object] = {}
 
   async def fake_rwrc(prompt, on_event, stale_tasks=None, options=None,
-                       options_factory=None, max_attempts=3):
+                       options_factory=None, max_attempts=3, is_paused=None):
     captured["factory"] = options_factory
     return (0.0, {})
 

@@ -212,17 +212,23 @@ class SDKThread:
     prompt: str,
     on_event: Callable[[TurnEvent], None],
     stale_tasks: set[str] | None = None,
+    is_paused: Callable[[], bool] | None = None,
   ) -> tuple[float, JsonObject]:
     """Run a single SDK turn on the SDK thread.
 
     on_event is called from the SDK thread — it must be thread-safe.
     Lark API calls (send_card, update_card) are synchronous HTTP and safe.
+
+    ``is_paused`` lets the turn watchdog stand down while an interactive
+    prompt is awaiting the user (see turn._single_turn).
     """
     if self._client is None:
       raise RuntimeError("SDK client not connected")
 
     async def _turn():
-      return await run_turn(self._client, prompt, on_event, stale_tasks=stale_tasks)
+      return await run_turn(
+        self._client, prompt, on_event,
+        stale_tasks=stale_tasks, is_paused=is_paused)
 
     return await self.run_on_sdk_loop(_turn())
 
@@ -238,6 +244,7 @@ class SDKThread:
     options: object = None,
     options_factory: Callable[[], object] | None = None,
     max_attempts: int = 3,
+    is_paused: Callable[[], bool] | None = None,
   ) -> tuple[float, JsonObject]:
     """Run turn with automatic reconnect on timeout or disconnection.
 
@@ -259,7 +266,8 @@ class SDKThread:
       if self._cancelled.is_set():
         raise asyncio.CancelledError("SDK turn cancelled")
       try:
-        return await self.run_turn(prompt, on_event, stale_tasks=stale_tasks)
+        return await self.run_turn(
+          prompt, on_event, stale_tasks=stale_tasks, is_paused=is_paused)
       except NonRetryableAPIError:
         log.warning("SDK turn non-retryable API error — closing client")
         await self.close_client()

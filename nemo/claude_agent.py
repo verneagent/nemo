@@ -357,13 +357,21 @@ class ClaudeCodingAgent(CodingAgent):
       return self._build_options(
         self._project_dir, self._model, resume=self._latest_session_id)
 
+    def _is_paused() -> bool:
+      # True while an AskUserQuestion / permission prompt is awaiting the
+      # user. The SDK is then blocked inside can_use_tool and emits nothing;
+      # without this the turn watchdog would treat the wait as a hang and
+      # force-reconnect, discarding the in-flight question.
+      return bool(getattr(self._channel, "permission_active", False))
+
     self._current_on_event = _wrapped
     try:
       return await self._sdk.run_turn_with_reconnect(
         prompt, _wrapped,
         stale_tasks=self._stale_tasks,
         options=self._options,
-        options_factory=_options_factory)
+        options_factory=_options_factory,
+        is_paused=_is_paused)
     finally:
       self._current_on_event = None
 

@@ -437,6 +437,7 @@ async def _single_turn(
   on_event: Callable[[TurnEvent], None],
   stale_tasks: set[str],
   stop_task_disabled: list[bool],
+  is_paused: Callable[[], bool] | None = None,
 ) -> _TurnResult:
   """Issue one query() and consume its receive_response() stream.
 
@@ -448,6 +449,14 @@ async def _single_turn(
   ``stop_task_disabled`` is a one-element mutable flag: once ``stop_task``
   returns "Control request timeout" the control channel is presumed wedged
   and we skip further stop_task calls for the remainder of this orchestration.
+
+  ``is_paused`` (optional) returns True while an interactive prompt
+  (AskUserQuestion / permission) is awaiting the user. During that time the
+  SDK emits no messages because it is legitimately blocked inside a
+  ``can_use_tool`` callback — that silence is expected, not a hang. While
+  paused the progress/heartbeat watchdog is held off so it never force-
+  reconnects mid-prompt (which would tear down the in-flight question and
+  re-ask it, discarding the user's selections).
   """
   from claude_agent_sdk import (
     AssistantMessage, TextBlock, ThinkingBlock, ToolUseBlock, ResultMessage,
@@ -476,22 +485,40 @@ async def _single_turn(
   msg_count = 0
   last_progress_at = _time.monotonic()
   response = client.receive_response()
+  # The pending receive future persists across watchdog ticks. While a prompt
+  # is awaiting the user (is_paused) we must NOT cancel it — the SDK is
+  # legitimately mid-``can_use_tool`` and a fresh ``__anext__`` would race the
+  # generator. We only recreate it after a message has been consumed.
+  next_task: asyncio.Future[object] | None = None
   while True:
     # Per-iteration timeout is the heartbeat budget, but we also cap it at
     # the remaining progress budget so SDK-internal retry loops (which emit
     # SystemMessage every ~1 min indefinitely) cannot keep a dead turn alive.
+    # While an interactive prompt (AskUserQuestion / permission) awaits the
+    # user, the SDK emits nothing — expected, not a hang. Hold the progress
+    # clock so the watchdog never force-reconnects mid-prompt.
+    paused = bool(is_paused()) if is_paused is not None else False
+    if paused:
+      last_progress_at = _time.monotonic()
     heartbeat_budget = FIRST_MSG_TIMEOUT if msg_count == 0 else HEARTBEAT_TIMEOUT
     progress_budget = PROGRESS_TIMEOUT - (_time.monotonic() - last_progress_at)
-    if progress_budget <= 0:
+    if progress_budget <= 0 and not paused:
       log.error("no progress for %ds (msgs=%d) — forcing reconnect",
                 PROGRESS_TIMEOUT, msg_count)
       timed_out = True
       break
     iter_timeout = max(1, min(heartbeat_budget, progress_budget))
-    next_task = asyncio.ensure_future(response.__anext__())
+    if next_task is None:
+      next_task = asyncio.ensure_future(response.__anext__())
     done, _ = await asyncio.wait({next_task}, timeout=iter_timeout)
     if not done:
+      # No message this tick. If a prompt is awaiting the user, keep the
+      # receive future alive and just defer — do not cancel or reconnect.
+      if is_paused is not None and is_paused():
+        last_progress_at = _time.monotonic()
+        continue
       next_task.cancel()
+      next_task = None
       since_progress = _time.monotonic() - last_progress_at
       if since_progress >= PROGRESS_TIMEOUT:
         log.error("no progress for %.0fs (msgs=%d) — forcing reconnect",
@@ -504,7 +531,9 @@ async def _single_turn(
     try:
       message = next_task.result()
     except StopAsyncIteration:
+      next_task = None
       break
+    next_task = None
     msg_count += 1
     msg_type = type(message).__name__
     sys_subtype = getattr(message, "subtype", "") if msg_type == "SystemMessage" else ""
@@ -724,6 +753,7 @@ async def run_turn(
   prompt: str,
   on_event: Callable[[TurnEvent], None],
   stale_tasks: set[str] | None = None,
+  is_paused: Callable[[], bool] | None = None,
 ) -> tuple[float, JsonObject]:
   """Send prompt to SDK client, stream responses, emit events.
 
@@ -745,7 +775,7 @@ async def run_turn(
   # _single_turn raises (StaleLeakError / TimeoutError / TransientAPIError)
   # straight through; the reconnect layer owns recovery.
   result = await _single_turn(
-    client, prompt, on_event, stale_tasks, stop_task_disabled,
+    client, prompt, on_event, stale_tasks, stop_task_disabled, is_paused,
   )
 
   total_cost = result.cost
