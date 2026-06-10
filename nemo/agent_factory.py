@@ -79,6 +79,7 @@ class ModelCatalog:
 _CATALOG_BY_AGENT: dict[AgentKind, ModelCatalog] = {
   "claude": ModelCatalog(
     visible=(
+      "claude-fable-5",
       "claude-opus-4-8",
       "claude-sonnet-4-6",
       "claude-haiku-4-5",
@@ -89,6 +90,7 @@ _CATALOG_BY_AGENT: dict[AgentKind, ModelCatalog] = {
       "claude-opus-4-6",
     ),
     aliases={
+      "fable": "claude-fable-5",
       "opus": "claude-opus-4-8",
       "sonnet": "claude-sonnet-4-6",
       "haiku": "claude-haiku-4-5",
