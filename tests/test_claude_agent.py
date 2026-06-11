@@ -372,6 +372,110 @@ def test_start_does_not_retry_when_no_resume():
   assert attempts["n"] == 1
 
 
+def _make_process_error_exc():
+  """Helper: ProcessError(exit_code=1) chained under a RuntimeError."""
+  class _ProcessError(Exception):
+    def __init__(self):
+      super().__init__("Command failed with exit code 1")
+      self.exit_code = 1
+  _ProcessError.__name__ = "ProcessError"
+  err = RuntimeError("SDK connect failed after 5 attempts")
+  err.__cause__ = _ProcessError()
+  return err
+
+
+def _bare_reset_agent():
+  """Construct a ClaudeCodingAgent ready for reset() tests."""
+  from nemo.claude_agent import ClaudeCodingAgent
+  agent = ClaudeCodingAgent.__new__(ClaudeCodingAgent)
+  agent._stale_tasks = set()
+  agent._project_dir = ""
+  agent._model = ""
+  agent._latest_session_id = ""
+  agent._options = None
+  return agent
+
+
+def test_reset_falls_back_when_resume_unrecoverable():
+  """reset() must drop the stale resume and retry once when exit-1 on reconnect."""
+  import asyncio
+  from unittest import mock
+
+  agent = _bare_reset_agent()
+
+  build_calls: list[str] = []
+  reconnect_calls: list[object] = []
+
+  def fake_build(_proj, _model, resume=""):
+    build_calls.append(resume)
+    return f"OPTIONS(resume={resume!r})"
+
+  attempts = {"n": 0}
+
+  async def fake_reconnect(opts):
+    reconnect_calls.append(opts)
+    attempts["n"] += 1
+    if attempts["n"] == 1:
+      raise _make_process_error_exc()
+
+  agent._sdk = mock.MagicMock()
+  agent._sdk.reconnect = fake_reconnect
+  agent._build_options = fake_build  # type: ignore[assignment]
+
+  asyncio.run(agent.reset("/tmp/project", "deepseek-v4-flash", resume="stale-uuid"))
+
+  assert build_calls == ["stale-uuid", ""], build_calls
+  assert len(reconnect_calls) == 2
+  assert agent._latest_session_id == ""
+
+
+def test_reset_propagates_non_resume_failures():
+  """Network errors on reset() must NOT trigger the resume fallback."""
+  import asyncio
+  from unittest import mock
+
+  agent = _bare_reset_agent()
+
+  async def fake_reconnect(_opts):
+    raise RuntimeError("ECONNREFUSED 127.0.0.1:1234")
+
+  agent._sdk = mock.MagicMock()
+  agent._sdk.reconnect = fake_reconnect
+  agent._build_options = lambda *_a, **_k: "OPTIONS"  # type: ignore[assignment]
+
+  raised: list[BaseException] = []
+  try:
+    asyncio.run(agent.reset("/tmp/project", "deepseek-v4-flash", resume="uuid"))
+  except BaseException as exc:
+    raised.append(exc)
+  assert raised and "ECONNREFUSED" in str(raised[0])
+
+
+def test_reset_does_not_retry_when_no_resume():
+  """exit-1 on reset() with no resume id must propagate, not silently retry."""
+  import asyncio
+  from unittest import mock
+
+  agent = _bare_reset_agent()
+  attempts = {"n": 0}
+
+  async def fake_reconnect(_opts):
+    attempts["n"] += 1
+    raise _make_process_error_exc()
+
+  agent._sdk = mock.MagicMock()
+  agent._sdk.reconnect = fake_reconnect
+  agent._build_options = lambda *_a, **_k: "OPTIONS"  # type: ignore[assignment]
+
+  raised = False
+  try:
+    asyncio.run(agent.reset("/tmp/project", "deepseek-v4-flash", resume=""))
+  except RuntimeError:
+    raised = True
+  assert raised
+  assert attempts["n"] == 1
+
+
 # ---------------------------------------------------------------------------
 # /btw side questions
 # ---------------------------------------------------------------------------

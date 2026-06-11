@@ -415,7 +415,18 @@ class ClaudeCodingAgent(CodingAgent):
     self._model = model
     self._latest_session_id = resume
     self._options = self._build_options(project_dir, model, resume=resume)
-    await self._sdk.reconnect(self._options)
+    try:
+      await self._sdk.reconnect(self._options)
+    except Exception as exc:
+      if not resume or not _is_resume_unrecoverable(exc):
+        raise
+      log.warning(
+        "Claude SDK resume %s unusable (%s) — starting fresh session",
+        resume[:8], _short_error(exc),
+      )
+      self._latest_session_id = ""
+      self._options = self._build_options(project_dir, model, resume="")
+      await self._sdk.reconnect(self._options)
 
   async def side_question(self, question: str, sdk_session_id: str) -> str:
     """Read-only ephemeral side question — see CodingAgent.side_question.
