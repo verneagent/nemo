@@ -15,12 +15,13 @@ from typing import Literal
 
 from .channel import Channel
 from .claude_agent import ClaudeCodingAgent
+from .claude_cli_agent import ClaudeCliCodingAgent
 from .coding_agent import CodingAgent, EndpointConfig
 from .codex_agent import CodexCodingAgent
 from .db import Database
 from .opencode_agent import OpenCodeCodingAgent
 
-type AgentKind = Literal["claude", "codex", "opencode"]
+type AgentKind = Literal["claude", "codex", "opencode", "claude-cli"]
 
 DEFAULT_AGENT: AgentKind = "claude"
 
@@ -39,6 +40,8 @@ __all__ = [
 
 _DEFAULT_MODEL_BY_AGENT: dict[AgentKind, str] = {
   "claude": "claude-opus-4-8",
+  # claude-cli drives the interactive TUI; same model slugs as claude.
+  "claude-cli": "claude-opus-4-8",
   # gpt-5.5 is the current top-priority codex model — works for both
   # ChatGPT subscribers and API users. The codex-specialized slugs
   # (-codex variants) are API-only and return HTTP 400 for ChatGPT
@@ -131,6 +134,10 @@ _CATALOG_BY_AGENT: dict[AgentKind, ModelCatalog] = {
     ),
   ),
 }
+
+# claude-cli (pty-driven interactive TUI) accepts the same model slugs as the
+# SDK-backed claude agent — it's the same binary, just driven differently.
+_CATALOG_BY_AGENT["claude-cli"] = _CATALOG_BY_AGENT["claude"]
 
 
 def default_model_for_agent(agent: AgentKind) -> str:
@@ -253,6 +260,13 @@ def build_coding_agent(
   endpoint = endpoint or EndpointConfig()
   if agent == "claude":
     return ClaudeCodingAgent(
+      credentials, chat_id, db, channel,
+      permission_mode=permission_mode,
+      system_prompt=system_prompt,
+      endpoint=endpoint,
+    )
+  if agent == "claude-cli":
+    return ClaudeCliCodingAgent(
       credentials, chat_id, db, channel,
       permission_mode=permission_mode,
       system_prompt=system_prompt,

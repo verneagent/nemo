@@ -19,6 +19,9 @@ dependencies = [
   "lark-oapi>=1.3.0",
   "pyyaml>=6.0",
   "websockets>=15.0",
+  # pyte: terminal emulator used by the claude-cli (pty-driven TUI) adapter
+  # to maintain a stable screen buffer for scraping turn output.
+  "pyte>=0.8.2",
 ]
 
 [project.urls]

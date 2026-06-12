@@ -2752,7 +2752,8 @@ def main():
   parser = argparse.ArgumentParser(description="Nemo E2E test runner")
   parser.add_argument("--chat-id", default="",
                       help="Chat ID (defaults to a fresh temp group)")
-  parser.add_argument("--agent", default="claude", choices=["claude", "codex", "opencode"],
+  parser.add_argument("--agent", default="claude",
+                      choices=["claude", "codex", "opencode", "claude-cli"],
                       help="Coding agent agent (default: claude)")
   parser.add_argument("--skip-sdk", action="store_true",
                       help="Skip all SDK turn tests (commands only)")

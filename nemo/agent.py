@@ -1106,13 +1106,13 @@ def _agent_picker_options() -> list[tuple[str, str]]:
   pairs for the picker dropdown.
 
   The set is fixed by ``agent_factory.AgentKind``; we hard-code the order
-  (claude, codex, opencode) so the picker is stable across daemons and
-  doesn't depend on dict iteration order. Labels carry each agent's
-  default model so the user can see what the switch will land on without
-  reading the catalog separately.
+  (claude, claude-cli, codex, opencode) so the picker is stable across
+  daemons and doesn't depend on dict iteration order. Labels carry each
+  agent's default model so the user can see what the switch will land on
+  without reading the catalog separately.
   """
   from .agent_factory import default_model_for_agent
-  agents: tuple[AgentKind, ...] = ("claude", "codex", "opencode")
+  agents: tuple[AgentKind, ...] = ("claude", "claude-cli", "codex", "opencode")
   return [(f"{name} (default: {default_model_for_agent(name)})", name)
           for name in agents]
 
