@@ -69,15 +69,21 @@ def test_per_agent_session_ids_isolated(tmp_path):
     db.set_sdk_session_id("chat1", "claude-uuid", "claude")
     db.set_sdk_session_id("chat1", "codex-thread", "codex")
     db.set_sdk_session_id("chat1", "opencode-sess", "opencode")
+    # claude-cli (pty TUI) keeps a SEPARATE slot from the SDK claude — without
+    # its own column this round-trip silently no-op'd and daemon restart could
+    # never resume a claude-cli conversation.
+    db.set_sdk_session_id("chat1", "clicli-uuid", "claude-cli")
     assert db.get_sdk_session_id("chat1", "claude") == "claude-uuid"
     assert db.get_sdk_session_id("chat1", "codex") == "codex-thread"
     assert db.get_sdk_session_id("chat1", "opencode") == "opencode-sess"
+    assert db.get_sdk_session_id("chat1", "claude-cli") == "clicli-uuid"
     # Each agent's slot survives a deactivate + reactivate.
     db.deactivate("sess1")
     db.activate("sess2", "chat1", "opus")
     assert db.get_sdk_session_id("chat1", "claude") == "claude-uuid"
     assert db.get_sdk_session_id("chat1", "codex") == "codex-thread"
     assert db.get_sdk_session_id("chat1", "opencode") == "opencode-sess"
+    assert db.get_sdk_session_id("chat1", "claude-cli") == "clicli-uuid"
     # Unknown agent is a no-op rather than a crash.
     assert db.get_sdk_session_id("chat1", "bogus") == ""
     db.set_sdk_session_id("chat1", "ignored", "bogus")  # silent
