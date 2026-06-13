@@ -7,6 +7,8 @@ import sys
 import urllib.error
 from unittest import mock
 
+import pytest
+
 from nemo.agent import (
   _RECALL_PROMPT_PREFIX,
   _format_rate_limit_notice,
@@ -2900,3 +2902,120 @@ def test_session_picker_no_arg_sends_picker_card(tmp_path):
   assert "session_recall:01fe69c7-5793-4ad7-9ba6-7d1aa1e01f90" in blob
   assert "fix the bug" in blob
   assert "select_static" not in blob
+
+
+# ---------------------------------------------------------------------------
+# Lark-free integration: real claude-cli adapter through the real main_loop.
+#
+# The full daemon e2e (scripts/e2e_test.py) needs Lark (the daemon is a Lark
+# bot — preflight token, group, cards). But the adapter is channel-agnostic, so
+# we exercise the WHOLE turn path (run_turn → on_event → card rendering →
+# session store) with a fake channel + fake DB and NO Lark. Gated behind
+# NEMO_REAL_SDK=1 because it spawns the real claude CLI and bills a real turn.
+# ---------------------------------------------------------------------------
+
+class _RecordingDB(_FakeDB):
+  def __init__(self, _project_dir):
+    super().__init__(_project_dir)
+    self.stored_sessions = []
+
+  def set_sdk_session_id(self, _chat_id, sdk_session_id, _agent, _endpoint_key=""):
+    self.stored_sessions.append(sdk_session_id)
+
+
+class _CapturingChannel(_FakeChannel):
+  """Fake channel: feeds one real prompt, then holds /exit until the turn's
+  answer is actually rendered (a real turn takes seconds, so returning /exit
+  eagerly would stop the loop mid-turn). Records cards/texts."""
+  def __init__(self, _chat_id):
+    super().__init__(_chat_id)
+    self.cards = []
+    self.texts = []
+    self.prompt = ""
+    self._sent_prompt = False
+    self._exited = False
+    self._answered = False
+
+  def _msg(self, text, mid):
+    from nemo.channel import IncomingMessage
+    return IncomingMessage(
+      event_type="im.message.receive_v1", chat_id="oc_test",
+      sender_id="ou_user", message_id=mid, msg_type="text",
+      text=text, create_time="1")
+
+  async def receive(self, timeout=300):
+    del timeout
+    if not self._sent_prompt:
+      self._sent_prompt = True
+      return self._msg(self.prompt, "om_prompt")
+    if not self._exited:
+      # Wait for the turn to render an answer before ending the loop.
+      for _ in range(300):  # up to ~60s
+        if self._answered:
+          break
+        await asyncio.sleep(0.2)
+      self._exited = True
+      return self._msg("/exit", "om_exit")
+    return None
+
+  async def send_card(self, chat_id, card):
+    self.cards.append(card)
+    return f"om_card_{len(self.cards)}"
+
+  async def update_card(self, message_id, card):
+    self.cards.append(card)
+    return message_id
+
+  async def send_text(self, chat_id, text):
+    self.texts.append(text)
+    if text.strip():
+      self._answered = True   # the turn's answer reached the channel
+    return f"om_text_{len(self.texts)}"
+
+
+@pytest.mark.realsdk
+@pytest.mark.skipif(
+  os.environ.get("NEMO_REAL_SDK") != "1",
+  reason="real-SDK integration: set NEMO_REAL_SDK=1 (needs claude CLI + auth)",
+)
+def test_claude_cli_turn_through_main_loop_no_lark(tmp_path):
+  """One real claude-cli turn driven through the real orchestration, Lark-free:
+  asserts the answer reaches the channel and the session id is persisted."""
+  import subprocess
+  from nemo.claude_cli_agent import ClaudeCliCodingAgent
+  subprocess.run(["git", "init", "-q"], cwd=str(tmp_path))  # real project dir
+  marker = "pineapple7392"
+  db = _RecordingDB(str(tmp_path))
+  channel = _CapturingChannel("oc_test")
+  channel.prompt = f"Reply with exactly this token and nothing else: {marker}"
+
+  def _build(*_a, **_k):
+    return ClaudeCliCodingAgent(
+      {}, "oc_test", db, channel, permission_mode="bypassPermissions")
+
+  with mock.patch("nemo.agent.load_credentials", return_value={
+        "app_id": "a", "app_secret": "s", "email": "u@example.com"}), \
+       mock.patch("nemo.agent.Database", return_value=db), \
+       mock.patch("nemo.agent.LarkChannel", return_value=channel), \
+       mock.patch("nemo.agent.build_coding_agent", side_effect=_build), \
+       mock.patch("nemo.group_config.load_config", return_value={}), \
+       mock.patch("nemo.config.load_relay_config", return_value=("", "")), \
+       mock.patch("signal.signal"):
+    rc = asyncio.run(main_loop(
+      "oc_test", str(tmp_path),
+      os.environ.get("NEMO_REAL_SDK_MODEL", "claude-haiku-4-5"),
+      agent="claude-cli"))
+
+  assert rc == 0
+  rendered = " ".join(_card_json(c) for c in channel.cards) + " ".join(channel.texts)
+  assert marker in rendered, f"answer not rendered to channel; got: {rendered[:300]}"
+  # Session id persisted for cross-restart resume.
+  assert any(s for s in db.stored_sessions), "no sdk session id stored"
+
+
+def _card_json(card):
+  import json
+  try:
+    return json.dumps(card, ensure_ascii=False)
+  except Exception:
+    return str(card)
