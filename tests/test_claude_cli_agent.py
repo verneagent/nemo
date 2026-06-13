@@ -213,6 +213,8 @@ def test_build_argv_includes_effort_and_settings() -> None:
   a._settings_path = "/tmp/s.json"
   argv = a._build_argv(resume="sess-1")
   assert "--dangerously-skip-permissions" in argv
+  # AskUserQuestion disabled: its on-screen picker can't be answered from Lark.
+  assert argv[argv.index("--disallowed-tools") + 1] == "AskUserQuestion"
   assert argv[argv.index("--effort") + 1] == "high"
   assert argv[argv.index("--model") + 1] == "claude-opus-4-8"
   assert argv[argv.index("--settings") + 1] == "/tmp/s.json"

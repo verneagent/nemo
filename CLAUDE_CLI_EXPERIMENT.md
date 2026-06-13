@@ -178,6 +178,14 @@ Correction above). `_SessionLog` tails that file after each turn:
   *fallback* completion heuristic — both fire only if the structured channels
   came up empty, and the fallback path logs a marker-drift warning so a `claude`
   TUI reflow surfaces immediately rather than silently breaking.
+- **AskUserQuestion is disabled** (`--disallowed-tools AskUserQuestion`). In the
+  TUI that tool renders an on-screen arrow-key picker waiting for *terminal*
+  input — invisible to the Lark user, and it wedges the session (verified: the
+  turn mis-detected "done" with an empty answer and left the picker open). With
+  the tool off, the model just asks the question in plain text and the user
+  answers as the next message (verified). The SDK adapter instead bridges it to
+  a Lark card via `can_use_tool`; the pty path has no equivalent, so plain-text
+  Q&A is the deliberate trade-off.
 - **No cost in USD** — only token counts (the transcript has no per-turn cost).
 - **Observability is close to the SDK now** — thinking, structured tool calls,
   per-turn usage, errors (`api_error`), compaction (realtime `PreCompact` +

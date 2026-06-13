@@ -690,6 +690,15 @@ class ClaudeCliCodingAgent(CodingAgent):
       argv.append("--dangerously-skip-permissions")
     else:
       argv += ["--permission-mode", self._permission_mode or "acceptEdits"]
+    # Disable the AskUserQuestion tool. In the interactive TUI it renders an
+    # on-screen arrow-key picker that waits for *terminal* keyboard input — but
+    # the user is on Lark, not the terminal, so the question is invisible and the
+    # session wedges on the picker. With the tool disabled the model just asks
+    # the question in plain text; the user answers as the next message — natural
+    # for a chat channel, and no screen-picker bridging needed. (The SDK adapter
+    # instead bridges it to a Lark card via can_use_tool, which the pty path has
+    # no equivalent for.)
+    argv += ["--disallowed-tools", "AskUserQuestion"]
     if self._model:
       argv += ["--model", self._model]
     if self._effort:
