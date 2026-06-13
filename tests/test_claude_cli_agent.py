@@ -9,11 +9,17 @@ claude-cli 2.1.175 render captured in development.
 
 from __future__ import annotations
 
+import json
+import os
+import tempfile
+
 from nemo.claude_cli_agent import (
+  _SessionLog,
   _extract_answer,
   _iter_assistant_blocks,
   _new_tool_summaries,
   _region_after_echo,
+  _sum_turn_usage,
 )
 
 
@@ -103,3 +109,83 @@ def test_new_tool_summaries_ignores_prose_and_other_turns() -> None:
   ]
   # Scoped to the NEW turn: the old Read(...) tool must not be surfaced.
   assert _new_tool_summaries(lines, "new question", set()) == []
+
+
+# --- session JSONL: token usage + resumable session id -----------------------
+
+def _arow(*, usage: dict | None = None) -> dict:
+  msg: dict = {"role": "assistant", "content": [{"type": "text", "text": "x"}]}
+  if usage is not None:
+    msg["usage"] = usage
+  return {"type": "assistant", "message": msg}
+
+
+def test_sum_turn_usage_sums_across_messages_to_canonical() -> None:
+  rows = [
+    _arow(usage={"input_tokens": 10, "output_tokens": 5,
+                 "cache_read_input_tokens": 100, "cache_creation_input_tokens": 7}),
+    _arow(usage={"input_tokens": 2, "output_tokens": 8,
+                 "cache_read_input_tokens": 200}),
+  ]
+  u = _sum_turn_usage(rows)
+  assert u["input_tokens"] == 12
+  assert u["output_tokens"] == 13
+  assert u["cache_read_input_tokens"] == 300
+  assert u["cache_creation_input_tokens"] == 7
+  assert u["total_tokens"] == 12 + 13 + 300 + 7
+
+
+def test_sum_turn_usage_empty_when_no_usage() -> None:
+  assert _sum_turn_usage([{"type": "user", "message": {}}, _arow()]) == {}
+
+
+def test_session_log_tail_and_lazy_bind() -> None:
+  with tempfile.TemporaryDirectory() as d:
+    log = _SessionLog.__new__(_SessionLog)
+    log._dir = d  # type: ignore[attr-defined]
+    log._baseline = set()  # type: ignore[attr-defined]
+    log._resume_id = ""  # type: ignore[attr-defined]
+    log._path = ""  # type: ignore[attr-defined]
+    log._pos = 0  # type: ignore[attr-defined]
+    log._buf = ""  # type: ignore[attr-defined]
+    log._session_id = ""  # type: ignore[attr-defined]
+    # No file yet → binds to nothing.
+    assert log.read_new() == []
+    # Create the "new" session file; lazy bind picks it up.
+    p = os.path.join(d, "abc123.jsonl")
+    with open(p, "w") as f:
+      f.write(json.dumps(_arow(usage={"output_tokens": 3})) + "\n")
+    rows = log.read_new()
+    assert len(rows) == 1
+    assert log.session_id == "abc123"        # id derived from filename
+    assert log.read_new() == []              # offset advanced
+    # Partial line buffered until completed.
+    with open(p, "a") as f:
+      f.write('{"type":"user","mes')
+    assert log.read_new() == []
+    with open(p, "a") as f:
+      f.write('sage":{}}\n')
+    assert len(log.read_new()) == 1
+
+
+def test_session_log_resume_binds_to_id_at_eof() -> None:
+  with tempfile.TemporaryDirectory() as d:
+    # Pre-existing transcript with prior history.
+    p = os.path.join(d, "resume-me.jsonl")
+    with open(p, "w") as f:
+      f.write(json.dumps(_arow(usage={"output_tokens": 99})) + "\n")
+    log = _SessionLog.__new__(_SessionLog)
+    log._dir = d  # type: ignore[attr-defined]
+    log._baseline = {p}  # type: ignore[attr-defined]
+    log._resume_id = "resume-me"  # type: ignore[attr-defined]
+    log._path = ""  # type: ignore[attr-defined]
+    log._pos = 0  # type: ignore[attr-defined]
+    log._buf = ""  # type: ignore[attr-defined]
+    log._session_id = ""  # type: ignore[attr-defined]
+    # Resume binds to <id>.jsonl seeked to END — prior history is NOT re-read.
+    assert log.read_new() == []
+    assert log.session_id == "resume-me"
+    with open(p, "a") as f:
+      f.write(json.dumps(_arow(usage={"output_tokens": 4})) + "\n")
+    rows = log.read_new()
+    assert len(rows) == 1  # only the new turn, not the replayed history

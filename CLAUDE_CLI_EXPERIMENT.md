@@ -6,10 +6,19 @@ SDK/headless path that bills against the metered Agent-SDK credit pool?
 
 **Answer: yes, and it's built to a usable bar** — confirmed end-to-end through the
 real Nemo daemon, with reliability hardening (worker-thread turns, readiness
-detection, idle-gating, process-death handling). Two hard limits are inherent to
-driving a human TUI and cannot be engineered away (no per-turn token usage, no
-cross-restart resume — see below); everything else is solid. Ship it opt-in,
-because the billing approach is a ToS gray area.
+detection, idle-gating, process-death handling) **and** real per-turn token usage
++ cross-restart resume read from the session transcript. The only residual
+caveats are screen-scrape coupling to the TUI layout and the ToS gray area —
+ship it opt-in.
+
+> **Correction (important).** An earlier version of this doc claimed "no per-turn
+> usage" and "no resume" were *inherent* limits. That was wrong — an artifact of
+> testing from *inside* a Claude Code session. The parent session exports
+> `CLAUDE_CODE_CHILD_SESSION=1` / `CLAUDECODE=1`; passing those through to the
+> spawned `claude` made it behave as a nested child and skip persisting its own
+> transcript jsonl. `_build_env` now strips all `CLAUDE_CODE_*` / `CLAUDECODE` /
+> `AI_AGENT` markers, so the spawned CLI persists per-turn like any normal
+> top-level session — which gives us both usage and resume.
 
 ---
 
@@ -121,25 +130,34 @@ message → turn → card):
   deterministic assertions (files written, the None-input bug actually fixed).
   This is the repeatable regression case for the adapter.
 
-## Inherent limitations (cannot be engineered away — they're properties of the TUI)
+## Token usage + resume (work — read from the session transcript)
 
-- **No per-turn token usage / cost.** `DoneEvent` carries empty usage / 0 cost.
-  Investigated thoroughly: the *spawned interactive* CLI does not persist
-  conversation to its session JSONL — a live, idle session for 30 s leaves only
-  metadata (`ai-title`/`mode`) on disk, no assistant messages or usage. (The SDK
-  path's structured usage comes from stream-json, which is exactly the
-  `sdk-cli`-billed channel we're avoiding.) So Nemo's token cards / `/context`
-  are blank under this adapter.
-- **No cross-restart resume.** Context lives in the running TUI process; since
-  the JSONL isn't persisted, `--continue` has nothing to resume (it errors and
-  exits). `reset()` therefore respawns a fresh session and **loses context**.
-  Within a *live* daemon, multi-turn context IS preserved (the process stays up)
-  — only a restart/crash loses it.
-- **Scraping is coupled to TUI markers** (`⏺` / `⎿` / `❯` / `esc to interrupt`);
-  a major `claude` TUI reflow could break turn boundaries or answer extraction.
-- **Weaker observability.** Tool calls are scraped `⏺` lines, not structured
-  events; sub-agent (`Task`) lifecycle, rate-limit notices, and compaction
-  banners that the SDK adapter surfaces are not available here.
+The spawned CLI persists each turn's transcript to
+`~/.claude/projects/<slug>/<session_id>.jsonl` (the same file `--resume` uses),
+**provided** the parent's `CLAUDE_CODE_*` markers are stripped (see the
+Correction above). `_SessionLog` tails that file after each turn:
+
+- **Per-turn token usage** — summed across the turn's assistant messages into
+  the canonical usage schema, surfaced on `DoneEvent.usage`. Verified live, e.g.
+  `{input: 12280, cache_read: 18073, cache_creation: 9509, output: 4,
+  total: 39866}`. Cost in USD is still not reported (the transcript records
+  tokens, not a per-turn cost figure).
+- **Cross-restart resume** — the session id is captured from the transcript and
+  carried on `DoneEvent.session_id`; `reset(resume=<id>)` respawns
+  `claude --resume <id>`, falling back to a fresh session if the id can't be
+  materialised. Verified live: after a `reset(resume)` (simulated daemon
+  restart) the agent still recalled a secret word set before the restart.
+
+## Remaining limitations
+
+- **Scraping is coupled to TUI markers** (`⏺` / `⎿` / `❯` / `esc to interrupt`)
+  for completion detection + answer extraction; a major `claude` TUI reflow
+  could break turn boundaries or answer extraction. (Usage/resume come from the
+  structured JSONL and are not affected by layout.)
+- **No cost in USD** — only token counts (the transcript has no per-turn cost).
+- **Weaker observability than the SDK** — tool calls are scraped `⏺` lines, not
+  structured events; sub-agent (`Task`) lifecycle, rate-limit notices, and
+  compaction banners are not surfaced.
 - **ToS gray area → account risk.** This runs the unmodified official binary on
   the user's own account and automates their own terminal input (softer than
   forging the `User-Agent`), but it can still be read as circumventing usage
@@ -151,17 +169,18 @@ message → turn → card):
 |---|---|
 | Does pty TUI bill as `(external, cli)`? | **Yes** — confirmed via header capture (B) and headless contrast (C). |
 | Functional + reliable as a Nemo agent? | **Yes** — multi-turn, tool calls, interrupt, readiness/idle-gating/crash handling; verified through the daemon + repeatable workflow e2e. |
-| Per-turn usage / cost | **Unavailable** — inherent to the TUI; token cards blank. |
-| Cross-restart resume | **Unavailable** — inherent (no persisted JSONL); live-session context preserved. |
+| Per-turn token usage | **Works** — summed from the session transcript onto `DoneEvent.usage` (USD cost still not reported). |
+| Cross-restart resume | **Works** — `--resume <session_id>` from the persisted transcript; verified context survives a simulated restart. |
 | Maintenance cost | **Medium-high** — coupled to TUI markers; expect occasional breakage on `claude` updates, guarded by the scraping unit tests + workflow e2e. |
 | ToS risk | **Material** — possible account suspension; ship behind an explicit opt-in. |
 
-**Recommendation:** usable for real work where subscription billing matters and
-the two inherent gaps (no usage display, no resume across restart) are
-acceptable. It is **not** a drop-in replacement for the SDK adapter — keep it an
-opt-in `--agent claude-cli` provider with the ToS caveat surfaced. The
-reliability work means it behaves like a real agent (no hangs, clean turn
-boundaries, interruptible), not a demo.
+**Recommendation:** usable for real work where subscription billing matters —
+multi-turn context, tool calls, interrupt, per-turn token usage, and
+cross-restart resume all work; the reliability hardening means it behaves like a
+real agent (no hangs, clean turn boundaries, interruptible), not a demo. The
+remaining trade-offs vs the SDK adapter are screen-scrape fragility, no USD cost,
+and weaker tool/sub-agent observability. Keep it an opt-in `--agent claude-cli`
+provider with the ToS caveat surfaced.
 
 ## Artifacts
 

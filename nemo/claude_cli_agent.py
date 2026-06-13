@@ -13,17 +13,22 @@ interactive TUI under a pty makes the *same* binary report ``(external, cli)``
 (verified by ``scripts/cli_billing_probe.py``) — i.e. it bills against the
 Claude subscription.
 
-How it works — the TUI is built for humans, so this is screen-driving, not an
-API. A reader thread feeds pty bytes into a ``pyte`` terminal emulator that
-maintains a stable screen buffer; we type prompts in, watch the rendered screen
-to know when a turn starts/finishes and to scrape its output, and send ESC to
-interrupt. Each turn runs on a worker thread (see ``run_turn``).
+Two channels:
+  * CONTROL/output via the screen — a reader thread feeds pty bytes into a
+    ``pyte`` terminal emulator; we type prompts in, watch the rendered screen to
+    know when a turn starts/finishes and to scrape the answer, and send ESC to
+    interrupt. Each turn runs on a worker thread (see ``run_turn``).
+  * DATA via the session JSONL — the CLI persists each turn's transcript to
+    ``~/.claude/projects/<slug>/<session_id>.jsonl`` (the file ``--resume``
+    uses). ``_SessionLog`` tails it for real per-turn token usage and the
+    resumable session id.
 
-Why screen-scraping and not the session JSONL: the headless SDK writes a
-structured transcript, but the *spawned interactive* CLI does not persist
-conversation messages to its session JSONL (verified: a live, idle session
-leaves only metadata on disk; ``--continue`` then has nothing to resume). So the
-screen is the only per-turn data channel available here.
+Env caveat that gates persistence: if nemo is launched from *inside* a Claude
+Code session, the inherited ``CLAUDE_CODE_CHILD_SESSION`` / ``CLAUDECODE``
+markers make the spawned CLI act as a nested child and skip persisting its own
+transcript. ``_build_env`` strips all ``CLAUDE_CODE_*`` / ``CLAUDECODE`` /
+``AI_AGENT`` vars so the spawned CLI is a normal top-level session that persists
+per-turn (and still reports the ``(external, cli)`` surface).
 
 Design choices that make this reliable rather than a toy:
   * Worker-thread turns — the host's ``on_event`` marshals card sends to the
@@ -34,14 +39,11 @@ Design choices that make this reliable rather than a toy:
   * Process-death detection — surface an error instead of hanging if the TUI
     exits mid-turn.
 
-Honest limitations (see CLAUDE_CLI_EXPERIMENT.md):
-  * No per-turn token usage / cost — the interactive TUI exposes neither on a
-    machine channel; ``DoneEvent`` carries empty usage / 0 cost.
-  * No cross-restart resume — context lives in the running TUI process; a
-    ``reset`` respawns a fresh session. (Within a live daemon, multi-turn
-    context is preserved because the process stays up.)
-  * Scraping is coupled to the TUI's markers (``⏺`` / ``⎿`` / ``❯`` /
-    "esc to interrupt"); a major TUI reflow could break it.
+Remaining limitations (see CLAUDE_CLI_EXPERIMENT.md):
+  * No USD cost — the transcript records token counts, not a per-turn cost.
+  * Answer scraping is coupled to the TUI's markers (``⏺`` / ``⎿`` / ``❯`` /
+    "esc to interrupt"); a major TUI reflow could break it. (Usage/resume come
+    from the structured JSONL and are layout-independent.)
   * Running the official binary on the user's account, automating their own
     terminal, is a ToS gray area with account-suspension risk — opt-in only.
 """
@@ -50,6 +52,8 @@ from __future__ import annotations
 
 import asyncio
 import fcntl
+import glob
+import json
 import logging
 import os
 import pty
@@ -69,7 +73,10 @@ import pyte
 from .channel import Channel
 from .coding_agent import CodingAgent, EndpointConfig
 from .db import Database
-from .turn import AnswerEvent, DoneEvent, ErrorEvent, ProgressEvent, TurnEvent
+from .sessions import claude_project_slug
+from .turn import (
+  AnswerEvent, DoneEvent, ErrorEvent, ProgressEvent, TurnEvent, canonical_usage,
+)
 from .types import JsonObject
 
 log = logging.getLogger(__name__)
@@ -303,6 +310,126 @@ def _new_tool_summaries(lines: list[str], prompt: str, seen: set[str]) -> list[s
 
 
 # ---------------------------------------------------------------------------
+# session JSONL (token usage + resumable session id)
+# ---------------------------------------------------------------------------
+#
+# The interactive CLI persists each turn's transcript to
+# ``<config>/projects/<cwd-slug>/<session_id>.jsonl`` — the SAME file ``--resume``
+# uses. (NB: it only does so when NOT inherited as a nested Claude-Code child
+# session; ``_build_env`` strips the parent's CLAUDE_CODE_* markers so a freshly
+# spawned CLI persists like any normal top-level session.) We tail it after each
+# turn for real per-turn token usage, and capture the session id so a daemon
+# restart can resume the conversation with ``claude --resume <id>``.
+
+
+def _config_dir() -> str:
+  return os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
+
+
+class _SessionLog:
+  """Locates and tails the interactive session's JSONL for usage + session id.
+
+  Binds lazily: the file only appears after the first prompt. The baseline of
+  pre-existing files is snapshotted at construction (before spawn) so the new
+  file this session creates is identifiable; a resumed session binds directly to
+  ``<resume_id>.jsonl`` (seeking to its end so only new turns are read).
+  """
+
+  def __init__(self, project_dir: str, resume_id: str = ""):
+    self._dir = os.path.join(
+      _config_dir(), "projects", claude_project_slug(project_dir))
+    self._baseline: set[str] = set(self._list())
+    self._resume_id = resume_id
+    self._path = ""
+    self._pos = 0
+    self._buf = ""
+    self._session_id = ""
+
+  def _list(self) -> list[str]:
+    return glob.glob(os.path.join(self._dir, "*.jsonl"))
+
+  def _bind(self) -> bool:
+    if self._path:
+      return True
+    if self._resume_id:
+      cand = os.path.join(self._dir, f"{self._resume_id}.jsonl")
+      if os.path.exists(cand):
+        self._path, self._session_id = cand, self._resume_id
+        self._pos = os.path.getsize(cand)
+        return True
+      return False
+    new = [f for f in self._list() if f not in self._baseline]
+    if new:
+      self._path = max(new, key=os.path.getmtime)
+      self._session_id = os.path.splitext(os.path.basename(self._path))[0]
+      self._pos = 0
+      return True
+    return False
+
+  @property
+  def session_id(self) -> str:
+    if not self._path:
+      self._bind()
+    return self._session_id
+
+  def read_new(self) -> list[JsonObject]:
+    """JSON rows appended since the last read; advances the offset. Binds
+    lazily, tolerates partial trailing lines."""
+    if not self._path and not self._bind():
+      return []
+    if not os.path.exists(self._path):
+      return []
+    try:
+      with open(self._path, "r", encoding="utf-8", errors="replace") as f:
+        f.seek(self._pos)
+        chunk = f.read()
+        self._pos = f.tell()
+    except OSError as e:
+      log.warning("session log read failed: %s", e)
+      return []
+    self._buf += chunk
+    *complete, self._buf = self._buf.split("\n")
+    rows: list[JsonObject] = []
+    for line in complete:
+      line = line.strip()
+      if not line:
+        continue
+      try:
+        rows.append(json.loads(line))
+      except json.JSONDecodeError:
+        continue
+    return rows
+
+
+def _sum_turn_usage(rows: list[JsonObject]) -> JsonObject:
+  """Sum per-message token usage across a turn's assistant rows → canonical
+  usage. Empty when no usage seen (card omits the token line)."""
+  inp = cr = cc = out = 0
+  seen = False
+  for row in rows:
+    if row.get("type") != "assistant":
+      continue
+    msg = row.get("message")
+    if not isinstance(msg, dict):
+      continue
+    usage = msg.get("usage")
+    if not isinstance(usage, dict):
+      continue
+    def _i(key: str) -> int:
+      v = usage.get(key)
+      return max(0, int(v)) if isinstance(v, (int, float)) and not isinstance(v, bool) else 0
+    inp += _i("input_tokens")
+    cr += _i("cache_read_input_tokens")
+    cc += _i("cache_creation_input_tokens")
+    out += _i("output_tokens")
+    seen = True
+  if not seen:
+    return {}
+  return canonical_usage(
+    input_tokens=inp, cache_read=cr, cache_creation=cc, output_tokens=out)
+
+
+# ---------------------------------------------------------------------------
 # adapter
 # ---------------------------------------------------------------------------
 
@@ -340,6 +467,8 @@ class ClaudeCliCodingAgent(CodingAgent):
     self._model = ""
     self._effort = ""
     self._tui: _PtyTui | None = None
+    self._log: _SessionLog | None = None
+    self._session_id = ""
     self._booted = False
 
   def set_effort(self, effort: str) -> None:
@@ -350,7 +479,7 @@ class ClaudeCliCodingAgent(CodingAgent):
   def set_endpoint(self, endpoint: EndpointConfig) -> None:
     self._endpoint = endpoint
 
-  def _build_argv(self) -> list[str]:
+  def _build_argv(self, resume: str = "") -> list[str]:
     claude = shutil.which("claude") or "claude"
     argv = [claude]
     # Unattended daemon: bypass interactive permission panels.
@@ -360,14 +489,25 @@ class ClaudeCliCodingAgent(CodingAgent):
       argv += ["--permission-mode", self._permission_mode or "acceptEdits"]
     if self._model:
       argv += ["--model", self._model]
+    if resume:
+      # Resume the prior conversation's transcript (daemon restart / model
+      # switch). The session jsonl is persisted per-turn, so context is intact.
+      argv += ["--resume", resume]
     return argv
 
   def _build_env(self) -> dict[str, str]:
     env = dict(os.environ)
     env["TERM"] = "xterm-256color"
-    # Do NOT set CLAUDE_CODE_ENTRYPOINT — letting the CLI pick its own keeps the
-    # interactive ``(external, cli)`` surface (the whole point).
-    env.pop("CLAUDE_CODE_ENTRYPOINT", None)
+    # Strip the parent Claude Code session's identity markers. If nemo itself is
+    # ever launched from *inside* a Claude Code session, these are inherited and
+    # the spawned ``claude`` treats itself as a nested CHILD session — which
+    # makes it NOT persist its own transcript jsonl (so --resume has nothing to
+    # resume). Removing them makes the spawned CLI a normal top-level
+    # interactive session that persists like any other. Also keeps the
+    # ``(external, cli)`` surface (the CLI re-derives its own entrypoint=cli).
+    for key in list(env):
+      if key.startswith("CLAUDE_CODE") or key in ("CLAUDECODE", "AI_AGENT"):
+        env.pop(key, None)
     if self._endpoint.base_url:
       env["ANTHROPIC_BASE_URL"] = self._endpoint.base_url
     if self._endpoint.api_key:
@@ -376,16 +516,22 @@ class ClaudeCliCodingAgent(CodingAgent):
     return env
 
   async def start(self, project_dir: str, model: str, resume: str = "") -> None:
-    del resume  # interactive TUI holds context in-process; no resume channel
     self._project_dir = project_dir
     self._model = model
-    await self._spawn()
+    self._session_id = resume
+    await self._spawn(resume)
 
-  async def _spawn(self) -> None:
-    tui = _PtyTui(self._build_argv(), self._project_dir, self._build_env())
-    await asyncio.to_thread(tui.spawn)
-    self._tui = tui
+  async def _spawn(self, resume: str = "") -> None:
+    def _do() -> tuple[_PtyTui, _SessionLog]:
+      # Snapshot existing transcripts BEFORE spawn so the new one is identifiable.
+      sess = _SessionLog(self._project_dir, resume_id=resume)
+      tui = _PtyTui(self._build_argv(resume), self._project_dir, self._build_env())
+      tui.spawn()
+      return tui, sess
+    self._tui, self._log = await asyncio.to_thread(_do)
     self._booted = False
+    if resume:
+      self._session_id = self._log.session_id or resume
 
   def _wait_ready(self, tui: _PtyTui) -> None:
     """Block until the TUI footer shows it's ready for input, then nudge past
@@ -519,9 +665,26 @@ class ClaudeCliCodingAgent(CodingAgent):
 
     lines = tui.snapshot()
     answer = _extract_answer(lines, prompt)
+
+    # Read this turn's real token usage + session id from the persisted JSONL
+    # (the transcript --resume uses). It can lag the screen by a beat, so retry
+    # briefly. Best-effort: empty usage just omits the token line on the card.
+    usage: JsonObject = {}
+    if self._log is not None:
+      rows: list[JsonObject] = []
+      for _ in range(8):
+        rows += self._log.read_new()
+        usage = _sum_turn_usage(rows)
+        if usage:
+          break
+        time.sleep(0.5)
+      if self._log.session_id:
+        self._session_id = self._log.session_id
+
     log.info("claude-cli run_turn: done (began=%s timed_out=%s answer=%d chars "
-             "tools=%d %.0fs)", began, timed_out, len(answer), len(seen_tools),
-             time.monotonic() - start)
+             "tools=%d out_tokens=%s session=%s %.0fs)", began, timed_out,
+             len(answer), len(seen_tools), usage.get("output_tokens", "?"),
+             (self._session_id[:8] or "?"), time.monotonic() - start)
 
     if answer:
       on_event(AnswerEvent(text=answer))
@@ -531,8 +694,8 @@ class ClaudeCliCodingAgent(CodingAgent):
       # Tools ran but no prose tail scraped — avoid a silent empty card.
       on_event(AnswerEvent(text="(done — no text answer captured from the TUI)"))
 
-    on_event(DoneEvent(cost=0.0, usage={}))
-    return 0.0, {}
+    on_event(DoneEvent(cost=0.0, usage=usage, session_id=self._session_id))
+    return 0.0, usage
 
   async def interrupt(self) -> None:
     # ESC interrupts the current turn without killing the session (matches the
@@ -541,13 +704,18 @@ class ClaudeCliCodingAgent(CodingAgent):
       self._tui.write(b"\x1b")
 
   async def reset(self, project_dir: str, model: str, resume: str = "") -> None:
-    del resume  # no resume channel; respawn is a fresh session (context lost)
+    # Respawn, resuming the persisted transcript so a model switch / reconnect /
+    # daemon restart keeps the conversation (falls back to a fresh session if the
+    # resume id can't be materialised — see start()/_spawn).
     await self.stop()
     self._project_dir = project_dir
     self._model = model
-    await self._spawn()
+    resume_id = resume or self._session_id
+    self._session_id = resume_id
+    await self._spawn(resume_id)
 
   async def stop(self) -> None:
+    self._log = None
     if self._tui is not None:
       tui = self._tui
       self._tui = None
