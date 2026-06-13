@@ -515,6 +515,7 @@ def _emit_jsonl_events(
             # The Task/Agent tool spawns a sub-agent; surface its start.
             if name in ("Task", "Agent"):
               tid = str(b.get("id") or "")
+              log.info("claude-cli subagent start: tool=%s id=%s", name, tid[:12])
               on_event(TaskStartedEvent(task_id=tid))
       _accumulate_usage(state, msg.get("usage"))
     elif rtype == "system":
@@ -524,18 +525,31 @@ def _emit_jsonl_events(
       elif sub == "api_error":
         err = row.get("error")
         text = ""
+        code = ""
         if isinstance(err, dict):
           text = str(err.get("formatted") or err.get("message") or "")
+          conn = err.get("connection")
+          if isinstance(conn, dict):
+            code = str(conn.get("code") or "")
+        # Forensic breadcrumb: error classification + auto-reconnect are not yet
+        # implemented for claude-cli (see CLAUDE_CLI_EXPERIMENT.md), so log the
+        # raw error so a wedged/failed turn is diagnosable from the daemon log.
+        log.warning("claude-cli api_error: code=%s msg=%s", code or "?", text[:200])
         on_event(ErrorEvent(message=text or "claude-cli: API error"))
         state["error"] = text or "API error"
       elif sub == "compact_boundary":
         meta = row.get("compact_metadata")
         meta = meta if isinstance(meta, dict) else {}
+        log.info("claude-cli compaction (post): trigger=%s pre=%s post=%s dur=%sms",
+                 meta.get("trigger"), meta.get("pre_tokens"),
+                 meta.get("post_tokens"), meta.get("duration_ms"))
         on_event(CompactNoticeEvent(
           trigger=str(meta.get("trigger") or ""),
           pre_tokens=int(meta.get("pre_tokens") or 0),
           post_tokens=int(meta.get("post_tokens") or 0),
           duration_ms=int(meta.get("duration_ms") or 0)))
+      elif sub in ("microcompact_boundary", "microcompact"):
+        log.info("claude-cli microcompaction (suppressed)")
 
 
 def _emit_hook_events(
@@ -549,11 +563,18 @@ def _emit_hook_events(
     if name == "Stop":
       state["turn_done"] = True
     elif name == "PreCompact":
+      log.info("claude-cli PreCompact hook (realtime compaction): trigger=%s",
+               row.get("trigger"))
       on_event(CompactStartedEvent(trigger=str(row.get("trigger") or "")))
     elif name == "SubagentStop":
+      log.info("claude-cli SubagentStop hook")
       on_event(TaskDoneEvent(task_id="", status="done"))
     elif name == "Notification":
       note = str(row.get("message") or "").strip()
+      # Notifications include permission/idle prompts — e.g. an AskUserQuestion
+      # picker (disabled, but log defensively) or a blocking prompt. Worth a
+      # breadcrumb since these can correlate with a stalled turn.
+      log.info("claude-cli Notification hook: %s", note[:200])
       if note:
         on_event(ProgressEvent(kind="reasoning", summary=f"ℹ️ {note}"))
 
@@ -825,6 +846,8 @@ class ClaudeCliCodingAgent(CodingAgent):
     on_event: Callable[[TurnEvent], None],
   ) -> tuple[float, JsonObject]:
     if not tui.alive():
+      log.warning("claude-cli: TUI process not running at turn start "
+                  "(crashed/exited) — turn cannot run")
       on_event(ErrorEvent(message="claude-cli: TUI process is not running"))
       on_event(DoneEvent(cost=0.0, usage={}))
       return 0.0, {}
@@ -869,6 +892,8 @@ class ClaudeCliCodingAgent(CodingAgent):
       time.sleep(self._POLL)
       now = time.monotonic()
       if not tui.alive():
+        log.warning("claude-cli: TUI exited mid-turn (%.0fs in) — surfacing error",
+                    now - start)
         on_event(ErrorEvent(message="claude-cli: TUI exited mid-turn"))
         on_event(DoneEvent(cost=0.0, usage={}))
         return 0.0, {}
