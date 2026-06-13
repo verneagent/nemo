@@ -2747,6 +2747,118 @@ def run_fork_tests(chat_id: str, result: "E2EResult", agent: str = "claude",
       dissolve_temp_group(chat_id)
 
 
+def run_workflow_tests(pid: int, chat_id: str, result: "E2EResult",
+                       agent: str = "claude") -> None:
+  """Phase W — a realistic end-to-end coding session, crystallized as a
+  repeatable case.
+
+  Simulates the natural arc of working with the agent over Lark:
+    W01  one-line prompt → the agent proposes a plan (discussion, no code)
+    W02  back-and-forth → refine requirements, finalize the plan
+    W03  finalize → implement with file tools (asserts files are written)
+    W04  invoke a skill to review the code (best-effort — lenient assert)
+    W05  bug report → the agent runs tests, edits the fix, re-runs to verify
+         (asserts the deterministic bug — None input — is actually fixed)
+
+  All file artifacts land in an isolated git-init'd scratch dir so the repo
+  stays clean and the assertions are deterministic regardless of agent.
+  """
+  print(f"{Colors.BOLD}Phase W: Full-flow coding workflow{Colors.RESET}")
+  wd = tempfile.mkdtemp(prefix="nemo_wf_")
+  subprocess.run(["git", "init", "-q"], cwd=wd)
+  impl = os.path.join(wd, "emailutil.py")
+  test = os.path.join(wd, "test_emailutil.py")
+  print(f"  scratch project: {wd}")
+  log = LogAnalyzer(pid)
+  any_failed = [False]
+
+  def turn(name: str, text: str, wait: int = 200,
+           check=None, note: str = "") -> bool:
+    # Gate on TURN COMPLETION in the daemon log, not on a card appearing — the
+    # working card is sent at turn START, so polling for a card would let the
+    # next prompt fire mid-turn and the daemon would batch/desync the messages.
+    # Both adapters log a once-per-turn completion line.
+    mark = log.mark()
+    send_msg(text, chat_id)
+    done = (log.wait_for_since("run_turn: done", mark, timeout=wait, poll=2)
+            or log.wait_for_since("turn done (cost=", mark, timeout=3, poll=1))
+    if not done:
+      any_failed[0] = True
+      result.fail(name, f"turn did not complete within {wait}s")
+      return False
+    time.sleep(2)  # let the final card render + file writes flush
+    if check is not None:
+      ok_c, detail = check()
+      if not ok_c:
+        any_failed[0] = True
+      (result.ok if ok_c else result.fail)(name, detail)
+      return ok_c
+    result.ok(name, note)
+    return True
+
+  # W01 — one-line prompt, discussion only (no code yet)
+  turn("W01 discuss plan",
+       "I want a small Python helper that validates email addresses. Before "
+       "writing any code, propose a brief plan: the function signature and 2-3 "
+       "edge cases to handle. Do NOT write code yet.", wait=150)
+
+  # W02 — back-and-forth refinement, finalize the plan
+  turn("W02 refine + finalize plan",
+       "Good. Two changes: it must return a bool, and for now ASSUME the input "
+       "is always a string (do not handle None yet — we'll get to it). Restate "
+       "the final plan in one short paragraph.", wait=150)
+
+  # W03 — implement with file tools; assert the files actually got written
+  def _files_written():
+    ok_f = os.path.exists(impl) and os.path.exists(test)
+    return ok_f, f"impl={os.path.exists(impl)} test={os.path.exists(test)}"
+  turn("W03 implement (file tools)",
+       f"Implement the plan now using your file tools:\n"
+       f"- Write {impl} with `def is_valid_email(s) -> bool` using a regex "
+       f"(assume s is a str).\n"
+       f"- Write {test} with a few assert-based checks (valid + invalid).\n"
+       f"Then reply 'done'.", wait=300, check=_files_written)
+
+  # W04 — invoke a skill to review the code (best-effort; lenient)
+  turn("W04 skill: review code",
+       f"Use a skill to review {impl} for issues — if you have a code review "
+       f"skill, invoke it; otherwise review it yourself. Summarize findings in "
+       f"a few bullets.", wait=240,
+       note="best-effort skill invocation")
+
+  # W05 — deterministic bug-fix cycle: None must not crash. Assert it's fixed.
+  def _none_fixed():
+    if not os.path.exists(impl):
+      return False, "impl file missing"
+    probe = (
+      "import importlib.util\n"
+      f"spec=importlib.util.spec_from_file_location('eu',{impl!r})\n"
+      "m=importlib.util.module_from_spec(spec)\n"
+      "try:\n"
+      "    spec.loader.exec_module(m)\n"
+      "    r=m.is_valid_email(None)\n"
+      "    print('OK' if r is False else 'BAD:%r'%(r,))\n"
+      "except Exception as e:\n"
+      "    print('RAISED:%s:%s'%(type(e).__name__,e))\n"
+    )
+    p = subprocess.run(["python3", "-c", probe], cwd=wd,
+                       capture_output=True, text=True)
+    out = (p.stdout + p.stderr).strip().replace("\n", " ")
+    return p.stdout.strip().startswith("OK"), f"is_valid_email(None) -> {out[:120]}"
+  turn("W05 bug fix + verify",
+       f"Bug report: is_valid_email(None) currently crashes, but it should "
+       f"return False. Reproduce it, then fix {impl} so that None and the empty "
+       f"string both return False instead of raising. Add a regression test for "
+       f"None in {test}, run the tests with your Bash tool to confirm they all "
+       f"pass, then reply with a one-line summary.", wait=420, check=_none_fixed)
+
+  # Keep the scratch dir on failure so the run is debuggable; clean on success.
+  if any_failed[0]:
+    print(f"  (workflow had failures — leaving scratch for inspection: {wd})")
+  else:
+    shutil.rmtree(wd, ignore_errors=True)
+
+
 def main():
   import argparse
   parser = argparse.ArgumentParser(description="Nemo E2E test runner")
@@ -2781,6 +2893,9 @@ def main():
                       help="Run only /agent + preset switch test (Phase 12)")
   parser.add_argument("--fork", action="store_true",
                       help="Run only /fork sub-thread test (Phase 13, local relay)")
+  parser.add_argument("--workflow", action="store_true",
+                      help="Run only the full-flow coding workflow (Phase W): "
+                           "discuss → plan → implement → skill review → bug fix")
   parser.add_argument("--verbose", "-v", action="store_true",
                       help="Verbose nemo logging")
   args = parser.parse_args()
@@ -2790,7 +2905,8 @@ def main():
   single_phase = (args.stress or args.project or args.perm
                   or args.askq or args.picker or args.recall_picker
                   or args.dual or args.media or args.topic
-                  or args.shell or args.switch or args.fork)
+                  or args.shell or args.switch or args.fork
+                  or args.workflow)
   run_all = not single_phase
   created_temp_chat = False
 
@@ -2869,6 +2985,8 @@ def main():
     print(f"  Mode: /agent + preset switch test only")
   elif args.fork:
     print(f"  Mode: /fork sub-thread test only (local relay)")
+  elif args.workflow:
+    print(f"  Mode: full-flow coding workflow only")
   print()
 
   # Dual-instance manages its own processes
@@ -3207,6 +3325,14 @@ def main():
     elif args.switch:
       try:
         run_switch_tests(pid, chat_id, result, args.agent)
+      finally:
+        send_msg("/exit", chat_id)
+        if not wait_for_exit(pid, timeout=35):
+          kill_nemo(pid)
+
+    elif args.workflow:
+      try:
+        run_workflow_tests(pid, chat_id, result, args.agent)
       finally:
         send_msg("/exit", chat_id)
         if not wait_for_exit(pid, timeout=35):

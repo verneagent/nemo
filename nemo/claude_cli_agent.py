@@ -1,5 +1,5 @@
-"""CodingAgent adapter that drives the *unmodified interactive* `claude` TUI
-under a pseudo-terminal (pty).
+"""CodingAgent adapter that drives the *unmodified interactive* ``claude`` TUI
+under a pseudo-terminal (pty), billing turns at the subscription rate.
 
 Why this exists — billing surface. The Claude CLI tags its API requests with a
 self-reported surface in the User-Agent header:
@@ -8,34 +8,42 @@ self-reported surface in the User-Agent header:
   * headless / SDK     → ``claude-cli/<ver> (external, sdk-cli)`` (Agent credits)
 
 Every SDK-based adapter (``ClaudeCodingAgent``) drives the headless stream-json
-path, so it bills against the Agent SDK credit pool. Spawning the real
+path, so it bills against the metered Agent-SDK credit pool. Spawning the real
 interactive TUI under a pty makes the *same* binary report ``(external, cli)``
-— verified by ``scripts/cli_billing_probe.py``. This adapter is the
-feasibility prototype for billing turns at the subscription rate.
+(verified by ``scripts/cli_billing_probe.py``) — i.e. it bills against the
+Claude subscription.
 
-How it works — the TUI is built for humans, not machines, so this is
-screen-scraping, not a clean API:
+How it works — the TUI is built for humans, so this is screen-driving, not an
+API. A reader thread feeds pty bytes into a ``pyte`` terminal emulator that
+maintains a stable screen buffer; we type prompts in, watch the rendered screen
+to know when a turn starts/finishes and to scrape its output, and send ESC to
+interrupt. Each turn runs on a worker thread (see ``run_turn``).
 
-  * Spawn ``claude`` on a pty (stdlib ``pty``), fixed winsize, ``TERM`` set.
-  * A reader thread continuously feeds pty bytes into a ``pyte`` terminal
-    emulator, which maintains a stable screen buffer + scrollback under a lock.
-  * ``run_turn`` writes the prompt, then polls the emulated screen: it waits for
-    work to start (the "esc to interrupt" spinner appears), then for it to end
-    (spinner gone + empty input box + screen stable), then scrapes the answer.
-  * The answer is the last ``⏺`` block that is NOT a tool call — tool calls
-    render as ``⏺ Name(args)`` and are always followed by a ``⎿`` result line;
-    prose answers are not.
+Why screen-scraping and not the session JSONL: the headless SDK writes a
+structured transcript, but the *spawned interactive* CLI does not persist
+conversation messages to its session JSONL (verified: a live, idle session
+leaves only metadata on disk; ``--continue`` then has nothing to resume). So the
+screen is the only per-turn data channel available here.
 
-KNOWN LIMITATIONS (this is a prototype — see the experiment write-up):
-  * No structured usage/cost. ``DoneEvent`` reports empty usage / 0 cost; the
-    TUI does not expose per-turn token counts on a machine channel.
-  * Fragile to TUI layout/version changes — any reflow of the markers
-    (``⏺`` / ``⎿`` / ``❯`` / "esc to interrupt") breaks scraping.
-  * The interactive TUI does NOT flush its transcript jsonl per-turn (verified),
-    so ``resume`` across daemon restarts is unsupported — ``reset`` respawns a
-    fresh session and loses context.
-  * Tool observability is best-effort (scraped ``⏺`` lines), far weaker than the
-    SDK adapter's structured ProgressEvents.
+Design choices that make this reliable rather than a toy:
+  * Worker-thread turns — the host's ``on_event`` marshals card sends to the
+    main loop with a *blocking* call, so it must be invoked off the main loop.
+  * Readiness detection — wait for the TUI footer instead of a blind sleep.
+  * Idle-gating — never submit into a busy TUI (would queue prompts and desync).
+  * Completion = "esc to interrupt" gone + screen stable.
+  * Process-death detection — surface an error instead of hanging if the TUI
+    exits mid-turn.
+
+Honest limitations (see CLAUDE_CLI_EXPERIMENT.md):
+  * No per-turn token usage / cost — the interactive TUI exposes neither on a
+    machine channel; ``DoneEvent`` carries empty usage / 0 cost.
+  * No cross-restart resume — context lives in the running TUI process; a
+    ``reset`` respawns a fresh session. (Within a live daemon, multi-turn
+    context is preserved because the process stays up.)
+  * Scraping is coupled to the TUI's markers (``⏺`` / ``⎿`` / ``❯`` /
+    "esc to interrupt"); a major TUI reflow could break it.
+  * Running the official binary on the user's account, automating their own
+    terminal, is a ToS gray area with account-suspension risk — opt-in only.
 """
 
 from __future__ import annotations
@@ -66,9 +74,9 @@ from .types import JsonObject
 
 log = logging.getLogger(__name__)
 
-# Fixed terminal geometry. Tall so a typical turn's output stays in the live
-# pyte screen (plus scrollback) without us having to page history.
-_ROWS = 200
+# Fixed terminal geometry. Tall + wide so a turn's output and the input-box
+# footer stay in the live pyte buffer (plus scrollback) for scraping.
+_ROWS = 120
 _COLS = 160
 
 # Markers in the claude TUI render (observed on claude-cli 2.1.175).
@@ -79,15 +87,22 @@ _THINKING = "✻"           # post-hoc "Cogitated for Ns" summary line
 # Present while a turn is running; absent when idle. The single most reliable
 # "is the agent working" signal the TUI gives us.
 _WORKING_HINT = "esc to interrupt"
+# Footer shown once the TUI is booted and ready for input (both permission
+# modes render "shift+tab to cycle"); used for readiness detection.
+_READY_HINT = "shift+tab to cycle"
 # A ⏺ line that is a tool call: a single CapitalCase identifier then "(".
 _TOOL_CALL_RE = re.compile(r"^[A-Z][A-Za-z0-9_]*\(")
 
+
+# ---------------------------------------------------------------------------
+# pty terminal session
+# ---------------------------------------------------------------------------
 
 class _PtyTui:
   """Owns the pty + claude subprocess + a pyte emulator fed by a reader thread.
 
   Thread-safety: only the reader thread feeds the pyte stream; ``snapshot`` and
-  ``feed`` both take ``_lock`` so a snapshot never races a feed.
+  the feed both take ``_lock`` so a snapshot never races a feed.
   """
 
   def __init__(self, argv: list[str], cwd: str, env: dict[str, str]):
@@ -96,7 +111,7 @@ class _PtyTui:
     self._env = env
     self._master = -1
     self._proc: subprocess.Popen[bytes] | None = None
-    self._screen = pyte.HistoryScreen(_COLS, _ROWS, history=10000, ratio=0.5)
+    self._screen = pyte.HistoryScreen(_COLS, _ROWS, history=4000, ratio=0.5)
     self._stream = pyte.ByteStream(self._screen)
     self._lock = threading.Lock()
     self._reader: threading.Thread | None = None
@@ -139,12 +154,22 @@ class _PtyTui:
         self._stream.feed(data)
     self._alive = False
 
+  def alive(self) -> bool:
+    return self._alive
+
   def write(self, data: bytes) -> None:
     if self._master >= 0:
       try:
         os.write(self._master, data)
       except OSError as e:
         log.warning("pty write failed: %s", e)
+
+  def submit(self, text: str) -> None:
+    """Type a prompt then submit it. Sending the text and the CR as one write
+    can be dropped by the TUI; a brief gap between them is reliable."""
+    self.write(text.encode())
+    time.sleep(0.3)
+    self.write(b"\r")
 
   def _row_text(self, row: object) -> str:
     """Render one pyte history row (a col→Char mapping) to a plain string."""
@@ -168,16 +193,6 @@ class _PtyTui:
       lines.extend(line.rstrip() for line in self._screen.display)
     return lines
 
-  def is_working(self) -> bool:
-    return any(_WORKING_HINT in line for line in self.snapshot())
-
-  def submit(self, text: str) -> None:
-    """Type a prompt then submit it. Sending the text and the CR as one write
-    can be dropped by the TUI; a brief gap between them is reliable."""
-    self.write(text.encode())
-    time.sleep(0.3)
-    self.write(b"\r")
-
   def close(self) -> None:
     self._alive = False
     if self._proc is not None:
@@ -198,6 +213,10 @@ class _PtyTui:
       self._master = -1
 
 
+# ---------------------------------------------------------------------------
+# screen scraping
+# ---------------------------------------------------------------------------
+
 def _is_prompt_echo(stripped: str) -> bool:
   """True for a user prompt echo line ``❯ <text>`` (not the empty input box
   ``❯`` and not the box border)."""
@@ -208,9 +227,8 @@ def _is_prompt_echo(stripped: str) -> bool:
 
 def _region_after_echo(lines: list[str], prompt: str) -> list[str]:
   """The screen lines that belong to THIS turn: from the last echo of its
-  prompt (``❯ <prompt>``) up to the NEXT prompt echo (or end). Anchor not
-  found ⇒ all lines. Bounding at the next echo keeps a mid-scrollback turn
-  from bleeding into a later turn's output."""
+  prompt (``❯ <prompt>``) up to the NEXT prompt echo (or end). Bounding at the
+  next echo keeps a mid-scrollback turn from bleeding into a later turn."""
   anchor = -1
   needle = prompt.strip()[:48]
   for i, line in enumerate(lines):
@@ -227,19 +245,14 @@ def _region_after_echo(lines: list[str], prompt: str) -> list[str]:
   return lines[anchor + 1:end]
 
 
-def _extract_answer(lines: list[str], prompt: str) -> str:
-  """Scrape the final assistant prose answer from the screen lines.
+def _iter_assistant_blocks(region: list[str]) -> list[tuple[str, bool]]:
+  """Parse a turn region into ``(text, is_tool)`` blocks.
 
-  Anchors on the echo of THIS turn's prompt (``❯ <prompt>``), then returns the
-  last ``⏺`` block in the region that is NOT a tool call. A tool call is a ``⏺``
-  block whose text matches ``Name(...)`` or that is immediately followed by a
-  ``⎿`` result line; prose answers are neither.
+  A ``⏺`` block runs until the next marker. It is a tool call if its head
+  matches ``Name(...)`` or it is followed by a ``⎿`` result line; otherwise it
+  is prose. Tool blocks keep the ``⏺`` head text (the invocation) as their text.
   """
-  region = _region_after_echo(lines, prompt)
-
-  # Collect ⏺ blocks: each block is the ⏺ line plus following indented
-  # continuation lines, until the next marker / input-box border.
-  blocks: list[tuple[str, bool]] = []  # (text, is_tool)
+  blocks: list[tuple[str, bool]] = []
   i = 0
   n = len(region)
   while i < n:
@@ -255,7 +268,7 @@ def _extract_answer(lines: list[str], prompt: str) -> str:
             or nxt.startswith("─") or nxt.startswith(_USER_ECHO)):
           break
         if nxt.startswith(_TOOL_RESULT):
-          is_tool = True  # ⏺ block followed by ⎿ result ⇒ it was a tool call
+          is_tool = True
           break
         cont.append(nxt)
         j += 1
@@ -263,37 +276,48 @@ def _extract_answer(lines: list[str], prompt: str) -> str:
       i = j
     else:
       i += 1
+  return blocks
 
-  for text, is_tool in reversed(blocks):
+
+def _extract_answer(lines: list[str], prompt: str) -> str:
+  """The final assistant prose answer: the last ``⏺`` block in this turn's
+  region that is NOT a tool call."""
+  for text, is_tool in reversed(_iter_assistant_blocks(_region_after_echo(lines, prompt))):
     if not is_tool and text:
       return text
   return ""
 
 
-def _latest_tool_summary(lines: list[str], seen: set[str]) -> str | None:
-  """Return a newly-appeared ``⏺ Name(args)`` tool line not yet in ``seen``."""
-  for line in lines:
-    s = line.strip()
-    if s.startswith(_ASSISTANT):
-      body = s[len(_ASSISTANT):].strip()
-      if _TOOL_CALL_RE.match(body) and body not in seen:
-        seen.add(body)
-        return body
-  return None
+def _new_tool_summaries(lines: list[str], prompt: str, seen: set[str]) -> list[str]:
+  """Tool invocations (``⏺ Name(args)``) in this turn's region not yet seen.
 
+  Scoped to the current turn so stale ``⏺`` lines from earlier turns (still in
+  scrollback) aren't re-emitted as progress."""
+  out: list[str] = []
+  for text, is_tool in _iter_assistant_blocks(_region_after_echo(lines, prompt)):
+    head = text.splitlines()[0] if text else ""
+    if is_tool and head and head not in seen:
+      seen.add(head)
+      out.append(head)
+  return out
+
+
+# ---------------------------------------------------------------------------
+# adapter
+# ---------------------------------------------------------------------------
 
 class ClaudeCliCodingAgent(CodingAgent):
   """Drives the interactive ``claude`` TUI over a pty (subscription billing).
 
-  See the module docstring for the rationale and known limitations.
+  See the module docstring for the rationale, design, and limitations.
   """
 
   # Tunables (seconds).
-  _BOOT_WAIT = 6.0          # let the TUI splash/onboarding render before turn 1
-  _START_TIMEOUT = 20.0     # max wait for a turn to BEGIN working after submit
-  _TURN_TIMEOUT = 600.0     # hard ceiling on a single turn
-  _SETTLE = 2.5             # screen stable this long + idle ⇒ turn done
-  _POLL = 0.3               # screen poll cadence
+  _BOOT_TIMEOUT = 30.0      # max wait for the TUI to become ready for input
+  _START_TIMEOUT = 25.0     # max wait for a turn to BEGIN after submit
+  _TURN_TIMEOUT = 1800.0    # hard ceiling on a single turn
+  _SETTLE = 2.0             # screen idle + stable this long ⇒ turn done
+  _POLL = 0.3               # poll cadence
 
   def __init__(
     self,
@@ -319,8 +343,8 @@ class ClaudeCliCodingAgent(CodingAgent):
     self._booted = False
 
   def set_effort(self, effort: str) -> None:
-    # The interactive TUI has no per-turn effort flag we drive here; record it
-    # for parity but it is a no-op in this prototype.
+    # No per-turn effort flag on the interactive binary we drive; stored for
+    # parity (a future version could send the `/effort <level>` slash command).
     self._effort = effort
 
   def set_endpoint(self, endpoint: EndpointConfig) -> None:
@@ -329,9 +353,7 @@ class ClaudeCliCodingAgent(CodingAgent):
   def _build_argv(self) -> list[str]:
     claude = shutil.which("claude") or "claude"
     argv = [claude]
-    # Permission handling: the daemon runs unattended, so bypass interactive
-    # permission panels. bypassPermissions → --dangerously-skip-permissions;
-    # anything else maps to the closest non-interactive stance we can take.
+    # Unattended daemon: bypass interactive permission panels.
     if self._permission_mode == "bypassPermissions":
       argv.append("--dangerously-skip-permissions")
     else:
@@ -343,8 +365,8 @@ class ClaudeCliCodingAgent(CodingAgent):
   def _build_env(self) -> dict[str, str]:
     env = dict(os.environ)
     env["TERM"] = "xterm-256color"
-    # Do NOT set CLAUDE_CODE_ENTRYPOINT — letting the CLI choose its own keeps
-    # the interactive ``(external, cli)`` surface (the whole point).
+    # Do NOT set CLAUDE_CODE_ENTRYPOINT — letting the CLI pick its own keeps the
+    # interactive ``(external, cli)`` surface (the whole point).
     env.pop("CLAUDE_CODE_ENTRYPOINT", None)
     if self._endpoint.base_url:
       env["ANTHROPIC_BASE_URL"] = self._endpoint.base_url
@@ -354,7 +376,7 @@ class ClaudeCliCodingAgent(CodingAgent):
     return env
 
   async def start(self, project_dir: str, model: str, resume: str = "") -> None:
-    del resume  # interactive TUI holds context in-process; no resume support
+    del resume  # interactive TUI holds context in-process; no resume channel
     self._project_dir = project_dir
     self._model = model
     await self._spawn()
@@ -365,26 +387,32 @@ class ClaudeCliCodingAgent(CodingAgent):
     self._tui = tui
     self._booted = False
 
-  def _ensure_booted(self) -> None:
-    """Sync — runs on the turn worker thread (see run_turn)."""
-    if self._booted or self._tui is None:
-      return
-    # Let the splash / onboarding settle, then nudge past any trust/theme
-    # dialog so the input box is ready for the first prompt.
-    time.sleep(self._BOOT_WAIT)
-    self._tui.write(b"\r")
-    time.sleep(0.6)
+  def _wait_ready(self, tui: _PtyTui) -> None:
+    """Block until the TUI footer shows it's ready for input, then nudge past
+    any first-run trust/theme dialog. Replaces a blind fixed sleep."""
+    deadline = time.monotonic() + self._BOOT_TIMEOUT
+    while time.monotonic() < deadline:
+      if not tui.alive():
+        return
+      if any(_READY_HINT in ln for ln in tui.snapshot()):
+        break
+      time.sleep(self._POLL)
+    # A first run in an untrusted dir can park on a trust/theme prompt; a CR
+    # accepts the default. Harmless once already trusted.
+    tui.write(b"\r")
+    time.sleep(0.5)
     self._booted = True
 
   def _wait_idle(self, tui: _PtyTui, timeout: float) -> bool:
     """Block until the TUI is not working and its screen has been stable for a
-    beat — i.e. ready to accept a new prompt. Prevents submitting into a busy
-    TUI, which would queue prompts and desync answers from turns. Sync — runs
-    on the turn worker thread."""
+    beat — ready for a new prompt. Prevents submitting into a busy TUI (which
+    queues prompts and desyncs answers from turns)."""
     last = ""
     stable_since = time.monotonic()
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
+      if not tui.alive():
+        return False
       time.sleep(self._POLL)
       lines = tui.snapshot()
       working = any(_WORKING_HINT in ln for ln in lines)
@@ -404,13 +432,11 @@ class ClaudeCliCodingAgent(CodingAgent):
   ) -> tuple[float, JsonObject]:
     """Run one turn on a worker thread.
 
-    Critical: the host's ``on_event`` callback marshals card sends back to the
-    main loop with a *blocking* ``run_coroutine_threadsafe(...).result()`` — it
-    is written to be invoked from a worker thread (the SDK adapter calls it from
-    ``SDKThread``). If we called ``on_event`` directly from this coroutine (i.e.
-    on the main loop) the DoneEvent's blocking marshal would deadlock the loop.
-    So the whole turn — pty polling and every ``on_event`` call — runs in a
-    thread, exactly like the SDK path. The main loop stays free to receive
+    Critical: the host's ``on_event`` marshals card sends to the main loop with
+    a *blocking* ``run_coroutine_threadsafe(...).result()`` — it is written to
+    be invoked from a worker thread (the SDK adapter calls it from ``SDKThread``).
+    Calling it from this coroutine (the main loop) would deadlock. So the whole
+    turn runs in a thread, like the SDK path; the main loop stays free to take
     /esc and call ``interrupt()`` concurrently.
     """
     if self._tui is None:
@@ -424,67 +450,67 @@ class ClaudeCliCodingAgent(CodingAgent):
     prompt: str,
     on_event: Callable[[TurnEvent], None],
   ) -> tuple[float, JsonObject]:
-    self._ensure_booted()
+    if not tui.alive():
+      on_event(ErrorEvent(message="claude-cli: TUI process is not running"))
+      on_event(DoneEvent(cost=0.0, usage={}))
+      return 0.0, {}
 
-    # Never submit into a busy TUI — wait for the previous turn to fully drain
-    # so prompts can't queue and desync.
+    if not self._booted:
+      self._wait_ready(tui)
+
+    # Never submit into a busy TUI — wait for any prior turn to fully drain.
     log.info("claude-cli run_turn: waiting for idle TUI (prompt=%d chars)", len(prompt))
     self._wait_idle(tui, timeout=self._TURN_TIMEOUT)
 
-    # Submit the prompt (text + CR sent separately; see _PtyTui.submit). The
-    # TUI echoes "❯ <prompt>" once it accepts the input.
     log.info("claude-cli run_turn: submitting prompt")
     tui.submit(prompt)
 
     start = time.monotonic()
     began = False
+    progress_started = False
     seen_tools: set[str] = set()
     last_display = ""
     last_change = start
-    progress_started = False
-    timed_out = False
     needle = prompt.strip()[:48]
+    timed_out = False
 
     def _echo_present(lines: list[str]) -> bool:
-      return any(ln.strip().startswith(_USER_ECHO) and needle in ln
-                 for ln in lines)
+      return any(_is_prompt_echo(ln.strip()) and needle in ln for ln in lines)
 
     while True:
       time.sleep(self._POLL)
       now = time.monotonic()
+      if not tui.alive():
+        on_event(ErrorEvent(message="claude-cli: TUI exited mid-turn"))
+        on_event(DoneEvent(cost=0.0, usage={}))
+        return 0.0, {}
       lines = tui.snapshot()
       working = any(_WORKING_HINT in ln for ln in lines)
 
-      # Surface tool calls as ProgressEvents as they appear. Scope to THIS
-      # turn's region so stale ⏺ tool lines from prior turns (still in
-      # scrollback) aren't re-emitted.
-      tool = _latest_tool_summary(_region_after_echo(lines, prompt), seen_tools)
-      if tool is not None:
+      # Surface tool calls as ProgressEvents as they appear on screen.
+      for summary in _new_tool_summaries(lines, prompt, seen_tools):
         on_event(ProgressEvent(
-          kind="tool", summary=tool, first=not progress_started))
+          kind="tool", summary=summary, first=not progress_started))
         progress_started = True
 
       if working:
         began = True
-
       display = "\n".join(lines[-_ROWS:])
       if display != last_display:
         last_display = display
         last_change = now
 
       if not began:
-        # Waiting for the turn to start. A trivial turn can finish before the
-        # spinner is ever caught; treat "our prompt echoed + content present +
-        # stable while idle" as an implicit start.
+        # A trivial turn can finish before the spinner is ever caught; treat
+        # "our prompt echoed + content present" as an implicit start.
         if _echo_present(lines) and any(
             ln.strip().startswith(_ASSISTANT) for ln in lines):
           began = True
         elif now - start > self._START_TIMEOUT:
           timed_out = not _echo_present(lines)
-          began = True  # give the done-check a chance; if nothing, answer="".
+          began = True
         continue
 
-      # Turn has begun: done when no longer working AND screen is stable.
       if not working and (now - last_change) >= self._SETTLE:
         break
       if now - start > self._TURN_TIMEOUT:
@@ -493,19 +519,16 @@ class ClaudeCliCodingAgent(CodingAgent):
 
     lines = tui.snapshot()
     answer = _extract_answer(lines, prompt)
-    log.info("claude-cli run_turn: done (began=%s timed_out=%s answer=%d chars, %.0fs)",
-             began, timed_out, len(answer), time.monotonic() - start)
-
-    if timed_out and not answer:
-      on_event(ErrorEvent(message="claude-cli turn timed out (no answer scraped)"))
-      on_event(DoneEvent(cost=0.0, usage={}))
-      return 0.0, {}
+    log.info("claude-cli run_turn: done (began=%s timed_out=%s answer=%d chars "
+             "tools=%d %.0fs)", began, timed_out, len(answer), len(seen_tools),
+             time.monotonic() - start)
 
     if answer:
       on_event(AnswerEvent(text=answer))
+    elif timed_out:
+      on_event(ErrorEvent(message="claude-cli turn timed out (no answer scraped)"))
     elif progress_started:
-      # Tools ran but no prose tail was scraped — surface a minimal note rather
-      # than a silent empty card.
+      # Tools ran but no prose tail scraped — avoid a silent empty card.
       on_event(AnswerEvent(text="(done — no text answer captured from the TUI)"))
 
     on_event(DoneEvent(cost=0.0, usage={}))
@@ -518,7 +541,7 @@ class ClaudeCliCodingAgent(CodingAgent):
       self._tui.write(b"\x1b")
 
   async def reset(self, project_dir: str, model: str, resume: str = "") -> None:
-    del resume  # no resume; respawn is a fresh session (context is lost)
+    del resume  # no resume channel; respawn is a fresh session (context lost)
     await self.stop()
     self._project_dir = project_dir
     self._model = model
