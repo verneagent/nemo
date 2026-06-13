@@ -59,10 +59,12 @@ import os
 import pty
 import re
 import select
+import shlex
 import shutil
 import signal
 import struct
 import subprocess
+import tempfile
 import termios
 import threading
 import time
@@ -75,7 +77,8 @@ from .coding_agent import CodingAgent, EndpointConfig
 from .db import Database
 from .sessions import claude_project_slug
 from .turn import (
-  AnswerEvent, DoneEvent, ErrorEvent, ProgressEvent, TurnEvent, canonical_usage,
+  AnswerEvent, CompactNoticeEvent, CompactStartedEvent, DoneEvent, ErrorEvent,
+  ProgressEvent, TaskDoneEvent, TaskStartedEvent, TurnEvent, canonical_usage,
 )
 from .types import JsonObject
 
@@ -99,6 +102,9 @@ _WORKING_HINT = "esc to interrupt"
 _READY_HINT = "shift+tab to cycle"
 # A ⏺ line that is a tool call: a single CapitalCase identifier then "(".
 _TOOL_CALL_RE = re.compile(r"^[A-Z][A-Za-z0-9_]*\(")
+
+# Valid values for the interactive CLI's --effort flag.
+_EFFORT_LEVELS = frozenset({"low", "medium", "high", "max"})
 
 
 # ---------------------------------------------------------------------------
@@ -430,6 +436,197 @@ def _sum_turn_usage(rows: list[JsonObject]) -> JsonObject:
 
 
 # ---------------------------------------------------------------------------
+# structured event mapping (jsonl rows + hook events → TurnEvents)
+# ---------------------------------------------------------------------------
+#
+# The transcript jsonl is the primary structured channel: assistant text /
+# thinking / tool_use, per-message usage, and ``system`` rows (turn_duration =
+# turn end, api_error, compact_boundary). Hooks (Phase 2, via --settings) add
+# the realtime/control signals the jsonl lacks: PreCompact (BEFORE compaction)
+# and Stop (authoritative completion), plus SubagentStop / Notification. Both
+# feed the SAME TurnEvent stream the SDK adapter produces, so the host renders
+# claude-cli turns with the same fidelity.
+
+
+def _new_turn_state() -> dict[str, object]:
+  return {
+    "progress_started": False,
+    "answer_seen": False,
+    "turn_done": False,        # set by jsonl turn_duration OR hook Stop
+    "error": "",               # set by api_error
+    "usage": {"input_tokens": 0, "cache_read": 0,
+              "cache_creation": 0, "output_tokens": 0},
+  }
+
+
+def _accumulate_usage(state: dict[str, object], usage: object) -> None:
+  if not isinstance(usage, dict):
+    return
+  acc = state["usage"]
+  assert isinstance(acc, dict)
+  for src, dst in (
+    ("input_tokens", "input_tokens"),
+    ("cache_read_input_tokens", "cache_read"),
+    ("cache_creation_input_tokens", "cache_creation"),
+    ("output_tokens", "output_tokens"),
+  ):
+    v = usage.get(src)
+    if isinstance(v, (int, float)) and not isinstance(v, bool):
+      acc[dst] = int(acc.get(dst, 0)) + max(0, int(v))
+
+
+def _emit_jsonl_events(
+  rows: list[JsonObject],
+  on_event: Callable[[TurnEvent], None],
+  state: dict[str, object],
+) -> None:
+  """Map transcript jsonl rows to ordered TurnEvents + accumulate usage."""
+  from .cards import tool_use_summary
+
+  for row in rows:
+    rtype = row.get("type")
+    if rtype == "assistant":
+      msg = row.get("message")
+      if not isinstance(msg, dict):
+        continue
+      content = msg.get("content")
+      if isinstance(content, list):
+        for b in content:
+          if not isinstance(b, dict):
+            continue
+          bt = b.get("type")
+          if bt == "thinking":
+            think = b.get("thinking") or ""
+            if think:
+              on_event(ProgressEvent(kind="thinking", summary=think,
+                                     first=not state["progress_started"]))
+              state["progress_started"] = True
+          elif bt == "text":
+            text = b.get("text") or ""
+            if text:
+              on_event(AnswerEvent(text=text))
+              state["answer_seen"] = True
+          elif bt == "tool_use":
+            name = b.get("name") or ""
+            on_event(ProgressEvent(
+              kind="tool", summary=tool_use_summary(name, b.get("input") or {}),
+              first=not state["progress_started"]))
+            state["progress_started"] = True
+            # The Task/Agent tool spawns a sub-agent; surface its start.
+            if name in ("Task", "Agent"):
+              tid = str(b.get("id") or "")
+              on_event(TaskStartedEvent(task_id=tid))
+      _accumulate_usage(state, msg.get("usage"))
+    elif rtype == "system":
+      sub = row.get("subtype")
+      if sub == "turn_duration":
+        state["turn_done"] = True
+      elif sub == "api_error":
+        err = row.get("error")
+        text = ""
+        if isinstance(err, dict):
+          text = str(err.get("formatted") or err.get("message") or "")
+        on_event(ErrorEvent(message=text or "claude-cli: API error"))
+        state["error"] = text or "API error"
+      elif sub == "compact_boundary":
+        meta = row.get("compact_metadata")
+        meta = meta if isinstance(meta, dict) else {}
+        on_event(CompactNoticeEvent(
+          trigger=str(meta.get("trigger") or ""),
+          pre_tokens=int(meta.get("pre_tokens") or 0),
+          post_tokens=int(meta.get("post_tokens") or 0),
+          duration_ms=int(meta.get("duration_ms") or 0)))
+
+
+def _emit_hook_events(
+  rows: list[JsonObject],
+  on_event: Callable[[TurnEvent], None],
+  state: dict[str, object],
+) -> None:
+  """Map hook NDJSON lines (Phase 2) to TurnEvents. Keyed by hook_event_name."""
+  for row in rows:
+    name = row.get("hook_event_name") or ""
+    if name == "Stop":
+      state["turn_done"] = True
+    elif name == "PreCompact":
+      on_event(CompactStartedEvent(trigger=str(row.get("trigger") or "")))
+    elif name == "SubagentStop":
+      on_event(TaskDoneEvent(task_id="", status="done"))
+    elif name == "Notification":
+      note = str(row.get("message") or "").strip()
+      if note:
+        on_event(ProgressEvent(kind="reasoning", summary=f"ℹ️ {note}"))
+
+
+def _tail_ndjson(path: str, pos: int, buf: str) -> tuple[list[JsonObject], int, str]:
+  """Read complete JSON lines appended to ``path`` since byte offset ``pos``.
+  Returns (rows, new_pos, new_buf). Tolerates partial trailing lines."""
+  if not path or not os.path.exists(path):
+    return [], pos, buf
+  try:
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+      f.seek(pos)
+      chunk = f.read()
+      pos = f.tell()
+  except OSError as e:
+    log.warning("ndjson tail failed (%s): %s", path, e)
+    return [], pos, buf
+  buf += chunk
+  *complete, buf = buf.split("\n")
+  rows: list[JsonObject] = []
+  for line in complete:
+    line = line.strip()
+    if not line:
+      continue
+    try:
+      rows.append(json.loads(line))
+    except json.JSONDecodeError:
+      continue
+  return rows, pos, buf
+
+
+class _HookStream:
+  """Per-session hook IPC. Writes a settings JSON whose hooks append their
+  stdin payload to an NDJSON file, injected into the CLI via ``--settings``
+  (a trusted source — project .claude/settings.json hooks are trust-gated and
+  won't fire). The adapter tails the NDJSON for realtime control signals.
+
+  Isolation: the settings file carries ONLY nemo's hooks and is passed
+  explicitly; it does not touch the user's global/project settings.
+  """
+
+  # Only the signals the jsonl can't give (or gives only post-hoc): realtime
+  # compaction, authoritative completion, sub-agent end, idle/permission.
+  _EVENTS = ("PreCompact", "Stop", "SubagentStop", "Notification")
+
+  def __init__(self, dirpath: str):
+    self._events_path = os.path.join(dirpath, "nemo_hooks.ndjson")
+    self._settings_path = os.path.join(dirpath, "nemo_settings.json")
+    self._pos = 0
+    self._buf = ""
+
+  @property
+  def settings_path(self) -> str:
+    return self._settings_path
+
+  def write_settings(self) -> None:
+    open(self._events_path, "w").close()
+    q = shlex.quote(self._events_path)
+    # Append the hook's stdin JSON (one object) + a newline, atomically enough
+    # for the low-frequency control events we register.
+    cmd = f"cat >> {q}; printf '\\n' >> {q}"
+    hooks = {ev: [{"hooks": [{"type": "command", "command": cmd}]}]
+             for ev in self._EVENTS}
+    with open(self._settings_path, "w", encoding="utf-8") as f:
+      json.dump({"hooks": hooks}, f)
+
+  def read_new(self) -> list[JsonObject]:
+    rows, self._pos, self._buf = _tail_ndjson(
+      self._events_path, self._pos, self._buf)
+    return rows
+
+
+# ---------------------------------------------------------------------------
 # adapter
 # ---------------------------------------------------------------------------
 
@@ -443,8 +640,9 @@ class ClaudeCliCodingAgent(CodingAgent):
   _BOOT_TIMEOUT = 30.0      # max wait for the TUI to become ready for input
   _START_TIMEOUT = 25.0     # max wait for a turn to BEGIN after submit
   _TURN_TIMEOUT = 1800.0    # hard ceiling on a single turn
-  _SETTLE = 2.0             # screen idle + stable this long ⇒ turn done
+  _SETTLE = 2.0             # screen idle + stable this long ⇒ turn done (fallback)
   _POLL = 0.3               # poll cadence
+  _JSONL_GRACE = 6.0        # after completion, drain trailing structured rows
 
   def __init__(
     self,
@@ -470,11 +668,16 @@ class ClaudeCliCodingAgent(CodingAgent):
     self._log: _SessionLog | None = None
     self._session_id = ""
     self._booted = False
+    # Phase 2 hook IPC: a per-session settings file injected via --settings and
+    # the NDJSON file its hooks append to. Populated in _spawn.
+    self._settings_path = ""
+    self._hooks: _HookStream | None = None
+    self._hookdir = ""
 
   def set_effort(self, effort: str) -> None:
-    # No per-turn effort flag on the interactive binary we drive; stored for
-    # parity (a future version could send the `/effort <level>` slash command).
-    self._effort = effort
+    # The interactive CLI accepts a session-wide --effort flag; store the
+    # validated level (host calls reset() after, which respawns with it).
+    self._effort = effort if effort in _EFFORT_LEVELS else ""
 
   def set_endpoint(self, endpoint: EndpointConfig) -> None:
     self._endpoint = endpoint
@@ -489,6 +692,14 @@ class ClaudeCliCodingAgent(CodingAgent):
       argv += ["--permission-mode", self._permission_mode or "acceptEdits"]
     if self._model:
       argv += ["--model", self._model]
+    if self._effort:
+      # The interactive CLI takes a session-wide --effort flag (low/medium/
+      # high/max), so we set it at spawn; /effort changes flow through reset().
+      argv += ["--effort", self._effort]
+    if self._settings_path:
+      # Trusted hook injection (Phase 2). Project .claude/settings.json hooks are
+      # trust-gated and won't fire, but --settings is an explicit trusted source.
+      argv += ["--settings", self._settings_path]
     if resume:
       # Resume the prior conversation's transcript (daemon restart / model
       # switch). The session jsonl is persisted per-turn, so context is intact.
@@ -525,6 +736,14 @@ class ClaudeCliCodingAgent(CodingAgent):
     def _do() -> tuple[_PtyTui, _SessionLog]:
       # Snapshot existing transcripts BEFORE spawn so the new one is identifiable.
       sess = _SessionLog(self._project_dir, resume_id=resume)
+      # Per-session hook IPC: write an isolated settings file (injected via
+      # --settings in _build_argv) whose hooks append realtime control signals
+      # to an NDJSON file we tail.
+      self._hookdir = tempfile.mkdtemp(prefix="nemo_clicli_")
+      hooks = _HookStream(self._hookdir)
+      hooks.write_settings()
+      self._hooks = hooks
+      self._settings_path = hooks.settings_path
       tui = _PtyTui(self._build_argv(resume), self._project_dir, self._build_env())
       tui.spawn()
       return tui, sess
@@ -608,20 +827,34 @@ class ClaudeCliCodingAgent(CodingAgent):
     log.info("claude-cli run_turn: waiting for idle TUI (prompt=%d chars)", len(prompt))
     self._wait_idle(tui, timeout=self._TURN_TIMEOUT)
 
+    # Drain pre-turn rows from both structured channels so we only emit THIS
+    # turn's events.
+    if self._log is not None:
+      self._log.read_new()
+    if self._hooks is not None:
+      self._hooks.read_new()
+
     log.info("claude-cli run_turn: submitting prompt")
     tui.submit(prompt)
 
+    state = _new_turn_state()
     start = time.monotonic()
     began = False
-    progress_started = False
-    seen_tools: set[str] = set()
     last_display = ""
     last_change = start
     needle = prompt.strip()[:48]
     timed_out = False
+    used_screen_completion = False
 
     def _echo_present(lines: list[str]) -> bool:
       return any(_is_prompt_echo(ln.strip()) and needle in ln for ln in lines)
+
+    def _drain() -> None:
+      # Structured channels are the event source (layout-independent).
+      if self._log is not None:
+        _emit_jsonl_events(self._log.read_new(), on_event, state)
+      if self._hooks is not None:
+        _emit_hook_events(self._hooks.read_new(), on_event, state)
 
     while True:
       time.sleep(self._POLL)
@@ -630,25 +863,21 @@ class ClaudeCliCodingAgent(CodingAgent):
         on_event(ErrorEvent(message="claude-cli: TUI exited mid-turn"))
         on_event(DoneEvent(cost=0.0, usage={}))
         return 0.0, {}
+      _drain()
       lines = tui.snapshot()
       working = any(_WORKING_HINT in ln for ln in lines)
 
-      # Surface tool calls as ProgressEvents as they appear on screen.
-      for summary in _new_tool_summaries(lines, prompt, seen_tools):
-        on_event(ProgressEvent(
-          kind="tool", summary=summary, first=not progress_started))
-        progress_started = True
-
-      if working:
+      if working or state["progress_started"] or state["answer_seen"]:
         began = True
       display = "\n".join(lines[-_ROWS:])
       if display != last_display:
         last_display = display
         last_change = now
 
+      # Authoritative completion: jsonl turn_duration OR hook Stop.
+      if state["turn_done"]:
+        break
       if not began:
-        # A trivial turn can finish before the spinner is ever caught; treat
-        # "our prompt echoed + content present" as an implicit start.
         if _echo_present(lines) and any(
             ln.strip().startswith(_ASSISTANT) for ln in lines):
           began = True
@@ -656,43 +885,57 @@ class ClaudeCliCodingAgent(CodingAgent):
           timed_out = not _echo_present(lines)
           began = True
         continue
-
+      # Fallback completion: screen idle + stable (marker-drift canary below).
       if not working and (now - last_change) >= self._SETTLE:
+        used_screen_completion = True
         break
       if now - start > self._TURN_TIMEOUT:
         timed_out = True
         break
 
-    lines = tui.snapshot()
-    answer = _extract_answer(lines, prompt)
+    # Grace: the final text/usage rows can lag the completion signal by a beat.
+    grace_end = time.monotonic() + self._JSONL_GRACE
+    while time.monotonic() < grace_end:
+      _drain()
+      if state["answer_seen"]:
+        time.sleep(0.4)
+        _drain()
+        break
+      time.sleep(0.3)
 
-    # Read this turn's real token usage + session id from the persisted JSONL
-    # (the transcript --resume uses). It can lag the screen by a beat, so retry
-    # briefly. Best-effort: empty usage just omits the token line on the card.
-    usage: JsonObject = {}
-    if self._log is not None:
-      rows: list[JsonObject] = []
-      for _ in range(8):
-        rows += self._log.read_new()
-        usage = _sum_turn_usage(rows)
-        if usage:
-          break
-        time.sleep(0.5)
-      if self._log.session_id:
-        self._session_id = self._log.session_id
+    if self._log is not None and self._log.session_id:
+      self._session_id = self._log.session_id
 
-    log.info("claude-cli run_turn: done (began=%s timed_out=%s answer=%d chars "
-             "tools=%d out_tokens=%s session=%s %.0fs)", began, timed_out,
-             len(answer), len(seen_tools), usage.get("output_tokens", "?"),
-             (self._session_id[:8] or "?"), time.monotonic() - start)
+    acc = state["usage"]
+    assert isinstance(acc, dict)
+    usage = canonical_usage(
+      input_tokens=int(acc["input_tokens"]), cache_read=int(acc["cache_read"]),
+      cache_creation=int(acc["cache_creation"]), output_tokens=int(acc["output_tokens"]),
+    ) if any(acc.values()) else {}
 
-    if answer:
-      on_event(AnswerEvent(text=answer))
-    elif timed_out:
-      on_event(ErrorEvent(message="claude-cli turn timed out (no answer scraped)"))
-    elif progress_started:
-      # Tools ran but no prose tail scraped — avoid a silent empty card.
-      on_event(AnswerEvent(text="(done — no text answer captured from the TUI)"))
+    if used_screen_completion:
+      # Marker-drift canary: completion fell back to screen scraping. With hooks
+      # the Stop hook should always fire, so a fallback there signals real drift.
+      if self._hooks is not None:
+        log.warning("claude-cli: completed via SCREEN fallback despite hooks "
+                    "(no Stop/turn_duration) — possible TUI/hook drift")
+      else:
+        log.info("claude-cli: completed via screen idle (no turn_duration row)")
+
+    log.info("claude-cli run_turn: done (began=%s timed_out=%s answer=%s "
+             "out_tokens=%s session=%s screen_fallback=%s %.0fs)", began,
+             timed_out, state["answer_seen"], acc["output_tokens"],
+             (self._session_id[:8] or "?"), used_screen_completion,
+             time.monotonic() - start)
+
+    # Fallback answer: structured channel produced no text — scrape the screen
+    # so the turn still yields a reply.
+    if not state["answer_seen"]:
+      scraped = _extract_answer(tui.snapshot(), prompt)
+      if scraped:
+        on_event(AnswerEvent(text=scraped))
+      elif timed_out and not state["error"]:
+        on_event(ErrorEvent(message="claude-cli turn timed out (no answer)"))
 
     on_event(DoneEvent(cost=0.0, usage=usage, session_id=self._session_id))
     return 0.0, usage
@@ -716,7 +959,13 @@ class ClaudeCliCodingAgent(CodingAgent):
 
   async def stop(self) -> None:
     self._log = None
+    self._hooks = None
+    self._settings_path = ""
+    hookdir = self._hookdir
+    self._hookdir = ""
     if self._tui is not None:
       tui = self._tui
       self._tui = None
       await asyncio.to_thread(tui.close)
+    if hookdir:
+      shutil.rmtree(hookdir, ignore_errors=True)

@@ -14,12 +14,21 @@ import os
 import tempfile
 
 from nemo.claude_cli_agent import (
+  ClaudeCliCodingAgent,
+  _HookStream,
   _SessionLog,
+  _emit_hook_events,
+  _emit_jsonl_events,
   _extract_answer,
   _iter_assistant_blocks,
   _new_tool_summaries,
+  _new_turn_state,
   _region_after_echo,
   _sum_turn_usage,
+)
+from nemo.turn import (
+  AnswerEvent, CompactNoticeEvent, CompactStartedEvent, ErrorEvent,
+  ProgressEvent, TaskDoneEvent, TaskStartedEvent, TurnEvent,
 )
 
 
@@ -189,3 +198,138 @@ def test_session_log_resume_binds_to_id_at_eof() -> None:
       f.write(json.dumps(_arow(usage={"output_tokens": 4})) + "\n")
     rows = log.read_new()
     assert len(rows) == 1  # only the new turn, not the replayed history
+
+
+# --- Phase 0/1/2: argv flags, structured event mapping, hook IPC -------------
+
+def _agent(**kw):
+  return ClaudeCliCodingAgent({}, "c", None, None, **kw)  # type: ignore[arg-type]
+
+
+def test_build_argv_includes_effort_and_settings() -> None:
+  a = _agent(permission_mode="bypassPermissions")
+  a.set_effort("high")
+  a._model = "claude-opus-4-8"
+  a._settings_path = "/tmp/s.json"
+  argv = a._build_argv(resume="sess-1")
+  assert "--dangerously-skip-permissions" in argv
+  assert argv[argv.index("--effort") + 1] == "high"
+  assert argv[argv.index("--model") + 1] == "claude-opus-4-8"
+  assert argv[argv.index("--settings") + 1] == "/tmp/s.json"
+  assert argv[argv.index("--resume") + 1] == "sess-1"
+
+
+def test_set_effort_validates() -> None:
+  a = _agent()
+  a.set_effort("high")
+  assert a._effort == "high"
+  a.set_effort("bogus")
+  assert a._effort == ""  # invalid cleared, so no --effort is passed
+
+
+def _run_jsonl(rows: list[dict]) -> tuple[list[TurnEvent], dict]:
+  events: list[TurnEvent] = []
+  state = _new_turn_state()
+  _emit_jsonl_events(rows, events.append, state)
+  return events, state
+
+
+def _amsg(*blocks: dict, usage: dict | None = None) -> dict:
+  msg: dict = {"role": "assistant", "content": list(blocks)}
+  if usage is not None:
+    msg["usage"] = usage
+  return {"type": "assistant", "message": msg}
+
+
+def test_jsonl_text_thinking_tool_in_order() -> None:
+  events, state = _run_jsonl([
+    _amsg({"type": "thinking", "thinking": "let me think"}),
+    _amsg({"type": "tool_use", "name": "Bash", "input": {"command": "ls"}}),
+    _amsg({"type": "text", "text": "done"}),
+  ])
+  kinds = [("answer", e.text) if isinstance(e, AnswerEvent)
+           else (e.kind, None) for e in events
+           if isinstance(e, (AnswerEvent, ProgressEvent))]
+  assert kinds == [("thinking", None), ("tool", None), ("answer", "done")]
+  assert state["answer_seen"] is True
+
+
+def test_jsonl_turn_duration_sets_done() -> None:
+  _, state = _run_jsonl([{"type": "system", "subtype": "turn_duration", "durationMs": 5}])
+  assert state["turn_done"] is True
+
+
+def test_jsonl_api_error_emits_and_records() -> None:
+  events, state = _run_jsonl([{
+    "type": "system", "subtype": "api_error",
+    "error": {"message": "Connection error.", "formatted": "Unable to connect (ECONNRESET)"},
+  }])
+  errs = [e for e in events if isinstance(e, ErrorEvent)]
+  assert errs and "ECONNRESET" in errs[0].message
+  assert state["error"]
+
+
+def test_jsonl_compact_boundary_emits_notice() -> None:
+  events, _ = _run_jsonl([{
+    "type": "system", "subtype": "compact_boundary",
+    "compact_metadata": {"trigger": "auto", "pre_tokens": 100, "post_tokens": 40, "duration_ms": 1200},
+  }])
+  notices = [e for e in events if isinstance(e, CompactNoticeEvent)]
+  assert notices and notices[0].pre_tokens == 100 and notices[0].trigger == "auto"
+
+
+def test_jsonl_task_tool_emits_task_started() -> None:
+  events, _ = _run_jsonl([
+    _amsg({"type": "tool_use", "name": "Task", "id": "t1", "input": {"prompt": "x"}}),
+  ])
+  assert any(isinstance(e, TaskStartedEvent) and e.task_id == "t1" for e in events)
+
+
+def test_jsonl_usage_accumulates() -> None:
+  _, state = _run_jsonl([
+    _amsg({"type": "text", "text": "a"}, usage={"input_tokens": 5, "output_tokens": 2}),
+    _amsg({"type": "text", "text": "b"}, usage={"input_tokens": 3, "output_tokens": 4,
+                                                 "cache_read_input_tokens": 10}),
+  ])
+  assert state["usage"] == {"input_tokens": 8, "cache_read": 10,
+                            "cache_creation": 0, "output_tokens": 6}
+
+
+def _run_hooks(rows: list[dict]) -> tuple[list[TurnEvent], dict]:
+  events: list[TurnEvent] = []
+  state = _new_turn_state()
+  _emit_hook_events(rows, events.append, state)
+  return events, state
+
+
+def test_hook_stop_sets_done() -> None:
+  _, state = _run_hooks([{"hook_event_name": "Stop", "session_id": "s"}])
+  assert state["turn_done"] is True
+
+
+def test_hook_precompact_emits_started() -> None:
+  events, _ = _run_hooks([{"hook_event_name": "PreCompact", "trigger": "auto"}])
+  assert any(isinstance(e, CompactStartedEvent) and e.trigger == "auto" for e in events)
+
+
+def test_hook_subagent_stop_emits_task_done() -> None:
+  events, _ = _run_hooks([{"hook_event_name": "SubagentStop"}])
+  assert any(isinstance(e, TaskDoneEvent) for e in events)
+
+
+def test_hookstream_writes_valid_settings_and_tails(tmp_path) -> None:
+  import json
+  hs = _HookStream(str(tmp_path))
+  hs.write_settings()
+  cfg = json.load(open(hs.settings_path))
+  # Registers exactly the realtime/control signals the jsonl can't give.
+  assert set(cfg["hooks"]) == {"PreCompact", "Stop", "SubagentStop", "Notification"}
+  cmd = cfg["hooks"]["Stop"][0]["hooks"][0]["command"]
+  assert "nemo_hooks.ndjson" in cmd
+  # Tailing the events file yields appended JSON lines.
+  assert hs.read_new() == []
+  events_path = os.path.join(str(tmp_path), "nemo_hooks.ndjson")
+  with open(events_path, "a") as f:
+    f.write('{"hook_event_name":"Stop"}\n')
+  rows = hs.read_new()
+  assert rows and rows[0]["hook_event_name"] == "Stop"

@@ -94,13 +94,31 @@ properties Nemo needs from a `CodingAgent`.
 - **Submit:** type the prompt, then send `\r` **after a short gap** (a combined
   `text\r` write is silently dropped by the TUI).
 - **Sync:** wait for the TUI to be idle before submitting (else prompts queue and
-  answers desync from turns — the first bug found), then wait for the turn to
-  start and finish.
-- **Completion:** the `esc to interrupt` spinner is present while working and
-  gone when idle; done = spinner gone + empty `❯` input box + screen stable.
-- **Answer extraction:** scrape the region after this turn's `❯ <prompt>` echo;
-  the answer is the last `⏺` block that is **not** a tool call (tool calls render
-  `⏺ Name(args)` and are followed by a `⎿` result line; prose answers are not).
+  answers desync from turns — the first bug found).
+- **Effort:** `set_effort` passes `--effort <level>` at spawn; `/effort` flows
+  through `reset()`.
+
+### Event source: structured channels, screen only as fallback
+Turn events come from two **structured** channels, not screen scraping:
+
+- **Session JSONL** (tailed live during the turn): assistant `text` → AnswerEvent,
+  `thinking` → ProgressEvent (full content, not a "Cogitated Ns" summary),
+  `tool_use` → ProgressEvent via `tool_use_summary(name, input)` (structured,
+  e.g. `Bash: Print hi`, not a scraped `⏺` line); `system` rows give
+  `turn_duration` (completion), `api_error` (→ ErrorEvent), `compact_boundary`
+  (→ CompactNoticeEvent); per-message `usage` is summed for DoneEvent. The
+  `Task`/`Agent` tool emits TaskStartedEvent.
+- **Hooks via `--settings`** (Phase 2 — an isolated settings file, NOT the
+  trust-gated project `.claude/settings.json`): `Stop` → authoritative
+  completion, `PreCompact` → the realtime "compacting…" banner the JSONL can't
+  give (it only has the post-hoc boundary), `SubagentStop` → TaskDoneEvent,
+  `Notification` → idle/permission note. Each hook appends its stdin JSON to a
+  per-session NDJSON file the adapter tails.
+- **Screen scraping is now only a FALLBACK:** completion falls back to
+  "`esc to interrupt` gone + stable" when neither `turn_duration` nor `Stop`
+  fired (logged as a marker-drift canary); answer falls back to the last
+  non-tool `⏺` block when the JSONL produced no text. The screen is otherwise
+  used only for readiness + sending input/ESC.
 
 ### Reliability hardening (what makes it product-grade, not a toy)
 - **Worker-thread turns:** the whole turn (pty polling + every `on_event` call)
@@ -116,8 +134,12 @@ properties Nemo needs from a `CodingAgent`.
   stable, else prompts queue and answers desync from turns (the first bug found).
 - **Process-death handling:** if the TUI exits mid-turn, surface an `ErrorEvent`
   instead of hanging the chat.
+- **Marker-drift canary:** whenever completion falls back to screen scraping
+  (no `turn_duration`/`Stop`), log a warning — so a `claude` TUI change that
+  breaks the markers is visible instead of silent.
 
-Pure scraping logic is pinned by `tests/test_claude_cli_agent.py` (9 tests).
+Pure logic (scraping + jsonl/hook mappers + session log + argv) is pinned by
+`tests/test_claude_cli_agent.py` (25 tests).
 
 ### End-to-end daemon verification
 Driven through the real `nemo --agent claude-cli` daemon (relay-injected Lark
@@ -150,14 +172,18 @@ Correction above). `_SessionLog` tails that file after each turn:
 
 ## Remaining limitations
 
-- **Scraping is coupled to TUI markers** (`⏺` / `⎿` / `❯` / `esc to interrupt`)
-  for completion detection + answer extraction; a major `claude` TUI reflow
-  could break turn boundaries or answer extraction. (Usage/resume come from the
-  structured JSONL and are not affected by layout.)
+- **Screen coupling is now only a fallback.** Answer/tools/thinking/usage/
+  completion all come from the structured JSONL + hooks (layout-independent). The
+  screen is used for readiness + input/ESC, plus a *fallback* answer scrape and a
+  *fallback* completion heuristic — both fire only if the structured channels
+  came up empty, and the fallback path logs a marker-drift warning so a `claude`
+  TUI reflow surfaces immediately rather than silently breaking.
 - **No cost in USD** — only token counts (the transcript has no per-turn cost).
-- **Weaker observability than the SDK** — tool calls are scraped `⏺` lines, not
-  structured events; sub-agent (`Task`) lifecycle, rate-limit notices, and
-  compaction banners are not surfaced.
+- **Observability is close to the SDK now** — thinking, structured tool calls,
+  per-turn usage, errors (`api_error`), compaction (realtime `PreCompact` +
+  post-hoc boundary), sub-agent start/stop, and authoritative completion are all
+  surfaced. Gaps vs the SDK: rate-limit state is not yet parsed, and error
+  classification → auto-reconnect is coarser than the SDK's typed handling.
 - **ToS gray area → account risk.** This runs the unmodified official binary on
   the user's own account and automates their own terminal input (softer than
   forging the `User-Agent`), but it can still be read as circumventing usage
