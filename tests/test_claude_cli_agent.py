@@ -27,8 +27,9 @@ from nemo.claude_cli_agent import (
   _sum_turn_usage,
 )
 from nemo.turn import (
-  AnswerEvent, CompactNoticeEvent, CompactStartedEvent, ErrorEvent,
-  ProgressEvent, TaskDoneEvent, TaskStartedEvent, TurnEvent,
+  AnswerEvent, CompactNoticeEvent, CompactStartedEvent, DoneEvent, ErrorEvent,
+  ProgressEvent, RateLimitNoticeEvent, TaskDoneEvent, TaskStartedEvent,
+  TurnEvent,
 )
 
 
@@ -261,14 +262,48 @@ def test_jsonl_turn_duration_sets_done() -> None:
   assert state["turn_done"] is True
 
 
-def test_jsonl_api_error_emits_and_records() -> None:
+def test_jsonl_api_error_transient_sets_reconnect_no_error_event() -> None:
+  # ECONNRESET is transient → flagged for reconnect-with-resume, NOT surfaced
+  # as a user-facing ErrorEvent (the retry may succeed).
   events, state = _run_jsonl([{
     "type": "system", "subtype": "api_error",
-    "error": {"message": "Connection error.", "formatted": "Unable to connect (ECONNRESET)"},
+    "error": {"message": "Connection error.",
+              "formatted": "Unable to connect (ECONNRESET)",
+              "connection": {"code": "ECONNRESET"}},
   }])
-  errs = [e for e in events if isinstance(e, ErrorEvent)]
-  assert errs and "ECONNRESET" in errs[0].message
-  assert state["error"]
+  assert "ECONNRESET" in str(state["transient"])
+  assert not state["error"]
+  assert not [e for e in events if isinstance(e, ErrorEvent)]
+
+
+def test_jsonl_api_error_non_retryable_surfaces() -> None:
+  events, state = _run_jsonl([{
+    "type": "system", "subtype": "api_error",
+    "error": {"message": "402 insufficient balance"},
+  }])
+  assert state["error"] and not state["transient"]
+  assert [e for e in events if isinstance(e, ErrorEvent)]
+
+
+def test_jsonl_api_error_rate_limit_emits_notice() -> None:
+  events, state = _run_jsonl([{
+    "type": "system", "subtype": "api_error",
+    "error": {"message": "429 Too Many Requests (rate limit)"},
+  }])
+  assert state["rate_limited"] is True
+  assert [e for e in events if isinstance(e, RateLimitNoticeEvent)]
+  assert not state["transient"]  # rate-limit is NOT auto-retried
+
+
+def test_classify_api_error() -> None:
+  from nemo.claude_cli_agent import _classify_api_error
+  assert _classify_api_error("ECONNRESET", "Unable to connect") == "transient"
+  assert _classify_api_error("", "fetch failed") == "transient"
+  assert _classify_api_error("", "429 rate limit exceeded") == "rate_limit"
+  assert _classify_api_error("", "overloaded") == "rate_limit"
+  assert _classify_api_error("", "402 payment required") == "non_retryable"
+  assert _classify_api_error("", "insufficient balance") == "non_retryable"
+  assert _classify_api_error("", "weird novel error") == "unknown"
 
 
 def test_jsonl_compact_boundary_emits_notice() -> None:
@@ -335,3 +370,55 @@ def test_hookstream_writes_valid_settings_and_tails(tmp_path) -> None:
     f.write('{"hook_event_name":"Stop"}\n')
   rows = hs.read_new()
   assert rows and rows[0]["hook_event_name"] == "Stop"
+
+
+# --- reconnect-with-resume orchestration (run_turn) -------------------------
+
+def test_run_turn_reconnects_on_transient_then_succeeds() -> None:
+  import asyncio
+  a = _agent(permission_mode="bypassPermissions")
+  a._tui = object()  # non-None sentinel so run_turn skips spawn
+  calls = {"sync": 0, "reset": 0}
+
+  def fake_sync(_tui, _prompt, on_event):
+    calls["sync"] += 1
+    if calls["sync"] == 1:
+      return 0.0, {}, True  # transient → signal reconnect, emit nothing
+    on_event(AnswerEvent("recovered"))
+    on_event(DoneEvent(cost=0.0, usage={"output_tokens": 5}))
+    return 0.0, {"output_tokens": 5}, False
+
+  async def fake_reset(_pd, _m, resume=""):
+    calls["reset"] += 1
+
+  a._run_turn_sync = fake_sync  # type: ignore[assignment]
+  a.reset = fake_reset          # type: ignore[assignment]
+  evs: list[TurnEvent] = []
+  cost, usage = asyncio.run(a.run_turn("hi", evs.append))
+  assert calls["sync"] == 2 and calls["reset"] == 1
+  assert usage == {"output_tokens": 5}
+  assert any(isinstance(e, AnswerEvent) and e.text == "recovered" for e in evs)
+
+
+def test_run_turn_gives_up_after_max_reconnects() -> None:
+  import asyncio
+  a = _agent(permission_mode="bypassPermissions")
+  a._tui = object()
+  calls = {"sync": 0, "reset": 0}
+
+  def fake_sync(_tui, _prompt, _on_event):
+    calls["sync"] += 1
+    return 0.0, {}, True  # always transient
+
+  async def fake_reset(_pd, _m, resume=""):
+    calls["reset"] += 1
+
+  a._run_turn_sync = fake_sync   # type: ignore[assignment]
+  a.reset = fake_reset           # type: ignore[assignment]
+  evs: list[TurnEvent] = []
+  asyncio.run(a.run_turn("hi", evs.append))
+  # MAX_RECONNECT=2 → 3 sync attempts, 2 resets, then an error + done emitted.
+  assert calls["sync"] == a._MAX_RECONNECT + 1
+  assert calls["reset"] == a._MAX_RECONNECT
+  assert any(isinstance(e, ErrorEvent) for e in evs)
+  assert any(isinstance(e, DoneEvent) for e in evs)

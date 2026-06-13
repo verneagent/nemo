@@ -78,7 +78,8 @@ from .db import Database
 from .sessions import claude_project_slug
 from .turn import (
   AnswerEvent, CompactNoticeEvent, CompactStartedEvent, DoneEvent, ErrorEvent,
-  ProgressEvent, TaskDoneEvent, TaskStartedEvent, TurnEvent, canonical_usage,
+  ProgressEvent, RateLimitNoticeEvent, TaskDoneEvent, TaskStartedEvent,
+  TurnEvent, canonical_usage,
 )
 from .types import JsonObject
 
@@ -105,6 +106,38 @@ _TOOL_CALL_RE = re.compile(r"^[A-Z][A-Za-z0-9_]*\(")
 
 # Valid values for the interactive CLI's --effort flag.
 _EFFORT_LEVELS = frozenset({"low", "medium", "high", "max"})
+
+# api_error classification (mirrors the SDK adapter's turn.py signal sets).
+# rate-limit: surfaced as a notice, NOT auto-retried (retrying just re-hits it).
+_RATE_LIMIT_SIGNALS = (
+  "429", "rate limit", "rate_limit", "ratelimit", "too many requests",
+  "overloaded", "usage limit", "quota exceeded",
+)
+# non-retryable: account/billing — retrying won't help.
+_NON_RETRYABLE_SIGNALS = (
+  "402", "insufficient balance", "insufficient_quota", "payment required",
+  "billing", "invalid api key", "authentication_error",
+)
+# transient: network/connection — a reconnect-with-resume can recover.
+_TRANSIENT_SIGNALS = (
+  "econnreset", "econnrefused", "etimedout", "enetunreach", "eai_again",
+  "socket hang up", "fetch failed", "unable to connect", "timed out",
+  "network", "connection error", "503", "502", "500", "529",
+)
+
+
+def _classify_api_error(code: str, text: str) -> str:
+  """Classify an api_error → 'rate_limit' | 'non_retryable' | 'transient' |
+  'unknown'. Rate-limit is checked first (a 429 is technically transient but we
+  must NOT hammer-retry it)."""
+  blob = f"{code} {text}".lower()
+  if any(s in blob for s in _RATE_LIMIT_SIGNALS):
+    return "rate_limit"
+  if any(s in blob for s in _NON_RETRYABLE_SIGNALS):
+    return "non_retryable"
+  if any(s in blob for s in _TRANSIENT_SIGNALS):
+    return "transient"
+  return "unknown"
 
 
 # ---------------------------------------------------------------------------
@@ -453,7 +486,9 @@ def _new_turn_state() -> dict[str, object]:
     "progress_started": False,
     "answer_seen": False,
     "turn_done": False,        # set by jsonl turn_duration OR hook Stop
-    "error": "",               # set by api_error
+    "error": "",               # non-retryable/unknown api_error (surface, no retry)
+    "transient": "",           # transient api_error → reconnect-with-resume + retry
+    "rate_limited": False,     # rate-limit notice surfaced this turn
     "usage": {"input_tokens": 0, "cache_read": 0,
               "cache_creation": 0, "output_tokens": 0},
   }
@@ -531,12 +566,23 @@ def _emit_jsonl_events(
           conn = err.get("connection")
           if isinstance(conn, dict):
             code = str(conn.get("code") or "")
-        # Forensic breadcrumb: error classification + auto-reconnect are not yet
-        # implemented for claude-cli (see CLAUDE_CLI_EXPERIMENT.md), so log the
-        # raw error so a wedged/failed turn is diagnosable from the daemon log.
-        log.warning("claude-cli api_error: code=%s msg=%s", code or "?", text[:200])
-        on_event(ErrorEvent(message=text or "claude-cli: API error"))
-        state["error"] = text or "API error"
+        kind = _classify_api_error(code, text)
+        log.warning("claude-cli api_error: kind=%s code=%s msg=%s",
+                    kind, code or "?", text[:200])
+        msg = text or "claude-cli: API error"
+        if kind == "rate_limit":
+          # Surface, do NOT auto-retry (would re-hit the limit); the TUI itself
+          # backs off. resets_at/utilization aren't in the row, so omit them.
+          on_event(RateLimitNoticeEvent(status="rejected"))
+          state["rate_limited"] = True
+          state["error"] = msg
+        elif kind == "transient":
+          # Recoverable: run_turn reconnects-with-resume and retries the prompt.
+          state["transient"] = msg
+        else:
+          # non_retryable / unknown: surface, no retry.
+          on_event(ErrorEvent(message=msg))
+          state["error"] = msg
       elif sub == "compact_boundary":
         meta = row.get("compact_metadata")
         meta = meta if isinstance(meta, dict) else {}
@@ -664,6 +710,7 @@ class ClaudeCliCodingAgent(CodingAgent):
   _SETTLE = 2.0             # screen idle + stable this long ⇒ turn done (fallback)
   _POLL = 0.3               # poll cadence
   _JSONL_GRACE = 6.0        # after completion, drain trailing structured rows
+  _MAX_RECONNECT = 2        # transient-error reconnect-with-resume retries
 
   def __init__(
     self,
@@ -837,20 +884,44 @@ class ClaudeCliCodingAgent(CodingAgent):
     if self._tui is None:
       await self._spawn()
     assert self._tui is not None
-    return await asyncio.to_thread(self._run_turn_sync, self._tui, prompt, on_event)
+    # Reconnect-with-resume retry loop (mirrors the SDK adapter): on a transient
+    # API/network error the spawned CLI is usually wedged, so we respawn with
+    # --resume <session> (clean replayed history) and re-submit the prompt.
+    for attempt in range(self._MAX_RECONNECT + 1):
+      assert self._tui is not None
+      cost, usage, needs_reconnect = await asyncio.to_thread(
+        self._run_turn_sync, self._tui, prompt, on_event)
+      if not needs_reconnect:
+        return cost, usage
+      if attempt < self._MAX_RECONNECT:
+        log.warning("claude-cli: transient error — reconnect-with-resume "
+                    "(retry %d/%d, session=%s)", attempt + 1, self._MAX_RECONNECT,
+                    self._session_id[:8] or "?")
+        await self.reset(self._project_dir, self._model, resume=self._session_id)
+      else:
+        log.error("claude-cli: transient error — retries exhausted (%d)",
+                  self._MAX_RECONNECT)
+        on_event(ErrorEvent(
+          message="claude-cli: API/network error, retries exhausted"))
+        on_event(DoneEvent(cost=0.0, usage={}, session_id=self._session_id))
+        return 0.0, {}
+    return 0.0, {}
 
   def _run_turn_sync(
     self,
     tui: _PtyTui,
     prompt: str,
     on_event: Callable[[TurnEvent], None],
-  ) -> tuple[float, JsonObject]:
+  ) -> tuple[float, JsonObject, bool]:
+    """Returns (cost, usage, needs_reconnect). When needs_reconnect is True the
+    turn hit a transient API error and emitted NO Done — the caller (run_turn)
+    reconnects-with-resume and retries."""
     if not tui.alive():
       log.warning("claude-cli: TUI process not running at turn start "
                   "(crashed/exited) — turn cannot run")
       on_event(ErrorEvent(message="claude-cli: TUI process is not running"))
       on_event(DoneEvent(cost=0.0, usage={}))
-      return 0.0, {}
+      return 0.0, {}, False
 
     if not self._booted:
       self._wait_ready(tui)
@@ -896,10 +967,18 @@ class ClaudeCliCodingAgent(CodingAgent):
                     now - start)
         on_event(ErrorEvent(message="claude-cli: TUI exited mid-turn"))
         on_event(DoneEvent(cost=0.0, usage={}))
-        return 0.0, {}
+        return 0.0, {}, False
       _drain()
       lines = tui.snapshot()
       working = any(_WORKING_HINT in ln for ln in lines)
+
+      # A transient API error wedges the CLI — stop now and signal reconnect.
+      if state["transient"] and not state["answer_seen"]:
+        log.warning("claude-cli: transient api_error mid-turn — will reconnect")
+        return 0.0, {}, True
+      # Non-retryable / unknown error already surfaced by the mapper; finish.
+      if state["error"]:
+        break
 
       if working or state["progress_started"] or state["answer_seen"]:
         began = True
@@ -940,6 +1019,11 @@ class ClaudeCliCodingAgent(CodingAgent):
     if self._log is not None and self._log.session_id:
       self._session_id = self._log.session_id
 
+    # A transient error surfaced during the grace drain with no answer → retry.
+    if state["transient"] and not state["answer_seen"]:
+      log.warning("claude-cli: transient api_error (post-completion) — will reconnect")
+      return 0.0, {}, True
+
     acc = state["usage"]
     assert isinstance(acc, dict)
     usage = canonical_usage(
@@ -972,7 +1056,7 @@ class ClaudeCliCodingAgent(CodingAgent):
         on_event(ErrorEvent(message="claude-cli turn timed out (no answer)"))
 
     on_event(DoneEvent(cost=0.0, usage=usage, session_id=self._session_id))
-    return 0.0, usage
+    return 0.0, usage, False
 
   async def interrupt(self) -> None:
     # ESC interrupts the current turn without killing the session (matches the

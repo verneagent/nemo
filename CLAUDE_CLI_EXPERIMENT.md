@@ -187,11 +187,17 @@ Correction above). `_SessionLog` tails that file after each turn:
   a Lark card via `can_use_tool`; the pty path has no equivalent, so plain-text
   Q&A is the deliberate trade-off.
 - **No cost in USD** — only token counts (the transcript has no per-turn cost).
-- **Observability is close to the SDK now** — thinking, structured tool calls,
-  per-turn usage, errors (`api_error`), compaction (realtime `PreCompact` +
-  post-hoc boundary), sub-agent start/stop, and authoritative completion are all
-  surfaced. Gaps vs the SDK: rate-limit state is not yet parsed, and error
-  classification → auto-reconnect is coarser than the SDK's typed handling.
+- **Observability is on par with the SDK for the common signals** — thinking,
+  structured tool calls, per-turn usage, sub-agent start/stop, compaction
+  (realtime `PreCompact` + post-hoc boundary), authoritative completion, and
+  now **API-error classification with auto reconnect-with-resume** (transient
+  ECONNRESET/timeout/5xx → respawn `--resume` + retry the prompt, capped at 2;
+  402/balance → surfaced, no retry) and **rate-limit notices** (429/overloaded
+  → `RateLimitNoticeEvent`, surfaced not retried) are all wired. Honest caveat:
+  the error/rate-limit paths are **unit-tested but not observed against a live
+  failure** (no way to deterministically trigger ECONNRESET / a 429 in a test);
+  the classifier + reconnect loop are verified, the exact interactive-jsonl
+  `api_error` shape for a rate-limit specifically is inferred, not sampled.
 - **ToS gray area → account risk.** This runs the unmodified official binary on
   the user's own account and automates their own terminal input (softer than
   forging the `User-Agent`), but it can still be read as circumventing usage
