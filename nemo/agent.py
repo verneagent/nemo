@@ -24,7 +24,7 @@ import uuid
 from typing import TYPE_CHECKING, Awaitable, Callable
 
 from . import cards, commands, messages, monitor, shell_command
-from .agent_factory import AgentKind, build_coding_agent, is_model_compatible
+from .agent_factory import AGENT_KINDS, AgentKind, build_coding_agent, is_model_compatible
 from .coding_agent import CodingAgent, EndpointConfig
 from .channel import IncomingMessage, TurnCardCtx
 from .fork import ForkManager
@@ -1148,7 +1148,7 @@ async def _send_agent_picker(
     await _send_response(
       channel, chat_id,
       f"Current agent: **{ctx.agent}** (model **{ctx.model}**)\n\n"
-      f"Available: `claude`, `claude-cli`, `codex`, `opencode`. {info}\n\n"
+      f"Available: {', '.join(f'`{k}`' for k in sorted(AGENT_KINDS))}. {info}\n\n"
       f"Usage: `/agent NAME`",
       db,
     )
@@ -1744,8 +1744,7 @@ async def main_loop(
               reply.operator_id,
             )
             continue
-          valid_agents = ("claude", "claude-cli", "codex", "opencode")
-          if agent_name not in valid_agents:
+          if agent_name not in AGENT_KINDS:
             # Should be unreachable (the dropdown only offers valid kinds),
             # but defend in case the wire delivers something weird.
             await _lock_agent_picker(

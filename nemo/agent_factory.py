@@ -11,7 +11,7 @@ upstream gateway like DeepSeek or Kimi.)
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import Literal, get_args
 
 from .channel import Channel
 from .claude_agent import ClaudeCodingAgent
@@ -23,10 +23,13 @@ from .opencode_agent import OpenCodeCodingAgent
 
 type AgentKind = Literal["claude", "codex", "opencode", "claude-cli"]
 
+AGENT_KINDS: frozenset[str] = frozenset(get_args(AgentKind.__value__))
+
 DEFAULT_AGENT: AgentKind = "claude"
 
 __all__ = [
   "AgentKind",
+  "AGENT_KINDS",
   "DEFAULT_AGENT",
   "EndpointConfig",
   "ModelCatalog",
