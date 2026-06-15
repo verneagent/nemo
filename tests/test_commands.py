@@ -865,3 +865,24 @@ def test_effort_invalid():
 def test_effort_inline_safe():
   _, resp = try_dispatch("/effort low", _ctx())
   assert is_inline_safe(resp)
+
+
+def _ctx_agent(agent):
+  ctx = AgentContext(model="opus", project_dir="/tmp/test", start_time=0)
+  ctx.agent = agent
+  return ctx
+
+
+def test_compact_forwards_only_for_claude_cli():
+  handled, resp = try_dispatch("/compact", _ctx_agent("claude-cli"))
+  assert handled and resp == "__forward__:/compact"
+  # other agents: handled, but a "not supported" message (not the sentinel)
+  handled, resp = try_dispatch("/compact", _ctx_agent("claude"))
+  assert handled and resp is not None and "__forward__" not in resp
+
+
+def test_usage_forwards_for_claude_cli_else_static():
+  handled, resp = try_dispatch("/usage", _ctx_agent("claude-cli"))
+  assert handled and resp == "__forward__:/usage"
+  handled, resp = try_dispatch("/usage", _ctx_agent("claude"))
+  assert handled and resp is not None and "claude.ai/settings/usage" in resp

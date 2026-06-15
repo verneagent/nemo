@@ -73,6 +73,12 @@ _AGENT_SESSION_COLUMNS: dict[str, str] = {
   "claude": "claude_session_id",
   "codex": "codex_session_id",
   "opencode": "opencode_session_id",
+  # claude-cli keeps its own slot: it's a distinct session id (a pty-driven
+  # interactive transcript), not interchangeable with the SDK claude session.
+  # The column is auto-created by the migration in _ensure_tables. Without this
+  # entry, set/get_sdk_session_id silently no-op for claude-cli (default
+  # endpoint), so a daemon restart could never resume the conversation.
+  "claude-cli": "claude_cli_session_id",
 }
 
 

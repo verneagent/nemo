@@ -63,6 +63,14 @@ def _ensure_codex_cli() -> None:
   sys.exit(1)
 
 
+def _ensure_claude_cli() -> None:
+  """Ensure the local interactive `claude` CLI is available (pty-driven TUI)."""
+  if shutil.which("claude"):
+    return
+  print("Error: claude CLI not found in PATH.", file=sys.stderr)
+  sys.exit(1)
+
+
 def _ensure_opencode_cli() -> None:
   """Ensure the local opencode CLI is available."""
   if shutil.which("opencode"):
@@ -74,6 +82,9 @@ def _ensure_opencode_cli() -> None:
 def _ensure_agent_runtime(agent: str) -> None:
   if agent == "claude":
     _ensure_claude_sdk()
+    return
+  if agent == "claude-cli":
+    _ensure_claude_cli()
     return
   if agent == "codex":
     _ensure_codex_cli()
@@ -357,7 +368,8 @@ def main():
                       help="Lark chat ID (auto-discovered if omitted)")
   parser.add_argument("--chat-name", default="", help="Find chat by name substring")
   parser.add_argument("--project-dir", default=".", help="Project directory (default: cwd)")
-  parser.add_argument("--agent", default="claude", choices=["claude", "codex", "opencode"],
+  parser.add_argument("--agent", default="claude",
+                      choices=["claude", "codex", "opencode", "claude-cli"],
                       help="Coding agent runtime (default: claude)")
   parser.add_argument("--model", default="", help="Model to use (agent default if omitted)")
   parser.add_argument("--effort", default="", choices=["", "low", "medium", "high", "max"],

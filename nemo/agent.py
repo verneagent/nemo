@@ -1106,13 +1106,13 @@ def _agent_picker_options() -> list[tuple[str, str]]:
   pairs for the picker dropdown.
 
   The set is fixed by ``agent_factory.AgentKind``; we hard-code the order
-  (claude, codex, opencode) so the picker is stable across daemons and
-  doesn't depend on dict iteration order. Labels carry each agent's
-  default model so the user can see what the switch will land on without
-  reading the catalog separately.
+  (claude, claude-cli, codex, opencode) so the picker is stable across
+  daemons and doesn't depend on dict iteration order. Labels carry each
+  agent's default model so the user can see what the switch will land on
+  without reading the catalog separately.
   """
   from .agent_factory import default_model_for_agent
-  agents: tuple[AgentKind, ...] = ("claude", "codex", "opencode")
+  agents: tuple[AgentKind, ...] = ("claude", "claude-cli", "codex", "opencode")
   return [(f"{name} (default: {default_model_for_agent(name)})", name)
           for name in agents]
 
@@ -2199,6 +2199,20 @@ async def main_loop(
           await _restart_client()
           await channel.update_workspace_tag(project_dir)
           await _send_response(channel, chat_id, f"Working directory: **{project_dir}**", db)
+        elif response and response.startswith("__forward__:"):
+          # Forward a CLI-native slash command (/compact, /usage) to the agent's
+          # underlying CLI and post its rendered result. Only claude-cli
+          # implements forward_native_command; others returned a static reply
+          # above and never reach this branch.
+          native_cmd = response.split(":", 1)[1]
+          try:
+            result = await coding_agent.forward_native_command(native_cmd)
+          except Exception as exc:
+            log.warning("forward_native_command(%s) raised: %s", native_cmd, exc)
+            result = ""
+          await _send_response(
+            channel, chat_id,
+            result.strip() or f"`{native_cmd}` produced no output.", db)
         elif response == "__autoapprove_toggle__":
           sess = db.get_session(session_id) or {}
           enabled = not bool(sess.get("autoapprove"))
