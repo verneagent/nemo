@@ -279,14 +279,14 @@ def try_dispatch(text: str, ctx: AgentContext) -> tuple[bool, str | None]:
   # /agent
   if t.startswith("/agent"):
     from .agent_factory import default_model_for_agent
-    valid = ("claude", "codex", "opencode")
+    valid = ("claude", "codex", "opencode", "claude-cli")
     parts = text.strip().split(None, 1)
     if len(parts) >= 2:
       arg = parts[1].strip().lower()
       if arg not in valid:
         return True, (
           f"Unknown agent `{arg}`. "
-          f"Use `/agent claude|codex|opencode`."
+          f"Use `/agent claude|codex|opencode|claude-cli`."
         )
       if arg == ctx.agent:
         return True, f"Already on agent **{ctx.agent}**."
@@ -463,7 +463,7 @@ def try_dispatch(text: str, ctx: AgentContext) -> tuple[bool, str | None]:
       "| `/model` | Show current model |\n"
       "| `/model <name>` | Switch model |\n"
       "| `/agent` | Show current agent |\n"
-      "| `/agent <claude\\|codex\\|opencode>` | Switch coding agent (resets to its default model) |\n"
+      "| `/agent <claude\\|codex\\|opencode\\|claude-cli>` | Switch coding agent (resets to its default model) |\n"
       "| `/effort` | Show current reasoning effort |\n"
       "| `/effort <low\\|medium\\|high\\|max\\|default>` | Set reasoning effort |\n"
       "| `/clear` | Reset conversation |\n"

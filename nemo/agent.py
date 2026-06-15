@@ -1148,7 +1148,7 @@ async def _send_agent_picker(
     await _send_response(
       channel, chat_id,
       f"Current agent: **{ctx.agent}** (model **{ctx.model}**)\n\n"
-      f"Available: `claude`, `codex`, `opencode`. {info}\n\n"
+      f"Available: `claude`, `claude-cli`, `codex`, `opencode`. {info}\n\n"
       f"Usage: `/agent NAME`",
       db,
     )

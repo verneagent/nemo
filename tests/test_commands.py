@@ -238,6 +238,14 @@ def test_agent_unknown_name_rejected():
   assert "claude" in resp
 
 
+def test_agent_switch_to_claude_cli_accepted():
+  ctx = _ctx()
+  ctx.agent = "claude"
+  handled, resp = try_dispatch("/agent claude-cli", ctx)
+  assert handled
+  assert resp is not None and resp.startswith("__agent__:claude-cli:")
+
+
 def test_agent_action_code_marked_needs_sdk():
   # Agent switch tears down the SDK adapter, so it must be in the
   # _NEEDS_SDK guard list — otherwise the loop would try to handle it
