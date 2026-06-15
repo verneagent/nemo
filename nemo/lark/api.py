@@ -70,29 +70,50 @@ def _request(url: str, token: str, payload: JsonObject | None = None,
 # Message operations
 # ---------------------------------------------------------------------------
 
+def _card_without_schema(card: JsonObject) -> JsonObject:
+  """Strip 'schema' from a card dict (workaround for Lark 230099 on Card V2)."""
+  return {k: v for k, v in card.items() if k != "schema"}
+
+
 def send_card(token: str, chat_id: str, card: JsonObject) -> str:
   """Send an interactive card message. Returns message_id."""
   url = f"{BASE_URL}/im/v1/messages?receive_id_type=chat_id"
-  payload = {
-    "receive_id": chat_id,
-    "msg_type": "interactive",
-    "content": json.dumps(card),
-  }
+  candidates = [card]
+  if "schema" in card:
+    # Fallback: strip schema when Lark's universal-card service returns 230099.
+    candidates.append(_card_without_schema(card))
   data: JsonObject = {}
-  for attempt in range(3):
-    data = _request(url, token, payload)
-    if data.get("code") == 0:
-      return data["data"]["message_id"]
-    if attempt < 2:
-      time.sleep(1)
+  for c in candidates:
+    payload = {
+      "receive_id": chat_id,
+      "msg_type": "interactive",
+      "content": json.dumps(c),
+    }
+    for attempt in range(3):
+      data = _request(url, token, payload)
+      if data.get("code") == 0:
+        return data["data"]["message_id"]
+      if data.get("code") == 230099:
+        break  # try next candidate immediately
+      if attempt < 2:
+        time.sleep(1)
   raise RuntimeError(f"Failed to send card: {data}")
 
 
 def update_card(token: str, message_id: str, card: JsonObject) -> None:
   """PATCH an existing card message."""
   url = f"{BASE_URL}/im/v1/messages/{message_id}"
-  payload = {"msg_type": "interactive", "content": json.dumps(card)}
-  data = _request(url, token, payload, method="PATCH")
+  candidates = [card]
+  if "schema" in card:
+    candidates.append(_card_without_schema(card))
+  data: JsonObject = {}
+  for c in candidates:
+    payload = {"msg_type": "interactive", "content": json.dumps(c)}
+    data = _request(url, token, payload, method="PATCH")
+    if data.get("code") == 0:
+      return
+    if data.get("code") != 230099:
+      break  # non-recoverable error, stop trying
   if data.get("code") != 0:
     raise RuntimeError(f"Failed to update card: {data}")
 
