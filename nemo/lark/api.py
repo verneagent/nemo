@@ -105,6 +105,7 @@ def update_card(token: str, message_id: str, card: JsonObject) -> None:
   url = f"{BASE_URL}/im/v1/messages/{message_id}"
   candidates = [card]
   if "schema" in card:
+    # Fallback: strip schema when Lark's universal-card service returns 230099.
     candidates.append(_card_without_schema(card))
   data: JsonObject = {}
   for c in candidates:
