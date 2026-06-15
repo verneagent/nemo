@@ -1744,7 +1744,7 @@ async def main_loop(
               reply.operator_id,
             )
             continue
-          valid_agents = ("claude", "codex", "opencode")
+          valid_agents = ("claude", "claude-cli", "codex", "opencode")
           if agent_name not in valid_agents:
             # Should be unreachable (the dropdown only offers valid kinds),
             # but defend in case the wire delivers something weird.
