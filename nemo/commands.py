@@ -412,11 +412,23 @@ def try_dispatch(text: str, ctx: AgentContext) -> tuple[bool, str | None]:
 
   # /usage
   if t in ("/usage", "usage"):
+    # claude-cli drives the real interactive TUI, which has a rich /usage
+    # dashboard — forward to it (handled in agent.py via the __forward__ sentinel).
+    if ctx.agent == "claude-cli":
+      return True, "__forward__:/usage"
     if ctx.agent == "claude":
       return True, "Plan usage: [claude.ai/settings/usage](https://claude.ai/settings/usage)"
     if ctx.agent == "opencode":
       return True, "Usage is agent-specific under OpenCode. Run `opencode stats` locally for totals."
     return True, "Usage is agent-specific. Check the local CLI/account UI for totals."
+
+  # /compact — only the claude-cli agent can forward to the CLI's native
+  # context-compaction command; others have no equivalent host action.
+  if t in ("/compact", "compact"):
+    if ctx.agent == "claude-cli":
+      return True, "__forward__:/compact"
+    return True, ("`/compact` is only available with the `claude-cli` agent "
+                  "(it forwards to the CLI's own context compaction).")
 
   # /tokens
   if t in ("/tokens", "tokens"):

@@ -422,3 +422,40 @@ def test_run_turn_gives_up_after_max_reconnects() -> None:
   assert calls["reset"] == a._MAX_RECONNECT
   assert any(isinstance(e, ErrorEvent) for e in evs)
   assert any(isinstance(e, DoneEvent) for e in evs)
+
+
+# --- forwarded slash-command result scraping (/btw popup, /usage, /compact) ---
+
+def test_scrape_command_btw_popup() -> None:
+  from nemo.claude_cli_agent import _scrape_command_result
+  lines = [
+    "❯ /btw what is the secret word? answer in one word",
+    "  /btw what is the secret word? answer in one word",
+    "    zebra",
+    "  ↑/↓ to scroll · c to copy · f to fork · Esc to close",
+  ]
+  assert _scrape_command_result(lines, "/btw what is the secret word? answer in one word") == "zebra"
+
+
+def test_scrape_command_usage_popup() -> None:
+  from nemo.claude_cli_agent import _scrape_command_result
+  lines = [
+    "❯ /usage",
+    "  Usage credits",
+    "  34% of your usage was at >150k context",
+    "  Esc to cancel",
+  ]
+  out = _scrape_command_result(lines, "/usage")
+  assert "Usage credits" in out and "34%" in out
+  assert "Esc to cancel" not in out
+
+
+def test_scrape_command_compact_inline() -> None:
+  from nemo.claude_cli_agent import _scrape_command_result
+  lines = [
+    "❯ /compact",
+    "  ⎿  Not enough messages to compact.",
+    "────────────────────────",
+    "❯",
+  ]
+  assert _scrape_command_result(lines, "/compact") == "Not enough messages to compact."

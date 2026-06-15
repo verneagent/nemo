@@ -170,6 +170,27 @@ Correction above). `_SessionLog` tails that file after each turn:
   materialised. Verified live: after a `reset(resume)` (simulated daemon
   restart) the agent still recalled a secret word set before the restart.
 
+## Forwarded CLI-native commands (/btw, /compact, /usage)
+
+The interactive CLI has its own slash commands; claude-cli forwards a few that
+have no host-level equivalent by typing them into the live TUI and scraping the
+result (`_forward_command_sync` + `_scrape_command_result`):
+
+- **`/btw`** → the CLI's native "ask a quick side question without interrupting
+  the main conversation". `side_question()` types `/btw <q>`, waits past the
+  "✳ Answering…" spinner, scrapes the popup answer, dismisses it with ESC.
+  Verified: answered `zebra` from prior context.
+- **`/compact`** → inline result (`⎿ …`) scraped directly. Verified.
+- **`/usage`** → the usage/cost dashboard; the box-drawn overlay is de-boxed
+  (`│ 11% used │` → `11% used`) and splash chrome stripped. Verified: returns
+  cost, per-model usage, and reset times.
+
+These are screen-scraped (the only channel — `/btw`/`/usage` are ephemeral and
+not in the JSONL), so they're coupled to the popup layout; the scraper skips
+borders/spinner/splash and unwraps box rows. The session stays usable after each
+(ESC dismiss). `/fork` and `/session recall` are still unimplemented for
+claude-cli (would need a separate resumed read-only spawn).
+
 ## Remaining limitations
 
 - **Screen coupling is now only a fallback.** Answer/tools/thinking/usage/

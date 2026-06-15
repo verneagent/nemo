@@ -108,6 +108,18 @@ class CodingAgent(ABC):
     del question, sdk_session_id
     return ""
 
+  async def forward_native_command(self, command: str) -> str:
+    """Forward a CLI-native slash command (e.g. ``/compact``, ``/usage``) to the
+    underlying agent and return its rendered result as text.
+
+    Only the claude-cli (pty TUI) adapter implements this — it types the command
+    into the live TUI and scrapes the result. SDK/headless adapters have no such
+    surface, so the default is a no-op returning "" (the host then reports the
+    command as unsupported for that agent).
+    """
+    del command
+    return ""
+
   async def digest_transcript(self, transcript_path: str, fmt_hint: str) -> str:
     """Summarise a past session transcript in a FRESH, context-free session.
 

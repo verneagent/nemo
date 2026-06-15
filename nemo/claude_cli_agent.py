@@ -101,6 +101,10 @@ _WORKING_HINT = "esc to interrupt"
 # Footer shown once the TUI is booted and ready for input (both permission
 # modes render "shift+tab to cycle"); used for readiness detection.
 _READY_HINT = "shift+tab to cycle"
+# Footers of a forwarded-command popup (e.g. /btw, /usage). Their presence means
+# the command rendered an overlay whose body we scrape, then dismiss with ESC.
+_POPUP_FOOTERS = ("Esc to close", "Esc to cancel", "↑/↓ to scroll",
+                  "to copy", "f to fork")
 # A ⏺ line that is a tool call: a single CapitalCase identifier then "(".
 _TOOL_CALL_RE = re.compile(r"^[A-Z][A-Za-z0-9_]*\(")
 
@@ -346,6 +350,77 @@ def _new_tool_summaries(lines: list[str], prompt: str, seen: set[str]) -> list[s
       seen.add(head)
       out.append(head)
   return out
+
+
+def _scrape_command_result(lines: list[str], cmd_text: str) -> str:
+  """Scrape the result of a forwarded slash command (e.g. /btw, /usage,
+  /compact) from the screen.
+
+  Two render shapes are handled:
+    * popup/overlay (``/btw``, ``/usage``) — the body sits between the command
+      echo and a popup footer (``Esc to close`` / ``Esc to cancel`` / ``↑/↓``).
+    * inline result (``/compact``) — a ``⎿`` / ``⏺`` block right after the echo.
+  """
+  needle = cmd_text.strip()[:48]
+  # Anchor on the LAST echo of the command (the input echo or the popup title).
+  echo_idx = -1
+  for i, line in enumerate(lines):
+    s = line.strip()
+    if needle and needle in s and (s.startswith(_USER_ECHO) or s.startswith("/")):
+      echo_idx = i
+  region = lines[echo_idx + 1:] if echo_idx >= 0 else lines
+
+  # Popup: collect everything up to the footer, dropping a duplicated title line.
+  footer_idx = -1
+  for i, line in enumerate(region):
+    if any(fm in line for fm in _POPUP_FOOTERS):
+      footer_idx = i
+      break
+  if footer_idx >= 0:
+    body = []
+    for line in region[:footer_idx]:
+      inner = _debox(line)               # unwrap "│ content │" → "content"
+      if not inner or (needle and needle in inner) or _is_chrome(inner):
+        continue
+      body.append(inner)
+    return "\n".join(body).strip()
+
+  # Inline: a ⎿/⏺ result block until the input box border / next echo.
+  body = []
+  for line in region:
+    s = line.strip()
+    if not s or s.startswith("─") or _is_prompt_echo(s):
+      break
+    if _is_chrome(s):
+      continue
+    body.append(s.lstrip("⎿⏺ ").strip())
+  return "\n".join(b for b in body if b).strip()
+
+
+# Box-drawing / spinner lines that are popup chrome, not content.
+_CHROME_CHARS = set("─│╭╮╰╯┌┐└┘├┤┬┴┼ ")
+_BOX_EDGE = "─│╭╮╰╯┌┐└┘├┤┬┴┼ "
+_SPINNER_HINTS = ("Answering", "Thinking", "✳", "✻", "esc to interrupt")
+# Splash chrome that the /usage etc. overlay draws over.
+_SPLASH_HINTS = ("Claude Code v", "Welcome back", "Tips for getting started",
+                 "What's new", "setup issue", "/release-notes")
+
+
+def _debox(line: str) -> str:
+  """Unwrap a box-drawn row: strip surrounding borders/whitespace, keep inner
+  text. ``│ 34% usage │`` → ``34% usage``; a pure border → ``""``."""
+  return line.strip().strip(_BOX_EDGE).strip()
+
+
+def _is_chrome(stripped: str) -> bool:
+  """True for a popup border / splash / spinner line (not real content)."""
+  if not stripped:
+    return True
+  if all(ch in _CHROME_CHARS for ch in stripped):   # pure box-drawing
+    return True
+  if any(h in stripped for h in _SPINNER_HINTS):
+    return True
+  return any(h in stripped for h in _SPLASH_HINTS)
 
 
 # ---------------------------------------------------------------------------
@@ -1063,6 +1138,84 @@ class ClaudeCliCodingAgent(CodingAgent):
     # CLI's Escape semantics — context preserved).
     if self._tui is not None:
       self._tui.write(b"\x1b")
+
+  async def side_question(self, question: str, sdk_session_id: str) -> str:
+    """Answer a `/btw` side question by forwarding to the CLI's NATIVE `/btw`.
+
+    The interactive CLI has its own `/btw` ("ask a quick side question without
+    interrupting the main conversation") — it answers from the live session
+    context and renders in an ephemeral popup that is NOT written to the
+    transcript. We type `/btw <question>` into the live TUI, scrape the popup,
+    and dismiss it with ESC. Unlike the SDK's forked one-shot query this shares
+    the single pty, so it waits for any in-flight turn to finish first (it can't
+    truly interleave) — consistent with how `/btw` works in the TUI anyway.
+    """
+    del sdk_session_id  # the live TUI already holds the context
+    if self._tui is None or not self._tui.alive():
+      return ""
+    return await asyncio.to_thread(self._forward_command_sync, f"/btw {question}")
+
+  async def forward_native_command(self, command: str) -> str:
+    """Forward a CLI-native slash command (/compact, /usage, …) to the live TUI
+    and return its scraped result. See CodingAgent.forward_native_command."""
+    if self._tui is None or not self._tui.alive():
+      return ""
+    cmd = command if command.startswith("/") else f"/{command}"
+    return await asyncio.to_thread(self._forward_command_sync, cmd)
+
+  def _forward_command_sync(self, cmd_line: str) -> str:
+    """Worker-thread: submit a slash command to the TUI, wait for its popup or
+    inline result, scrape it, dismiss any popup with ESC, return the text."""
+    tui = self._tui
+    if tui is None or not tui.alive():
+      return ""
+    if not self._booted:
+      self._wait_ready(tui)
+    # Don't inject mid-turn — wait for the TUI to be idle first.
+    self._wait_idle(tui, timeout=self._TURN_TIMEOUT)
+    log.info("claude-cli forward command: %s", cmd_line.split()[0])
+    tui.submit(cmd_line)
+
+    start = time.monotonic()
+    last_display = ""
+    last_change = start
+    popup_ready_since: float | None = None
+    is_popup = False
+    needle = cmd_line.strip()[:48]
+    deadline = start + self._START_TIMEOUT + self._SETTLE + 30
+    while time.monotonic() < deadline:
+      time.sleep(self._POLL)
+      lines = tui.snapshot()
+      snap = "\n".join(lines)
+      popup = any(fm in snap for fm in _POPUP_FOOTERS)
+      # The popup can show a spinner ("✳ Answering…") before the real body.
+      busy = any(h in snap for h in _SPINNER_HINTS)
+      now = time.monotonic()
+      if snap != last_display:
+        last_display = snap
+        last_change = now
+      # Popup: a static overlay (e.g. /usage) keeps redrawing over the splash so
+      # full screen-stability may never hold — scrape a short grace after the
+      # footer appears and the spinner is gone.
+      if popup and not busy:
+        if popup_ready_since is None:
+          popup_ready_since = now
+        if now - popup_ready_since >= 1.5:
+          is_popup = True
+          break
+      else:
+        popup_ready_since = None
+      # Inline result (e.g. /compact): command echoed, screen idle + stable.
+      echoed = any(_is_prompt_echo(ln.strip()) and needle in ln for ln in lines)
+      if not popup and echoed and not busy and (now - last_change) >= self._SETTLE:
+        break
+    result = _scrape_command_result(tui.snapshot(), cmd_line)
+    if is_popup:
+      tui.write(b"\x1b")  # dismiss the popup so the session returns to normal
+      time.sleep(0.5)
+    log.info("claude-cli forward command done: %s (popup=%s, %d chars)",
+             cmd_line.split()[0], is_popup, len(result))
+    return result
 
   async def reset(self, project_dir: str, model: str, resume: str = "") -> None:
     # Respawn, resuming the persisted transcript so a model switch / reconnect /
