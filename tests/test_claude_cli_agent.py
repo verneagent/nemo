@@ -465,3 +465,29 @@ def test_scrape_command_compact_inline() -> None:
     "❯",
   ]
   assert _scrape_command_result(lines, "/compact") == "Not enough messages to compact."
+
+
+def test_reset_clear_creates_fresh_session() -> None:
+  """reset(resume="") should NOT fall back to self._session_id — /clear
+  must create a brand-new session, not resume the previous one."""
+  from nemo.claude_cli_agent import ClaudeCliCodingAgent
+  agent = ClaudeCliCodingAgent.__new__(ClaudeCliCodingAgent)
+  agent._session_id = "old-session-id"
+  agent._project_dir = "/tmp"
+  agent._model = "test-model"
+  agent._log = None
+  agent._hooks = None
+  agent._settings_path = ""
+  agent._hookdir = ""
+  agent._tui = None
+  spawned_with: list[str] = []
+  async def _fake_stop():
+    pass
+  async def _fake_spawn(resume: str):
+    spawned_with.append(resume)
+  agent.stop = _fake_stop
+  agent._spawn = _fake_spawn
+  import asyncio
+  asyncio.run(agent.reset(agent._project_dir, agent._model, resume=""))
+  assert agent._session_id == ""
+  assert spawned_with == [""], f"expected fresh session, got spawn({spawned_with})"

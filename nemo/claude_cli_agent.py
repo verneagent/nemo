@@ -1238,7 +1238,9 @@ class ClaudeCliCodingAgent(CodingAgent):
     await self.stop()
     self._project_dir = project_dir
     self._model = model
-    resume_id = resume or self._session_id
+    # resume="" means /clear — force a fresh session. Every real caller
+    # always passes an explicit resume id (daemon restart, model switch).
+    resume_id = resume
     self._session_id = resume_id
     await self._spawn(resume_id)
 
