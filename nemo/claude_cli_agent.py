@@ -134,6 +134,10 @@ def _classify_api_error(code: str, text: str) -> str:
   """Classify an api_error → 'rate_limit' | 'non_retryable' | 'transient' |
   'unknown'. Rate-limit is checked first (a 429 is technically transient but we
   must NOT hammer-retry it)."""
+  # 529 is a server-side overload (CloudFront / load-balancer), not a
+  # user rate-limit — reconnecting may route to a healthier backend.
+  if code == "529":
+    return "transient"
   blob = f"{code} {text}".lower()
   if any(s in blob for s in _RATE_LIMIT_SIGNALS):
     return "rate_limit"
@@ -516,9 +520,12 @@ class _SessionLog:
 
 
 def _sum_turn_usage(rows: list[JsonObject]) -> JsonObject:
-  """Sum per-message token usage across a turn's assistant rows → canonical
-  usage. Empty when no usage seen (card omits the token line)."""
-  inp = cr = cc = out = 0
+  """Extract the last assistant message's token usage → canonical usage.
+
+  The Claude Agent SDK reports **full-turn** usage on every assistant row
+  (not incremental per-message), so we take the last value — summing
+  across rows would multiply the real counts."""
+  last_inp = last_cr = last_cc = last_out = 0
   seen = False
   for row in rows:
     if row.get("type") != "assistant":
@@ -532,15 +539,15 @@ def _sum_turn_usage(rows: list[JsonObject]) -> JsonObject:
     def _i(key: str) -> int:
       v = usage.get(key)
       return max(0, int(v)) if isinstance(v, (int, float)) and not isinstance(v, bool) else 0
-    inp += _i("input_tokens")
-    cr += _i("cache_read_input_tokens")
-    cc += _i("cache_creation_input_tokens")
-    out += _i("output_tokens")
+    last_inp = _i("input_tokens")
+    last_cr = _i("cache_read_input_tokens")
+    last_cc = _i("cache_creation_input_tokens")
+    last_out = _i("output_tokens")
     seen = True
   if not seen:
     return {}
   return canonical_usage(
-    input_tokens=inp, cache_read=cr, cache_creation=cc, output_tokens=out)
+    input_tokens=last_inp, cache_read=last_cr, cache_creation=last_cc, output_tokens=last_out)
 
 
 # ---------------------------------------------------------------------------
@@ -570,6 +577,11 @@ def _new_turn_state() -> dict[str, object]:
 
 
 def _accumulate_usage(state: dict[str, object], usage: object) -> None:
+  """Record the latest usage snapshot from an assistant message.
+
+  The Claude Agent SDK reports **full-turn** usage on every assistant row
+  (not incremental per-message), so we keep only the last value — summing
+  across rows would multiply the real counts."""
   if not isinstance(usage, dict):
     return
   acc = state["usage"]
@@ -582,7 +594,7 @@ def _accumulate_usage(state: dict[str, object], usage: object) -> None:
   ):
     v = usage.get(src)
     if isinstance(v, (int, float)) and not isinstance(v, bool):
-      acc[dst] = int(acc.get(dst, 0)) + max(0, int(v))
+      acc[dst] = max(0, int(v))
 
 
 def _emit_jsonl_events(

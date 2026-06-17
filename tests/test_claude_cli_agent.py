@@ -131,6 +131,7 @@ def _arow(*, usage: dict | None = None) -> dict:
 
 
 def test_sum_turn_usage_sums_across_messages_to_canonical() -> None:
+  """Last assistant message's usage wins — the SDK reports full-turn usage."""
   rows = [
     _arow(usage={"input_tokens": 10, "output_tokens": 5,
                  "cache_read_input_tokens": 100, "cache_creation_input_tokens": 7}),
@@ -138,11 +139,12 @@ def test_sum_turn_usage_sums_across_messages_to_canonical() -> None:
                  "cache_read_input_tokens": 200}),
   ]
   u = _sum_turn_usage(rows)
-  assert u["input_tokens"] == 12
-  assert u["output_tokens"] == 13
-  assert u["cache_read_input_tokens"] == 300
-  assert u["cache_creation_input_tokens"] == 7
-  assert u["total_tokens"] == 12 + 13 + 300 + 7
+  # Last message wins (full-turn usage, not incremental)
+  assert u["input_tokens"] == 2
+  assert u["output_tokens"] == 8
+  assert u["cache_read_input_tokens"] == 200
+  assert u["cache_creation_input_tokens"] == 0  # not in last message
+  assert u["total_tokens"] == 2 + 8 + 200 + 0
 
 
 def test_sum_turn_usage_empty_when_no_usage() -> None:
@@ -301,6 +303,8 @@ def test_classify_api_error() -> None:
   assert _classify_api_error("", "fetch failed") == "transient"
   assert _classify_api_error("", "429 rate limit exceeded") == "rate_limit"
   assert _classify_api_error("", "overloaded") == "rate_limit"
+  assert _classify_api_error("529", "529 Overloaded") == "transient"
+  assert _classify_api_error("529", "Overloaded") == "transient"
   assert _classify_api_error("", "402 payment required") == "non_retryable"
   assert _classify_api_error("", "insufficient balance") == "non_retryable"
   assert _classify_api_error("", "weird novel error") == "unknown"
@@ -323,13 +327,14 @@ def test_jsonl_task_tool_emits_task_started() -> None:
 
 
 def test_jsonl_usage_accumulates() -> None:
+  """Last assistant message's usage wins — the SDK reports full-turn usage."""
   _, state = _run_jsonl([
     _amsg({"type": "text", "text": "a"}, usage={"input_tokens": 5, "output_tokens": 2}),
     _amsg({"type": "text", "text": "b"}, usage={"input_tokens": 3, "output_tokens": 4,
                                                  "cache_read_input_tokens": 10}),
   ])
-  assert state["usage"] == {"input_tokens": 8, "cache_read": 10,
-                            "cache_creation": 0, "output_tokens": 6}
+  assert state["usage"] == {"input_tokens": 3, "cache_read": 10,
+                            "cache_creation": 0, "output_tokens": 4}
 
 
 def _run_hooks(rows: list[dict]) -> tuple[list[TurnEvent], dict]:
