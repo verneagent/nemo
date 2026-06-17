@@ -115,7 +115,7 @@ _EFFORT_LEVELS = frozenset({"low", "medium", "high", "max"})
 # rate-limit: surfaced as a notice, NOT auto-retried (retrying just re-hits it).
 _RATE_LIMIT_SIGNALS = (
   "429", "rate limit", "rate_limit", "ratelimit", "too many requests",
-  "overloaded", "usage limit", "quota exceeded",
+  "usage limit", "quota exceeded",
 )
 # non-retryable: account/billing — retrying won't help.
 _NON_RETRYABLE_SIGNALS = (
@@ -126,7 +126,8 @@ _NON_RETRYABLE_SIGNALS = (
 _TRANSIENT_SIGNALS = (
   "econnreset", "econnrefused", "etimedout", "enetunreach", "eai_again",
   "socket hang up", "fetch failed", "unable to connect", "timed out",
-  "network", "connection error", "503", "502", "500", "529",
+  "network", "connection error", "overloaded",
+  "503", "502", "500", "529",
 )
 
 
@@ -136,7 +137,8 @@ def _classify_api_error(code: str, text: str) -> str:
   must NOT hammer-retry it)."""
   # 529 is a server-side overload (CloudFront / load-balancer), not a
   # user rate-limit — reconnecting may route to a healthier backend.
-  if code == "529":
+  # claude-cli may report 529 in the message text with an empty code field.
+  if code == "529" or "529" in text:
     return "transient"
   blob = f"{code} {text}".lower()
   if any(s in blob for s in _RATE_LIMIT_SIGNALS):

@@ -302,9 +302,10 @@ def test_classify_api_error() -> None:
   assert _classify_api_error("ECONNRESET", "Unable to connect") == "transient"
   assert _classify_api_error("", "fetch failed") == "transient"
   assert _classify_api_error("", "429 rate limit exceeded") == "rate_limit"
-  assert _classify_api_error("", "overloaded") == "rate_limit"
+  assert _classify_api_error("", "overloaded") == "transient"
   assert _classify_api_error("529", "529 Overloaded") == "transient"
   assert _classify_api_error("529", "Overloaded") == "transient"
+  assert _classify_api_error("", "529 Overloaded") == "transient"  # code field empty
   assert _classify_api_error("", "402 payment required") == "non_retryable"
   assert _classify_api_error("", "insufficient balance") == "non_retryable"
   assert _classify_api_error("", "weird novel error") == "unknown"
