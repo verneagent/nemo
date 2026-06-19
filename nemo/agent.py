@@ -804,8 +804,19 @@ def _format_session_delete_result(
       by_agent[s.agent] = by_agent.get(s.agent, 0) + 1
     detail = ", ".join(f"{count} {agent}" for agent, count in sorted(by_agent.items()))
     parts.append(f"Removed {len(result.deleted)} session(s) ({detail}).")
-  else:
+  elif not result.skipped_active:
     parts.append("No sessions matched the purge criteria.")
+
+  if result.skipped_active:
+    skipped = ", ".join(f"`{s.uuid[:8]}`" for s in result.skipped_active[:5])
+    more = (
+      "" if len(result.skipped_active) <= 5
+      else f" (+{len(result.skipped_active) - 5} more)"
+    )
+    parts.append(
+      f"Skipped {len(result.skipped_active)} active session(s) still in use "
+      f"by a running daemon: {skipped}{more}."
+    )
 
   if result.failures:
     failures = ", ".join(

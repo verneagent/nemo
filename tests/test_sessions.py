@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import time
 from unittest import mock
+
+import pytest
 
 from nemo import sessions
 
@@ -532,6 +535,85 @@ def test_purge_sessions_without_target_keeps_current(tmp_path):
   ]
   assert os.path.exists(current_path)
   assert not os.path.exists(old_path)
+
+
+def test_session_is_active_detects_open_transcript(tmp_path):
+  # An open file handle is ground truth that a daemon is using the
+  # session; lsof must report it as active and report it inactive once
+  # the handle is closed.
+  if shutil.which("lsof") is None:
+    pytest.skip("lsof not available on this host")
+  path = str(tmp_path / "live.jsonl")
+  with open(path, "w", encoding="utf-8") as f:
+    f.write("{}\n")
+    f.flush()
+    assert sessions._session_is_active(path) is True
+  assert sessions._session_is_active(path) is False
+
+
+def test_session_is_active_false_without_lsof(tmp_path):
+  # No lsof → can't probe → preserve "delete anything" behaviour.
+  path = str(tmp_path / "x.jsonl")
+  with open(path, "w", encoding="utf-8") as f:
+    f.write("{}\n")
+  with mock.patch.object(sessions.shutil, "which", return_value=None):
+    assert sessions._session_is_active(path) is False
+
+
+def test_remove_session_skips_active_session(tmp_path):
+  home = str(tmp_path / "home")
+  project = str(tmp_path / "project")
+  os.makedirs(project, exist_ok=True)
+  path = _claude_session(home, project, "abc12345-0000-0000-0000-000000000000", [
+    {"type": "user", "message": {"role": "user", "content": "in use"}},
+  ])
+  with mock.patch.dict(os.environ, {"HOME": home}), \
+       mock.patch.object(sessions, "_session_is_active", return_value=True):
+    result = sessions.remove_session(project, "abc12345")
+  assert [s.uuid for s in result.skipped_active] == [
+    "abc12345-0000-0000-0000-000000000000"
+  ]
+  assert result.deleted == []
+  assert os.path.exists(path)  # an in-progress session is never removed
+
+
+def test_purge_skips_active_sessions_of_other_daemons(tmp_path):
+  # Two sessions share the workspace: the current daemon's (excluded by
+  # uuid) and another daemon's still-live one. Purge must keep the live
+  # one even though it isn't this daemon's "current".
+  home = str(tmp_path / "home")
+  project = str(tmp_path / "project")
+  os.makedirs(project, exist_ok=True)
+  current_path = _claude_session(
+    home, project, "aaaaaaaa-0000-0000-0000-000000000000", [
+      {"type": "user", "message": {"role": "user", "content": "current"}},
+    ])
+  live_other_path = _claude_session(
+    home, project, "bbbbbbbb-0000-0000-0000-000000000000", [
+      {"type": "user", "message": {"role": "user", "content": "other live"}},
+    ])
+  dead_path = _claude_session(
+    home, project, "cccccccc-0000-0000-0000-000000000000", [
+      {"type": "user", "message": {"role": "user", "content": "dead"}},
+    ])
+
+  def fake_active(path: str) -> bool:
+    return path == live_other_path
+
+  with mock.patch.dict(os.environ, {"HOME": home}), \
+       mock.patch.object(sessions, "_session_is_active", side_effect=fake_active):
+    result = sessions.purge_sessions(
+      project, current_uuid="aaaaaaaa-0000-0000-0000-000000000000")
+
+  assert [s.uuid for s in result.deleted] == [
+    "cccccccc-0000-0000-0000-000000000000"
+  ]
+  assert [s.uuid for s in result.skipped_active] == [
+    "bbbbbbbb-0000-0000-0000-000000000000"
+  ]
+  assert os.path.exists(current_path)
+  assert os.path.exists(live_other_path)
+  assert not os.path.exists(dead_path)
 
 
 # ---------------------------------------------------------------------------

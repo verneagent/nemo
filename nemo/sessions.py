@@ -15,6 +15,8 @@ import glob as _glob
 import json
 import os
 import re
+import shutil
+import subprocess
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Iterable
@@ -48,6 +50,7 @@ class SessionDeleteResult:
   deleted: list[SessionInfo] = field(default_factory=list)
   failures: list[SessionDeleteFailure] = field(default_factory=list)
   ambiguous: list[SessionInfo] = field(default_factory=list)
+  skipped_active: list[SessionInfo] = field(default_factory=list)
   not_found: str = ""
 
 
@@ -608,9 +611,38 @@ def write_cached_digest(info: SessionInfo, digest: str) -> None:
     pass
 
 
+def _session_is_active(path: str) -> bool:
+  """True if a live process currently holds the transcript open.
+
+  The running Claude CLI / Codex SDK keeps its session JSONL open for
+  append while a daemon is alive, so an open file handle is ground truth
+  that *some* daemon is using this session right now — far more reliable
+  than ``~/.nemo/pids`` (which goes stale on crash/kill and is subject to
+  PID reuse) and independent of chat_id/DB. We use it to refuse deleting a
+  session another daemon sharing this workspace is live on.
+
+  If lsof isn't installed we can't probe, so return False (preserve the
+  old "delete anything" behavior rather than refusing every delete). If
+  lsof is present but the probe itself errors, assume active to be safe.
+  """
+  if shutil.which("lsof") is None:
+    return False
+  try:
+    proc = subprocess.run(
+      ["lsof", "-t", "--", path],
+      capture_output=True, text=True, timeout=5,
+    )
+  except (OSError, subprocess.SubprocessError):
+    return True
+  return bool(proc.stdout.strip())
+
+
 def _delete_session_files(candidates: Iterable[SessionInfo]) -> SessionDeleteResult:
   result = SessionDeleteResult()
   for session in candidates:
+    if _session_is_active(session.path):
+      result.skipped_active.append(session)
+      continue
     try:
       os.remove(session.path)
     except OSError as e:
