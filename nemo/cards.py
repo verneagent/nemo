@@ -12,12 +12,29 @@ All phases update the SAME message via Lark PATCH API.
 
 from __future__ import annotations
 
+import json
 import os
 import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 from .types import JsonObject
+
+
+# The inline thinking timeline is trimmed (oldest entries dropped first) to
+# this many characters so a very long turn — hundreds of thinking/tool steps,
+# which for a done card collapse into a SINGLE uncapped group — cannot blow
+# the Lark card size limit. The full, uncapped timeline is attached as a .md
+# file by the done-card path when this trim kicks in, so no detail is lost.
+# See _update_done_card_with_fallback in agent.py.
+TIMELINE_CHAR_BUDGET = 18000
+
+# Lark Card V2 content (the JSON string sent in the `content` field) has a
+# hard size limit (~30 KB). A card that exceeds it is accepted by Lark with
+# code=0 but renders an EMPTY body — no exception is raised — so callers must
+# detect oversize proactively rather than rely on update_card to fail. Leave
+# margin under the documented 30 KB ceiling.
+LARK_CARD_BYTE_LIMIT = 28000
 
 if TYPE_CHECKING:
   from .channel import AnsweredQuestion, PendingQuestion
@@ -250,21 +267,15 @@ def _render_tool_lines(tool_steps: list[ThinkingStep]) -> list[str]:
   return lines
 
 
-def _collapsible_thinking(steps: list[ThinkingStep]) -> JsonObject:
-  """Build a collapsible_panel with grouped narrative text + tool lines.
+def _timeline_entries(
+  groups: list[tuple[str, list[ThinkingStep]]],
+) -> list[tuple[str, str]]:
+  """Build ordered ("text" | "tool" | "divider", content) timeline entries.
 
-  Steps are split into groups at each text step. Each group shows:
-  - The group's text (default font)
-  - Any thinking steps (default font)
-  - The last MAX_TOOLS_PER_GROUP tool calls (small font, grey type)
-  - A "+N earlier" indicator if tools were dropped
-
-  Header shows the number of groups, not the total step count.
+  Each group renders its text, then its thinking steps, then the last
+  MAX_TOOLS_PER_GROUP tool calls (with a "+N earlier" indicator if dropped).
   Groups are separated by a horizontal rule.
   """
-  groups = _split_into_groups(steps)
-
-  # Each entry: ("text" | "tool" | "divider", content)
   entries: list[tuple[str, str]] = []
   for i, (text, grp_steps) in enumerate(groups):
     if i > 0:
@@ -300,6 +311,69 @@ def _collapsible_thinking(steps: list[ThinkingStep]) -> JsonObject:
       ))
     for line in _render_tool_lines(kept_tools):
       entries.append(("tool", line))
+  return entries
+
+
+def _trim_entries_to_budget(
+  entries: list[tuple[str, str]],
+) -> tuple[list[tuple[str, str]], int]:
+  """Drop oldest entries until under TIMELINE_CHAR_BUDGET.
+
+  Returns (kept_entries, omitted_count). A done card's whole timeline is a
+  single uncapped group, so the per-group tool cap alone can't bound it —
+  this byte budget is the backstop that guarantees the panel fits.
+  """
+  def _sz(e: tuple[str, str]) -> int:
+    return len(e[1]) + 8  # + small per-element JSON overhead estimate
+
+  total = sum(_sz(e) for e in entries)
+  omitted = 0
+  while entries and total > TIMELINE_CHAR_BUDGET:
+    e = entries.pop(0)
+    total -= _sz(e)
+    if e[0] != "divider":
+      omitted += 1
+  # Trimming can leave a now-leading divider — drop it.
+  while entries and entries[0][0] == "divider":
+    entries.pop(0)
+  return entries, omitted
+
+
+def timeline_overflows(steps: list[ThinkingStep]) -> bool:
+  """True if the timeline would be trimmed to fit (i.e. detail was dropped).
+
+  The done-card path uses this to decide whether to attach the full,
+  uncapped timeline as a .md file.
+  """
+  entries = _timeline_entries(_split_into_groups(steps))
+  _, omitted = _trim_entries_to_budget(entries)
+  return omitted > 0
+
+
+def _collapsible_thinking(steps: list[ThinkingStep]) -> JsonObject:
+  """Build a collapsible_panel with grouped narrative text + tool lines.
+
+  Steps are split into groups at each text step. Each group shows:
+  - The group's text (default font)
+  - Any thinking steps (default font)
+  - The last MAX_TOOLS_PER_GROUP tool calls (small font, grey type)
+  - A "+N earlier" indicator if tools were dropped
+
+  The whole timeline is then trimmed to TIMELINE_CHAR_BUDGET (oldest entries
+  first) so it can never exceed Lark's card size limit. Header shows the
+  number of groups, not the total step count. Groups are separated by an hr.
+  """
+  groups = _split_into_groups(steps)
+  total_groups = len(groups)
+  entries = _timeline_entries(groups)
+
+  entries, omitted = _trim_entries_to_budget(entries)
+  if omitted:
+    entries.insert(0, (
+      "text",
+      f"<font color='grey'>… {omitted} earlier timeline "
+      f"entr{'ies' if omitted != 1 else 'y'} omitted</font>",
+    ))
 
   # Coalesce consecutive entries of the same kind into markdown blocks.
   elements: list[JsonObject] = []
@@ -338,12 +412,47 @@ def _collapsible_thinking(steps: list[ThinkingStep]) -> JsonObject:
     "header": {
       "title": {
         "tag": "plain_text",
-        "content": f"Thinking ({len(groups)})",
+        "content": f"Thinking ({total_groups})",
       },
     },
     "vertical_spacing": "4px",
     "elements": elements,
   }
+
+
+def card_content_bytes(card: JsonObject) -> int:
+  """Serialized size of a card's `content`, as Lark measures it (utf-8)."""
+  return len(json.dumps(card, ensure_ascii=False).encode("utf-8"))
+
+
+def is_card_oversized(card: JsonObject) -> bool:
+  """True if the card exceeds Lark's content size limit.
+
+  Lark accepts an oversized card with code=0 but renders an empty body, so
+  callers must check this before PATCHing instead of relying on an exception.
+  """
+  return card_content_bytes(card) > LARK_CARD_BYTE_LIMIT
+
+
+def render_timeline_markdown(steps: list[ThinkingStep]) -> str:
+  """Render the FULL (uncapped) thinking timeline as plain markdown.
+
+  Used to attach a long turn's complete timeline as a .md file when the
+  inline card panel is capped to MAX_THINKING_GROUPS.
+  """
+  groups = _split_into_groups(steps)
+  out: list[str] = []
+  for i, (text, grp_steps) in enumerate(groups):
+    out.append(f"## Step group {i + 1}/{len(groups)}")
+    if text:
+      out.append(text)
+    for s in grp_steps:
+      if s.kind in ("thinking", "reasoning"):
+        out.append(f"> {s.content}")
+      elif s.kind == "tool":
+        out.append(f"- {s.content}")
+    out.append("")
+  return "\n".join(out).rstrip() + "\n"
 
 
 def _note_element(text: str) -> JsonObject:

@@ -1716,7 +1716,7 @@ class _FakeUpdateChannel:
     return outcome
 
 
-def _run_fallback(channel, final_text="answer body", compact_notice=""):
+def _run_fallback(channel, final_text="answer body", compact_notice="", thinking=None):
   """Drive _update_done_card_with_fallback with identity await_channel."""
   register_calls = []
   return _update_done_card_with_fallback(
@@ -1724,7 +1724,7 @@ def _run_fallback(channel, final_text="answer body", compact_notice=""):
     chat_id="oc_test",
     turn_card_id="om_card0",
     final_text=final_text,
-    thinking=[],
+    thinking=thinking or [],
     elapsed=1,
     usage={"input_tokens": 1},
     session_id="sess_x",
@@ -1810,6 +1810,51 @@ def test_done_card_auth_error_skips_fallback_chain():
   assert len(channel.calls) == 1
   upload.assert_not_called()
   send_file.assert_not_called()
+
+
+def test_done_card_oversized_body_uploads_file_without_doomed_patch():
+  # The empty-card bug: Lark 200s an oversized card but renders it EMPTY, so
+  # we must detect oversize proactively and never PATCH the doomed card.
+  from nemo.cards import LARK_CARD_BYTE_LIMIT
+  channel = _FakeUpdateChannel(outcomes=["om_card_file"])
+  huge_body = "x" * (LARK_CARD_BYTE_LIMIT + 5000)
+
+  with mock.patch("nemo.lark.api.upload_file", return_value="fk") as upload, \
+       mock.patch("nemo.lark.api.send_file") as send_file:
+    result = _run_fallback(channel, final_text=huge_body)
+
+  # No oversized full_card was ever sent — the single update_card call carries
+  # only the short preview, and the body went out as a file.
+  upload.assert_called_once()
+  send_file.assert_called_once()
+  assert len(channel.calls) == 1
+  _, preview_card = channel.calls[0]
+  assert "sent as file" in repr(preview_card)
+  assert result == "om_card_file"
+
+
+def test_done_card_huge_timeline_attaches_file_and_updates_normally():
+  # A huge timeline must be preserved as a .md file while the (now bounded)
+  # done card still PATCHes normally — the inline panel is trimmed, not empty.
+  from nemo.cards import ThinkingStep, timeline_overflows
+  huge_thinking = []
+  for i in range(1500):
+    huge_thinking.append(
+      ThinkingStep("thinking", f"reasoning block {i} " + "x" * 120))
+    huge_thinking.append(ThinkingStep("tool", f"Read: file_{i}.py"))
+  assert timeline_overflows(huge_thinking)
+  channel = _FakeUpdateChannel(outcomes=["om_card1"])
+
+  with mock.patch("nemo.lark.api.upload_file", return_value="fk") as upload, \
+       mock.patch("nemo.lark.api.send_file") as send_file:
+    result = _run_fallback(channel, thinking=huge_thinking)
+
+  # Timeline went out as a file…
+  upload.assert_called_once()
+  send_file.assert_called_once()
+  # …and the done card still updated in a single normal PATCH.
+  assert result == "om_card1"
+  assert len(channel.calls) == 1
 
 
 def test_should_send_plain_text_for_short_natural_language():

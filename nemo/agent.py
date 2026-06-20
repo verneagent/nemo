@@ -31,6 +31,7 @@ from .fork import ForkManager
 from .config import load_credentials
 from .db import Database
 from .lark_channel import LarkChannel
+from .types import JsonObject
 from .turn import (
   AnswerEvent, CompactNoticeEvent, CompactStartedEvent, DoneEvent,
   ProgressEvent, RateLimitNoticeEvent, StaleLeakNoticeEvent,
@@ -260,6 +261,68 @@ def _cancel_emoji(elapsed: float) -> str:
   return "🫠"
 
 
+def _attach_timeline_file(
+  channel: LarkChannel, chat_id: str, thinking,
+) -> None:
+  """Upload the full (uncapped) thinking timeline as a .md file.
+
+  Called when the inline card panel is trimmed (cards.TIMELINE_CHAR_BUDGET) so
+  a very long turn's complete timeline is preserved despite the bounded card.
+  Best-effort: a failed attach must never block the done card.
+  """
+  try:
+    import tempfile
+    text = cards.render_timeline_markdown(thinking)
+    file_dir = os.path.join("/tmp/nemo", "nemo-files")
+    os.makedirs(file_dir, exist_ok=True)
+    fd, path = tempfile.mkstemp(
+      suffix=".md", prefix="nemo-timeline-", dir=file_dir)
+    with os.fdopen(fd, "w") as f:
+      f.write(text)
+    from .lark import api as lark_api
+    file_key = lark_api.upload_file(channel.token, path)
+    lark_api.send_file(channel.token, chat_id, file_key)
+    log.info(
+      "Attached full timeline as file (%d steps): %s",
+      len(thinking), path)
+  except Exception as e:
+    log.warning("Failed to attach timeline file: %s", e)
+
+
+def _upload_body_as_file(
+  *,
+  channel: LarkChannel,
+  chat_id: str,
+  turn_card_id: str,
+  final_text: str,
+  build_card,
+  patch,
+) -> str:
+  """Upload `final_text` as a .md file and patch the card with a short preview.
+
+  Used as the terminal fallback when the body itself is too large to render
+  inline. Returns the resulting card id.
+  """
+  try:
+    import tempfile
+    file_dir = os.path.join("/tmp/nemo", "nemo-files")
+    os.makedirs(file_dir, exist_ok=True)
+    fd, overflow_path = tempfile.mkstemp(
+      suffix=".md", prefix="nemo-response-", dir=file_dir)
+    with os.fdopen(fd, "w") as f:
+      f.write(final_text)
+    from .lark import api as lark_api
+    file_key = lark_api.upload_file(channel.token, overflow_path)
+    lark_api.send_file(channel.token, chat_id, file_key)
+    log.info("Sent overflow response as file: %s", overflow_path)
+    preview = final_text[:500].rsplit("\n", 1)[0]
+    preview += f"\n\n_…full response ({len(final_text)} chars) sent as file_"
+    turn_card_id = patch(build_card(preview))
+  except Exception as e:
+    log.warning("Failed to send overflow fallback: %s", e)
+  return turn_card_id
+
+
 def _update_done_card_with_fallback(
   *,
   channel: LarkChannel,
@@ -277,24 +340,53 @@ def _update_done_card_with_fallback(
 ) -> str:
   """Update the done card with tiered fallback; return the resulting id.
 
-  1. Try the full-body card.
-  2. On failure (other than auth-class HTTPError), retry with a truncated
-     preview — this recovers transport blips and card-body-too-large alike.
-  3. If the preview retry also fails, upload the full text as a .md file
-     and update the card with a short preview + "sent as file" note.
+  The inline timeline is bounded (cards.TIMELINE_CHAR_BUDGET); when it was
+  trimmed, the full timeline is attached as a .md file so no detail is lost.
+
+  Card-size handling:
+  - Lark accepts an oversized card with code=0 but renders an EMPTY body (no
+    exception), so we check size proactively rather than wait for a failure.
+  - An oversized card now can only come from a huge final_text (the timeline
+    is bounded) — that goes straight to the body-as-file fallback.
+  - A transport blip (exception) still retries with a truncated preview, then
+    the file fallback, as before.
   """
-  full_card = cards.build_turn_card(
-    "done", body=final_text, steps=thinking,
-    elapsed=elapsed, usage=usage, session_id=session_id,
-    compact_notice=compact_notice,
-    answered_questions=answered_questions,
-  )
-  try:
+  # Preserve the full timeline as a file when the inline panel was trimmed.
+  if cards.timeline_overflows(thinking):
+    _attach_timeline_file(channel, chat_id, thinking)
+
+  def _build(body: str) -> JsonObject:
+    return cards.build_turn_card(
+      "done", body=body, steps=thinking,
+      elapsed=elapsed, usage=usage, session_id=session_id,
+      compact_notice=compact_notice,
+      answered_questions=answered_questions,
+    )
+
+  def _patch(card: JsonObject) -> str:
+    nonlocal turn_card_id
     prev_id = turn_card_id
-    turn_card_id = await_channel(channel.update_card(turn_card_id, full_card))
+    turn_card_id = await_channel(channel.update_card(turn_card_id, card))
     if turn_card_id != prev_id:
       register_msg(turn_card_id, chat_id)
     return turn_card_id
+
+  full_card = _build(final_text)
+
+  # Proactive size guard: an oversized card would 200 + render empty, so skip
+  # the doomed PATCH and go straight to the body-as-file fallback.
+  if cards.is_card_oversized(full_card):
+    log.warning(
+      "Done card too large (%d > %d bytes) — uploading body as file",
+      cards.card_content_bytes(full_card), cards.LARK_CARD_BYTE_LIMIT)
+    if not final_text:
+      return turn_card_id
+    return _upload_body_as_file(
+      channel=channel, chat_id=chat_id, turn_card_id=turn_card_id,
+      final_text=final_text, build_card=_build, patch=_patch)
+
+  try:
+    return _patch(full_card)
   except Exception as e:
     log.warning("Failed to update done card: %s", e)
     first_err = e
@@ -306,51 +398,16 @@ def _update_done_card_with_fallback(
   ) or not final_text:
     return turn_card_id
 
-  preview_body = _truncate_for_preview(final_text)
-  preview_card = cards.build_turn_card(
-    "done", body=preview_body, steps=thinking,
-    elapsed=elapsed, usage=usage, session_id=session_id,
-    compact_notice=compact_notice,
-    answered_questions=answered_questions,
-  )
-  try:
-    prev_id = turn_card_id
-    turn_card_id = await_channel(
-      channel.update_card(turn_card_id, preview_card))
-    if turn_card_id != prev_id:
-      register_msg(turn_card_id, chat_id)
-    return turn_card_id
-  except Exception as e:
-    log.warning("Preview card update also failed: %s", e)
+  preview_card = _build(_truncate_for_preview(final_text))
+  if not cards.is_card_oversized(preview_card):
+    try:
+      return _patch(preview_card)
+    except Exception as e:
+      log.warning("Preview card update also failed: %s", e)
 
-  try:
-    import tempfile
-    file_dir = os.path.join("/tmp/nemo", "nemo-files")
-    os.makedirs(file_dir, exist_ok=True)
-    fd, overflow_path = tempfile.mkstemp(
-      suffix=".md", prefix="nemo-response-", dir=file_dir)
-    with os.fdopen(fd, "w") as f:
-      f.write(final_text)
-    from .lark import api as lark_api
-    file_key = lark_api.upload_file(channel.token, overflow_path)
-    lark_api.send_file(channel.token, chat_id, file_key)
-    log.info("Sent overflow response as file: %s", overflow_path)
-    preview = final_text[:500].rsplit("\n", 1)[0]
-    preview += f"\n\n_…full response ({len(final_text)} chars) sent as file_"
-    fallback_card = cards.build_turn_card(
-      "done", body=preview, steps=thinking,
-      elapsed=elapsed, usage=usage, session_id=session_id,
-      compact_notice=compact_notice,
-      answered_questions=answered_questions,
-    )
-    prev_id = turn_card_id
-    turn_card_id = await_channel(
-      channel.update_card(turn_card_id, fallback_card))
-    if turn_card_id != prev_id:
-      register_msg(turn_card_id, chat_id)
-  except Exception as e:
-    log.warning("Failed to send overflow fallback: %s", e)
-  return turn_card_id
+  return _upload_body_as_file(
+    channel=channel, chat_id=chat_id, turn_card_id=turn_card_id,
+    final_text=final_text, build_card=_build, patch=_patch)
 
 
 async def _handle_turn_error(

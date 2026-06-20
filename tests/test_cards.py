@@ -10,6 +10,9 @@ from nemo.cards import (
   build_session_picker_card, build_session_recalled_card,
   tool_use_summary, _elapsed_title, _elapsed_text, _usage_text,
   _collapsible_thinking,
+  LARK_CARD_BYTE_LIMIT, TIMELINE_CHAR_BUDGET,
+  card_content_bytes, is_card_oversized, timeline_overflows,
+  render_timeline_markdown,
 )
 
 
@@ -298,6 +301,76 @@ def test_collapsible_thinking_empty():
   """Empty steps list — should not normally be rendered but handle gracefully."""
   panel = _collapsible_thinking([])
   assert "Thinking (0)" in panel["header"]["title"]["content"]
+
+
+# ---------------------------------------------------------------------------
+# Timeline size bounding (SDK-#788 empty-card regression)
+# ---------------------------------------------------------------------------
+
+def _huge_single_group(n: int = 1500) -> list[ThinkingStep]:
+  """A long turn's timeline: many thinking/tool steps, NO answer steps.
+
+  A done card filters out answer steps, so the whole timeline collapses into
+  a SINGLE uncapped group — exactly the shape that blew the card size limit
+  and made Lark render an empty body (no exception → no fallback).
+  """
+  steps: list[ThinkingStep] = []
+  for i in range(n):
+    steps.append(ThinkingStep("thinking", f"reasoning block {i} " + "x" * 120))
+    steps.append(ThinkingStep("tool", f"Read: /some/path/file_{i}.py"))
+  return steps
+
+
+def test_timeline_overflows_false_for_short_timeline():
+  steps = [ThinkingStep("tool", "Read: a.py"), ThinkingStep("thinking", "hi")]
+  assert timeline_overflows(steps) is False
+
+
+def test_timeline_overflows_true_for_huge_single_group():
+  assert timeline_overflows(_huge_single_group()) is True
+
+
+def test_collapsible_thinking_trims_huge_timeline_under_budget():
+  panel = _collapsible_thinking(_huge_single_group())
+  # The panel itself must be bounded by the char budget (with margin).
+  size = len(json.dumps(panel, ensure_ascii=False).encode("utf-8"))
+  assert size <= TIMELINE_CHAR_BUDGET + 2000
+  # A breadcrumb must explain the dropped entries.
+  serialized = json.dumps(panel, ensure_ascii=False)
+  assert "earlier timeline" in serialized
+
+
+def test_done_card_with_huge_timeline_not_oversized():
+  """The bug: a huge timeline made the done card exceed Lark's limit, which
+  Lark accepted with code=0 but rendered empty. The trim must keep the card
+  under the limit AND preserve the final answer body."""
+  card = build_turn_card(
+    "done", body="All 5 phases complete and committed.",
+    steps=_huge_single_group(), elapsed=9000,
+    usage={"input_tokens": 6}, session_id="262948fd",
+  )
+  assert is_card_oversized(card) is False
+  assert "All 5 phases complete" in json.dumps(card, ensure_ascii=False)
+
+
+def test_is_card_oversized_for_huge_body():
+  big = build_turn_card("done", body="Z" * 40000, elapsed=1, session_id="x")
+  assert is_card_oversized(big) is True
+  assert card_content_bytes(big) > LARK_CARD_BYTE_LIMIT
+
+
+def test_render_timeline_markdown_includes_all_steps():
+  steps = [
+    ThinkingStep("thinking", "first thought"),
+    ThinkingStep("tool", "Read: a.py"),
+    ThinkingStep("answer", "interim answer"),
+    ThinkingStep("tool", "Edit: b.py"),
+  ]
+  md = render_timeline_markdown(steps)
+  assert "first thought" in md
+  assert "Read: a.py" in md
+  assert "interim answer" in md
+  assert "Edit: b.py" in md
 
 
 # ---------------------------------------------------------------------------
