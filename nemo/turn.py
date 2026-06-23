@@ -438,7 +438,6 @@ async def _single_turn(
   stale_tasks: set[str],
   stop_task_disabled: list[bool],
   is_paused: Callable[[], bool] | None = None,
-  pending_steers: list[int] | None = None,
 ) -> _TurnResult:
   """Issue one query() and consume its receive_response() stream.
 
@@ -458,13 +457,6 @@ async def _single_turn(
   paused the progress/heartbeat watchdog is held off so it never force-
   reconnects mid-prompt (which would tear down the in-flight question and
   re-ask it, discarding the user's selections).
-
-  ``pending_steers`` (optional) is a one-element mutable counter shared with
-  the steering path: each mid-turn ``client.query()`` injection bumps it.
-  Because every ``query()`` yields its own ``ResultMessage``, a steer
-  produces an *extra* Result mid-stream. While the counter is positive we
-  absorb that Result (decrement + keep consuming) instead of ending the turn,
-  so the steered follow-up runs in the SAME turn / on the SAME card.
   """
   from claude_agent_sdk import (
     AssistantMessage, TextBlock, ThinkingBlock, ToolUseBlock, ResultMessage,
@@ -728,19 +720,6 @@ async def _single_turn(
         pending_tasks.clear()
         raise TransientAPIError(err_sample)
 
-      # Mid-turn steer absorption: a follow-up was injected via client.query()
-      # while this turn was running, and each query() yields its own Result.
-      # Swallow this Result and keep consuming so the steered message runs in
-      # the same turn. Reset the progress clock — the steer's own messages are
-      # the next real progress. We deliberately do NOT run the stale-task
-      # cleanup here: the conversation continues, so pending tasks are not stale.
-      if pending_steers is not None and pending_steers[0] > 0:
-        pending_steers[0] -= 1
-        log.info("absorbing steer result (%d steer(s) still pending)",
-                 pending_steers[0])
-        last_progress_at = _time.monotonic()
-        continue
-
       # Mark remaining pending tasks as stale for future turns.
       for tid in list(pending_tasks):
         stale_tasks.add(tid)
@@ -775,7 +754,6 @@ async def run_turn(
   on_event: Callable[[TurnEvent], None],
   stale_tasks: set[str] | None = None,
   is_paused: Callable[[], bool] | None = None,
-  pending_steers: list[int] | None = None,
 ) -> tuple[float, JsonObject]:
   """Send prompt to SDK client, stream responses, emit events.
 
@@ -798,7 +776,6 @@ async def run_turn(
   # straight through; the reconnect layer owns recovery.
   result = await _single_turn(
     client, prompt, on_event, stale_tasks, stop_task_disabled, is_paused,
-    pending_steers,
   )
 
   total_cost = result.cost

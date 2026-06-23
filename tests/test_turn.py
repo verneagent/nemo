@@ -246,53 +246,6 @@ def test_task_lifecycle():
   assert any(isinstance(e, TaskDoneEvent) and e.task_id == "task_1" for e in events)
 
 
-def test_steer_absorbs_extra_result():
-  """A mid-turn steer injects a query() → a second ResultMessage. With the
-  pending-steers counter set, _single_turn absorbs the first Result and keeps
-  consuming so the steered follow-up lands in the SAME turn (one DoneEvent)."""
-  messages = [
-    FakeAssistantMessage(content=[FakeTextBlock(text="first answer")]),
-    FakeResultMessage(total_cost_usd=0.01),
-    FakeAssistantMessage(content=[FakeTextBlock(text="steered answer")]),
-    FakeResultMessage(total_cost_usd=0.02),
-  ]
-  events = []
-  pending = [1]
-  async def _run():
-    with mock.patch.dict("sys.modules", _sdk_modules()):
-      client = FakeClient(messages)
-      cost, _usage = await run_turn(
-        client, "do it", events.append, pending_steers=pending)
-      assert cost == 0.02  # final result wins
-      assert pending[0] == 0  # the extra result was absorbed
-  asyncio.run(_run())
-  answers = [e.text for e in events if isinstance(e, AnswerEvent)]
-  assert "first answer" in answers
-  assert "steered answer" in answers
-  done = [e for e in events if isinstance(e, DoneEvent)]
-  assert len(done) == 1  # single turn-end despite two ResultMessages
-
-
-def test_no_steer_ends_at_first_result():
-  """Without a pending steer, the first ResultMessage ends the turn — any
-  later messages in the stream are never consumed."""
-  messages = [
-    FakeAssistantMessage(content=[FakeTextBlock(text="first answer")]),
-    FakeResultMessage(total_cost_usd=0.01),
-    FakeAssistantMessage(content=[FakeTextBlock(text="never seen")]),
-    FakeResultMessage(total_cost_usd=0.02),
-  ]
-  events = []
-  async def _run():
-    with mock.patch.dict("sys.modules", _sdk_modules()):
-      client = FakeClient(messages)
-      cost, _usage = await run_turn(client, "do it", events.append)
-      assert cost == 0.01
-  asyncio.run(_run())
-  answers = [e.text for e in events if isinstance(e, AnswerEvent)]
-  assert answers == ["first answer"]
-
-
 def test_stale_leak_raises_for_reconnect_resume():
   """SDK #788: a stale TaskNotification leaking into the stream must raise
   StaleLeakError (a TransientAPIError) so SDKThread.run_turn_with_reconnect

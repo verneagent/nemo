@@ -103,7 +103,6 @@ def test_run_turn_resumes_latest_session_after_done_event():
   agent._model = "claude-opus-4-7"
   agent._latest_session_id = "old-session"
   agent._stale_tasks = set()
-  agent._pending_steers = [0]
   agent._options = "STATIC_OPTIONS"
 
   build_calls: list[dict[str, str]] = []
@@ -117,8 +116,7 @@ def test_run_turn_resumes_latest_session_after_done_event():
   captured: dict[str, object] = {}
 
   async def fake_rwrc(prompt, on_event, stale_tasks=None, options=None,
-                       options_factory=None, max_attempts=3, is_paused=None,
-                       pending_steers=None):
+                       options_factory=None, max_attempts=3, is_paused=None):
     captured["options"] = options
     captured["options_factory"] = options_factory
     # Simulate the SDK reporting a session id at end of turn.
@@ -157,7 +155,6 @@ def test_run_turn_factory_uses_initial_resume_before_first_done_event():
   agent._model = "claude-opus-4-7"
   agent._latest_session_id = "seed-from-start"
   agent._stale_tasks = set()
-  agent._pending_steers = [0]
   agent._options = "STATIC"
 
   build_calls: list[str] = []
@@ -171,8 +168,7 @@ def test_run_turn_factory_uses_initial_resume_before_first_done_event():
   captured: dict[str, object] = {}
 
   async def fake_rwrc(prompt, on_event, stale_tasks=None, options=None,
-                       options_factory=None, max_attempts=3, is_paused=None,
-                       pending_steers=None):
+                       options_factory=None, max_attempts=3, is_paused=None):
     captured["factory"] = options_factory
     return (0.0, {})
 
@@ -182,62 +178,6 @@ def test_run_turn_factory_uses_initial_resume_before_first_done_event():
   asyncio.run(agent.run_turn("hi", on_event=lambda _e: None))
   assert captured["factory"]() == "OPTIONS(seed-from-start)"
   assert build_calls[-1] == "seed-from-start"
-
-
-def test_claude_supports_steering():
-  from nemo.claude_agent import ClaudeCodingAgent
-  agent = ClaudeCodingAgent.__new__(ClaudeCodingAgent)
-  assert agent.supports_steering() is True
-
-
-def test_steer_declines_when_no_turn_running():
-  """No live turn → _current_on_event is None → a query() would start a NEW
-  turn instead of steering, so decline and let the host queue."""
-  import asyncio
-  from unittest import mock
-  from nemo.claude_agent import ClaudeCodingAgent
-
-  agent = ClaudeCodingAgent.__new__(ClaudeCodingAgent)
-  agent._current_on_event = None
-  agent._pending_steers = [0]
-  agent._sdk = mock.MagicMock()
-  agent._sdk.steer = mock.AsyncMock(return_value=True)
-
-  assert asyncio.run(agent.steer("nudge")) is False
-  agent._sdk.steer.assert_not_called()
-
-
-def test_steer_declines_empty_text():
-  import asyncio
-  from unittest import mock
-  from nemo.claude_agent import ClaudeCodingAgent
-
-  agent = ClaudeCodingAgent.__new__(ClaudeCodingAgent)
-  agent._current_on_event = lambda _e: None
-  agent._pending_steers = [0]
-  agent._sdk = mock.MagicMock()
-  agent._sdk.steer = mock.AsyncMock(return_value=True)
-
-  assert asyncio.run(agent.steer("   ")) is False
-  agent._sdk.steer.assert_not_called()
-
-
-def test_steer_delegates_to_sdk_with_shared_counter():
-  """A live turn → steer() forwards the stripped text and the SAME counter
-  object the running turn was handed, so the absorb logic sees the bump."""
-  import asyncio
-  from unittest import mock
-  from nemo.claude_agent import ClaudeCodingAgent
-
-  agent = ClaudeCodingAgent.__new__(ClaudeCodingAgent)
-  agent._current_on_event = lambda _e: None
-  agent._pending_steers = [0]
-  agent._sdk = mock.MagicMock()
-  agent._sdk.steer = mock.AsyncMock(return_value=True)
-
-  assert asyncio.run(agent.steer("  also fix the README  ")) is True
-  agent._sdk.steer.assert_awaited_once_with(
-    "also fix the README", agent._pending_steers)
 
 
 def test_default_trailing_note_is_empty():
