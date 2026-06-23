@@ -213,6 +213,7 @@ class SDKThread:
     on_event: Callable[[TurnEvent], None],
     stale_tasks: set[str] | None = None,
     is_paused: Callable[[], bool] | None = None,
+    pending_steers: list[int] | None = None,
   ) -> tuple[float, JsonObject]:
     """Run a single SDK turn on the SDK thread.
 
@@ -221,6 +222,9 @@ class SDKThread:
 
     ``is_paused`` lets the turn watchdog stand down while an interactive
     prompt is awaiting the user (see turn._single_turn).
+
+    ``pending_steers`` is the shared steer counter (see steer()) so a
+    mid-turn ``client.query()`` injection is folded into this turn.
     """
     if self._client is None:
       raise RuntimeError("SDK client not connected")
@@ -228,7 +232,8 @@ class SDKThread:
     async def _turn():
       return await run_turn(
         self._client, prompt, on_event,
-        stale_tasks=stale_tasks, is_paused=is_paused)
+        stale_tasks=stale_tasks, is_paused=is_paused,
+        pending_steers=pending_steers)
 
     return await self.run_on_sdk_loop(_turn())
 
@@ -245,6 +250,7 @@ class SDKThread:
     options_factory: Callable[[], object] | None = None,
     max_attempts: int = 3,
     is_paused: Callable[[], bool] | None = None,
+    pending_steers: list[int] | None = None,
   ) -> tuple[float, JsonObject]:
     """Run turn with automatic reconnect on timeout or disconnection.
 
@@ -265,9 +271,15 @@ class SDKThread:
     for attempt in range(max_attempts):
       if self._cancelled.is_set():
         raise asyncio.CancelledError("SDK turn cancelled")
+      # A steer's injected query() dies with the subprocess on reconnect, so
+      # reset the counter before each attempt — a leftover would make the
+      # retry wait for a Result that will never come.
+      if pending_steers is not None:
+        pending_steers[0] = 0
       try:
         return await self.run_turn(
-          prompt, on_event, stale_tasks=stale_tasks, is_paused=is_paused)
+          prompt, on_event, stale_tasks=stale_tasks, is_paused=is_paused,
+          pending_steers=pending_steers)
       except NonRetryableAPIError:
         log.warning("SDK turn non-retryable API error — closing client")
         await self.close_client()
@@ -318,6 +330,35 @@ class SDKThread:
         log.warning("interrupt() error: %s", e)
 
     await self.run_on_sdk_loop(_interrupt())
+
+  async def steer(self, text: str, pending_steers: list[int]) -> bool:
+    """Inject a follow-up into the running turn via a fresh user message.
+
+    ``client.query(text)`` writes a user message onto the live streaming
+    session, so the model folds it into the work in flight. Each query()
+    yields its own ResultMessage, so we bump ``pending_steers`` AFTER a
+    successful write — that tells _single_turn to absorb the extra Result
+    instead of ending the turn. Bumping only on success means a failed
+    write never leaves the turn waiting for a Result that won't arrive.
+
+    The query runs on the SDK loop (same loop as the live turn), so the
+    counter increment is serialised with the turn's own consumption — no
+    lock needed. Returns True if the message was injected.
+    """
+    if self._client is None:
+      return False
+
+    async def _steer():
+      assert self._client is not None
+      await self._client.query(text)
+      pending_steers[0] += 1
+      return True
+
+    try:
+      return bool(await self.run_on_sdk_loop(_steer()))
+    except Exception as exc:
+      log.warning("steer() failed: %s", exc)
+      return False
 
   def stop(self) -> None:
     """Stop the SDK thread."""

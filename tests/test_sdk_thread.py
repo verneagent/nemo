@@ -185,7 +185,8 @@ class TestRunTurnWithReconnect:
     expected = (0.5, {})
     call_count = 0
 
-    async def fake_turn(prompt, on_event, stale_tasks=None, is_paused=None):
+    async def fake_turn(prompt, on_event, stale_tasks=None, is_paused=None,
+                      pending_steers=None):
       nonlocal call_count
       call_count += 1
       if call_count < 2:
@@ -217,7 +218,8 @@ class TestRunTurnWithReconnect:
     call_count = 0
     seen_prompts: list[str] = []
 
-    async def fake_turn(prompt, on_event, stale_tasks=None, is_paused=None):
+    async def fake_turn(prompt, on_event, stale_tasks=None, is_paused=None,
+                      pending_steers=None):
       nonlocal call_count
       call_count += 1
       seen_prompts.append(prompt)
@@ -265,7 +267,8 @@ class TestRunTurnWithReconnect:
     """If options is None, TimeoutError propagates immediately."""
     sdk_thread._client = mock.MagicMock()
 
-    async def fake_turn(prompt, on_event, stale_tasks=None, is_paused=None):
+    async def fake_turn(prompt, on_event, stale_tasks=None, is_paused=None,
+                      pending_steers=None):
       raise TimeoutError("hung")
 
     with mock.patch.object(sdk_thread, "run_turn", side_effect=fake_turn):
@@ -287,7 +290,8 @@ class TestRunTurnWithReconnect:
     turn_calls = 0
     reconnect_calls = 0
 
-    async def fake_turn(prompt, on_event, stale_tasks=None, is_paused=None):
+    async def fake_turn(prompt, on_event, stale_tasks=None, is_paused=None,
+                      pending_steers=None):
       nonlocal turn_calls
       turn_calls += 1
       raise TimeoutError("hung")
@@ -314,7 +318,8 @@ class TestRunTurnWithReconnect:
     turn_calls = 0
     expected = (1.0, {"ok": True})
 
-    async def fake_turn(prompt, on_event, stale_tasks=None, is_paused=None):
+    async def fake_turn(prompt, on_event, stale_tasks=None, is_paused=None,
+                      pending_steers=None):
       nonlocal turn_calls
       turn_calls += 1
       if turn_calls < 3:
@@ -336,7 +341,8 @@ class TestRunTurnWithReconnect:
     expected = (0.5, {})
     call_count = 0
 
-    async def fake_turn(prompt, on_event, stale_tasks=None, is_paused=None):
+    async def fake_turn(prompt, on_event, stale_tasks=None, is_paused=None,
+                      pending_steers=None):
       nonlocal call_count
       call_count += 1
       if call_count < 2:
@@ -361,7 +367,8 @@ class TestRunTurnWithReconnect:
 
     call_count = 0
 
-    async def fake_turn(prompt, on_event, stale_tasks=None, is_paused=None):
+    async def fake_turn(prompt, on_event, stale_tasks=None, is_paused=None,
+                      pending_steers=None):
       nonlocal call_count
       call_count += 1
       raise NonRetryableAPIError("API Error: 402 Insufficient Balance")
@@ -383,7 +390,8 @@ class TestRunTurnWithReconnect:
 
   def test_not_connected_raises_after_max_attempts(self, sdk_thread: SDKThread):
     """Should raise after exhausting all reconnect attempts for not-connected."""
-    async def fake_turn(prompt, on_event, stale_tasks=None, is_paused=None):
+    async def fake_turn(prompt, on_event, stale_tasks=None, is_paused=None,
+                      pending_steers=None):
       raise RuntimeError("SDK client not connected")
 
     with mock.patch.object(sdk_thread, "run_turn", side_effect=fake_turn):
@@ -398,7 +406,8 @@ class TestRunTurnWithReconnect:
     """cancel() should abort the reconnect loop between attempts."""
     call_count = 0
 
-    async def fake_turn(prompt, on_event, stale_tasks=None, is_paused=None):
+    async def fake_turn(prompt, on_event, stale_tasks=None, is_paused=None,
+                      pending_steers=None):
       nonlocal call_count
       call_count += 1
       raise TimeoutError("hung")
@@ -423,7 +432,8 @@ class TestRunTurnWithReconnect:
     expected = (0.5, {})
     call_count = 0
 
-    async def fake_turn(prompt, on_event, stale_tasks=None, is_paused=None):
+    async def fake_turn(prompt, on_event, stale_tasks=None, is_paused=None,
+                      pending_steers=None):
       nonlocal call_count
       call_count += 1
       if call_count < 2:
@@ -452,7 +462,8 @@ class TestRunTurnWithReconnect:
     turn_calls = 0
     factory_calls = 0
 
-    async def fake_turn(prompt, on_event, stale_tasks=None, is_paused=None):
+    async def fake_turn(prompt, on_event, stale_tasks=None, is_paused=None,
+                      pending_steers=None):
       nonlocal turn_calls
       turn_calls += 1
       if turn_calls < 2:
@@ -482,7 +493,8 @@ class TestRunTurnWithReconnect:
 
   def test_factory_returning_none_raises_immediately(self, sdk_thread: SDKThread):
     """If options_factory returns None, treat it like no-options and raise."""
-    async def fake_turn(prompt, on_event, stale_tasks=None, is_paused=None):
+    async def fake_turn(prompt, on_event, stale_tasks=None, is_paused=None,
+                      pending_steers=None):
       raise TimeoutError("hung")
 
     with mock.patch.object(sdk_thread, "run_turn", side_effect=fake_turn):
@@ -495,11 +507,40 @@ class TestRunTurnWithReconnect:
 
     mock_reconn.assert_not_awaited()
 
+  def test_reconnect_resets_pending_steers(self, sdk_thread: SDKThread):
+    """A steer's injected query dies with the subprocess on reconnect, so the
+    shared counter is reset before each attempt — a leftover would make the
+    retry wait for a Result that will never come."""
+    pending = [2]  # stale leftover from a prior (aborted) attempt
+    seen: list[int] = []
+    call_count = 0
+
+    async def fake_turn(prompt, on_event, stale_tasks=None, is_paused=None,
+                        pending_steers=None):
+      nonlocal call_count
+      call_count += 1
+      seen.append(pending_steers[0])
+      if call_count < 2:
+        pending_steers[0] += 1  # a steer lands mid-attempt
+        raise TimeoutError("hung")
+      return (0.0, {})
+
+    sdk_thread._client = mock.MagicMock()
+    with mock.patch.object(sdk_thread, "run_turn", side_effect=fake_turn):
+      with mock.patch.object(sdk_thread, "reconnect", new_callable=mock.AsyncMock):
+        _run(sdk_thread.run_turn_with_reconnect(
+          "hi", on_event=lambda e: None, options=mock.MagicMock(),
+          max_attempts=3, pending_steers=pending))
+
+    # Each attempt started from a freshly-zeroed counter.
+    assert seen == [0, 0]
+
   def test_other_runtime_error_not_retried(self, sdk_thread: SDKThread):
     """RuntimeError without 'not connected' should not be retried."""
     call_count = 0
 
-    async def fake_turn(prompt, on_event, stale_tasks=None, is_paused=None):
+    async def fake_turn(prompt, on_event, stale_tasks=None, is_paused=None,
+                      pending_steers=None):
       nonlocal call_count
       call_count += 1
       raise RuntimeError("some other error")
@@ -543,6 +584,39 @@ class TestInterrupt:
 
     # Should not raise — errors are logged but suppressed
     _run(sdk_thread.interrupt())
+
+
+# ---------------------------------------------------------------------------
+# steer — inject a follow-up into the running turn via client.query()
+# ---------------------------------------------------------------------------
+
+class TestSteer:
+  def test_steer_writes_query_and_bumps_counter(self, sdk_thread: SDKThread):
+    mock_client = mock.AsyncMock()
+    sdk_thread._client = mock_client
+    pending = [0]
+
+    assert _run(sdk_thread.steer("also fix the tests", pending)) is True
+    mock_client.query.assert_awaited_once_with("also fix the tests")
+    # Bumped so _single_turn absorbs the extra ResultMessage this query yields.
+    assert pending[0] == 1
+
+  def test_steer_noop_without_client(self, sdk_thread: SDKThread):
+    sdk_thread._client = None
+    pending = [0]
+    assert _run(sdk_thread.steer("x", pending)) is False
+    assert pending[0] == 0
+
+  def test_steer_does_not_bump_on_query_failure(self, sdk_thread: SDKThread):
+    """If the write fails, the counter must stay put — otherwise the turn
+    would wait forever for a Result that no injected query produced."""
+    mock_client = mock.AsyncMock()
+    mock_client.query = mock.AsyncMock(side_effect=RuntimeError("boom"))
+    sdk_thread._client = mock_client
+    pending = [0]
+
+    assert _run(sdk_thread.steer("x", pending)) is False
+    assert pending[0] == 0
 
 
 # ---------------------------------------------------------------------------

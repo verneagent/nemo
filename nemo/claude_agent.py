@@ -279,6 +279,11 @@ class ClaudeCodingAgent(CodingAgent):
     # current turn's callback. Set at the top of run_turn(), cleared on
     # exit. None means no turn is active — we drop the hook event.
     self._current_on_event: Callable[[TurnEvent], None] | None = None
+    # Shared steer counter (see steer()). One element so the SDK loop can
+    # bump it in place; _single_turn absorbs one extra ResultMessage per
+    # count. Lives on the agent (not per-turn) so steer() and the running
+    # turn reference the same object.
+    self._pending_steers: list[int] = [0]
 
   def set_effort(self, effort: str) -> None:
     self._effort = effort if effort in _CLAUDE_EFFORT_LEVELS else ""
@@ -371,7 +376,8 @@ class ClaudeCodingAgent(CodingAgent):
         stale_tasks=self._stale_tasks,
         options=self._options,
         options_factory=_options_factory,
-        is_paused=_is_paused)
+        is_paused=_is_paused,
+        pending_steers=self._pending_steers)
     finally:
       self._current_on_event = None
 
@@ -714,6 +720,23 @@ class ClaudeCodingAgent(CodingAgent):
         shutil.copy2(src, dst)
     except OSError as e:
       log.warning("fork transcript seed failed (%s) — fork starts fresh", e)
+
+  def supports_steering(self) -> bool:
+    return True
+
+  async def steer(self, text: str) -> bool:
+    """Fold a follow-up into the running turn — see CodingAgent.steer.
+
+    Gated on a live turn: ``_current_on_event`` is set only while run_turn
+    is in flight. If no turn is running a query() would start a brand-new
+    turn out of band (not steering), so we decline and let the host queue.
+    """
+    if self._current_on_event is None:
+      return False
+    text = text.strip()
+    if not text:
+      return False
+    return await self._sdk.steer(text, self._pending_steers)
 
   def supports_fork(self) -> bool:
     return True
