@@ -319,6 +319,29 @@ class SDKThread:
 
     await self.run_on_sdk_loop(_interrupt())
 
+  async def steer(self, text: str) -> bool:
+    """Inject a user message into the RUNNING turn via the bidirectional
+    stream. The SDK speaks ``claude --input-format stream-json``; a user
+    message written while a turn is in flight is folded into that turn (the
+    live ``receive_response`` loop keeps yielding and still ends at the single
+    Result). Returns True if the message was written, False if no client.
+
+    NB: this does NOT spawn a second turn and there is no extra Result to
+    absorb — a mid-turn ``query()`` is consumed by the turn already running.
+    """
+    if self._client is None:
+      return False
+
+    async def _steer():
+      try:
+        await self._client.query(text)
+        return True
+      except Exception as e:
+        log.warning("steer query() error: %s", e)
+        return False
+
+    return bool(await self.run_on_sdk_loop(_steer()))
+
   def stop(self) -> None:
     """Stop the SDK thread."""
     if self._loop and self._lifecycle_q is not None:

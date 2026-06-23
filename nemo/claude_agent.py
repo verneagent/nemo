@@ -406,6 +406,26 @@ class ClaudeCodingAgent(CodingAgent):
     self._sdk.cancel()
     await self._sdk.interrupt()
 
+  def supports_steering(self) -> bool:
+    return True
+
+  async def steer(self, text: str) -> bool:
+    """Fold a follow-up into the running turn via the SDK's bidirectional
+    stream (``client.query`` mid-turn). We only inject while a turn is
+    actually live — ``_current_on_event`` is set for exactly the duration of
+    ``run_turn`` — otherwise ``query`` would START a brand-new turn (the
+    queue's job), so we decline and let the host queue the message.
+    """
+    text = text.strip()
+    if not text:
+      return False
+    if self._current_on_event is None:
+      return False  # no turn running — let the host queue it
+    if not await self._sdk.steer(text):
+      return False
+    log.info("claude-sdk: steered %d chars into running turn", len(text))
+    return True
+
   async def reset(self, project_dir: str, model: str, resume: str = "") -> None:
     # Reconnecting spawns a new CLI / SDK session. Any task ids previously
     # marked stale belong to the old session and will never be delivered

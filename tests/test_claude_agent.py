@@ -180,6 +180,70 @@ def test_run_turn_factory_uses_initial_resume_before_first_done_event():
   assert build_calls[-1] == "seed-from-start"
 
 
+# ---------------------------------------------------------------------------
+# Steering: fold a follow-up into the RUNNING SDK turn via client.query()
+# ---------------------------------------------------------------------------
+
+def _steer_agent():
+  from unittest import mock
+  from nemo.claude_agent import ClaudeCodingAgent
+  agent = ClaudeCodingAgent.__new__(ClaudeCodingAgent)
+  agent._current_on_event = None
+  agent._sdk = mock.MagicMock()
+  return agent
+
+
+def test_supports_steering_true():
+  assert _steer_agent().supports_steering() is True
+
+
+def test_steer_injects_when_turn_running():
+  import asyncio
+  from unittest import mock
+  agent = _steer_agent()
+  # A live turn ⇒ _current_on_event is set; steer folds the STRIPPED text in.
+  agent._current_on_event = lambda _e: None
+  agent._sdk.steer = mock.AsyncMock(return_value=True)
+
+  assert asyncio.run(agent.steer("  also update the README\n")) is True
+  agent._sdk.steer.assert_awaited_once_with("also update the README")
+
+
+def test_steer_declines_when_no_turn_running():
+  import asyncio
+  from unittest import mock
+  agent = _steer_agent()
+  # No turn in flight ⇒ injecting would START a new turn (the queue's job),
+  # so steer declines and the host queues the message.
+  agent._current_on_event = None
+  agent._sdk.steer = mock.AsyncMock(return_value=True)
+
+  assert asyncio.run(agent.steer("hello")) is False
+  agent._sdk.steer.assert_not_awaited()
+
+
+def test_steer_declines_empty_text():
+  import asyncio
+  from unittest import mock
+  agent = _steer_agent()
+  agent._current_on_event = lambda _e: None
+  agent._sdk.steer = mock.AsyncMock(return_value=True)
+
+  assert asyncio.run(agent.steer("   ")) is False
+  agent._sdk.steer.assert_not_awaited()
+
+
+def test_steer_returns_false_when_sdk_declines():
+  import asyncio
+  from unittest import mock
+  agent = _steer_agent()
+  agent._current_on_event = lambda _e: None
+  # e.g. client gone mid-turn — SDKThread.steer returns False.
+  agent._sdk.steer = mock.AsyncMock(return_value=False)
+
+  assert asyncio.run(agent.steer("do the thing")) is False
+
+
 def test_default_trailing_note_is_empty():
   """CodingAgent default (non-Claude adapter) returns no note."""
   from nemo.coding_agent import CodingAgent

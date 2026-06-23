@@ -545,6 +545,29 @@ class TestInterrupt:
     _run(sdk_thread.interrupt())
 
 
+class TestSteer:
+  def test_steer_calls_query_and_returns_true(self, sdk_thread: SDKThread):
+    # Mid-turn steer writes a user message into the live stream via query()
+    # — it is folded into the running turn, no extra Result to absorb.
+    mock_client = mock.AsyncMock()
+    sdk_thread._client = mock_client
+
+    assert _run(sdk_thread.steer("also add tests")) is True
+    mock_client.query.assert_awaited_once_with("also add tests")
+
+  def test_steer_noop_without_client(self, sdk_thread: SDKThread):
+    sdk_thread._client = None
+    assert _run(sdk_thread.steer("hello")) is False
+
+  def test_steer_returns_false_on_error(self, sdk_thread: SDKThread):
+    mock_client = mock.AsyncMock()
+    mock_client.query = mock.AsyncMock(side_effect=RuntimeError("boom"))
+    sdk_thread._client = mock_client
+
+    # Error is suppressed; steer reports failure so the host queues instead.
+    assert _run(sdk_thread.steer("hello")) is False
+
+
 # ---------------------------------------------------------------------------
 # 8. close_client cleans up
 # ---------------------------------------------------------------------------
