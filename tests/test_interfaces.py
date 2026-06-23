@@ -251,6 +251,16 @@ def test_base_agent_does_not_support_fork():
   asyncio.run(_run())
 
 
+def test_base_agent_does_not_support_steering():
+  """Adapters that can't inject mid-turn (Codex / OpenCode) inherit the
+  unsupported default, so the host falls back to queuing."""
+  agent = FakeAgent()
+  assert agent.supports_steering() is False
+  async def _run():
+    assert await agent.steer("nudge") is False
+  asyncio.run(_run())
+
+
 def _make_fork_agent():
   from nemo.claude_agent import ClaudeCodingAgent
   a = ClaudeCodingAgent({}, "oc_test", None, FakeChannel(), read_only=True)

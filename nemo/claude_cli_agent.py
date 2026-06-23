@@ -1153,6 +1153,30 @@ class ClaudeCliCodingAgent(CodingAgent):
     if self._tui is not None:
       self._tui.write(b"\x1b")
 
+  def supports_steering(self) -> bool:
+    return True
+
+  async def steer(self, text: str) -> bool:
+    """Inject a follow-up message into the running turn.
+
+    The real ``claude`` TUI natively supports steering: text submitted while
+    it is working is folded into the in-flight turn. We only inject when the
+    screen actually shows the working hint — otherwise the TUI is idle (the
+    submit would start a brand-new turn, which is the queue's job) or paused
+    on a prompt, so we report failure and let the host queue the message.
+    """
+    tui = self._tui
+    if tui is None or not tui.alive():
+      return False
+    text = text.strip()
+    if not text:
+      return False
+    if not any(_WORKING_HINT in ln for ln in tui.snapshot()):
+      return False
+    await asyncio.to_thread(tui.submit, text)
+    log.info("claude-cli: steered %d chars into running turn", len(text))
+    return True
+
   async def side_question(self, question: str, sdk_session_id: str) -> str:
     """Answer a `/btw` side question by forwarding to the CLI's NATIVE `/btw`.
 

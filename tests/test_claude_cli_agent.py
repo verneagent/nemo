@@ -467,6 +467,66 @@ def test_scrape_command_compact_inline() -> None:
   assert _scrape_command_result(lines, "/compact") == "Not enough messages to compact."
 
 
+# --- steering: inject a follow-up into the RUNNING TUI turn ----------------
+
+class _FakeTui:
+  def __init__(self, lines: list[str]):
+    self._lines = lines
+    self.submitted: list[str] = []
+    self._alive = True
+
+  def alive(self) -> bool:
+    return self._alive
+
+  def snapshot(self) -> list[str]:
+    return list(self._lines)
+
+  def submit(self, text: str) -> None:
+    self.submitted.append(text)
+
+
+def test_supports_steering_true() -> None:
+  assert _agent().supports_steering() is True
+
+
+def test_steer_injects_when_working() -> None:
+  import asyncio
+  a = _agent()
+  # "esc to interrupt" present ⇒ a turn is in flight; steer folds the
+  # follow-up into it and submits the STRIPPED text.
+  tui = _FakeTui(["⏺ Bash(make)", "  ⎿ building", "  esc to interrupt"])
+  a._tui = tui  # type: ignore[assignment]
+  assert asyncio.run(a.steer("  also update the README\n")) is True
+  assert tui.submitted == ["also update the README"]
+
+
+def test_steer_declines_when_idle() -> None:
+  import asyncio
+  a = _agent()
+  # No working hint ⇒ TUI idle; injecting would start a new turn (queue's
+  # job), so steer must decline and let the host queue the message.
+  tui = _FakeTui(["⏺ done", "────────", "❯"])
+  a._tui = tui  # type: ignore[assignment]
+  assert asyncio.run(a.steer("hello")) is False
+  assert tui.submitted == []
+
+
+def test_steer_declines_when_no_tui() -> None:
+  import asyncio
+  a = _agent()
+  a._tui = None
+  assert asyncio.run(a.steer("hello")) is False
+
+
+def test_steer_declines_empty_text() -> None:
+  import asyncio
+  a = _agent()
+  tui = _FakeTui(["  esc to interrupt"])
+  a._tui = tui  # type: ignore[assignment]
+  assert asyncio.run(a.steer("   ")) is False
+  assert tui.submitted == []
+
+
 def test_reset_clear_creates_fresh_session() -> None:
   """reset(resume="") should NOT fall back to self._session_id — /clear
   must create a brand-new session, not resume the previous one."""

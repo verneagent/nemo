@@ -140,6 +140,29 @@ class CodingAgent(ABC):
     del transcript_path, fmt_hint
     return ""
 
+  def supports_steering(self) -> bool:
+    """True if a new user message can be injected into a RUNNING turn.
+
+    Steering delivers a follow-up message into the in-flight turn so the
+    model adapts course without losing work and without restarting the
+    turn (mirrors typing into Claude Code while it works). Adapters that
+    cannot inject mid-turn (Codex / OpenCode spawn a fresh process per
+    turn and read the prompt once) inherit ``False`` and the host falls
+    back to queuing the message until the turn finishes.
+    """
+    return False
+
+  async def steer(self, text: str) -> bool:
+    """Inject ``text`` into the currently running turn.
+
+    Returns ``True`` if the text was injected (the turn keeps running and
+    folds it in), ``False`` if steering was not possible right now (no
+    turn running, paused on a prompt, or unsupported) — the caller then
+    queues the message normally. Default is unsupported.
+    """
+    del text
+    return False
+
   def supports_fork(self) -> bool:
     """True if this adapter can spawn a read-only forked sub-session.
 

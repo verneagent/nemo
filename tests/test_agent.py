@@ -640,6 +640,84 @@ def test_fork_command_during_turn_opens_fork(tmp_path):
   assert spy.opened[0]["anchor_msg_id"] == "om_fork"
 
 
+def test_message_during_turn_steers_instead_of_queuing(tmp_path):
+  """With autoesc off and a steering-capable agent, a plain follow-up sent
+  mid-turn is injected into the RUNNING turn (steer) and acked with `Get` —
+  NOT appended to the pending queue (no `OneSecond`)."""
+  steered: list[str] = []
+  steer_seen = asyncio.Event()
+  turn_done = asyncio.Event()
+
+  class _SteeringAgent(_FakeAgent):
+    def supports_steering(self):
+      return True
+
+    async def steer(self, text):
+      steered.append(text)
+      steer_seen.set()
+      return True
+
+    async def run_turn(self, _prompt, on_event):
+      await asyncio.to_thread(
+        lambda: on_event(ProgressEvent(kind="tool", summary="Read", first=True)))
+      await steer_seen.wait()  # block until a follow-up steers this turn
+      await asyncio.to_thread(
+        lambda: on_event(DoneEvent(cost=0.0, usage={"input_tokens": 1})))
+      turn_done.set()
+      return 0.0, {"input_tokens": 1}
+
+  class _SteerChannel(_QueuedChannel):
+    def __init__(self):
+      super().__init__("oc_test", [
+        IncomingMessage(event_type="im.message.receive_v1", chat_id="oc_test",
+                        sender_id="ou_user", message_id="om_work",
+                        msg_type="text", text="work on it", create_time="1"),
+        IncomingMessage(event_type="im.message.receive_v1", chat_id="oc_test",
+                        sender_id="ou_user", message_id="om_steer",
+                        msg_type="text", text="also handle the edge case",
+                        create_time="2"),
+        IncomingMessage(event_type="im.message.receive_v1", chat_id="oc_test",
+                        sender_id="ou_user", message_id="om_exit",
+                        msg_type="text", text="/exit", create_time="3"),
+      ])
+      self._n = 0
+
+    async def receive(self, timeout=300):
+      self._n += 1
+      if self._n == 2:  # let the turn establish before steering
+        await asyncio.sleep(0.05)
+      if self._n == 3:  # hold /exit until the steered turn has finished
+        await turn_done.wait()
+      return await super().receive(timeout)
+
+    async def send_card(self, _chat_id, _card):
+      return "om_card"
+
+    async def update_card(self, card_id, _card):
+      return card_id
+
+  channel = _SteerChannel()
+
+  with mock.patch("nemo.agent.load_credentials", return_value={
+    "app_id": "app_id", "app_secret": "app_secret",
+    "email": "user@example.com",
+  }), \
+       mock.patch("nemo.agent.Database", _FakeDB), \
+       mock.patch("nemo.agent.LarkChannel", return_value=channel), \
+       mock.patch("nemo.agent.build_coding_agent", return_value=_SteeringAgent()), \
+       mock.patch.object(_FakeChannel, "add_reaction") as add_reaction, \
+       mock.patch("nemo.group_config.load_config", return_value={}), \
+       mock.patch("nemo.config.load_relay_config", return_value=("", "")), \
+       mock.patch("signal.signal"):
+    result = asyncio.run(main_loop("oc_test", str(tmp_path), "claude-opus-4-6"))
+
+  assert result == 0
+  assert steered == ["also handle the edge case"]
+  calls = [c.args for c in add_reaction.await_args_list]
+  assert ("om_steer", "Get") in calls
+  assert ("om_steer", "OneSecond") not in calls
+
+
 def test_pacing_hint_prepended_after_timeout(tmp_path):
   """After a TimeoutError the next turn's prompt is prefixed with a pacing hint;
   the hint is not applied to subsequent turns."""

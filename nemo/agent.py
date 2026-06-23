@@ -3274,6 +3274,24 @@ async def main_loop(
                 if msg.message_id:
                   await channel.add_reaction(msg.message_id, "CROSS_MARK")
               continue
+          # Steer: with a turn mid-flight and the agent able to inject, fold
+          # this follow-up into the RUNNING turn instead of queuing it. Skip
+          # when autoesc is on (the user explicitly wants interrupt+restart)
+          # or a prompt is pending (the agent is blocked awaiting the user —
+          # injecting would answer the prompt, not steer).
+          if (not autoesc and coding_agent.supports_steering()
+              and not channel.permission_active):
+            steer_text = messages.strip_parent_quote(
+              messages.strip_mentions_preserve_newlines(
+                msg_text, [msg], bot_open_id=bot_open_id))
+            if steer_text and await coding_agent.steer(steer_text):
+              log.info("Steered message into running turn: %s", steer_text[:60])
+              if msg.message_id:
+                try:
+                  await channel.add_reaction(msg.message_id, "Get")
+                except Exception as exc:
+                  log.warning("Failed to ack steered message: %s", exc)
+              continue
           # Re-queue non-signal messages so they aren't lost
           _pending_msgs.append(msg)
           await _ack_pending(msg)
