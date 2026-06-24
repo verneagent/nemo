@@ -642,9 +642,9 @@ def test_fork_command_during_turn_opens_fork(tmp_path):
 
 def test_message_during_turn_steers_instead_of_queuing(tmp_path):
   """With autoesc off and a steering-capable agent, a plain follow-up sent
-  mid-turn is injected into the RUNNING turn (steer) and acked with `Salute` —
-  NOT appended to the pending queue (no `OneSecond`). Once the steered turn
-  completes, the `Salute` ack is swapped for `CheckMark`."""
+  mid-turn is injected into the RUNNING turn (steer) and acked with `SaluteFace`
+  — NOT appended to the pending queue (no `OneSecond`). Once the steered turn
+  completes, the `SaluteFace` ack is swapped for `CheckMark`."""
   steered: list[str] = []
   steer_seen = asyncio.Event()
   turn_done = asyncio.Event()
@@ -715,12 +715,12 @@ def test_message_during_turn_steers_instead_of_queuing(tmp_path):
   assert result == 0
   assert steered == ["also handle the edge case"]
   calls = [c.args for c in add_reaction.await_args_list]
-  assert ("om_steer", "SALUTE") in calls
+  assert ("om_steer", "SaluteFace") in calls
   assert ("om_steer", "OneSecond") not in calls
   assert ("om_steer", "Get") not in calls
-  # After the steered turn completed, the SALUTE ack was upgraded to CheckMark.
+  # After the steered turn completed, the SaluteFace ack was upgraded to CheckMark.
   assert ("om_steer", "CheckMark") in calls
-  assert calls.index(("om_steer", "SALUTE")) < calls.index(("om_steer", "CheckMark"))
+  assert calls.index(("om_steer", "SaluteFace")) < calls.index(("om_steer", "CheckMark"))
 
 
 def test_pacing_hint_prepended_after_timeout(tmp_path):
