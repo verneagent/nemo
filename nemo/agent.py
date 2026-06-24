@@ -2631,9 +2631,10 @@ async def main_loop(
       # first real progress event so it doesn't linger as stale.
       _turn_status_notice = ""
       # Messages steered into THIS turn: (message_id, SaluteFace reaction_id).
-      # Acked with SaluteFace while the turn runs; swapped to CheckMark once the
-      # turn completes (in the DoneEvent handler) so the user can see the
-      # steered follow-up was actually handled, not merely received.
+      # Acked with SaluteFace while the turn runs; swapped to CheckMark when the
+      # turn reaches DoneEvent (completed OR interrupted, in the DoneEvent
+      # handler) so the user can see the steered follow-up was actually
+      # handled, not merely received.
       _steered_acks: list[tuple[str, str]] = []
 
       async def _update_interrupt_card(phase: str) -> None:
@@ -2846,14 +2847,16 @@ async def main_loop(
             _sdk_session_id = event.session_id
             db.set_sdk_session_id(
               chat_id, _sdk_session_id, agent, _endpoint_key)
+          # By the time this turn reaches DoneEvent the steered message has
+          # been folded in and handled, so upgrade its SaluteFace ack to
+          # CheckMark -- even on interrupt (Stop/Escape ends the turn that
+          # already absorbed the steer; the follow-up was still handled).
+          if _steered_acks:
+            _await_channel(_checkmark_steered())
           if _turn_interrupt_phase:
             if _turn_card_id:
               db.clear_working(session_id)
             return
-          # Turn completed (not interrupted): upgrade any steered SaluteFace
-          # acks to CheckMark so the user sees the follow-up was handled.
-          if _steered_acks:
-            _await_channel(_checkmark_steered())
           elapsed = int(time.time() - _turn_start)
           # Final response = last answer step (if any)
           answer_steps = [s for s in _turn_steps if s.kind == "answer"]

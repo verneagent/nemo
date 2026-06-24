@@ -723,6 +723,96 @@ def test_message_during_turn_steers_instead_of_queuing(tmp_path):
   assert calls.index(("om_steer", "SaluteFace")) < calls.index(("om_steer", "CheckMark"))
 
 
+def test_steered_ack_upgraded_to_checkmark_even_when_turn_interrupted(tmp_path):
+  """A message steered into a running turn is acked with SaluteFace; if that
+  turn is then INTERRUPTED (/esc) before finishing on its own, the steered
+  follow-up was still folded in and handled, so its ack must still upgrade to
+  CheckMark at DoneEvent — not stay stuck on SaluteFace."""
+  steered: list[str] = []
+  steer_seen = asyncio.Event()
+  interrupted = asyncio.Event()
+  turn_done = asyncio.Event()
+
+  class _SteeringAgent(_FakeAgent):
+    def supports_steering(self):
+      return True
+
+    async def steer(self, text):
+      steered.append(text)
+      steer_seen.set()
+      return True
+
+    async def interrupt(self):
+      interrupted.set()
+
+    async def run_turn(self, _prompt, on_event):
+      await asyncio.to_thread(
+        lambda: on_event(ProgressEvent(kind="tool", summary="Read", first=True)))
+      await steer_seen.wait()   # block until a follow-up steers this turn
+      await interrupted.wait()  # then wait for the /esc interrupt
+      await asyncio.to_thread(
+        lambda: on_event(DoneEvent(cost=0.0, usage={"input_tokens": 1})))
+      turn_done.set()
+      return 0.0, {"input_tokens": 1}
+
+  class _SteerChannel(_QueuedChannel):
+    def __init__(self):
+      super().__init__("oc_test", [
+        IncomingMessage(event_type="im.message.receive_v1", chat_id="oc_test",
+                        sender_id="ou_user", message_id="om_work",
+                        msg_type="text", text="work on it", create_time="1"),
+        IncomingMessage(event_type="im.message.receive_v1", chat_id="oc_test",
+                        sender_id="ou_user", message_id="om_steer",
+                        msg_type="text", text="also handle the edge case",
+                        create_time="2"),
+        IncomingMessage(event_type="im.message.receive_v1", chat_id="oc_test",
+                        sender_id="ou_user", message_id="om_esc",
+                        msg_type="text", text="/esc", create_time="3"),
+        IncomingMessage(event_type="im.message.receive_v1", chat_id="oc_test",
+                        sender_id="ou_user", message_id="om_exit",
+                        msg_type="text", text="/exit", create_time="4"),
+      ])
+      self._n = 0
+
+    async def receive(self, timeout=300):
+      self._n += 1
+      if self._n in (2, 3):  # let the turn establish, then steer before /esc
+        await asyncio.sleep(0.05)
+      if self._n == 4:  # hold /exit until the interrupted turn has wound down
+        await turn_done.wait()
+      return await super().receive(timeout)
+
+    async def send_card(self, _chat_id, _card):
+      return "om_card"
+
+    async def update_card(self, card_id, _card):
+      return card_id
+
+  channel = _SteerChannel()
+
+  with mock.patch("nemo.agent.load_credentials", return_value={
+    "app_id": "app_id", "app_secret": "app_secret",
+    "email": "user@example.com",
+  }), \
+       mock.patch("nemo.agent.Database", _FakeDB), \
+       mock.patch("nemo.agent.LarkChannel", return_value=channel), \
+       mock.patch("nemo.agent.build_coding_agent", return_value=_SteeringAgent()), \
+       mock.patch.object(_FakeChannel, "add_reaction") as add_reaction, \
+       mock.patch("nemo.group_config.load_config", return_value={}), \
+       mock.patch("nemo.config.load_relay_config", return_value=("", "")), \
+       mock.patch("signal.signal"):
+    result = asyncio.run(main_loop("oc_test", str(tmp_path), "claude-opus-4-6"))
+
+  assert result == 0
+  assert steered == ["also handle the edge case"]
+  assert interrupted.is_set()
+  calls = [c.args for c in add_reaction.await_args_list]
+  assert ("om_steer", "SaluteFace") in calls
+  # Interrupted-but-handled: the steered ack still upgrades to CheckMark.
+  assert ("om_steer", "CheckMark") in calls
+  assert calls.index(("om_steer", "SaluteFace")) < calls.index(("om_steer", "CheckMark"))
+
+
 def test_pacing_hint_prepended_after_timeout(tmp_path):
   """After a TimeoutError the next turn's prompt is prefixed with a pacing hint;
   the hint is not applied to subsequent turns."""
