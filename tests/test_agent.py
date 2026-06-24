@@ -715,12 +715,12 @@ def test_message_during_turn_steers_instead_of_queuing(tmp_path):
   assert result == 0
   assert steered == ["also handle the edge case"]
   calls = [c.args for c in add_reaction.await_args_list]
-  assert ("om_steer", "Salute") in calls
+  assert ("om_steer", "SALUTE") in calls
   assert ("om_steer", "OneSecond") not in calls
   assert ("om_steer", "Get") not in calls
-  # After the steered turn completed, the Salute ack was upgraded to CheckMark.
+  # After the steered turn completed, the SALUTE ack was upgraded to CheckMark.
   assert ("om_steer", "CheckMark") in calls
-  assert calls.index(("om_steer", "Salute")) < calls.index(("om_steer", "CheckMark"))
+  assert calls.index(("om_steer", "SALUTE")) < calls.index(("om_steer", "CheckMark"))
 
 
 def test_pacing_hint_prepended_after_timeout(tmp_path):
