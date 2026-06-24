@@ -2630,12 +2630,6 @@ async def main_loop(
       # Set up front before the SDK starts streaming and cleared on the
       # first real progress event so it doesn't linger as stale.
       _turn_status_notice = ""
-      # Messages steered into THIS turn: (message_id, SaluteFace reaction_id).
-      # Acked with SaluteFace while the turn runs; swapped to CheckMark when the
-      # turn reaches DoneEvent (completed OR interrupted, in the DoneEvent
-      # handler) so the user can see the steered follow-up was actually
-      # handled, not merely received.
-      _steered_acks: list[tuple[str, str]] = []
 
       async def _update_interrupt_card(phase: str) -> None:
         nonlocal _turn_card_id, _turn_interrupt_phase
@@ -2661,24 +2655,6 @@ async def main_loop(
 
       def _await_channel(coro):
         return asyncio.run_coroutine_threadsafe(coro, main_loop_ref).result()
-
-      async def _checkmark_steered() -> None:
-        """Swap each steered message's SaluteFace ack for CheckMark.
-
-        Called from the DoneEvent handler once the steered-into turn
-        completes so the user sees the follow-up was not just received
-        (SaluteFace) but actually handled.
-        """
-        for mid, rid in _steered_acks:
-          try:
-            await channel.remove_reaction(mid, rid)
-          except Exception as exc:
-            log.warning("Failed to clear steer SaluteFace on %s: %s", mid, exc)
-          try:
-            await channel.add_reaction(mid, "CheckMark")
-          except Exception as exc:
-            log.warning("Failed to add steer CheckMark on %s: %s", mid, exc)
-        _steered_acks.clear()
 
       # _ensure_card and _update_working are lifted out of _on_event so the
       # askq handler can call them via channel.turn_ctx.redraw to embed an
@@ -2847,12 +2823,6 @@ async def main_loop(
             _sdk_session_id = event.session_id
             db.set_sdk_session_id(
               chat_id, _sdk_session_id, agent, _endpoint_key)
-          # By the time this turn reaches DoneEvent the steered message has
-          # been folded in and handled, so upgrade its SaluteFace ack to
-          # CheckMark -- even on interrupt (Stop/Escape ends the turn that
-          # already absorbed the steer; the follow-up was still handled).
-          if _steered_acks:
-            _await_channel(_checkmark_steered())
           if _turn_interrupt_phase:
             if _turn_card_id:
               db.clear_working(session_id)
@@ -3129,6 +3099,28 @@ async def main_loop(
           _pending_ack_msg_id = ""
           _pending_ack_reaction_id = ""
 
+      async def _mark_absorbed(message_id: str) -> None:
+        """The follow-up was folded (steered) into the running turn. It just
+        got the OneSecond pending ack like any other mid-turn message; swap
+        that for Get so the user sees it was absorbed, not merely queued.
+        Clears the pending-ack tracking so the next queued message starts the
+        OneSecond chain fresh.
+        """
+        nonlocal _pending_ack_msg_id, _pending_ack_reaction_id
+        if _pending_ack_msg_id == message_id and _pending_ack_reaction_id:
+          try:
+            await channel.remove_reaction(
+              _pending_ack_msg_id, _pending_ack_reaction_id)
+          except Exception as exc:
+            log.warning("Failed to clear OneSecond on absorbed %s: %s",
+                        message_id, exc)
+          _pending_ack_msg_id = ""
+          _pending_ack_reaction_id = ""
+        try:
+          await channel.add_reaction(message_id, "Get")
+        except Exception as exc:
+          log.warning("Failed to ack absorbed message: %s", exc)
+
       async def _watch_signals():
         nonlocal signal_detected
         while not sdk_task.done():
@@ -3304,6 +3296,12 @@ async def main_loop(
                 if msg.message_id:
                   await channel.add_reaction(msg.message_id, "CROSS_MARK")
               continue
+          # Every remaining mid-turn follow-up gets the OneSecond pending ack
+          # first (only the latest message shows it). This is uniform whether
+          # the message ends up steered or queued, so the pre-absorb behavior
+          # is identical in both cases.
+          if msg.message_id:
+            await _ack_pending(msg)
           # Steer: with a turn mid-flight and the agent able to inject, fold
           # this follow-up into the RUNNING turn instead of queuing it. Skip
           # when autoesc is on (the user explicitly wants interrupt+restart)
@@ -3316,16 +3314,12 @@ async def main_loop(
                 msg_text, [msg], bot_open_id=bot_open_id))
             if steer_text and await coding_agent.steer(steer_text):
               log.info("Steered message into running turn: %s", steer_text[:60])
+              # Absorbed into the turn: swap its OneSecond ack for Get.
               if msg.message_id:
-                try:
-                  rid = await channel.add_reaction(msg.message_id, "SaluteFace")
-                  _steered_acks.append((msg.message_id, rid))
-                except Exception as exc:
-                  log.warning("Failed to ack steered message: %s", exc)
+                await _mark_absorbed(msg.message_id)
               continue
-          # Re-queue non-signal messages so they aren't lost
+          # Not steered: re-queue so it isn't lost (keeps its OneSecond ack).
           _pending_msgs.append(msg)
-          await _ack_pending(msg)
           if autoesc:
             signal_detected = "autoesc"
             return
