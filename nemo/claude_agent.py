@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import re
@@ -160,6 +161,64 @@ def _session_jsonl_path(project_dir: str, sdk_session_id: str) -> str:
 def _short_error(exc: BaseException) -> str:
   """One-line summary suitable for a log breadcrumb."""
   return str(exc).split("\n")[0][:200]
+
+
+def _unconsumed_steers(
+    rows: list[JsonObject], texts: list[str]) -> list[str]:
+  """Pure detection core for ``ClaudeCodingAgent.unconsumed_steers``.
+
+  ``rows`` are the parsed session-transcript jsonl events; ``texts`` are the
+  follow-ups steered into the just-finished turn. Returns the subset whose
+  injection the turn never folded in (stranded by an end-of-turn / reconnect
+  race), so the host can re-queue them.
+
+  A mid-turn injection shows up as an ``enqueue`` queue-operation terminated
+  by a ``remove`` (a normal between-turn pull terminates with ``dequeue``
+  instead). It was *consumed* iff an ``assistant`` message follows the
+  ``remove`` before the next queue-operation. We collect every such
+  injection in order as ``(content, consumed)`` then, for each requested
+  text, claim its most-recent unused matching injection — most-recent because
+  identical text may have been steered in an earlier turn too. A text with no
+  matching injection was never even enqueued, so it counts as unconsumed.
+  """
+  pairs: list[tuple[str, bool]] = []  # (enqueued content, consumed)
+  pending: list[str] = []  # FIFO of enqueued contents awaiting their terminal
+  n = len(rows)
+  for i, r in enumerate(rows):
+    if r.get("type") != "queue-operation":
+      continue
+    op = r.get("operation")
+    if op == "enqueue":
+      pending.append(str(r.get("content") or ""))
+    elif op == "dequeue":
+      if pending:
+        pending.pop(0)
+    elif op == "remove":
+      content = pending.pop(0) if pending else ""
+      consumed = False
+      for j in range(i + 1, n):
+        tj = rows[j].get("type")
+        if tj == "queue-operation":
+          break
+        if tj == "assistant":
+          consumed = True
+          break
+      pairs.append((content, consumed))
+  used = [False] * len(pairs)
+  unconsumed: list[str] = []
+  for t in texts:
+    match = None
+    for k in range(len(pairs) - 1, -1, -1):
+      if not used[k] and pairs[k][0] == t:
+        match = k
+        break
+    if match is None:
+      unconsumed.append(t)  # never injected → re-queue to be safe
+    else:
+      used[match] = True
+      if not pairs[match][1]:
+        unconsumed.append(t)
+  return unconsumed
 
 
 def _stderr_tail(lines: "deque[str] | list[str]", limit: int = 20) -> str:
@@ -425,6 +484,32 @@ class ClaudeCodingAgent(CodingAgent):
       return False
     log.info("claude-sdk: steered %d chars into running turn", len(text))
     return True
+
+  def unconsumed_steers(self, texts: list[str]) -> list[str]:
+    """Report which of ``texts`` the just-finished turn never folded in.
+
+    The CLI records queue lifecycle into the session transcript: a mid-turn
+    injection is an ``enqueue`` whose terminal op is ``remove`` (vs
+    ``dequeue`` for a normal between-turn pull). A *consumed* injection is
+    followed by an ``assistant`` message before the next queue-operation; a
+    *stranded* one (end-of-turn / reconnect race) is immediately followed by
+    the next queue-op with no assistant in between. See ``_unconsumed_steers``.
+    """
+    if not texts or not self._latest_session_id:
+      return list(texts)  # can't introspect → safest is re-queue all
+    path = _session_jsonl_path(self._project_dir, self._latest_session_id)
+    try:
+      rows: list[JsonObject] = []
+      with open(path, encoding="utf-8") as fh:
+        for line in fh:
+          line = line.strip()
+          if line:
+            rows.append(json.loads(line))
+    except (OSError, ValueError) as exc:
+      log.warning("unconsumed_steers: cannot read transcript %s: %s",
+                  path, _short_error(exc))
+      return list(texts)
+    return _unconsumed_steers(rows, texts)
 
   async def reset(self, project_dir: str, model: str, resume: str = "") -> None:
     # Reconnecting spawns a new CLI / SDK session. Any task ids previously

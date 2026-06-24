@@ -163,6 +163,20 @@ class CodingAgent(ABC):
     del text
     return False
 
+  def unconsumed_steers(self, texts: list[str]) -> list[str]:
+    """Given ``texts`` steered into the turn that just finished, return the
+    subset the turn did NOT actually fold in, so the host can re-queue them.
+
+    ``steer`` only confirms the follow-up was *handed* to the running turn
+    (``client.query`` accepted it); it can't guarantee the turn consumed it.
+    An end-of-turn / reconnect race can strand a late injection — accepted
+    by the CLI, then discarded — leaving the user's message silently lost.
+    Adapters that can introspect their transcript report such strandings
+    here; the default assumes everything was consumed.
+    """
+    del texts
+    return []
+
   def supports_fork(self) -> bool:
     """True if this adapter can spawn a read-only forked sub-session.
 

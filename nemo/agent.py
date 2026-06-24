@@ -2823,6 +2823,31 @@ async def main_loop(
             _sdk_session_id = event.session_id
             db.set_sdk_session_id(
               chat_id, _sdk_session_id, agent, _endpoint_key)
+          # Safety net: a steer that `client.query()` accepted may still be
+          # stranded by an end-of-turn / reconnect race (Get got applied but
+          # the turn never folded it in). Detect any such drops and re-queue
+          # them so the next turn processes them — never silently lost.
+          if _steered_this_turn:
+            try:
+              dropped = coding_agent.unconsumed_steers(
+                [t for (_mid, t, _m, _rid) in _steered_this_turn])
+            except Exception as exc:
+              log.warning("unconsumed_steers check failed: %s", exc)
+              dropped = []
+            for (mid, t, m, rid) in _steered_this_turn:
+              if t not in dropped:
+                continue
+              dropped.remove(t)  # claim one match (handles duplicate texts)
+              log.info("Re-queuing stranded steer (turn never consumed it): "
+                       "%s", t[:60])
+              if mid and rid:
+                try:
+                  _await_channel(channel.remove_reaction(mid, rid))
+                except Exception as exc:
+                  log.warning("Failed to revert Get on stranded steer %s: %s",
+                              mid, exc)
+              _pending_msgs.append(m)
+            _steered_this_turn.clear()
           if _turn_interrupt_phase:
             if _turn_card_id:
               db.clear_working(session_id)
@@ -2919,6 +2944,10 @@ async def main_loop(
       signal_detected = None
 
       _pending_msgs: list = []
+      # Follow-ups folded into THIS turn via steering, tracked so we can
+      # detect (at turn end) any the turn never actually consumed and
+      # re-queue them: (message_id, steer_text, IncomingMessage, get_reaction_id).
+      _steered_this_turn: list[tuple[str, str, IncomingMessage, str]] = []
       _pending_ack_msg_id: str = ""
       _pending_ack_reaction_id: str = ""
 
@@ -3099,7 +3128,7 @@ async def main_loop(
           _pending_ack_msg_id = ""
           _pending_ack_reaction_id = ""
 
-      async def _mark_absorbed(message_id: str) -> None:
+      async def _mark_absorbed(message_id: str) -> str:
         """The follow-up was folded (steered) into the running turn. It just
         got the OneSecond pending ack like any other mid-turn message; swap
         that for Get so the user sees it was absorbed, not merely queued.
@@ -3117,9 +3146,10 @@ async def main_loop(
           _pending_ack_msg_id = ""
           _pending_ack_reaction_id = ""
         try:
-          await channel.add_reaction(message_id, "Get")
+          return await channel.add_reaction(message_id, "Get")
         except Exception as exc:
           log.warning("Failed to ack absorbed message: %s", exc)
+          return ""
 
       async def _watch_signals():
         nonlocal signal_detected
@@ -3314,9 +3344,14 @@ async def main_loop(
                 msg_text, [msg], bot_open_id=bot_open_id))
             if steer_text and await coding_agent.steer(steer_text):
               log.info("Steered message into running turn: %s", steer_text[:60])
-              # Absorbed into the turn: swap its OneSecond ack for Get.
+              # Optimistically swap its OneSecond ack for Get (absorbed).
+              # Recorded so the DoneEvent handler can verify the turn really
+              # folded it in; if not, the Get is reverted and it's re-queued.
+              get_rid = ""
               if msg.message_id:
-                await _mark_absorbed(msg.message_id)
+                get_rid = await _mark_absorbed(msg.message_id)
+              _steered_this_turn.append(
+                (msg.message_id, steer_text, msg, get_rid))
               continue
           # Not steered: re-queue so it isn't lost (keeps its OneSecond ack).
           _pending_msgs.append(msg)
