@@ -2630,6 +2630,11 @@ async def main_loop(
       # Set up front before the SDK starts streaming and cleared on the
       # first real progress event so it doesn't linger as stale.
       _turn_status_notice = ""
+      # Messages steered into THIS turn: (message_id, Salute reaction_id).
+      # Acked with Salute while the turn runs; swapped to CheckMark once the
+      # turn completes (in the DoneEvent handler) so the user can see the
+      # steered follow-up was actually handled, not merely received.
+      _steered_acks: list[tuple[str, str]] = []
 
       async def _update_interrupt_card(phase: str) -> None:
         nonlocal _turn_card_id, _turn_interrupt_phase
@@ -2655,6 +2660,24 @@ async def main_loop(
 
       def _await_channel(coro):
         return asyncio.run_coroutine_threadsafe(coro, main_loop_ref).result()
+
+      async def _checkmark_steered() -> None:
+        """Swap each steered message's Salute ack for CheckMark.
+
+        Called from the DoneEvent handler once the steered-into turn
+        completes so the user sees the follow-up was not just received
+        (Salute) but actually handled.
+        """
+        for mid, rid in _steered_acks:
+          try:
+            await channel.remove_reaction(mid, rid)
+          except Exception as exc:
+            log.warning("Failed to clear steer Salute on %s: %s", mid, exc)
+          try:
+            await channel.add_reaction(mid, "CheckMark")
+          except Exception as exc:
+            log.warning("Failed to add steer CheckMark on %s: %s", mid, exc)
+        _steered_acks.clear()
 
       # _ensure_card and _update_working are lifted out of _on_event so the
       # askq handler can call them via channel.turn_ctx.redraw to embed an
@@ -2827,6 +2850,10 @@ async def main_loop(
             if _turn_card_id:
               db.clear_working(session_id)
             return
+          # Turn completed (not interrupted): upgrade any steered Salute
+          # acks to CheckMark so the user sees the follow-up was handled.
+          if _steered_acks:
+            _await_channel(_checkmark_steered())
           elapsed = int(time.time() - _turn_start)
           # Final response = last answer step (if any)
           answer_steps = [s for s in _turn_steps if s.kind == "answer"]
@@ -3288,7 +3315,8 @@ async def main_loop(
               log.info("Steered message into running turn: %s", steer_text[:60])
               if msg.message_id:
                 try:
-                  await channel.add_reaction(msg.message_id, "Get")
+                  rid = await channel.add_reaction(msg.message_id, "Salute")
+                  _steered_acks.append((msg.message_id, rid))
                 except Exception as exc:
                   log.warning("Failed to ack steered message: %s", exc)
               continue
