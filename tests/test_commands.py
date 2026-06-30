@@ -300,31 +300,37 @@ def test_pid_command_reports_current_process_id():
 
 
 def test_model_typo_for_codex():
+  from nemo.agent_factory import ModelCatalog
   ctx = _ctx()
   ctx.agent = "codex"
-  handled, resp = try_dispatch("/model claude-sonnet-4-6", ctx)
+  with patch(
+    "nemo.agent_factory.query_codex_model_catalog",
+    return_value=ModelCatalog(visible=("gpt-5.5",)),
+  ):
+    handled, resp = try_dispatch("/model claude-sonnet-4-6", ctx)
   assert handled
   assert resp is not None and not resp.startswith("__model__:")
   assert "gpt-5.5" in resp
 
 
-def test_model_list_separates_chatgpt_from_api_only_codex():
-  """The catalog feeding the picker note must keep the API-only warning
-  separate from the everyday Available list so codex users on a ChatGPT
-  account don't pick a slug that'll 400."""
-  from nemo.agent_factory import model_catalog_for_agent
+def test_model_list_for_codex_uses_dynamic_catalog():
+  """Codex model listing comes from `codex debug models`, not a static Nemo list."""
+  from nemo.agent_factory import ModelCatalog, model_catalog_for_agent
   from nemo.commands import _format_model_catalog
-  catalog = model_catalog_for_agent("codex")
+  with patch(
+    "nemo.agent_factory.query_codex_model_catalog",
+    return_value=ModelCatalog(
+      visible=("gpt-5.5", "gpt-5.3-codex-spark"),
+      hidden=("gpt-5-hidden",),
+      note="Dynamic models from `codex debug models`.",
+    ),
+  ):
+    catalog = model_catalog_for_agent("codex")
   listing = _format_model_catalog(catalog)
-  available_line = next(l for l in listing.split("\n") if l.startswith("Available:"))
-  assert "gpt-5.5" in available_line
-  assert "gpt-5.4" in available_line
-  # The codex-specialized variants must be in a separate API-only bucket,
-  # not mixed into the plain Available list.
-  assert "gpt-5.3-codex" not in available_line
-  api_line = next(l for l in listing.split("\n") if l.startswith("API-only"))
-  assert "gpt-5.3-codex" in api_line
-  assert "ChatGPT" in api_line  # explains why they're segregated
+
+  assert "Available: `gpt-5.5`, `gpt-5.3-codex-spark`" in listing
+  assert "Legacy: `gpt-5-hidden`" in listing
+  assert "codex debug models" in listing
 
 
 def test_model_list_for_opencode_shows_dynamic_note():

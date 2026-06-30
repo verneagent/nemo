@@ -10,6 +10,8 @@ upstream gateway like DeepSeek or Kimi.)
 
 from __future__ import annotations
 
+import json
+import subprocess
 from dataclasses import dataclass, field
 from typing import Literal, get_args
 
@@ -37,6 +39,7 @@ __all__ = [
   "default_model_for_agent",
   "is_model_compatible",
   "model_catalog_for_agent",
+  "query_codex_model_catalog",
   "MediaVision",
   "model_media_vision",
 ]
@@ -45,15 +48,12 @@ _DEFAULT_MODEL_BY_AGENT: dict[AgentKind, str] = {
   "claude": "claude-opus-4-8",
   # claude-cli drives the interactive TUI; same model slugs as claude.
   "claude-cli": "claude-opus-4-8",
-  # gpt-5.5 is the current top-priority codex model — works for both
-  # ChatGPT subscribers and API users. The codex-specialized slugs
-  # (-codex variants) are API-only and return HTTP 400 for ChatGPT
-  # accounts, so they make a poor default.
+  # Kept as the startup default. The interactive /model catalog is read
+  # dynamically from `codex debug models`.
   "codex": "gpt-5.5",
   # OpenCode resolves the configured default model on its side.
   "opencode": "default",
 }
-
 
 @dataclass(frozen=True)
 class ModelCatalog:
@@ -80,8 +80,6 @@ class ModelCatalog:
 
 
 # Claude aliases mirror the Claude CLI's /model picker.
-# Codex slugs come from github.com/openai/codex `models-manager/models.json`.
-# Older bundled `codex` binaries may reject newer slugs at turn time.
 _CATALOG_BY_AGENT: dict[AgentKind, ModelCatalog] = {
   "claude": ModelCatalog(
     visible=(
@@ -101,33 +99,6 @@ _CATALOG_BY_AGENT: dict[AgentKind, ModelCatalog] = {
       "sonnet": "claude-sonnet-4-6",
       "haiku": "claude-haiku-4-5",
     },
-  ),
-  "codex": ModelCatalog(
-    # Slugs from the codex CLI's `~/.codex/models_cache.json`
-    # (priority-ordered, all marked supported_in_api). gpt-5.5 is the
-    # current default-tier coding model. Older 5.0 / 5.1 / -codex
-    # variants OpenAI dropped from the live list have been removed —
-    # passing them at /model would just 400.
-    visible=(
-      "gpt-5.5",
-      "gpt-5.4",
-      "gpt-5.4-mini",
-      "gpt-5.2",
-    ),
-    # API-only codex-specialized slug — works on API auth, returns 400
-    # ("not supported when using Codex with a ChatGPT account") for
-    # ChatGPT subscribers.
-    api_only=(
-      "gpt-5.3-codex",
-    ),
-    hidden=(
-      # gpt-5.3-codex-spark is ChatGPT-only (supported_in_api: false in
-      # the cache), kept here so /model accepts it for users who have it.
-      "gpt-5.3-codex-spark",
-      "gpt-oss-120b",
-      "gpt-oss-20b",
-    ),
-    aliases={},
   ),
   "opencode": ModelCatalog(
     note=(
@@ -155,6 +126,61 @@ def _preset_names_for_agent(agent: AgentKind) -> tuple[str, ...]:
   )
 
 
+def _codex_model_sort_key(item: object, index: int) -> tuple[int, int]:
+  if not isinstance(item, dict):
+    return (1_000_000, index)
+  priority = item.get("priority")
+  if isinstance(priority, int):
+    return (priority, index)
+  return (1_000_000, index)
+
+
+def query_codex_model_catalog() -> ModelCatalog:
+  """Read Codex's live model catalog via `codex debug models`."""
+  try:
+    result = subprocess.run(
+      ["codex", "debug", "models"],
+      capture_output=True,
+      text=True,
+      timeout=10,
+      check=False,
+    )
+  except (OSError, subprocess.TimeoutExpired) as exc:
+    return ModelCatalog(note=f"Codex model catalog unavailable: {exc}")
+  if result.returncode != 0:
+    detail = (result.stderr or result.stdout).strip()
+    suffix = f": {detail}" if detail else ""
+    return ModelCatalog(note=f"Codex model catalog unavailable{suffix}")
+  try:
+    parsed = json.loads(result.stdout)
+  except json.JSONDecodeError as exc:
+    return ModelCatalog(note=f"Codex model catalog unreadable: {exc}")
+  if not isinstance(parsed, dict):
+    return ModelCatalog(note="Codex model catalog unreadable: expected object")
+  raw_models = parsed.get("models")
+  if not isinstance(raw_models, list):
+    return ModelCatalog(note="Codex model catalog unreadable: missing models")
+
+  visible: list[str] = []
+  hidden: list[str] = []
+  for _, item in sorted(
+    enumerate(raw_models),
+    key=lambda pair: _codex_model_sort_key(pair[1], pair[0]),
+  ):
+    if not isinstance(item, dict):
+      continue
+    slug = item.get("slug")
+    if not isinstance(slug, str) or not slug:
+      continue
+    if item.get("visibility") == "list":
+      visible.append(slug)
+  return ModelCatalog(
+    visible=tuple(dict.fromkeys(visible)),
+    hidden=tuple(dict.fromkeys(hidden)),
+    note="Dynamic models from `codex debug models`.",
+  )
+
+
 def model_catalog_for_agent(
   agent: AgentKind,
   project_dir: str = "",
@@ -165,6 +191,20 @@ def model_catalog_for_agent(
     presets = _preset_names_for_agent(agent)
     visible = tuple(dict.fromkeys((*models, *presets)))
     return ModelCatalog(visible=visible, note=note)
+  if agent == "codex":
+    base = query_codex_model_catalog()
+    presets = _preset_names_for_agent(agent)
+    if not presets:
+      return base
+    existing = set(base.all_names())
+    extra = tuple(p for p in presets if p not in existing)
+    return ModelCatalog(
+      visible=base.visible + extra,
+      api_only=base.api_only,
+      hidden=base.hidden,
+      aliases=base.aliases,
+      note=base.note,
+    )
   base = _CATALOG_BY_AGENT.get(agent, ModelCatalog())
   presets = _preset_names_for_agent(agent)
   if not presets:

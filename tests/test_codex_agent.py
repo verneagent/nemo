@@ -3,12 +3,20 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import subprocess
 from pathlib import Path
 from unittest import mock
 
 import pytest
 
-from nemo.agent_factory import build_coding_agent, default_model_for_agent, is_model_compatible
+from nemo.agent_factory import (
+  build_coding_agent,
+  default_model_for_agent,
+  is_model_compatible,
+  ModelCatalog,
+  query_codex_model_catalog,
+)
 from nemo.claude_agent import ClaudeCodingAgent
 from nemo.codex_agent import CodexCodingAgent, _SIDE_CAR_SCRIPT
 from nemo.turn import AnswerEvent, DoneEvent, ErrorEvent, ProgressEvent
@@ -77,18 +85,65 @@ class _FakeProc:
 
 def test_default_model_for_agent():
   assert default_model_for_agent("claude") == "claude-opus-4-8"
-  # Codex default must work for both ChatGPT subscribers and API users —
-  # the codex-specialized (-codex) slugs are API-only.
+  # Startup default stays stable; /model gets the live catalog from Codex.
   assert default_model_for_agent("codex") == "gpt-5.5"
 
 
 def test_is_model_compatible():
   assert is_model_compatible("claude", "claude-opus-4-7")
   assert is_model_compatible("claude", "claude-opus-4-6")
-  assert not is_model_compatible("claude", "gpt-5.3-codex")
-  assert is_model_compatible("codex", "gpt-5.3-codex")
-  assert is_model_compatible("codex", "gpt-5.5")
-  assert not is_model_compatible("codex", "claude-sonnet-4-6")
+  assert not is_model_compatible("claude", "gpt-5.5")
+  with mock.patch(
+    "nemo.agent_factory.query_codex_model_catalog",
+    return_value=ModelCatalog(
+      visible=("gpt-5.5",),
+      hidden=("gpt-5-hidden",),
+    ),
+  ):
+    assert is_model_compatible("codex", "gpt-5-hidden")
+    assert is_model_compatible("codex", "gpt-5.5")
+    assert not is_model_compatible("codex", "claude-sonnet-4-6")
+
+
+def test_codex_model_catalog_uses_debug_models():
+  payload = {
+    "models": [
+      {"slug": "codex-auto-review", "visibility": "hide", "priority": 43},
+      {"slug": "gpt-5.3-codex-spark", "visibility": "list", "priority": 26},
+      {"slug": "gpt-5.5", "visibility": "list", "priority": 7},
+    ],
+  }
+  completed = subprocess.CompletedProcess(
+    ["codex", "debug", "models"],
+    0,
+    stdout=json.dumps(payload),
+    stderr="",
+  )
+  with mock.patch("nemo.agent_factory.subprocess.run", return_value=completed) as run:
+    catalog = query_codex_model_catalog()
+
+  run.assert_called_once()
+  assert catalog.visible == ("gpt-5.5", "gpt-5.3-codex-spark")
+  assert catalog.hidden == ()
+  assert "codex-auto-review" not in catalog.all_names()
+  assert catalog.api_only == ()
+  assert "codex debug models" in catalog.note
+
+
+def test_codex_model_catalog_failure_has_no_static_fallback():
+  completed = subprocess.CompletedProcess(
+    ["codex", "debug", "models"],
+    1,
+    stdout="",
+    stderr="boom",
+  )
+  with mock.patch("nemo.agent_factory.subprocess.run", return_value=completed):
+    catalog = query_codex_model_catalog()
+
+  assert catalog.visible == ()
+  assert catalog.hidden == ()
+  assert "unavailable" in catalog.note
+  assert "boom" in catalog.note
 
 
 def test_build_coding_agent_returns_expected_class():
