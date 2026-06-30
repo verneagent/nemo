@@ -697,10 +697,11 @@ def build_turn_card(
   compact_notice: str = "",
   answered_questions: list["AnsweredQuestion"] | None = None,
   pending_question: "PendingQuestion | None" = None,
+  part_label: str = "",
 ) -> JsonObject:
   """Build a unified turn card for any phase.
 
-  phase: "working" | "stopping" | "stopped" | "done" | "error"
+  phase: "working" | "continued" | "stopping" | "stopped" | "done" | "error"
   body:  for done/error — final response or error message
   steps: unified thinking timeline (text + tool entries in order)
   status_notice: short blue banner shown above the working state as a
@@ -721,6 +722,7 @@ def build_turn_card(
   pending_question: an in-flight AskUserQuestion, rendered inline with
     its option buttons in the working phase only. Stopping/stopped/done/
     error drop it (the loop has ended).
+  part_label: optional title suffix for multi-card turn segments.
   """
   steps = steps or []
   answered_questions = answered_questions or []
@@ -739,6 +741,27 @@ def build_turn_card(
     )
     title = _elapsed_title(elapsed)
     header: JsonObject | None = {
+      "title": {"tag": "plain_text", "content": title},
+      "template": "grey",
+    }
+
+  elif phase == "continued":
+    elements = _working_elements(
+      steps=steps,
+      current_tool=current_tool,
+      include_stop_button=False,
+      status_notice=status_notice,
+      rate_limit_notice=rate_limit_notice,
+      compact_notice=compact_notice,
+      answered_questions=answered_questions,
+      pending_question=None,
+    )
+    if not elements:
+      elements.append(_note_element("continued in the next card"))
+    title = "Earlier progress"
+    if part_label:
+      title = f"{title} · {part_label}"
+    header = {
       "title": {"tag": "plain_text", "content": title},
       "template": "grey",
     }

@@ -50,6 +50,14 @@ _COMPACT_FAILURE_MARKERS = (
   "failed to run pre-sampling compact",
   "error running remote compact task",
 )
+TURN_CARD_ROLLOVER_BYTE_LIMIT = 22000
+
+
+@dataclasses.dataclass
+class _TurnCardSegment:
+  message_id: str
+  start_index: int
+  end_index: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -2636,6 +2644,8 @@ async def main_loop(
 
       # Turn state
       _turn_card_id: str | None = None
+      _turn_card_segments: list[_TurnCardSegment] = []
+      _turn_active_start = 0
       _turn_steps: list[cards.ThinkingStep] = []
       _turn_start = time.time()
       _turn_current_tool = ""
@@ -2664,7 +2674,7 @@ async def main_loop(
         try:
           card = cards.build_turn_card(
             phase,
-            steps=_turn_steps,
+            steps=_turn_steps[_turn_active_start:],
             current_tool=_turn_current_tool,
             elapsed=int(time.time() - _turn_start),
             rate_limit_notice=_turn_rate_limit_notice,
@@ -2675,6 +2685,8 @@ async def main_loop(
           _turn_card_id = await channel.update_card(_turn_card_id, card)
           if _turn_card_id != prev_id:
             _register_msg(_turn_card_id, chat_id)
+            if _turn_card_segments:
+              _turn_card_segments[-1].message_id = _turn_card_id
         except Exception as e:
           log.warning("Failed to update interrupt card: %s", e)
 
@@ -2697,18 +2709,23 @@ async def main_loop(
         sequence flashes an empty grey "Working..." card for one frame
         before the question elements land.
         """
-        nonlocal _turn_card_id
+        nonlocal _turn_card_id, _turn_active_start
         if _turn_card_id:
           return
         _await_channel(_clear_ack())
+        if not _turn_card_segments:
+          _turn_active_start = 0
         card = cards.build_turn_card(
           "working",
+          steps=_turn_steps[_turn_active_start:],
           chat_id=chat_id,
           answered_questions=list(channel.turn_ctx.answered_questions),
           pending_question=channel.turn_ctx.pending_question,
         )
         try:
           _turn_card_id = _await_channel(channel.send_card(chat_id, card))
+          _turn_card_segments.append(_TurnCardSegment(
+            message_id=_turn_card_id, start_index=_turn_active_start))
           db.set_working(session_id, _turn_card_id)
           _register_msg(_turn_card_id, chat_id)
           channel.turn_ctx.turn_card_id = _turn_card_id
@@ -2717,7 +2734,7 @@ async def main_loop(
 
       def _update_working(**kwargs):
         """Update the working card with current state."""
-        nonlocal _turn_card_id
+        nonlocal _turn_card_id, _turn_active_start
         if _turn_interrupt_phase:
           return
         if not _turn_card_id:
@@ -2740,9 +2757,10 @@ async def main_loop(
           "pending_question": channel.turn_ctx.pending_question,
         }
         ctx_kwargs.update(kwargs)
+        active_steps = _turn_steps[_turn_active_start:]
         card = cards.build_turn_card(
           "working",
-          steps=_turn_steps,
+          steps=active_steps,
           elapsed=elapsed,
           chat_id=chat_id,
           status_notice=_turn_status_notice,
@@ -2751,11 +2769,62 @@ async def main_loop(
           **ctx_kwargs,
         )
         try:
+          if (
+            cards.card_content_bytes(card) > TURN_CARD_ROLLOVER_BYTE_LIMIT
+            and len(active_steps) > 1
+          ):
+            new_start = len(_turn_steps) - 1
+            freeze_steps = _turn_steps[_turn_active_start:new_start]
+            frozen_card = cards.build_turn_card(
+              "continued",
+              steps=freeze_steps,
+              elapsed=elapsed,
+              status_notice=_turn_status_notice,
+              rate_limit_notice=_turn_rate_limit_notice,
+              compact_notice=_turn_compact_notice,
+              answered_questions=list(channel.turn_ctx.answered_questions),
+              part_label=f"part {len(_turn_card_segments)}",
+            )
+            prev_id = _turn_card_id
+            frozen_id = _await_channel(
+              channel.update_card(_turn_card_id, frozen_card))
+            if frozen_id != prev_id:
+              _register_msg(frozen_id, chat_id)
+            if _turn_card_segments:
+              _turn_card_segments[-1].message_id = frozen_id
+              _turn_card_segments[-1].end_index = new_start
+
+            _turn_active_start = new_start
+            card = cards.build_turn_card(
+              "working",
+              steps=_turn_steps[_turn_active_start:],
+              elapsed=elapsed,
+              chat_id=chat_id,
+              status_notice=_turn_status_notice,
+              rate_limit_notice=_turn_rate_limit_notice,
+              compact_notice=_turn_compact_notice,
+              **ctx_kwargs,
+            )
+            try:
+              _turn_card_id = _await_channel(channel.send_card(chat_id, card))
+            except Exception:
+              _turn_card_id = None
+              channel.turn_ctx.turn_card_id = ""
+              raise
+            _turn_card_segments.append(_TurnCardSegment(
+              message_id=_turn_card_id, start_index=_turn_active_start))
+            db.set_working(session_id, _turn_card_id)
+            _register_msg(_turn_card_id, chat_id)
+            channel.turn_ctx.turn_card_id = _turn_card_id
+            return
+
           prev_id = _turn_card_id
           _turn_card_id = _await_channel(channel.update_card(_turn_card_id, card))
           if _turn_card_id != prev_id:
             _register_msg(_turn_card_id, chat_id)
             channel.turn_ctx.turn_card_id = _turn_card_id
+            if _turn_card_segments:
+              _turn_card_segments[-1].message_id = _turn_card_id
         except Exception as e:
           log.debug("Failed to update working card: %s", e)
 
@@ -2888,9 +2957,13 @@ async def main_loop(
             trailing = coding_agent.trailing_note(_sdk_session_id)
             if trailing:
               final_text = final_text + trailing
-          # Thinking timeline = all non-answer steps
-          thinking = [s for s in _turn_steps if s.kind != "answer"]
+          # Preserve the same timeline the user saw while the card was
+          # working. The final answer is still rendered inline as the done
+          # body, but keeping answer steps here preserves the working-phase
+          # grouping inside the collapsible Thinking panel.
+          thinking = list(_turn_steps[_turn_active_start:])
           if _turn_card_id:
+            prev_id = _turn_card_id
             _turn_card_id = _update_done_card_with_fallback(
               channel=channel,
               chat_id=chat_id,
@@ -2905,6 +2978,8 @@ async def main_loop(
               register_msg=_register_msg,
               answered_questions=list(channel.turn_ctx.answered_questions),
             )
+            if _turn_card_id != prev_id and _turn_card_segments:
+              _turn_card_segments[-1].message_id = _turn_card_id
             db.clear_working(session_id)
             if final_text:
               db.record_sent(_turn_card_id, text=final_text[:500], chat_id=chat_id)
@@ -2940,6 +3015,8 @@ async def main_loop(
             pending_question=channel.turn_ctx.pending_question,
           )
           _turn_card_id = await channel.send_card(chat_id, card)
+          _turn_card_segments.append(_TurnCardSegment(
+            message_id=_turn_card_id, start_index=_turn_active_start))
           db.set_working(session_id, _turn_card_id)
           _register_msg(_turn_card_id, chat_id)
           channel.turn_ctx.turn_card_id = _turn_card_id
@@ -3440,7 +3517,7 @@ async def main_loop(
             msg = f"{msg}\n\n{_turn_rate_limit_notice}"
           await _handle_turn_error(
             msg, exc, channel, chat_id, db, session_id,
-            _turn_card_id, _turn_steps, _turn_start,
+            _turn_card_id, _turn_steps[_turn_active_start:], _turn_start,
           )
           _pending_pacing_hint = True
           await _clear_ack()
@@ -3454,7 +3531,7 @@ async def main_loop(
             log.warning("SDK cleanup after turn error failed: %s", interrupt_exc)
           await _handle_turn_error(
             str(exc), exc, channel, chat_id, db, session_id,
-            _turn_card_id, _turn_steps, _turn_start,
+            _turn_card_id, _turn_steps[_turn_active_start:], _turn_start,
           )
           await _clear_ack()
           await _clear_pending_ack()

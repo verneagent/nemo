@@ -423,7 +423,7 @@ class CodexCodingAgent(CodingAgent):
     if total < _CODEX_CONTEXT_WARNING_TOKENS:
       return ""
     return (
-      "\n\n<font color='grey'>Codex context is getting large "
+      "\n\n<font color='grey'>⚠️ Codex context is getting large "
       f"(~{total:,} tokens). Consider `/clear` followed by `/session recall` "
       "before another long turn to avoid remote compact failures.</font>"
     )

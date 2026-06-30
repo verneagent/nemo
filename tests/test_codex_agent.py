@@ -617,6 +617,7 @@ def test_codex_trailing_note_warns_when_context_is_large():
   note = agent.trailing_note("sess-x")
 
   assert "Codex context is getting large" in note
+  assert "⚠️" in note
   assert "`/clear`" in note
   assert "`/session recall`" in note
 

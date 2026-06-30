@@ -446,6 +446,25 @@ def test_working_card_with_body_only():
   assert elements[0]["tag"] == "column_set"
 
 
+def test_continued_card_is_frozen_progress():
+  steps = [
+    ThinkingStep("answer", "Checking..."),
+    ThinkingStep("tool", "Read: a.py"),
+  ]
+  card = build_turn_card(
+    "continued",
+    steps=steps,
+    current_tool="Read: a.py",
+    part_label="part 1",
+    chat_id="oc_123",
+  )
+  assert card["header"]["template"] == "grey"
+  assert card["header"]["title"]["content"] == "Earlier progress · part 1"
+  elements = card["body"]["elements"]
+  assert any(e["tag"] == "collapsible_panel" for e in elements)
+  assert all(e.get("tag") != "column_set" for e in elements)
+
+
 def test_working_card_renders_rate_limit_notice_above_tool():
   """Rate-limit banner sits above the current_tool block on the working card."""
   card = build_turn_card(

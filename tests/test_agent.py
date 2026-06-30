@@ -1,6 +1,7 @@
 """Tests for nemo.agent main loop behavior."""
 
 import asyncio
+import json
 import os
 import shlex
 import sys
@@ -183,6 +184,9 @@ class _FakeAgent:
 
   async def stop(self):
     pass
+
+  def trailing_note(self, _session_id):
+    return ""
 
   async def run_turn(self, _prompt, on_event):
     def _emit():
@@ -568,6 +572,97 @@ def test_active_esc_updates_card_without_cancel_message(tmp_path):
     card.get("header", {}).get("title", {}).get("content") == "Stopped"
     for card in channel.updated_cards
   )
+
+
+def test_done_card_thinking_preserves_working_answer_steps(tmp_path):
+  """Done-card Thinking should keep the same answer-grouped timeline that was
+  visible while working; the final answer is duplicated into the body, not
+  removed from the collapsible panel."""
+
+  class _TimelineChannel(_QueuedChannel):
+    def __init__(self):
+      super().__init__("oc_test", [
+        IncomingMessage(
+          event_type="im.message.receive_v1",
+          chat_id="oc_test",
+          sender_id="ou_user",
+          message_id="om_work",
+          msg_type="text",
+          text="work",
+          create_time="1",
+        ),
+        IncomingMessage(
+          event_type="im.message.receive_v1",
+          chat_id="oc_test",
+          sender_id="ou_user",
+          message_id="om_exit",
+          msg_type="text",
+          text="/exit",
+          create_time="2",
+        ),
+      ])
+      self.updated_cards: list[object] = []
+      self._done_rendered = False
+
+    async def receive(self, timeout=300):
+      if self._messages and self._messages[0].text == "/exit":
+        for _ in range(300):
+          if self._done_rendered:
+            break
+          await asyncio.sleep(0.01)
+      return await super().receive(timeout)
+
+    async def send_card(self, _chat_id, _card):
+      return "om_card"
+
+    async def update_card(self, card_id, card):
+      self.updated_cards.append(card)
+      if card.get("header", {}).get("template") == "green":
+        self._done_rendered = True
+      return card_id
+
+  class _TimelineAgent(_FakeAgent):
+    def trailing_note(self, _session_id):
+      return ""
+
+    async def run_turn(self, _prompt, on_event):
+      def _emit():
+        on_event(ProgressEvent(kind="tool", summary="Read: a.py", first=True))
+        on_event(AnswerEvent("First visible draft"))
+        on_event(ProgressEvent(kind="tool", summary="Edit: b.py"))
+        on_event(AnswerEvent("Final visible answer"))
+        on_event(DoneEvent(cost=0.0, usage={"input_tokens": 1}))
+
+      await asyncio.to_thread(_emit)
+      return 0.0, {"input_tokens": 1}
+
+  channel = _TimelineChannel()
+  with mock.patch("nemo.agent.load_credentials", return_value={
+    "app_id": "app_id",
+    "app_secret": "app_secret",
+    "email": "user@example.com",
+  }), \
+       mock.patch("nemo.agent.Database", _FakeDB), \
+       mock.patch("nemo.agent.LarkChannel", return_value=channel), \
+       mock.patch("nemo.agent.build_coding_agent", return_value=_TimelineAgent()), \
+       mock.patch("nemo.group_config.load_config", return_value={}), \
+       mock.patch("nemo.config.load_relay_config", return_value=("", "")), \
+       mock.patch("signal.signal"):
+    result = asyncio.run(main_loop("oc_test", str(tmp_path), "claude-opus-4-6"))
+
+  assert result == 0
+  done_cards = [
+    card for card in channel.updated_cards
+    if card.get("header", {}).get("template") == "green"
+  ]
+  assert done_cards
+  done_card = done_cards[-1]
+  elements = done_card["body"]["elements"]
+  assert elements[0]["content"] == "Final visible answer"
+  panel = next(e for e in elements if e.get("tag") == "collapsible_panel")
+  assert panel["header"]["title"]["content"] == "Thinking (3)"
+  assert "First visible draft" in repr(panel)
+  assert "Final visible answer" in repr(panel)
 
 
 def test_fork_command_during_turn_opens_fork(tmp_path):
@@ -2629,6 +2724,100 @@ def test_working_card_retry_also_triggered_by_answer_event(tmp_path):
     f"working_creates={_state['working_create_attempts']}, "
     f"update_card={len(update_card_calls)}"
   )
+
+
+def test_turn_rolls_over_to_multiple_cards(tmp_path):
+  """A long turn freezes the full active card as Earlier progress and
+  continues on a new live card; only the last card becomes Done."""
+
+  sent_cards: list[object] = []
+  update_card_calls: list[tuple[str, object]] = []
+
+  class _RolloverChannel(_FakeChannel):
+    def __init__(self, chat_id):
+      super().__init__(chat_id)
+      self._done = False
+      self._sent_prompt = False
+      self._sent_exit = False
+      self._messages = [
+        IncomingMessage(
+          event_type="im.message.receive_v1",
+          chat_id="oc_test", sender_id="ou_user",
+          message_id="om_msg", msg_type="text",
+          text="do a long thing", create_time="1",
+        ),
+        IncomingMessage(
+          event_type="im.message.receive_v1",
+          chat_id="oc_test", sender_id="ou_user",
+          message_id="om_exit", msg_type="text",
+          text="/exit", create_time="2",
+        ),
+      ]
+
+    async def receive(self, timeout=300):
+      del timeout
+      if not self._sent_prompt:
+        self._sent_prompt = True
+        return self._messages[0]
+      if not self._sent_exit:
+        for _ in range(100):
+          if self._done:
+            break
+          await asyncio.sleep(0.01)
+        self._sent_exit = True
+        return self._messages[1]
+      return None
+
+    async def send_card(self, _chat_id, card):
+      sent_cards.append(card)
+      return f"om_card_{len(sent_cards)}"
+
+    async def update_card(self, card_id, card):
+      update_card_calls.append((card_id, card))
+      if card.get("header", {}).get("title", {}).get("content") == "Done ✓":
+        self._done = True
+      return card_id
+
+  class _LongTurnAgent(_FakeAgent):
+    async def run_turn(self, _prompt, on_event):
+      def _emit():
+        on_event(ProgressEvent(kind="tool", summary="Read: a.py", first=True))
+        on_event(ProgressEvent(kind="tool", summary="Edit: b.py"))
+        on_event(ProgressEvent(kind="tool", summary="Bash: pytest"))
+        on_event(AnswerEvent("done"))
+        on_event(DoneEvent(cost=0.0, usage={"input_tokens": 1}))
+      await asyncio.to_thread(_emit)
+      return 0.0, {"input_tokens": 1}
+
+  channel = _RolloverChannel("oc_test")
+
+  with mock.patch("nemo.agent.load_credentials", return_value={
+    "app_id": "app_id", "app_secret": "app_secret", "email": "u@e.com",
+  }), \
+       mock.patch("nemo.agent.Database", _FakeDB), \
+       mock.patch("nemo.agent.LarkChannel", return_value=channel), \
+       mock.patch("nemo.agent.build_coding_agent", return_value=_LongTurnAgent()), \
+       mock.patch("nemo.agent.TURN_CARD_ROLLOVER_BYTE_LIMIT", 100), \
+       mock.patch("nemo.agent._send_response", new=mock.AsyncMock()), \
+       mock.patch("nemo.group_config.load_config", return_value={}), \
+       mock.patch("nemo.config.load_relay_config", return_value=("", "")), \
+       mock.patch("signal.signal"):
+    rc = asyncio.run(main_loop("oc_test", str(tmp_path), "claude-opus-4-6"))
+
+  assert rc == 0
+  updated_cards = [card for (_mid, card) in update_card_calls]
+  continued = [
+    card for card in updated_cards
+    if card.get("header", {}).get("title", {}).get("content", "").startswith(
+      "Earlier progress")
+  ]
+  done = [
+    card for card in updated_cards
+    if card.get("header", {}).get("title", {}).get("content") == "Done ✓"
+  ]
+  assert continued, json.dumps(updated_cards, ensure_ascii=False)
+  assert done, json.dumps(updated_cards, ensure_ascii=False)
+  assert update_card_calls[-1][1]["header"]["title"]["content"] == "Done ✓"
 
 
 def test_compact_events_set_banner_not_thinking_steps(tmp_path):
