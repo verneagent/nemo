@@ -1383,6 +1383,79 @@ def test_main_loop_threads_agent_through_db_calls(tmp_path):
   assert ("oc_test", "codex-thread-xyz", "codex", "") in recorded_set, recorded_set
 
 
+def test_compact_failure_preserves_codex_resume_slot(tmp_path):
+  """Compaction failure should not silently discard memory. The daemon reports
+  the failure and keeps the active Codex thread as the next resume target.
+  """
+  from nemo.channel import IncomingMessage
+
+  recorded_set: list[tuple[str, str, str, str]] = []
+
+  class _ResumeDB(_FakeDB):
+    def get_chat_owner(self, _chat_id):
+      return "old_session"
+
+    def get_sdk_session_id(self, _chat_id, _agent, _endpoint_key=""):
+      return "codex-thread-big"
+
+    def set_sdk_session_id(self, chat_id, sdk_session_id, agent,
+                           endpoint_key=""):
+      recorded_set.append((chat_id, sdk_session_id, agent, endpoint_key))
+
+  class _FailingCompactAgent(_FakeAgent):
+    def __init__(self):
+      self.start_resumes: list[str] = []
+      self.reset_resumes: list[str] = []
+
+    async def start(self, _project_dir, _model, resume=""):
+      self.start_resumes.append(resume)
+
+    async def reset(self, _project_dir, _model, resume=""):
+      self.reset_resumes.append(resume)
+
+    async def run_turn(self, _prompt, _on_event):
+      raise RuntimeError(
+        "Error running remote compact task: stream disconnected before "
+        "completion: error sending request for url "
+        "(https://chatgpt.com/backend-api/codex/responses)"
+      )
+
+  agent = _FailingCompactAgent()
+  queued = _QueuedChannel("oc_test", [
+    IncomingMessage(
+      event_type="im.message.receive_v1",
+      chat_id="oc_test", sender_id="ou_user",
+      message_id="om_msg", msg_type="text",
+      text="continue", create_time="1",
+    ),
+    IncomingMessage(
+      event_type="im.message.receive_v1",
+      chat_id="oc_test", sender_id="ou_user",
+      message_id="om_exit", msg_type="text",
+      text="/exit", create_time="2",
+    ),
+  ])
+
+  with mock.patch("nemo.agent.load_credentials", return_value={
+    "app_id": "app_id", "app_secret": "app_secret", "email": "u@e.com",
+  }), \
+       mock.patch("nemo.agent.Database", _ResumeDB), \
+       mock.patch("nemo.agent.LarkChannel", return_value=queued), \
+       mock.patch("nemo.agent.build_coding_agent", return_value=agent), \
+       mock.patch("nemo.agent._send_response", new=mock.AsyncMock()), \
+       mock.patch("nemo.group_config.load_config", return_value={}), \
+       mock.patch("nemo.config.load_relay_config", return_value=("", "")), \
+       mock.patch("signal.signal"):
+    rc = asyncio.run(
+      main_loop("oc_test", str(tmp_path), "gpt-5.5", agent="codex")
+    )
+
+  assert rc == 0
+  assert agent.start_resumes == ["codex-thread-big"]
+  assert agent.reset_resumes == []
+  assert ("oc_test", "", "codex", "") not in recorded_set
+
+
 def test_model_switch_to_preset_sets_endpoint_and_remote_name(tmp_path):
   """`/model deepseek-v4-pro` must (a) flip the agent's EndpointConfig
   to the preset's anthropic_url + api key, (b) feed the protocol-

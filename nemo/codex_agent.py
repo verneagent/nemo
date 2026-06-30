@@ -200,11 +200,13 @@ def _codex_recovery_message(message: str) -> str:
   if not _is_codex_compact_failure(message):
     return message
   return (
-    "Codex session compaction failed. This usually means the current Codex "
-    "thread is very large and the remote compact request failed, so retrying "
-    "`继续` may hit the same pre-sampling compact failure.\n\n"
-    "Recommended recovery: run `/clear`, then `/session recall` to bring back "
-    "the useful summary from the previous session before continuing.\n\n"
+    "Codex session compaction failed. The current Codex thread is large enough "
+    "that Codex must compact it before the next response, but the remote "
+    "compact request failed. Nemo keeps the session memory intact; retrying "
+    "may succeed if this was a transient backend/network failure.\n\n"
+    "If it keeps failing, run `/clear` only when you explicitly want to start "
+    "a fresh session, then use `/session recall` to bring back a summary of "
+    "the previous thread.\n\n"
     f"Original error: {message}"
   )
 
@@ -303,7 +305,6 @@ class CodexCodingAgent(CodingAgent):
           visible_progress = True
         can_retry = (
           exc.retryable
-          and not _is_codex_compact_failure(last_error)
           and not exc.progressed
           and not self._interrupted
           and attempt < _CODEX_BACKEND_RETRY_ATTEMPTS

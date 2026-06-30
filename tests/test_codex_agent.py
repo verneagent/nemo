@@ -557,51 +557,63 @@ def test_codex_run_turn_raises_stdout_buffer_limit():
 
 def test_codex_compact_failure_gets_recovery_hint_from_turn_failed():
   async def _run():
-    proc = _FakeProc([
-      b'{"type":"turn.failed","error":{"message":"Error running remote compact task: stream disconnected before completion: error sending request for url (https://chatgpt.com/backend-api/codex/responses/compact)"}}\n',
-    ])
+    def _proc():
+      return _FakeProc([
+        b'{"type":"turn.failed","error":{"message":"Error running remote compact task: stream disconnected before completion: error sending request for url (https://chatgpt.com/backend-api/codex/responses/compact)"}}\n',
+      ])
     agent = CodexCodingAgent({}, "oc_1", _DummyDB(), _DummyChannel())
     await agent.start("/tmp/project", "gpt-5-codex", resume="sess-x")
 
     events = []
     w, s, p, f = _codex_runtime_patches()
     with w, s, p, f, \
-         mock.patch("asyncio.create_subprocess_exec", return_value=proc), \
+         mock.patch("asyncio.create_subprocess_exec",
+                    side_effect=[_proc(), _proc(), _proc()]) as exec_mock, \
+         mock.patch("asyncio.sleep", new=mock.AsyncMock()), \
          pytest.raises(RuntimeError) as raised:
       await agent.run_turn("continue", events.append)
 
+    assert exec_mock.call_count == 3
     assert "Codex session compaction failed" in str(raised.value)
     assert "`/clear`" in str(raised.value)
     assert "`/session recall`" in str(raised.value)
-    assert isinstance(events[0], ErrorEvent)
-    assert "Recommended recovery" in events[0].message
+    assert any(
+      isinstance(e, ProgressEvent) and "retrying (2/3)" in e.summary
+      for e in events
+    )
+    assert isinstance(events[-1], ErrorEvent)
+    assert "memory intact" in events[-1].message
 
   asyncio.run(_run())
 
 
 def test_codex_compact_failure_gets_recovery_hint_from_stderr_exit():
   async def _run():
-    proc = _FakeProc(
-      [],
-      returncode=1,
-      stderr_lines=[
-        b"2026-06-29T09:41:11Z ERROR codex_core::compact_remote: remote compaction failed compact_error=stream disconnected before completion: error sending request for url (https://chatgpt.com/backend-api/codex/responses/compact)\n",
-      ],
-    )
+    def _proc():
+      return _FakeProc(
+        [],
+        returncode=1,
+        stderr_lines=[
+          b"2026-06-29T09:41:11Z ERROR codex_core::compact_remote: remote compaction failed compact_error=stream disconnected before completion: error sending request for url (https://chatgpt.com/backend-api/codex/responses/compact)\n",
+        ],
+      )
     agent = CodexCodingAgent({}, "oc_1", _DummyDB(), _DummyChannel())
     await agent.start("/tmp/project", "gpt-5-codex", resume="sess-x")
 
     events = []
     w, s, p, f = _codex_runtime_patches()
     with w, s, p, f, \
-         mock.patch("asyncio.create_subprocess_exec", return_value=proc), \
+         mock.patch("asyncio.create_subprocess_exec",
+                    side_effect=[_proc(), _proc(), _proc()]) as exec_mock, \
+         mock.patch("asyncio.sleep", new=mock.AsyncMock()), \
          pytest.raises(RuntimeError) as raised:
       await agent.run_turn("continue", events.append)
 
+    assert exec_mock.call_count == 3
     assert "Codex session compaction failed" in str(raised.value)
     assert "`/clear`" in str(raised.value)
-    assert isinstance(events[0], ErrorEvent)
-    assert "responses/compact" in events[0].message
+    assert isinstance(events[-1], ErrorEvent)
+    assert "responses/compact" in events[-1].message
 
   asyncio.run(_run())
 

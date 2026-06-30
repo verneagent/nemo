@@ -142,13 +142,15 @@ def _format_turn_error_message(message: str) -> str:
   lower = message.lower()
   if "Recommended recovery:" in message:
     return message
-  if any(marker in lower for marker in _COMPACT_FAILURE_MARKERS):
+  if _is_compact_failure_message(message):
     return (
-      "Session compaction failed. The current coding-agent context is probably "
-      "too large and the remote compact request failed, so retrying the same "
-      "session may fail again.\n\n"
-      "Recommended recovery: run `/clear`, then `/session recall` to restore "
-      "the useful summary from the previous session before continuing.\n\n"
+      "Session compaction failed. The current coding-agent context is large "
+      "enough that the agent must compact it before continuing, but the remote "
+      "compact request failed. Session memory is still preserved; retrying may "
+      "succeed if this was a transient backend/network issue.\n\n"
+      "If it keeps failing, run `/clear` only when you explicitly want to start "
+      "a fresh session, then use `/session recall` to restore a summary from "
+      "the previous session.\n\n"
       f"Original error: {message}"
     )
   if any(marker in lower for marker in _CODEX_BACKEND_FAILURE_MARKERS):
@@ -163,6 +165,11 @@ def _format_turn_error_message(message: str) -> str:
       f"Original error: {message}"
     )
   return message
+
+
+def _is_compact_failure_message(message: str) -> bool:
+  lower = message.lower()
+  return any(marker in lower for marker in _COMPACT_FAILURE_MARKERS)
 
 
 def _is_user_message_event(msg: IncomingMessage) -> bool:
