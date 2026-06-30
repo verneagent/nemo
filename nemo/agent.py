@@ -50,6 +50,12 @@ _COMPACT_FAILURE_MARKERS = (
   "failed to run pre-sampling compact",
   "error running remote compact task",
 )
+_CODEX_BACKEND_FAILURE_MARKERS = (
+  "chatgpt.com/backend-api/codex/responses",
+  "failed to connect to websocket",
+  "tls handshake eof",
+  "authorizationrequired",
+)
 TURN_CARD_ROLLOVER_BYTE_LIMIT = int(
   os.environ.get("NEMO_TURN_CARD_ROLLOVER_BYTE_LIMIT", "22000"))
 
@@ -134,18 +140,29 @@ def _should_send_plain_text(text: str) -> bool:
 def _format_turn_error_message(message: str) -> str:
   """Add operator guidance for known recoverable SDK failure modes."""
   lower = message.lower()
-  if not any(marker in lower for marker in _COMPACT_FAILURE_MARKERS):
-    return message
   if "Recommended recovery:" in message:
     return message
-  return (
-    "Session compaction failed. The current coding-agent context is probably "
-    "too large and the remote compact request failed, so retrying the same "
-    "session may fail again.\n\n"
-    "Recommended recovery: run `/clear`, then `/session recall` to restore "
-    "the useful summary from the previous session before continuing.\n\n"
-    f"Original error: {message}"
-  )
+  if any(marker in lower for marker in _COMPACT_FAILURE_MARKERS):
+    return (
+      "Session compaction failed. The current coding-agent context is probably "
+      "too large and the remote compact request failed, so retrying the same "
+      "session may fail again.\n\n"
+      "Recommended recovery: run `/clear`, then `/session recall` to restore "
+      "the useful summary from the previous session before continuing.\n\n"
+      f"Original error: {message}"
+    )
+  if any(marker in lower for marker in _CODEX_BACKEND_FAILURE_MARKERS):
+    return (
+      "Codex could not connect to the ChatGPT Codex backend. This is usually "
+      "a transient network/login/backend issue, not a project or Lark card "
+      "problem.\n\n"
+      "Recommended recovery: retry once if this just happened. If it repeats, "
+      "switch to `/agent claude` and a working preset such as "
+      "`/model deepseek-v4-pro`, or refresh the Codex/ChatGPT login before "
+      "using Codex again.\n\n"
+      f"Original error: {message}"
+    )
+  return message
 
 
 def _is_user_message_event(msg: IncomingMessage) -> bool:

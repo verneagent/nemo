@@ -260,6 +260,20 @@ def test_turn_error_message_does_not_duplicate_existing_recovery_hint():
   assert _format_turn_error_message(msg) == msg
 
 
+def test_turn_error_message_adds_codex_backend_recovery_hint():
+  msg = (
+    "stream disconnected before completion: error sending request for url "
+    "(https://chatgpt.com/backend-api/codex/responses)"
+  )
+
+  out = _format_turn_error_message(msg)
+
+  assert "Codex could not connect to the ChatGPT Codex backend" in out
+  assert "`/agent claude`" in out
+  assert "`/model deepseek-v4-pro`" in out
+  assert "Original error" in out
+
+
 def test_idle_esc_is_silent(tmp_path):
   from nemo.channel import IncomingMessage
 
