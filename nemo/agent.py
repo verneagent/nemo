@@ -50,7 +50,8 @@ _COMPACT_FAILURE_MARKERS = (
   "failed to run pre-sampling compact",
   "error running remote compact task",
 )
-TURN_CARD_ROLLOVER_BYTE_LIMIT = 22000
+TURN_CARD_ROLLOVER_BYTE_LIMIT = int(
+  os.environ.get("NEMO_TURN_CARD_ROLLOVER_BYTE_LIMIT", "22000"))
 
 
 @dataclasses.dataclass

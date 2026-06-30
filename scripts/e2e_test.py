@@ -12,6 +12,7 @@ Usage (run with `-u`, see "Running it" below):
     python3 -u scripts/e2e_test.py --askq        # AskUserQuestion flow
     python3 -u scripts/e2e_test.py --picker      # /model picker form-submit
     python3 -u scripts/e2e_test.py --topic       # topic-chat / thread_id
+    python3 -u scripts/e2e_test.py --rollover    # one turn split into multiple cards
     python3 -u scripts/e2e_test.py --fork        # /fork sub-thread (local relay)
     python3 -u scripts/e2e_test.py --stress|--project|--dual|--media|--shell|--switch
     python3 -u scripts/e2e_test.py --chat-id <ID>  # reuse a chat (else a temp group)
@@ -574,6 +575,57 @@ def is_done_response(msg: dict | None) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Phase 12b: Turn-card rollover
+# ---------------------------------------------------------------------------
+
+def run_rollover_tests(pid: int, chat_id: str, result: "E2EResult") -> None:
+  """Verify one SDK turn can split into multiple Lark cards.
+
+  Start the daemon with a low NEMO_TURN_CARD_ROLLOVER_BYTE_LIMIT so a normal
+  multi-tool turn rolls over deterministically. The live assertion goes
+  through Lark history: an older card must be PATCHed to "Earlier progress"
+  and the final active card must be PATCHed to "Done".
+  """
+  print(f"{Colors.BOLD}Phase 12b: Turn-card rollover{Colors.RESET}")
+  log = LogAnalyzer(pid)
+  ts = str(int(time.time() * 1000))
+  prompt = (
+    "Run these as separate steps, then answer with exactly ROLLOVER_OK:\n"
+    "1. Run pwd.\n"
+    "2. Run ls.\n"
+    "3. Read the first line of pyproject.toml."
+  )
+  send_msg(prompt, chat_id)
+  msg, elapsed = wait_for_response(
+    chat_id, after=ts, timeout=150, poll=3, require_done=True)
+  if not msg:
+    result.fail("T97 turn-card rollover done",
+                "no final Done card within 150s")
+    log.dump_tail(20, "rollover")
+    return
+
+  deadline = time.time() + 30
+  titles: list[str] = []
+  while time.time() < deadline:
+    titles = [
+      interactive_card_title(m)
+      for m in get_bot_msgs(chat_id, after=ts, limit=20)
+      if m.get("type") == "interactive"
+    ]
+    if (
+      any(t.startswith("Earlier progress") for t in titles)
+      and any(t.startswith("Done") for t in titles)
+    ):
+      result.ok("T97 turn-card rollover", f"{elapsed:.1f}s titles={titles[:5]}")
+      return
+    time.sleep(2)
+
+  result.fail("T97 turn-card rollover",
+              f"missing Earlier progress or Done card; titles={titles}")
+  log.dump_tail(20, "rollover")
+
+
+# ---------------------------------------------------------------------------
 # Log analyzer
 # ---------------------------------------------------------------------------
 
@@ -678,16 +730,24 @@ class LogAnalyzer:
 
 def start_nemo(chat_id: str, verbose: bool = False,
                permission_mode: str = "bypassPermissions",
-               agent: str = "claude") -> int:
+               agent: str = "claude",
+               model: str = "",
+               extra_env: dict[str, str] | None = None) -> int:
   """Start a nemo process. Returns PID."""
   cmd = [sys.executable, "-m", "nemo", "--chat-id", chat_id,
          "--permission-mode", permission_mode,
          "--agent", agent]
+  if model:
+    cmd.extend(["--model", model])
   if verbose:
     cmd.append("--verbose")
+  env = os.environ.copy()
+  if extra_env:
+    env.update(extra_env)
   proc = subprocess.Popen(
     cmd, cwd=PROJECT_DIR,
     stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+    env=env,
     text=True)
   try:
     line = proc.stderr.readline().strip() if proc.stderr else ""
@@ -2867,6 +2927,8 @@ def main():
   parser.add_argument("--agent", default="claude",
                       choices=["claude", "codex", "opencode", "claude-cli"],
                       help="Coding agent agent (default: claude)")
+  parser.add_argument("--model", default="",
+                      help="Model to use (agent default if omitted)")
   parser.add_argument("--skip-sdk", action="store_true",
                       help="Skip all SDK turn tests (commands only)")
   parser.add_argument("--stress", action="store_true",
@@ -2891,6 +2953,8 @@ def main():
                       help="Run only shell shortcut test (Phase 11)")
   parser.add_argument("--switch", action="store_true",
                       help="Run only /agent + preset switch test (Phase 12)")
+  parser.add_argument("--rollover", action="store_true",
+                      help="Run only turn-card rollover test (Phase 12b)")
   parser.add_argument("--fork", action="store_true",
                       help="Run only /fork sub-thread test (Phase 13, local relay)")
   parser.add_argument("--workflow", action="store_true",
@@ -2905,7 +2969,7 @@ def main():
   single_phase = (args.stress or args.project or args.perm
                   or args.askq or args.picker or args.recall_picker
                   or args.dual or args.media or args.topic
-                  or args.shell or args.switch or args.fork
+                  or args.shell or args.switch or args.rollover or args.fork
                   or args.workflow)
   run_all = not single_phase
   created_temp_chat = False
@@ -2954,6 +3018,8 @@ def main():
   print(f"{Colors.BOLD}Nemo E2E Test Suite{Colors.RESET}")
   print(f"  Chat: {chat_id}")
   print(f"  Agent: {args.agent}")
+  if args.model:
+    print(f"  Model: {args.model}")
   print(f"  Project: {PROJECT_DIR}")
   if created_temp_chat:
     print("  Chat mode: fresh temp group")
@@ -2983,6 +3049,8 @@ def main():
     print(f"  Mode: shell shortcut test only")
   elif args.switch:
     print(f"  Mode: /agent + preset switch test only")
+  elif args.rollover:
+    print(f"  Mode: turn-card rollover test only")
   elif args.fork:
     print(f"  Mode: /fork sub-thread test only (local relay)")
   elif args.workflow:
@@ -3012,10 +3080,15 @@ def main():
   # which is not yet available in bundled CLI (2.1.81/2.1.92). Permission tests
   # will show auto-approved until a newer CLI version ships with this feature.
   perm_mode = "default" if args.perm else "bypassPermissions"
+  extra_env = None
+  if args.rollover:
+    extra_env = {"NEMO_TURN_CARD_ROLLOVER_BYTE_LIMIT": "900"}
   print(f"  Starting nemo (permission_mode={perm_mode})...")
   pid = start_nemo(chat_id, verbose=args.verbose,
                    permission_mode=perm_mode,
-                   agent=args.agent)
+                   agent=args.agent,
+                   model=args.model,
+                   extra_env=extra_env)
   print(f"  PID: {pid}")
 
   if not wait_for_ready(pid, timeout=30, agent=args.agent):
@@ -3143,7 +3216,8 @@ def main():
 
       # ---- Phase 4: Recovery ----
       print(f"{Colors.BOLD}Phase 4: Recovery{Colors.RESET}")
-      pid2 = start_nemo(chat_id, verbose=args.verbose, agent=args.agent)
+      pid2 = start_nemo(
+        chat_id, verbose=args.verbose, agent=args.agent, model=args.model)
       if wait_for_ready(pid2, timeout=30, agent=args.agent):
         result.ok("T14 restart")
       else:
@@ -3201,7 +3275,8 @@ def main():
       # ---- Phases 5-8: Advanced (need fresh nemo) ----
       if not args.skip_sdk:
         print("  Starting fresh nemo for advanced phases...")
-        pid = start_nemo(chat_id, verbose=args.verbose, agent=args.agent)
+        pid = start_nemo(
+          chat_id, verbose=args.verbose, agent=args.agent, model=args.model)
         if not wait_for_ready(pid, timeout=30, agent=args.agent):
           print(f"{Colors.RED}  Failed to start nemo for advanced phases"
                 f"{Colors.RESET}")
@@ -3231,7 +3306,8 @@ def main():
         print("  Starting nemo for permission tests (plan mode)...")
         pid_perm = start_nemo(chat_id, verbose=args.verbose,
                               permission_mode="plan",
-                              agent=args.agent)
+                              agent=args.agent,
+                              model=args.model)
         if wait_for_ready(pid_perm, timeout=30, agent=args.agent):
           try:
             run_permission_tests(pid_perm, chat_id, result)
@@ -3325,6 +3401,14 @@ def main():
     elif args.switch:
       try:
         run_switch_tests(pid, chat_id, result, args.agent)
+      finally:
+        send_msg("/exit", chat_id)
+        if not wait_for_exit(pid, timeout=35):
+          kill_nemo(pid)
+
+    elif args.rollover:
+      try:
+        run_rollover_tests(pid, chat_id, result)
       finally:
         send_msg("/exit", chat_id)
         if not wait_for_exit(pid, timeout=35):
