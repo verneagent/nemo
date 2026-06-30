@@ -606,6 +606,73 @@ def test_codex_compact_failure_gets_recovery_hint_from_stderr_exit():
   asyncio.run(_run())
 
 
+def test_codex_backend_failure_retries_before_progress():
+  async def _run():
+    fail = _FakeProc(
+      [],
+      returncode=1,
+      stderr_lines=[
+        b"failed to connect to websocket: IO error: tls handshake eof, url: wss://chatgpt.com/backend-api/codex/responses\n",
+      ],
+    )
+    ok = _FakeProc([
+      b'{"type":"thread.started","thread_id":"sess-2"}\n',
+      b'{"type":"item.completed","item":{"type":"agent_message","text":"Done"}}\n',
+      b'{"type":"turn.completed","usage":{"input_tokens":10,"cached_input_tokens":0,"output_tokens":2}}\n',
+    ])
+    agent = CodexCodingAgent({}, "oc_1", _DummyDB(), _DummyChannel())
+    await agent.start("/tmp/project", "gpt-5-codex")
+
+    events = []
+    w, s, p, f = _codex_runtime_patches()
+    with w, s, p, f, \
+         mock.patch("asyncio.create_subprocess_exec", side_effect=[fail, ok]) as exec_mock, \
+         mock.patch("asyncio.sleep", new=mock.AsyncMock()):
+      _, usage = await agent.run_turn("continue", events.append)
+
+    assert exec_mock.call_count == 2
+    assert fail.stdin.writes == [b"continue"]
+    assert ok.stdin.writes == [b"continue"]
+    assert any(
+      isinstance(e, ProgressEvent) and "retrying (2/3)" in e.summary
+      for e in events
+    )
+    assert any(isinstance(e, AnswerEvent) and e.text == "Done" for e in events)
+    assert any(isinstance(e, DoneEvent) for e in events)
+    assert usage["total_tokens"] == 12
+
+  asyncio.run(_run())
+
+
+def test_codex_backend_failure_does_not_retry_after_progress():
+  async def _run():
+    proc = _FakeProc(
+      [
+        b'{"type":"item.completed","item":{"type":"command_execution","command":"python mutate.py"}}\n',
+      ],
+      returncode=1,
+      stderr_lines=[
+        b"stream disconnected before completion: error sending request for url (https://chatgpt.com/backend-api/codex/responses)\n",
+      ],
+    )
+    agent = CodexCodingAgent({}, "oc_1", _DummyDB(), _DummyChannel())
+    await agent.start("/tmp/project", "gpt-5-codex")
+
+    events = []
+    w, s, p, f = _codex_runtime_patches()
+    with w, s, p, f, \
+         mock.patch("asyncio.create_subprocess_exec", return_value=proc) as exec_mock, \
+         pytest.raises(RuntimeError) as raised:
+      await agent.run_turn("continue", events.append)
+
+    assert exec_mock.call_count == 1
+    assert "chatgpt.com/backend-api/codex/responses" in str(raised.value)
+    assert isinstance(events[0], ProgressEvent)
+    assert isinstance(events[-1], ErrorEvent)
+
+  asyncio.run(_run())
+
+
 def test_codex_trailing_note_warns_when_context_is_large():
   agent = CodexCodingAgent({}, "oc_1", _DummyDB(), _DummyChannel())
   agent._cum_usage = {

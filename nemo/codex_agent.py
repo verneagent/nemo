@@ -43,12 +43,20 @@ _CLAUDE_TO_CODEX_EFFORT = {"max": "high"}
 _CODEX_SESSIONS = Path(os.path.expanduser("~/.codex/sessions"))
 _CODEX_CONTEXT_WARNING_TOKENS = 180_000
 _CODEX_STDERR_TAIL_LINES = 20
+_CODEX_BACKEND_RETRY_ATTEMPTS = 3
+_CODEX_BACKEND_RETRY_DELAYS = (2.0, 5.0)
 _CODEX_COMPACT_FAILURE_MARKERS = (
   "remote compact",
   "responses/compact",
   "pre-sampling compact",
   "failed to run pre-sampling compact",
   "error running remote compact task",
+)
+_CODEX_BACKEND_FAILURE_MARKERS = (
+  "chatgpt.com/backend-api/codex/responses",
+  "failed to connect to websocket",
+  "tls handshake eof",
+  "error sending request for url",
 )
 
 # Prepended to a read-only fork's first turn. The Codex sandbox physically
@@ -201,6 +209,20 @@ def _codex_recovery_message(message: str) -> str:
   )
 
 
+def _is_codex_backend_failure(message: str) -> bool:
+  lower = message.lower()
+  return any(marker in lower for marker in _CODEX_BACKEND_FAILURE_MARKERS)
+
+
+class _CodexTurnFailure(RuntimeError):
+  """Internal marker carrying retry metadata for one sidecar attempt."""
+
+  def __init__(self, message: str, *, retryable: bool, progressed: bool):
+    super().__init__(message)
+    self.retryable = retryable
+    self.progressed = progressed
+
+
 class CodexCodingAgent(CodingAgent):
   """CodingAgent adapter for the local Codex SDK sidecar runtime."""
 
@@ -253,6 +275,53 @@ class CodexCodingAgent(CodingAgent):
     self._cum_usage = _read_codex_cumulative(resume) if resume else {}
 
   async def run_turn(
+    self,
+    prompt: str,
+    on_event: Callable[[TurnEvent], None],
+  ) -> tuple[float, JsonObject]:
+    last_error = ""
+    visible_progress = False
+    for attempt in range(1, _CODEX_BACKEND_RETRY_ATTEMPTS + 1):
+      if attempt > 1:
+        await self._emit_event(
+          on_event,
+          ProgressEvent(
+            kind="reasoning",
+            summary=(
+              "Codex backend connection dropped before the turn started; "
+              f"retrying ({attempt}/{_CODEX_BACKEND_RETRY_ATTEMPTS})..."
+            ),
+            first=not visible_progress,
+          ),
+        )
+        visible_progress = True
+      try:
+        return await self._run_sidecar_once(prompt, on_event)
+      except _CodexTurnFailure as exc:
+        last_error = str(exc)
+        if exc.progressed:
+          visible_progress = True
+        can_retry = (
+          exc.retryable
+          and not _is_codex_compact_failure(last_error)
+          and not exc.progressed
+          and not self._interrupted
+          and attempt < _CODEX_BACKEND_RETRY_ATTEMPTS
+        )
+        if not can_retry:
+          await self._emit_event(on_event, ErrorEvent(message=last_error))
+          raise RuntimeError(last_error) from exc
+        delay = _CODEX_BACKEND_RETRY_DELAYS[
+          min(attempt - 1, len(_CODEX_BACKEND_RETRY_DELAYS) - 1)]
+        log.warning(
+          "codex backend failed before progress (attempt %d/%d); retrying in %.1fs: %s",
+          attempt, _CODEX_BACKEND_RETRY_ATTEMPTS, delay, _short(last_error, 300))
+        await asyncio.sleep(delay)
+    # Unreachable in normal control flow, but keeps the return type honest.
+    await self._emit_event(on_event, ErrorEvent(message=last_error))
+    raise RuntimeError(last_error)
+
+  async def _run_sidecar_once(
     self,
     prompt: str,
     on_event: Callable[[TurnEvent], None],
@@ -313,7 +382,6 @@ class CodexCodingAgent(CodingAgent):
         if event_type == "turn.failed":
           error = self._coerce_json_object(event.get("error"))
           failure = _codex_recovery_message(str(error.get("message", "Codex turn failed")))
-          await self._emit_event(on_event, ErrorEvent(message=failure))
           break
         if event_type != "item.completed":
           continue
@@ -343,11 +411,13 @@ class CodexCodingAgent(CodingAgent):
         if stderr_tail:
           stderr_text = "\n".join(stderr_tail)
           recovered = _codex_recovery_message(stderr_text)
-          if recovered != stderr_text:
-            failure = recovered
-        await self._emit_event(on_event, ErrorEvent(message=failure))
+          failure = recovered if recovered != stderr_text else stderr_text
       if failure is not None:
-        raise RuntimeError(failure)
+        raise _CodexTurnFailure(
+          failure,
+          retryable=_is_codex_backend_failure(failure),
+          progressed=progress_started,
+        )
 
       await self._emit_event(
         on_event,
