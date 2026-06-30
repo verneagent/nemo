@@ -43,6 +43,13 @@ if TYPE_CHECKING:
   from .sessions import SessionDeleteResult
 
 _USER_MESSAGE_EVENT_TYPES = {"", "message", "im.message.receive_v1"}
+_COMPACT_FAILURE_MARKERS = (
+  "remote compact",
+  "responses/compact",
+  "pre-sampling compact",
+  "failed to run pre-sampling compact",
+  "error running remote compact task",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -113,6 +120,23 @@ def _should_send_plain_text(text: str) -> bool:
     return False
 
   return True
+
+
+def _format_turn_error_message(message: str) -> str:
+  """Add operator guidance for known recoverable SDK failure modes."""
+  lower = message.lower()
+  if not any(marker in lower for marker in _COMPACT_FAILURE_MARKERS):
+    return message
+  if "Recommended recovery:" in message:
+    return message
+  return (
+    "Session compaction failed. The current coding-agent context is probably "
+    "too large and the remote compact request failed, so retrying the same "
+    "session may fail again.\n\n"
+    "Recommended recovery: run `/clear`, then `/session recall` to restore "
+    "the useful summary from the previous session before continuing.\n\n"
+    f"Original error: {message}"
+  )
 
 
 def _is_user_message_event(msg: IncomingMessage) -> bool:
@@ -423,19 +447,20 @@ async def _handle_turn_error(
 ) -> None:
   """Display a red error card for SDK turn errors (timeout, rate limit, etc.)."""
   log.error("Turn error: %s", exc)
+  display_message = _format_turn_error_message(message)
   try:
     if card_id:
       elapsed = int(time.time() - turn_start)
       err_card = cards.build_turn_card(
-        "error", body=f"**{message}**",
+        "error", body=f"**{display_message}**",
         steps=steps, elapsed=elapsed,
       )
       await channel.update_card(card_id, err_card)
       db.clear_working(session_id)
     else:
-      err_card = cards.build_card("Error", body=f"**{message}**", color="red")
+      err_card = cards.build_card("Error", body=f"**{display_message}**", color="red")
       msg_id = await channel.send_card(chat_id, err_card)
-      db.record_sent(msg_id, text=message[:500], chat_id=chat_id)
+      db.record_sent(msg_id, text=display_message[:500], chat_id=chat_id)
   except Exception as e:
     log.warning("Failed to send error card: %s", e)
 

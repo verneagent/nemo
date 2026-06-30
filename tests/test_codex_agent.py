@@ -6,10 +6,12 @@ import asyncio
 from pathlib import Path
 from unittest import mock
 
+import pytest
+
 from nemo.agent_factory import build_coding_agent, default_model_for_agent, is_model_compatible
 from nemo.claude_agent import ClaudeCodingAgent
 from nemo.codex_agent import CodexCodingAgent, _SIDE_CAR_SCRIPT
-from nemo.turn import AnswerEvent, DoneEvent, ProgressEvent
+from nemo.turn import AnswerEvent, DoneEvent, ErrorEvent, ProgressEvent
 
 
 class _DummyDB:
@@ -46,10 +48,15 @@ class _FakeStdin:
 
 
 class _FakeProc:
-  def __init__(self, stdout_lines: list[bytes], returncode: int = 0):
+  def __init__(
+    self,
+    stdout_lines: list[bytes],
+    returncode: int = 0,
+    stderr_lines: list[bytes] | None = None,
+  ):
     self.stdin = _FakeStdin()
     self.stdout = _FakeStream(stdout_lines)
-    self.stderr = _FakeStream([])
+    self.stderr = _FakeStream(stderr_lines or [])
     self.returncode = None
     self._final_returncode = returncode
     self.terminated = False
@@ -491,3 +498,80 @@ def test_codex_run_turn_raises_stdout_buffer_limit():
     assert kwargs.get("limit") == 16 * 1024 * 1024
 
   asyncio.run(_run())
+
+
+def test_codex_compact_failure_gets_recovery_hint_from_turn_failed():
+  async def _run():
+    proc = _FakeProc([
+      b'{"type":"turn.failed","error":{"message":"Error running remote compact task: stream disconnected before completion: error sending request for url (https://chatgpt.com/backend-api/codex/responses/compact)"}}\n',
+    ])
+    agent = CodexCodingAgent({}, "oc_1", _DummyDB(), _DummyChannel())
+    await agent.start("/tmp/project", "gpt-5-codex", resume="sess-x")
+
+    events = []
+    w, s, p, f = _codex_runtime_patches()
+    with w, s, p, f, \
+         mock.patch("asyncio.create_subprocess_exec", return_value=proc), \
+         pytest.raises(RuntimeError) as raised:
+      await agent.run_turn("continue", events.append)
+
+    assert "Codex session compaction failed" in str(raised.value)
+    assert "`/clear`" in str(raised.value)
+    assert "`/session recall`" in str(raised.value)
+    assert isinstance(events[0], ErrorEvent)
+    assert "Recommended recovery" in events[0].message
+
+  asyncio.run(_run())
+
+
+def test_codex_compact_failure_gets_recovery_hint_from_stderr_exit():
+  async def _run():
+    proc = _FakeProc(
+      [],
+      returncode=1,
+      stderr_lines=[
+        b"2026-06-29T09:41:11Z ERROR codex_core::compact_remote: remote compaction failed compact_error=stream disconnected before completion: error sending request for url (https://chatgpt.com/backend-api/codex/responses/compact)\n",
+      ],
+    )
+    agent = CodexCodingAgent({}, "oc_1", _DummyDB(), _DummyChannel())
+    await agent.start("/tmp/project", "gpt-5-codex", resume="sess-x")
+
+    events = []
+    w, s, p, f = _codex_runtime_patches()
+    with w, s, p, f, \
+         mock.patch("asyncio.create_subprocess_exec", return_value=proc), \
+         pytest.raises(RuntimeError) as raised:
+      await agent.run_turn("continue", events.append)
+
+    assert "Codex session compaction failed" in str(raised.value)
+    assert "`/clear`" in str(raised.value)
+    assert isinstance(events[0], ErrorEvent)
+    assert "responses/compact" in events[0].message
+
+  asyncio.run(_run())
+
+
+def test_codex_trailing_note_warns_when_context_is_large():
+  agent = CodexCodingAgent({}, "oc_1", _DummyDB(), _DummyChannel())
+  agent._cum_usage = {
+    "input_tokens": 181_000,
+    "cached_input_tokens": 120_000,
+    "output_tokens": 2_000,
+  }
+
+  note = agent.trailing_note("sess-x")
+
+  assert "Codex context is getting large" in note
+  assert "`/clear`" in note
+  assert "`/session recall`" in note
+
+
+def test_codex_trailing_note_stays_quiet_below_warning_threshold():
+  agent = CodexCodingAgent({}, "oc_1", _DummyDB(), _DummyChannel())
+  agent._cum_usage = {
+    "input_tokens": 100_000,
+    "cached_input_tokens": 50_000,
+    "output_tokens": 1_000,
+  }
+
+  assert agent.trailing_note("sess-x") == ""

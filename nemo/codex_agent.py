@@ -41,6 +41,15 @@ _CLAUDE_TO_CODEX_EFFORT = {"max": "high"}
 
 # Codex persists each thread as a rollout jsonl under here, keyed by thread id.
 _CODEX_SESSIONS = Path(os.path.expanduser("~/.codex/sessions"))
+_CODEX_CONTEXT_WARNING_TOKENS = 180_000
+_CODEX_STDERR_TAIL_LINES = 20
+_CODEX_COMPACT_FAILURE_MARKERS = (
+  "remote compact",
+  "responses/compact",
+  "pre-sampling compact",
+  "failed to run pre-sampling compact",
+  "error running remote compact task",
+)
 
 # Prepended to a read-only fork's first turn. The Codex sandbox physically
 # blocks writes (sandboxMode=read-only), but telling the model up front saves
@@ -169,6 +178,29 @@ def _short(text: str, limit: int) -> str:
   return text[: limit - 3] + "..."
 
 
+def _codex_cumulative_total(usage: dict[str, int]) -> int:
+  """Return Codex's best known cumulative context footprint."""
+  return max(0, usage.get("input_tokens", 0)) + max(0, usage.get("output_tokens", 0))
+
+
+def _is_codex_compact_failure(message: str) -> bool:
+  lower = message.lower()
+  return any(marker in lower for marker in _CODEX_COMPACT_FAILURE_MARKERS)
+
+
+def _codex_recovery_message(message: str) -> str:
+  if not _is_codex_compact_failure(message):
+    return message
+  return (
+    "Codex session compaction failed. This usually means the current Codex "
+    "thread is very large and the remote compact request failed, so retrying "
+    "`继续` may hit the same pre-sampling compact failure.\n\n"
+    "Recommended recovery: run `/clear`, then `/session recall` to bring back "
+    "the useful summary from the previous session before continuing.\n\n"
+    f"Original error: {message}"
+  )
+
+
 class CodexCodingAgent(CodingAgent):
   """CodingAgent adapter for the local Codex SDK sidecar runtime."""
 
@@ -249,7 +281,8 @@ class CodexCodingAgent(CodingAgent):
     assert proc.stdout is not None
     assert proc.stderr is not None
 
-    stderr_task = asyncio.create_task(self._log_stderr(proc.stderr))
+    stderr_tail: list[str] = []
+    stderr_task = asyncio.create_task(self._log_stderr(proc.stderr, stderr_tail))
     proc.stdin.write(self._prepare_prompt(prompt).encode())
     await proc.stdin.drain()
     proc.stdin.close()
@@ -279,7 +312,7 @@ class CodexCodingAgent(CodingAgent):
           continue
         if event_type == "turn.failed":
           error = self._coerce_json_object(event.get("error"))
-          failure = str(error.get("message", "Codex turn failed"))
+          failure = _codex_recovery_message(str(error.get("message", "Codex turn failed")))
           await self._emit_event(on_event, ErrorEvent(message=failure))
           break
         if event_type != "item.completed":
@@ -301,8 +334,17 @@ class CodexCodingAgent(CodingAgent):
           await self._emit_event(on_event, ProgressEvent(kind=kind, summary=summary, first=is_first))
 
       rc = await proc.wait()
+      try:
+        await asyncio.wait_for(asyncio.shield(stderr_task), timeout=0.2)
+      except (asyncio.TimeoutError, asyncio.CancelledError):
+        pass
       if failure is None and rc != 0 and not self._interrupted:
         failure = f"Codex sidecar exited with status {rc}"
+        if stderr_tail:
+          stderr_text = "\n".join(stderr_tail)
+          recovered = _codex_recovery_message(stderr_text)
+          if recovered != stderr_text:
+            failure = recovered
         await self._emit_event(on_event, ErrorEvent(message=failure))
       if failure is not None:
         raise RuntimeError(failure)
@@ -374,6 +416,17 @@ class CodexCodingAgent(CodingAgent):
       except OSError:
         pass
       self._fork_rollout_path = ""
+
+  def trailing_note(self, sdk_session_id: str) -> str:
+    del sdk_session_id
+    total = _codex_cumulative_total(self._cum_usage)
+    if total < _CODEX_CONTEXT_WARNING_TOKENS:
+      return ""
+    return (
+      "\n\n<font color='grey'>Codex context is getting large "
+      f"(~{total:,} tokens). Consider `/clear` followed by `/session recall` "
+      "before another long turn to avoid remote compact failures.</font>"
+    )
 
   def _per_turn_usage(self, cumulative: JsonObject) -> JsonObject:
     """Difference Codex's session-cumulative usage into a per-turn canonical dict.
@@ -475,12 +528,19 @@ class CodexCodingAgent(CodingAgent):
       env["OPENAI_API_KEY"] = self._endpoint.api_key
     return env
 
-  async def _log_stderr(self, stream: asyncio.StreamReader) -> None:
+  async def _log_stderr(
+    self,
+    stream: asyncio.StreamReader,
+    tail: list[str],
+  ) -> None:
     while True:
       raw = await stream.readline()
       if not raw:
         return
-      log.info("[codex-stderr] %s", raw.decode(errors="replace").rstrip())
+      line = raw.decode(errors="replace").rstrip()
+      tail.append(line)
+      del tail[:-_CODEX_STDERR_TAIL_LINES]
+      log.info("[codex-stderr] %s", line)
 
   async def _emit_event(
     self,

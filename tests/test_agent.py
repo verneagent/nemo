@@ -11,6 +11,7 @@ import pytest
 
 from nemo.agent import (
   _RECALL_PROMPT_PREFIX,
+  _format_turn_error_message,
   _format_rate_limit_notice,
   _in_turn_filtered_out,
   _interrupt_and_drain,
@@ -228,6 +229,31 @@ def test_text_only_turn_clears_thinking_reaction(tmp_path):
   assert result == 0
   add_reaction.assert_awaited_once_with("om_src", "THINKING")
   remove_reaction.assert_awaited_once_with("om_src", "r_thinking")
+
+
+def test_turn_error_message_adds_compact_recovery_hint():
+  msg = (
+    "Error running remote compact task: stream disconnected before completion: "
+    "error sending request for url "
+    "(https://chatgpt.com/backend-api/codex/responses/compact)"
+  )
+
+  out = _format_turn_error_message(msg)
+
+  assert "Session compaction failed" in out
+  assert "`/clear`" in out
+  assert "`/session recall`" in out
+  assert "Original error" in out
+
+
+def test_turn_error_message_does_not_duplicate_existing_recovery_hint():
+  msg = (
+    "Codex session compaction failed.\n\n"
+    "Recommended recovery: run `/clear`, then `/session recall`.\n\n"
+    "Original error: responses/compact"
+  )
+
+  assert _format_turn_error_message(msg) == msg
 
 
 def test_idle_esc_is_silent(tmp_path):
