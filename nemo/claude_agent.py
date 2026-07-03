@@ -172,15 +172,42 @@ def _unconsumed_steers(
   injection the turn never folded in (stranded by an end-of-turn / reconnect
   race), so the host can re-queue them.
 
-  A mid-turn injection shows up as an ``enqueue`` queue-operation terminated
-  by a ``remove`` (a normal between-turn pull terminates with ``dequeue``
-  instead). It was *consumed* iff an ``assistant`` message follows the
-  ``remove`` before the next queue-operation. We collect every such
-  injection in order as ``(content, consumed)`` then, for each requested
-  text, claim its most-recent unused matching injection — most-recent because
-  identical text may have been steered in an earlier turn too. A text with no
-  matching injection was never even enqueued, so it counts as unconsumed.
+  The CLI's transcript shape is not fully stable across Claude Code versions
+  and endpoints. A mid-turn injection may terminate as ``remove`` (classic
+  queue-cleanup path) or ``dequeue`` (observed with DeepSeek-compatible Claude
+  sessions after the injected message is actually folded into the turn). It is
+  consumed if either:
+
+  - the terminal op is ``dequeue``;
+  - a matching ``user`` transcript row appears before the next queue op;
+  - an assistant message appears after ``remove`` before the next queue op.
+
+  We collect every injection in order as ``(content, consumed)`` then, for each
+  requested text, claim its most-recent unused matching injection — most-recent
+  because identical text may have been steered in an earlier turn too. A text
+  with no matching injection was never even enqueued, so it counts as
+  unconsumed.
   """
+  def _user_text(row: JsonObject) -> str:
+    if row.get("type") != "user":
+      return ""
+    message = row.get("message")
+    if not isinstance(message, dict):
+      return ""
+    content = message.get("content")
+    if isinstance(content, str):
+      return content
+    if not isinstance(content, list):
+      return ""
+    parts: list[str] = []
+    for item in content:
+      if not isinstance(item, dict):
+        continue
+      text = item.get("text")
+      if isinstance(text, str):
+        parts.append(text)
+    return "\n".join(parts)
+
   pairs: list[tuple[str, bool]] = []  # (enqueued content, consumed)
   pending: list[str] = []  # FIFO of enqueued contents awaiting their terminal
   n = len(rows)
@@ -192,13 +219,17 @@ def _unconsumed_steers(
       pending.append(str(r.get("content") or ""))
     elif op == "dequeue":
       if pending:
-        pending.pop(0)
+        content = pending.pop(0)
+        pairs.append((content, True))
     elif op == "remove":
       content = pending.pop(0) if pending else ""
       consumed = False
       for j in range(i + 1, n):
         tj = rows[j].get("type")
         if tj == "queue-operation":
+          break
+        if _user_text(rows[j]) == content:
+          consumed = True
           break
         if tj == "assistant":
           consumed = True

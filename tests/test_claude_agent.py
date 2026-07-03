@@ -9,6 +9,7 @@ from nemo.claude_agent import (
   _SESSION_SIZE_STRONG,
   _format_size_warning,
   _session_jsonl_path,
+  _unconsumed_steers,
 )
 
 
@@ -84,6 +85,48 @@ def test_trailing_note_no_session_or_file(tmp_path, monkeypatch):
   # No project dir
   agent._project_dir = ""
   assert agent.trailing_note("anything") == ""
+
+
+def test_unconsumed_steers_treats_dequeue_as_consumed():
+  rows = [
+    {"type": "queue-operation", "operation": "enqueue",
+     "content": "next question"},
+    {"type": "assistant", "message": {"role": "assistant", "content": [
+      {"type": "text", "text": "answering current turn"}
+    ]}},
+    {"type": "queue-operation", "operation": "dequeue"},
+    {"type": "user", "message": {"role": "user", "content": "next question"}},
+    {"type": "assistant", "message": {"role": "assistant", "content": [
+      {"type": "text", "text": "answering next question"}
+    ]}},
+  ]
+
+  assert _unconsumed_steers(rows, ["next question"]) == []
+
+
+def test_unconsumed_steers_requeues_remove_without_consumption():
+  rows = [
+    {"type": "queue-operation", "operation": "enqueue",
+     "content": "next question"},
+    {"type": "queue-operation", "operation": "remove"},
+    {"type": "queue-operation", "operation": "enqueue",
+     "content": "later question"},
+  ]
+
+  assert _unconsumed_steers(rows, ["next question"]) == ["next question"]
+
+
+def test_unconsumed_steers_treats_matching_user_row_as_consumed():
+  rows = [
+    {"type": "queue-operation", "operation": "enqueue",
+     "content": "next question"},
+    {"type": "queue-operation", "operation": "remove"},
+    {"type": "user", "message": {"role": "user", "content": [
+      {"type": "text", "text": "next question"}
+    ]}},
+  ]
+
+  assert _unconsumed_steers(rows, ["next question"]) == []
 
 
 def test_run_turn_resumes_latest_session_after_done_event():
