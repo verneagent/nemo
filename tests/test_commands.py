@@ -387,6 +387,24 @@ def test_esc_with_follow_up_not_inline_safe():
   assert not is_inline_safe(resp)
 
 
+def test_queue_with_follow_up_text():
+  handled, resp = try_dispatch("/queue Use TypeScript", _ctx())
+  assert handled
+  assert resp == "__queue__:Use TypeScript"
+
+
+def test_queue_without_text_shows_usage():
+  handled, resp = try_dispatch("/queue", _ctx())
+  assert handled
+  assert "Usage: `/queue <message>`" in resp
+
+
+def test_queue_with_follow_up_not_inline_safe():
+  from nemo.commands import is_inline_safe
+  _, resp = try_dispatch("/queue do something later", _ctx())
+  assert not is_inline_safe(resp)
+
+
 def test_cd_valid(tmp_path):
   handled, resp = try_dispatch(f"/cd {tmp_path}", _ctx())
   assert handled

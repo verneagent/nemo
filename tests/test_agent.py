@@ -860,6 +860,91 @@ def test_message_during_turn_steers_instead_of_queuing(tmp_path):
   assert ("om_steer", "CheckMark") not in calls
 
 
+def test_queue_command_during_turn_bypasses_steering(tmp_path):
+  """`/queue <message>` must wait for the current turn even when the agent can
+  steer plain follow-ups into the active turn."""
+  prompts: list[str] = []
+  steered: list[str] = []
+  queue_ack_seen = asyncio.Event()
+  turn2_done = asyncio.Event()
+
+  class _SteeringAgent(_FakeAgent):
+    def supports_steering(self):
+      return True
+
+    async def steer(self, text):
+      steered.append(text)
+      return True
+
+    async def run_turn(self, prompt, on_event):
+      prompts.append(prompt)
+      if len(prompts) == 1:
+        await asyncio.to_thread(lambda: on_event(
+          ProgressEvent(kind="tool", summary="Read", first=True)))
+        await queue_ack_seen.wait()
+      else:
+        await asyncio.to_thread(lambda: on_event(AnswerEvent("queued done")))
+        turn2_done.set()
+      await asyncio.to_thread(lambda: on_event(
+        DoneEvent(cost=0.0, usage={"input_tokens": 1})))
+      return 0.0, {"input_tokens": 1}
+
+  class _QueueChannel(_QueuedChannel):
+    def __init__(self):
+      super().__init__("oc_test", [
+        IncomingMessage(event_type="im.message.receive_v1", chat_id="oc_test",
+                        sender_id="ou_user", message_id="om_work",
+                        msg_type="text", text="work on it", create_time="1"),
+        IncomingMessage(event_type="im.message.receive_v1", chat_id="oc_test",
+                        sender_id="ou_user", message_id="om_queue",
+                        msg_type="text", text="/queue handle this later",
+                        create_time="2"),
+        IncomingMessage(event_type="im.message.receive_v1", chat_id="oc_test",
+                        sender_id="ou_user", message_id="om_exit",
+                        msg_type="text", text="/exit", create_time="3"),
+      ])
+
+    def push_back(self, message):
+      self._messages.insert(0, message)
+
+    async def receive(self, timeout=300):
+      nxt = self._messages[0] if self._messages else None
+      if nxt is not None and nxt.text == "/queue handle this later":
+        await asyncio.sleep(0.05)
+      if nxt is not None and nxt.text == "/exit":
+        await turn2_done.wait()
+      return await super().receive(timeout)
+
+    async def add_reaction(self, message_id, emoji_type):
+      if message_id == "om_queue" and emoji_type == "OneSecond":
+        queue_ack_seen.set()
+      return "r_" + emoji_type.lower()
+
+    async def send_card(self, _chat_id, _card):
+      return "om_card"
+
+    async def update_card(self, card_id, _card):
+      return card_id
+
+  channel = _QueueChannel()
+
+  with mock.patch("nemo.agent.load_credentials", return_value={
+    "app_id": "app_id", "app_secret": "app_secret",
+    "email": "user@example.com",
+  }), \
+       mock.patch("nemo.agent.Database", _FakeDB), \
+       mock.patch("nemo.agent.LarkChannel", return_value=channel), \
+       mock.patch("nemo.agent.build_coding_agent", return_value=_SteeringAgent()), \
+       mock.patch("nemo.group_config.load_config", return_value={}), \
+       mock.patch("nemo.config.load_relay_config", return_value=("", "")), \
+       mock.patch("signal.signal"):
+    result = asyncio.run(main_loop("oc_test", str(tmp_path), "claude-opus-4-6"))
+
+  assert result == 0
+  assert steered == []
+  assert prompts[:2] == ["work on it", "handle this later"]
+
+
 def test_stranded_steer_is_requeued(tmp_path):
   """If `steer()` accepted a follow-up but the turn never actually folded it
   in (end-of-turn / reconnect race), the optimistic `Get` is reverted and the

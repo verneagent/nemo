@@ -374,6 +374,23 @@ def try_dispatch(text: str, ctx: AgentContext) -> tuple[bool, str | None]:
       return True, f"__esc__:{follow_up}"
     return True, "__esc__"
 
+  # /queue <message> — force a follow-up to run after the current turn. During
+  # an active turn this explicitly bypasses steering/absorb, even if the
+  # current agent supports it.
+  queue_m = re.match(
+    r"^/queue(?:\s+(.+))?$",
+    text.strip(),
+    re.IGNORECASE | re.DOTALL,
+  )
+  if queue_m:
+    follow_up = (queue_m.group(1) or "").strip()
+    if follow_up:
+      return True, f"__queue__:{follow_up}"
+    return True, (
+      "Usage: `/queue <message>` — run `<message>` after the current turn "
+      "instead of steering it into the running turn."
+    )
+
   # /cd
   if t.startswith("/cd "):
     parts = text.strip().split(None, 1)
@@ -470,6 +487,7 @@ def try_dispatch(text: str, ctx: AgentContext) -> tuple[bool, str | None]:
       "| `/cd <dir>` | Change working directory |\n"
       "| `/esc` | Cancel current operation |\n"
       "| `/esc <text>` | Cancel and send `<text>` as the next message |\n"
+      "| `/queue <message>` | Queue `<message>` after the current turn; never steer it into a running turn |\n"
       "| `/btw <question>` | Read-only side question; ephemeral, never enters history, doesn't interrupt the turn (Claude only) |\n"
       "| `/fork <prompt>` | Open a read-only branch in a sub-thread: shares context, has tools (incl. Bash), but sandboxed so it can't modify project files. Multi-turn; `/fork close` to end (Claude/Codex) |\n"
       "| `/ping` | Status check |\n"
@@ -631,8 +649,9 @@ def try_dispatch(text: str, ctx: AgentContext) -> tuple[bool, str | None]:
   return False, None
 
 
-# Commands that require SDK restart — NOT safe during a turn.
-_NEEDS_SDK = ("__clear__", "__undo_clear__", "__esc__",
+# Commands that are NOT safe to execute as generic inline commands during a
+# turn. Most require SDK restart/cancel; /queue has custom watcher handling.
+_NEEDS_SDK = ("__clear__", "__undo_clear__", "__esc__", "__queue__:",
               "__model__:", "__cd__:", "__agent__:",
               "__restart__", "__upgrade__")
 
@@ -647,7 +666,8 @@ def is_inline_safe(response: str | None) -> bool:
 
   Returns True for commands that don't interact with the SDK client:
   /ping, /cost, /help, /mention, /autoapprove, /norm, /guest, /diag, etc.
-  Returns False for /clear, /esc, /model, /cd (need SDK restart).
+  Returns False for /clear, /esc, /queue, /model, /cd and other deferred
+  commands.
   """
   if not response:
     return False

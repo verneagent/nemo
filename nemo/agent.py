@@ -2085,6 +2085,14 @@ async def main_loop(
             follow_up = response.split(":", 1)[1]
             follow_msg = dataclasses.replace(reply, text=follow_up)
             channel.push_back(follow_msg)
+        elif response and response.startswith("__queue__:"):
+          # Between turns, /queue is just a clean way to strip the command
+          # prefix before the next normal turn. During turns it is handled in
+          # the signal watcher and deliberately bypasses steering.
+          follow_up = response.split(":", 1)[1]
+          if follow_up:
+            follow_msg = dataclasses.replace(reply, text=follow_up)
+            channel.push_back(follow_msg)
         elif response == "__model_picker__":
           # `/model` (no args) — send the interactive picker card. The
           # actual model switch happens later when the user submits the
@@ -3426,6 +3434,13 @@ async def main_loop(
           if stripped:
             handled, response = commands.try_dispatch(
               messages.strip_parent_quote(stripped), ctx)
+            if handled and response and response.startswith("__queue__:"):
+              queued_text = response.split(":", 1)[1]
+              if queued_text:
+                queued_msg = dataclasses.replace(msg, text=queued_text)
+                _pending_msgs.append(queued_msg)
+                await _ack_pending(queued_msg)
+              continue
             if handled and commands.is_inline_safe(response):
               await _dispatch_inline(response, msg)
               continue
