@@ -343,6 +343,7 @@ _CODEX_INJECTED_PREFIXES = (
   "# AGENTS.md",
   "# Instructions",
   "<INSTRUCTIONS>",
+  "<environment_context>",
 )
 
 

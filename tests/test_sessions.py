@@ -155,6 +155,33 @@ def test_list_codex_sessions_skips_injected_agents_md_preview(tmp_path):
   assert out[0].first_user_text == "Actual user question here"
 
 
+def test_list_codex_sessions_skips_environment_context_preview(tmp_path):
+  # Codex records environment context as a user-shaped message. It is host
+  # metadata, not the prompt the operator needs in /session recall previews.
+  home = str(tmp_path / "home")
+  project = str(tmp_path / "p")
+  os.makedirs(project, exist_ok=True)
+  _codex_session(home, "2026", "04", "01",
+                 "bbbbbbbb-1111-2222-3333-444444444444", [
+    {"type": "session_meta", "payload": {
+      "id": "bbbbbbbb-1111-2222-3333-444444444444",
+      "cwd": os.path.abspath(project),
+    }},
+    {"type": "response_item", "payload": {
+      "type": "message", "role": "user",
+      "content": [{"type": "input_text",
+                   "text": "<environment_context>\n  <cwd>/tmp/p</cwd>"}],
+    }},
+    {"type": "response_item", "payload": {
+      "type": "message", "role": "user",
+      "content": [{"type": "input_text", "text": "Actual user question here"}],
+    }},
+  ])
+  with mock.patch.dict(os.environ, {"HOME": home}):
+    out = sessions.list_codex_sessions(project)
+  assert out[0].first_user_text == "Actual user question here"
+
+
 def test_list_codex_sessions_scopes_to_project_cwd(tmp_path):
   home = str(tmp_path / "home")
   project = str(tmp_path / "ours")
@@ -299,10 +326,10 @@ def test_list_codex_sessions_captures_last_three_user_prompts(tmp_path):
       "id": "beadbead-1111-2222-3333-444444444444",
       "cwd": os.path.abspath(project),
     }},
-    # Injected AGENTS.md (the tail scan must skip this too).
+    # Injected host context (the tail scan must skip this too).
     {"type": "response_item", "payload": {
       "type": "message", "role": "user",
-      "content": [{"type": "input_text", "text": "# AGENTS.md\n..."}],
+      "content": [{"type": "input_text", "text": "<environment_context>\n..."}],
     }},
   ]
   for i in range(5):
