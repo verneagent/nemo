@@ -2965,14 +2965,22 @@ async def main_loop(
               if t not in dropped:
                 continue
               dropped.remove(t)  # claim one match (handles duplicate texts)
-              log.info("Re-queuing stranded steer (turn never consumed it): "
-                       "%s", t[:60])
+              # Revert the optimistic Get on any steer the turn never folded
+              # in, so a checkmark never implies work that didn't happen.
               if mid and rid:
                 try:
                   _await_channel(channel.remove_reaction(mid, rid))
                 except Exception as exc:
                   log.warning("Failed to revert Get on stranded steer %s: %s",
                               mid, exc)
+              if _turn_interrupt_phase:
+                # User pressed Stop — halt means halt. Re-queuing the stranded
+                # steers would immediately spawn a fresh turn, making Stop feel
+                # broken (every Stop bounced straight into a new turn). Drop.
+                log.info("Dropping stranded steer after Stop: %s", t[:60])
+                continue
+              log.info("Re-queuing stranded steer (turn never consumed it): "
+                       "%s", t[:60])
               _pending_msgs.append(m)
             _steered_this_turn.clear()
           if _turn_interrupt_phase:

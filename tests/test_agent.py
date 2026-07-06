@@ -1043,6 +1043,102 @@ def test_stranded_steer_is_requeued(tmp_path):
     c.args for c in remove_reaction.await_args_list]
 
 
+def test_stranded_steer_after_stop_is_not_requeued(tmp_path):
+  """When the user presses Stop, a steer the interrupted turn never folded in
+  must NOT be re-queued — halt means halt. Re-queuing would immediately spawn a
+  fresh turn, making Stop feel broken (every Stop bounced into a new turn). The
+  optimistic Get is still reverted so no checkmark implies work that didn't
+  happen."""
+  prompts: list[str] = []
+  steer_seen = asyncio.Event()
+  interrupted = asyncio.Event()
+
+  class _StopAgent(_FakeAgent):
+    def supports_steering(self):
+      return True
+
+    async def steer(self, text):
+      steer_seen.set()
+      return True  # accepted by client.query()...
+
+    def unconsumed_steers(self, texts):
+      return list(texts)  # ...but the interrupted turn never consumed it
+
+    def trailing_note(self, _sdk_session_id):
+      return ""
+
+    async def interrupt(self):
+      interrupted.set()  # unblock run_turn so it winds down after Stop
+
+    async def run_turn(self, prompt, on_event):
+      prompts.append(prompt)
+      await asyncio.to_thread(lambda: on_event(
+        ProgressEvent(kind="tool", summary="Read", first=True)))
+      await steer_seen.wait()
+      await interrupted.wait()  # hold the turn open until Stop interrupts it
+      await asyncio.to_thread(lambda: on_event(
+        DoneEvent(cost=0.0, usage={"input_tokens": 1})))
+      return 0.0, {"input_tokens": 1}
+
+  class _StopChannel(_QueuedChannel):
+    def __init__(self):
+      super().__init__("oc_test", [
+        IncomingMessage(event_type="im.message.receive_v1", chat_id="oc_test",
+                        sender_id="ou_user", message_id="om_work",
+                        msg_type="text", text="work on it", create_time="1"),
+        IncomingMessage(event_type="im.message.receive_v1", chat_id="oc_test",
+                        sender_id="ou_user", message_id="om_steer",
+                        msg_type="text", text="also handle the edge case",
+                        create_time="2"),
+        IncomingMessage(event_type="card.action.trigger", chat_id="oc_test",
+                        operator_id="ou_user", sender_id="ou_user",
+                        message_id="om_stop", action_value={"action": "stop"},
+                        create_time="3"),
+        IncomingMessage(event_type="im.message.receive_v1", chat_id="oc_test",
+                        sender_id="ou_user", message_id="om_exit",
+                        msg_type="text", text="/exit", create_time="4"),
+      ])
+
+    def push_back(self, message):
+      self._messages.insert(0, message)
+
+    async def receive(self, timeout=300):
+      nxt = self._messages[0] if self._messages else None
+      if nxt is not None and nxt.text == "also handle the edge case" \
+          and not steer_seen.is_set():
+        await asyncio.sleep(0.05)  # let turn 1 establish before steering
+      return await super().receive(timeout)
+
+    async def send_card(self, _chat_id, _card):
+      return "om_card"
+
+    async def update_card(self, card_id, _card):
+      return card_id
+
+  channel = _StopChannel()
+  remove_reaction = mock.AsyncMock()
+
+  with mock.patch("nemo.agent.load_credentials", return_value={
+    "app_id": "app_id", "app_secret": "app_secret",
+    "email": "user@example.com",
+  }), \
+       mock.patch("nemo.agent.Database", _FakeDB), \
+       mock.patch("nemo.agent.LarkChannel", return_value=channel), \
+       mock.patch("nemo.agent.build_coding_agent", return_value=_StopAgent()), \
+       mock.patch.object(_FakeChannel, "remove_reaction", remove_reaction), \
+       mock.patch("nemo.group_config.load_config", return_value={}), \
+       mock.patch("nemo.config.load_relay_config", return_value=("", "")), \
+       mock.patch("signal.signal"):
+    result = asyncio.run(main_loop("oc_test", str(tmp_path), "claude-opus-4-6"))
+
+  assert result == 0
+  # Only the first turn ran — the stranded steer was DROPPED, not replayed.
+  assert len(prompts) == 1
+  # But its optimistic Get was still reverted.
+  assert ("om_steer", "r_thinking") in [
+    c.args for c in remove_reaction.await_args_list]
+
+
 def test_pacing_hint_prepended_after_timeout(tmp_path):
   """After a TimeoutError the next turn's prompt is prefixed with a pacing hint;
   the hint is not applied to subsequent turns."""
