@@ -2880,11 +2880,16 @@ async def main_loop(
         # _on_event calls have finished. No lock needed.
         nonlocal _turn_card_id, _sdk_session_id, _turn_current_tool
         nonlocal _turn_rate_limit_notice, _turn_compact_notice
-        nonlocal _turn_status_notice
+        nonlocal _turn_status_notice, _turn_saw_tool
 
         if isinstance(event, ProgressEvent):
           _turn_steps.append(cards.ThinkingStep(event.kind, event.summary))
           _turn_current_tool = event.summary if event.kind == "tool" else _turn_current_tool
+          if event.kind == "tool":
+            # Tool-call boundary reached — the turn is in an agentic loop, so
+            # boundary-deferred follow-ups can now be folded in as steers. Read
+            # by _watch_signals on the main loop (bool write is GIL-atomic).
+            _turn_saw_tool = True
           if event.first:
             # Real output is streaming now — drop the pre-first-token
             # placeholder banner (e.g. the recall "reading transcript" hint)
@@ -3091,6 +3096,16 @@ async def main_loop(
       # detect (at turn end) any the turn never actually consumed and
       # re-queue them: (message_id, steer_text, IncomingMessage, get_reaction_id).
       _steered_this_turn: list[tuple[str, str, IncomingMessage, str]] = []
+      # Follow-ups that arrived BEFORE this turn reached its first tool-call
+      # boundary. We hold them here instead of steering immediately: folding a
+      # brand-new question into a still-running text-only answer makes the reply
+      # land on the previous question's card (the "答上一个问题" bug). Once the
+      # turn hits a tool boundary (_turn_saw_tool) they are steered in as genuine
+      # course-corrections; if the turn ends text-only they fall through to
+      # _pending_msgs and run as their own next turn. This mirrors the
+      # boundary-deferred steering used by Cursor / Claude Code.
+      _deferred_steers: list[tuple[str, str, IncomingMessage, str]] = []
+      _turn_saw_tool = False
       _pending_ack_msg_id: str = ""
       _pending_ack_reaction_id: str = ""
 
@@ -3294,9 +3309,45 @@ async def main_loop(
           log.warning("Failed to ack absorbed message: %s", exc)
           return ""
 
+      async def _flush_deferred_steers() -> None:
+        """Fold boundary-deferred follow-ups into the running turn.
+
+        Called once the turn reaches a tool-call boundary. Each held message is
+        steered in; on success its OneSecond ack becomes Get and it is tracked
+        in _steered_this_turn (so the DoneEvent unconsumed check still applies).
+        A steer the agent rejects falls back to the pending queue.
+        """
+        while _deferred_steers:
+          mid, text, m, _rid = _deferred_steers.pop(0)
+          if await coding_agent.steer(text):
+            log.info("Steered deferred follow-up at tool boundary: %s", text[:60])
+            get_rid = ""
+            if mid:
+              get_rid = await _mark_absorbed(mid)
+            _steered_this_turn.append((mid, text, m, get_rid))
+          else:
+            _pending_msgs.append(m)
+
+      def _drain_deferred_to_pending() -> None:
+        """Any follow-up still deferred at turn end never reached a tool
+        boundary — run it as its own next turn rather than losing it."""
+        if not _deferred_steers:
+          return
+        log.info("Turn ended text-only; %d deferred follow-up(s) run as next turn",
+                 len(_deferred_steers))
+        for entry in _deferred_steers:
+          _pending_msgs.append(entry[2])
+        _deferred_steers.clear()
+
       async def _watch_signals():
         nonlocal signal_detected
         while not sdk_task.done():
+          # Fold any boundary-deferred follow-ups now that the turn has reached
+          # a tool-call boundary — the SDK is in an agentic loop, so a steer is
+          # a genuine course-correction, not a new question glued onto a
+          # finishing text answer.
+          if _turn_saw_tool and _deferred_steers:
+            await _flush_deferred_steers()
           # If permission handler is reading the queue, yield to it
           if channel.permission_active:
             await asyncio.sleep(0.2)
@@ -3492,6 +3543,17 @@ async def main_loop(
             steer_text = messages.strip_parent_quote(
               messages.strip_mentions_preserve_newlines(
                 msg_text, [msg], bot_open_id=bot_open_id))
+            if steer_text and not _turn_saw_tool:
+              # Boundary-deferred steering: the turn hasn't hit a tool-call
+              # boundary yet, so it's still (or only) a text answer. Steering a
+              # fresh question in now would fold it onto the previous question's
+              # card. Hold it — _watch_signals folds it in at the first
+              # boundary, or _drain_deferred_to_pending runs it as its own next
+              # turn if the turn ends text-only. Keeps its OneSecond ack.
+              log.info("Deferring follow-up until tool boundary: %s",
+                       steer_text[:60])
+              _deferred_steers.append((msg.message_id, steer_text, msg, ""))
+              continue
             if steer_text and await coding_agent.steer(steer_text):
               log.info("Steered message into running turn: %s", steer_text[:60])
               # Optimistically swap its OneSecond ack for Get (absorbed).
@@ -3569,6 +3631,7 @@ async def main_loop(
           )
           _pending_pacing_hint = True
           await _clear_ack()
+          _drain_deferred_to_pending()
           await _clear_pending_ack()
           _requeue_pending(_pending_msgs, channel)
           continue
@@ -3582,11 +3645,13 @@ async def main_loop(
             _turn_card_id, _turn_steps[_turn_active_start:], _turn_start,
           )
           await _clear_ack()
+          _drain_deferred_to_pending()
           await _clear_pending_ack()
           _requeue_pending(_pending_msgs, channel)
           continue
 
       # Re-queue any messages consumed during the turn
+      _drain_deferred_to_pending()
       await _clear_pending_ack()
       _requeue_pending(_pending_msgs, channel)
 

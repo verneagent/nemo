@@ -1043,6 +1043,205 @@ def test_stranded_steer_is_requeued(tmp_path):
     c.args for c in remove_reaction.await_args_list]
 
 
+def test_text_only_turn_defers_followup_to_next_turn(tmp_path):
+  """Boundary-deferred steering: a follow-up sent while the turn is still a
+  TEXT-only answer (no tool-call boundary reached) must NOT be steered into it —
+  folding it onto the running turn is what made replies land on the previous
+  question's card. It is held, and because the turn ends before any tool
+  boundary, it runs as its OWN next turn."""
+  prompts: list[str] = []
+  steered: list[str] = []
+  deferred_acked = asyncio.Event()
+  turn1_done = asyncio.Event()
+  turn2_done = asyncio.Event()
+
+  class _TextOnlyAgent(_FakeAgent):
+    def supports_steering(self):
+      return True
+
+    async def steer(self, text):
+      steered.append(text)
+      return True
+
+    async def run_turn(self, prompt, on_event):
+      prompts.append(prompt)
+      if len(prompts) == 1:
+        # Text-only: emit an answer, NEVER a tool ProgressEvent. The follow-up
+        # arrives during this window and must be deferred, not steered.
+        await asyncio.to_thread(lambda: on_event(AnswerEvent("first answer")))
+        await deferred_acked.wait()
+        await asyncio.to_thread(lambda: on_event(
+          DoneEvent(cost=0.0, usage={"input_tokens": 1})))
+        turn1_done.set()
+      else:
+        await asyncio.to_thread(lambda: on_event(AnswerEvent("second answer")))
+        await asyncio.to_thread(lambda: on_event(
+          DoneEvent(cost=0.0, usage={"input_tokens": 1})))
+        turn2_done.set()
+      return 0.0, {"input_tokens": 1}
+
+  class _TextChannel(_QueuedChannel):
+    def __init__(self):
+      super().__init__("oc_test", [
+        IncomingMessage(event_type="im.message.receive_v1", chat_id="oc_test",
+                        sender_id="ou_user", message_id="om_work",
+                        msg_type="text", text="work on it", create_time="1"),
+        IncomingMessage(event_type="im.message.receive_v1", chat_id="oc_test",
+                        sender_id="ou_user", message_id="om_follow",
+                        msg_type="text", text="also handle the edge case",
+                        create_time="2"),
+        IncomingMessage(event_type="im.message.receive_v1", chat_id="oc_test",
+                        sender_id="ou_user", message_id="om_exit",
+                        msg_type="text", text="/exit", create_time="3"),
+      ])
+
+    def push_back(self, message):
+      self._messages.insert(0, message)  # deferred follow-up comes back here
+
+    async def receive(self, timeout=300):
+      nxt = self._messages[0] if self._messages else None
+      if nxt is not None and nxt.text == "also handle the edge case" \
+          and not deferred_acked.is_set():
+        await asyncio.sleep(0.05)  # let turn 1 establish before the follow-up
+      if nxt is not None and nxt.text == "/exit":
+        await turn2_done.wait()  # hold /exit until the deferred turn ran
+      return await super().receive(timeout)
+
+    async def add_reaction(self, message_id, emoji_type):
+      if message_id == "om_follow" and emoji_type == "OneSecond":
+        deferred_acked.set()  # follow-up received & deferred (pending ack)
+      return "r_" + emoji_type.lower()
+
+    async def send_card(self, _chat_id, _card):
+      return "om_card"
+
+    async def update_card(self, card_id, _card):
+      return card_id
+
+  channel = _TextChannel()
+
+  with mock.patch("nemo.agent.load_credentials", return_value={
+    "app_id": "app_id", "app_secret": "app_secret",
+    "email": "user@example.com",
+  }), \
+       mock.patch("nemo.agent.Database", _FakeDB), \
+       mock.patch("nemo.agent.LarkChannel", return_value=channel), \
+       mock.patch("nemo.agent.build_coding_agent", return_value=_TextOnlyAgent()), \
+       mock.patch("nemo.group_config.load_config", return_value={}), \
+       mock.patch("nemo.config.load_relay_config", return_value=("", "")), \
+       mock.patch("signal.signal"):
+    result = asyncio.run(main_loop("oc_test", str(tmp_path), "claude-opus-4-6"))
+
+  assert result == 0
+  # Never folded into the text-only turn ...
+  assert steered == []
+  # ... it ran as its own next turn instead.
+  assert len(prompts) == 2
+  assert prompts[0] == "work on it"
+  assert "also handle the edge case" in prompts[1]
+
+
+def test_deferred_followup_folds_at_tool_boundary(tmp_path):
+  """A follow-up deferred during the text phase IS steered in once the turn
+  reaches a tool-call boundary — genuine mid-task course-correction. It folds
+  into the SAME turn (no second turn)."""
+  prompts: list[str] = []
+  steered: list[str] = []
+  deferred_acked = asyncio.Event()
+  steer_seen = asyncio.Event()
+  turn1_done = asyncio.Event()
+
+  class _BoundaryAgent(_FakeAgent):
+    def supports_steering(self):
+      return True
+
+    async def steer(self, text):
+      steered.append(text)
+      steer_seen.set()
+      return True
+
+    def unconsumed_steers(self, texts):
+      return []  # the turn folded it in
+
+    async def run_turn(self, prompt, on_event):
+      prompts.append(prompt)
+      # Text phase first (no tool) so the follow-up is DEFERRED, not steered.
+      await asyncio.to_thread(lambda: on_event(AnswerEvent("thinking...")))
+      await deferred_acked.wait()
+      # Now cross a tool-call boundary — _watch_signals folds the deferred
+      # follow-up in as a steer.
+      await asyncio.to_thread(lambda: on_event(
+        ProgressEvent(kind="tool", summary="Read", first=True)))
+      await steer_seen.wait()
+      await asyncio.to_thread(lambda: on_event(
+        DoneEvent(cost=0.0, usage={"input_tokens": 1})))
+      turn1_done.set()
+      return 0.0, {"input_tokens": 1}
+
+  class _BoundaryChannel(_QueuedChannel):
+    def __init__(self):
+      super().__init__("oc_test", [
+        IncomingMessage(event_type="im.message.receive_v1", chat_id="oc_test",
+                        sender_id="ou_user", message_id="om_work",
+                        msg_type="text", text="work on it", create_time="1"),
+        IncomingMessage(event_type="im.message.receive_v1", chat_id="oc_test",
+                        sender_id="ou_user", message_id="om_follow",
+                        msg_type="text", text="also handle the edge case",
+                        create_time="2"),
+        IncomingMessage(event_type="im.message.receive_v1", chat_id="oc_test",
+                        sender_id="ou_user", message_id="om_exit",
+                        msg_type="text", text="/exit", create_time="3"),
+      ])
+
+    def push_back(self, message):
+      self._messages.insert(0, message)
+
+    async def receive(self, timeout=300):
+      nxt = self._messages[0] if self._messages else None
+      if nxt is not None and nxt.text == "also handle the edge case" \
+          and not deferred_acked.is_set():
+        await asyncio.sleep(0.05)  # let turn 1 establish before the follow-up
+      if nxt is not None and nxt.text == "/exit":
+        # Do NOT block forever: _watch_signals must keep re-polling so the
+        # boundary flush runs. Yield None until the turn is truly done.
+        try:
+          await asyncio.wait_for(turn1_done.wait(), timeout=0.05)
+        except asyncio.TimeoutError:
+          return None
+      return await super().receive(timeout)
+
+    async def add_reaction(self, message_id, emoji_type):
+      if message_id == "om_follow" and emoji_type == "OneSecond":
+        deferred_acked.set()
+      return "r_" + emoji_type.lower()
+
+    async def send_card(self, _chat_id, _card):
+      return "om_card"
+
+    async def update_card(self, card_id, _card):
+      return card_id
+
+  channel = _BoundaryChannel()
+
+  with mock.patch("nemo.agent.load_credentials", return_value={
+    "app_id": "app_id", "app_secret": "app_secret",
+    "email": "user@example.com",
+  }), \
+       mock.patch("nemo.agent.Database", _FakeDB), \
+       mock.patch("nemo.agent.LarkChannel", return_value=channel), \
+       mock.patch("nemo.agent.build_coding_agent", return_value=_BoundaryAgent()), \
+       mock.patch("nemo.group_config.load_config", return_value={}), \
+       mock.patch("nemo.config.load_relay_config", return_value=("", "")), \
+       mock.patch("signal.signal"):
+    result = asyncio.run(main_loop("oc_test", str(tmp_path), "claude-opus-4-6"))
+
+  assert result == 0
+  # Folded into the running turn at the boundary ...
+  assert steered == ["also handle the edge case"]
+  # ... and did NOT spawn a second turn.
+  assert prompts == ["work on it"]
+
+
 def test_stranded_steer_after_stop_is_not_requeued(tmp_path):
   """When the user presses Stop, a steer the interrupted turn never folded in
   must NOT be re-queued — halt means halt. Re-queuing would immediately spawn a
