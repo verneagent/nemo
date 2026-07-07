@@ -152,6 +152,29 @@ _TAIL_BYTES_DEFAULT = 256 * 1024
 _PREVIEW_LIMIT = 120
 _RECENT_USER_COUNT = 3
 
+# Claude's SDK stamps synthetic assistant messages (interrupt/continue stubs
+# from a resumed session) with this literal model id. It's uninformative and,
+# worse, the angle brackets open a stray tag when rendered in a Lark card, so
+# the scanner ignores it and keeps looking for a real model id.
+_SYNTHETIC_MODEL = "<synthetic>"
+
+# A bare greeting as the opening prompt carries no topic — a session that
+# starts with "hi" and only later gets to the real request would otherwise
+# preview as "hi" and be unrecognisable in the recall picker. Skip these when
+# choosing the first-prompt preview (falling back to the greeting only if the
+# whole session is nothing but greetings).
+_GREETINGS = frozenset({
+  "hi", "hii", "hihi", "hi hi", "hello", "helo", "hey", "heya", "hiya",
+  "yo", "sup", "hola", "在", "在吗", "在么", "在不在", "你好", "您好",
+  "哈喽", "嗨", "早", "早上好", "晚上好", "hello?", "hi?",
+})
+_GREETING_STRIP = " \t\r\n!?.,~，。！？、…"
+
+
+def _is_greeting(text: str) -> bool:
+  """True for a content-free opening greeting (case/punctuation-insensitive)."""
+  return text.strip().strip(_GREETING_STRIP).lower() in _GREETINGS
+
 
 def _read_tail_lines(path: str, max_bytes: int = _TAIL_BYTES_DEFAULT) -> list[str]:
   """Return decoded lines from the tail of ``path`` without loading the
@@ -268,6 +291,7 @@ def _scan_claude_session(path: str) -> SessionInfo | None:
     return None
   uuid = os.path.basename(path).removesuffix(".jsonl")
   first_user = ""
+  first_any = ""  # fallback: the literal first prompt, even if a greeting
   model = ""
   try:
     with open(path, encoding="utf-8") as f:
@@ -279,12 +303,16 @@ def _scan_claude_session(path: str) -> SessionInfo | None:
         if not first_user:
           text = _claude_user_text(ev)
           if text:
-            first_user = text[:_PREVIEW_LIMIT]
+            snippet = text[:_PREVIEW_LIMIT]
+            if not first_any:
+              first_any = snippet
+            if not _is_greeting(text):
+              first_user = snippet
         if ev.get("type") == "assistant":
           msg = ev.get("message")
           if isinstance(msg, dict):
             m = msg.get("model")
-            if isinstance(m, str) and m:
+            if isinstance(m, str) and m and m != _SYNTHETIC_MODEL:
               model = m
         # Heuristic stop: once we have a first user message and at least
         # one assistant model id, no need to scan further — files can be
@@ -293,6 +321,8 @@ def _scan_claude_session(path: str) -> SessionInfo | None:
           break
   except OSError:
     return None
+  if not first_user:
+    first_user = first_any
 
   # Tail pass for recent user prompts. Keeps the last N seen, in order.
   recent: list[str] = []
@@ -366,6 +396,7 @@ def _scan_codex_session(path: str, want_cwd: str) -> SessionInfo | None:
   uuid = ""
   cwd = ""
   first_user = ""
+  first_any = ""  # fallback: the literal first prompt, even if a greeting
   model = ""
   try:
     with open(path, encoding="utf-8") as f:
@@ -394,13 +425,19 @@ def _scan_codex_session(path: str, want_cwd: str) -> SessionInfo | None:
         elif etype == "response_item" and not first_user:
           text = _codex_user_text(ev)
           if text and not _looks_like_injected_context(text):
-            first_user = text[:_PREVIEW_LIMIT]
+            snippet = text[:_PREVIEW_LIMIT]
+            if not first_any:
+              first_any = snippet
+            if not _is_greeting(text):
+              first_user = snippet
         if uuid and first_user and (model or cwd):
           break
   except OSError:
     return None
   if cwd != want_cwd or not uuid:
     return None
+  if not first_user:
+    first_user = first_any
 
   # Tail pass for recent user prompts. Skip the AGENTS.md auto-
   # injection so the recent-prompts column also lands on real prompts.

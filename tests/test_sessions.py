@@ -71,6 +71,64 @@ def test_list_claude_sessions_extracts_uuid_model_and_preview(tmp_path):
   assert s.first_user_text == "Help me debug this bug"
 
 
+def test_claude_first_prompt_skips_leading_greeting(tmp_path):
+  # A session that opens with bare greetings must preview the first
+  # *substantive* prompt, not "hi" — otherwise a real topic (e.g. buying a
+  # TV) is invisible in the recall picker.
+  home = str(tmp_path / "home")
+  project = str(tmp_path / "project")
+  os.makedirs(project, exist_ok=True)
+  _claude_session(home, project, "02fe69c7-5793-4ad7-9ba6-7d1aa1e01f91", [
+    {"type": "user", "message": {"role": "user", "content": "hi"}},
+    {"type": "user", "message": {"role": "user", "content": "Hi!"}},
+    {"type": "user", "message": {
+      "role": "user", "content": "我需要买一个电视机，需要关注什么参数"}},
+    {"type": "assistant", "message": {
+      "model": "deepseek-v4-pro",
+      "content": [{"type": "text", "text": "..."}]}},
+  ])
+  with mock.patch.dict(os.environ, {"HOME": home}):
+    s = sessions.list_claude_sessions(project)[0]
+  assert s.first_user_text == "我需要买一个电视机，需要关注什么参数"
+  assert s.model == "deepseek-v4-pro"
+
+
+def test_claude_first_prompt_all_greetings_falls_back(tmp_path):
+  # If the session is nothing but greetings, keep showing the greeting rather
+  # than an empty preview.
+  home = str(tmp_path / "home")
+  project = str(tmp_path / "project")
+  os.makedirs(project, exist_ok=True)
+  _claude_session(home, project, "03fe69c7-5793-4ad7-9ba6-7d1aa1e01f92", [
+    {"type": "user", "message": {"role": "user", "content": "hi"}},
+    {"type": "user", "message": {"role": "user", "content": "hello"}},
+  ])
+  with mock.patch.dict(os.environ, {"HOME": home}):
+    s = sessions.list_claude_sessions(project)[0]
+  assert s.first_user_text == "hi"
+
+
+def test_claude_scan_ignores_synthetic_model(tmp_path):
+  # The SDK stamps resume/interrupt stubs with model "<synthetic>"; the
+  # scanner must skip it (uninformative, and its angle brackets break Lark
+  # card rendering) and pick up the real model instead.
+  home = str(tmp_path / "home")
+  project = str(tmp_path / "project")
+  os.makedirs(project, exist_ok=True)
+  _claude_session(home, project, "04fe69c7-5793-4ad7-9ba6-7d1aa1e01f93", [
+    {"type": "user", "message": {"role": "user", "content": "look at this"}},
+    {"type": "assistant", "message": {
+      "model": "<synthetic>",
+      "content": [{"type": "text", "text": "continuing"}]}},
+    {"type": "assistant", "message": {
+      "model": "deepseek-v4-pro",
+      "content": [{"type": "text", "text": "real answer"}]}},
+  ])
+  with mock.patch.dict(os.environ, {"HOME": home}):
+    s = sessions.list_claude_sessions(project)[0]
+  assert s.model == "deepseek-v4-pro"
+
+
 def test_list_claude_sessions_handles_hidden_path_segments(tmp_path):
   home = str(tmp_path / "home")
   project = str(tmp_path / ".prowl" / "repos" / "fived" / "stt-stuck")
