@@ -644,6 +644,34 @@ def test_purge_skips_active_sessions_of_other_daemons(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# Recallable filter
+# ---------------------------------------------------------------------------
+
+def _info_with_first(first: str) -> sessions.SessionInfo:
+  return sessions.SessionInfo(
+    uuid="u", agent="claude", path="/x", mtime=0.0, first_user_text=first,
+    model="")
+
+
+def test_is_recallable_keeps_real_sessions():
+  assert sessions.is_recallable(_info_with_first("看一下电视选购"))
+  assert sessions.is_recallable(_info_with_first("hi"))
+  assert sessions.is_recallable(_info_with_first(""))
+
+
+def test_is_recallable_filters_recall_injection_and_digest():
+  # The recall-injection turn in the main agent and the throwaway digest
+  # sub-session both surface as JSONL sessions; neither is a real target.
+  assert not sessions.is_recallable(
+    _info_with_first(sessions.RECALL_PROMPT_PREFIX + "recall the past session"))
+  assert not sessions.is_recallable(
+    _info_with_first(sessions.DIGEST_TASK_INTRO + "\n\n  /path.jsonl"))
+  # Leading whitespace must not smuggle a synthetic session past the filter.
+  assert not sessions.is_recallable(
+    _info_with_first("  " + sessions.RECALL_PROMPT_PREFIX + "x"))
+
+
+# ---------------------------------------------------------------------------
 # Recall digest cache
 # ---------------------------------------------------------------------------
 

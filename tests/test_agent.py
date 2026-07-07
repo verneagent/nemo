@@ -12,6 +12,8 @@ import pytest
 
 from nemo.agent import (
   _RECALL_PROMPT_PREFIX,
+  _SESSION_PICKER_LIMIT,
+  _session_picker_options,
   _format_turn_error_message,
   _format_rate_limit_notice,
   _in_turn_filtered_out,
@@ -3682,6 +3684,48 @@ def _run_recall_loop(tmp_path, agent, queued):
        mock.patch("signal.signal"):
     return asyncio.run(
       main_loop("oc_test", str(tmp_path), "claude-opus-4-7", agent="claude"))
+
+
+def _picker_info(uuid, mtime, first, recent=None):
+  from nemo import sessions
+  return sessions.SessionInfo(
+    uuid=uuid, agent="claude", path=f"/{uuid}.jsonl", mtime=mtime,
+    first_user_text=first, model="claude-opus-4-7",
+    last_user_texts=recent or [])
+
+
+def test_session_picker_surfaces_recent_prompts_and_filters_synthetic():
+  from nemo import sessions
+  # A session that opened with a bare "hi" but whose recent turns carry the
+  # real topic must still be recognisable from the picker preview.
+  tv = _picker_info("aaaa1111", 100.0, "hi",
+                    recent=["hi", "看一下这个电视怎么样", "T7L Ultra 有低反膜吗"])
+  # A throwaway recall-digest sub-session must be filtered out entirely.
+  digest = _picker_info(
+    "bbbb2222", 200.0, sessions.DIGEST_TASK_INTRO + "\n\n  /x.jsonl")
+  with mock.patch("nemo.sessions.list_sessions",
+                  return_value=[digest, tv]):
+    options = _session_picker_options("/proj")
+  assert [uuid for _desc, uuid in options] == ["aaaa1111"]
+  desc = options[0][0]
+  assert "hi" in desc  # first prompt still shown
+  assert "T7L Ultra 有低反膜吗" in desc  # most recent topic surfaced
+
+
+def test_session_picker_respects_limit_after_filtering():
+  # 20 real sessions + interleaved synthetic ones: the cap applies to the
+  # recallable set, so the picker yields exactly _SESSION_PICKER_LIMIT reals.
+  from nemo import sessions
+  infos = []
+  for i in range(25):
+    infos.append(_picker_info(f"real{i:04d}", float(1000 - i), f"prompt {i}"))
+    infos.append(_picker_info(
+      f"syn{i:04d}", float(1000 - i) + 0.5,
+      sessions.RECALL_PROMPT_PREFIX + "x"))
+  with mock.patch("nemo.sessions.list_sessions", return_value=infos):
+    options = _session_picker_options("/proj")
+  assert len(options) == _SESSION_PICKER_LIMIT
+  assert all(uuid.startswith("real") for _d, uuid in options)
 
 
 def test_session_picker_submit_recalls_with_digest(tmp_path):

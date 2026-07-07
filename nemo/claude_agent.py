@@ -16,7 +16,7 @@ from .coding_agent import CodingAgent, EndpointConfig
 from .db import Database
 from .permissions import build_ask_user_question_handler, build_permission_handler
 from .sdk_thread import SDKThread
-from .sessions import claude_project_slug
+from .sessions import DIGEST_TASK_INTRO, claude_project_slug
 from .turn import CompactStartedEvent, TurnEvent
 from .types import JsonObject
 
@@ -121,7 +121,7 @@ _DIGEST_DIRECTIVE = (
 # hint. Asks for a compact, fixed-section briefing so the recall prompt that
 # carries it into the main agent's context stays small and predictable.
 _DIGEST_TASK = (
-  "A past coding session in this project was recorded as a JSONL transcript:\n\n"
+  DIGEST_TASK_INTRO + "\n\n"
   "  {path}\n\n"
   "On-disk format: {fmt}\n\n"
   "The file may be large. Prefer the TAIL — the most recent turns are usually "

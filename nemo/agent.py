@@ -980,8 +980,9 @@ async def _handle_session_purge(
 # Shared so the turn loop can recognise a recall turn (its first SDK token
 # can take a while — resume + reading the past transcript) and surface a
 # placeholder working card up front instead of leaving the user staring at
-# the recall ack during the silence.
-_RECALL_PROMPT_PREFIX = "[Nemo recall] "
+# the recall ack during the silence. Canonical definition lives in
+# nemo.sessions so the picker's synthetic-session filter can't drift.
+from .sessions import RECALL_PROMPT_PREFIX as _RECALL_PROMPT_PREFIX
 
 
 # When an SDK turn times out the underlying CLI/agent is usually choking on a
@@ -1311,7 +1312,7 @@ async def _lock_agent_picker(
 
 # Each session is its own card block (markdown + Recall button), so cap the
 # count to keep the card from getting absurdly tall on mobile.
-_SESSION_PICKER_LIMIT = 12
+_SESSION_PICKER_LIMIT = 18
 
 
 def _session_picker_options(
@@ -1320,16 +1321,23 @@ def _session_picker_options(
   """Flatten past sessions into ``(description_markdown, uuid)`` pairs,
   newest first, for the recall picker.
 
-  Each description is a two-line markdown block — a bold meta line
-  (``<uuid8> · <agent> · <model> · <age>`` + a current-session tag) and
-  the first user prompt as a preview — so the operator can recognise a
-  session at a glance without `/session list`. The card renders one
-  Recall button under each block.
+  Each description is a small markdown block — a bold meta line
+  (``<uuid8> · <agent> · <model> · <age>`` + a current-session tag), the
+  first user prompt, and the most recent user prompt(s) — so the operator
+  can recognise a session at a glance without `/session list`. Surfacing the
+  recent prompts (not just the first) matters: a session that opened with a
+  bare "hi" would otherwise be unrecognisable even though later turns carry
+  the real topic. Internal recall/digest sub-sessions are filtered out so
+  they don't eat picker slots. The card renders one Recall button per block.
   """
   from . import sessions as _sessions
   now = time.time()
   out: list[tuple[str, str]] = []
-  for s in _sessions.list_sessions(project_dir)[:_SESSION_PICKER_LIMIT]:
+  recallable = [
+    s for s in _sessions.list_sessions(project_dir)
+    if _sessions.is_recallable(s)
+  ]
+  for s in recallable[:_SESSION_PICKER_LIMIT]:
     age = max(0, int(now - s.mtime))
     if age < 3600:
       when = f"{age // 60}m ago"
@@ -1344,11 +1352,18 @@ def _session_picker_options(
     meta = " · ".join(bits)
     if s.uuid == current_sdk_session_id:
       meta += " · _(current)_"
-    preview = (s.first_user_text or "").replace("\n", " ").strip()[:120]
-    description = f"**{meta}**"
-    if preview:
-      description = f"{description}\n{preview}"
-    out.append((description, s.uuid))
+    lines = [f"**{meta}**"]
+    first = (s.first_user_text or "").replace("\n", " ").strip()
+    if first:
+      lines.append(first[:120])
+    # Most recent user prompts (oldest-first in last_user_texts) surface the
+    # session's current topic; drop any that duplicate the first line.
+    for recent in [
+      t.replace("\n", " ").strip() for t in s.last_user_texts[-2:]
+    ]:
+      if recent and recent != first:
+        lines.append(f"· {recent[:120]}")
+    out.append(("\n".join(lines), s.uuid))
   return out
 
 

@@ -443,6 +443,29 @@ def list_codex_sessions(project_dir: str) -> list[SessionInfo]:
 # Combined surface
 # ---------------------------------------------------------------------------
 
+# `/session recall` produces its own JSONL sessions in the same project dir:
+# a throwaway read-only digest sub-session (whose first user prompt is the
+# digest task, starting with DIGEST_TASK_INTRO) and, on completion, a
+# recall-injection turn in the main agent (starting with RECALL_PROMPT_PREFIX).
+# Neither is real user work, so the recall picker filters them out via
+# `is_recallable`. These are the canonical marker strings — the producers
+# (agent._RECALL_PROMPT_PREFIX, claude_agent._DIGEST_TASK) reference them here
+# so the filter can't drift out of sync.
+RECALL_PROMPT_PREFIX = "[Nemo recall] "
+DIGEST_TASK_INTRO = (
+  "A past coding session in this project was recorded as a JSONL transcript:"
+)
+_SYNTHETIC_FIRST_USER_PREFIXES = (RECALL_PROMPT_PREFIX, DIGEST_TASK_INTRO)
+
+
+def is_recallable(info: SessionInfo) -> bool:
+  """False for internal recall/digest sub-sessions that must not be offered
+  as recall targets (they'd otherwise eat picker slots and confuse the user).
+  """
+  return not info.first_user_text.lstrip().startswith(
+    _SYNTHETIC_FIRST_USER_PREFIXES)
+
+
 def list_sessions(project_dir: str) -> list[SessionInfo]:
   """All sessions for ``project_dir`` across agents, newest first."""
   sessions = list_claude_sessions(project_dir) + list_codex_sessions(project_dir)
