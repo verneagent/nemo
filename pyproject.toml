@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "captain-nemo"
-version = "0.4.56"
+version = "0.4.57"
 description = "Lark-connected coding agent daemon powered by Claude Agent SDK"
 requires-python = ">=3.14"
 license = "MIT"
