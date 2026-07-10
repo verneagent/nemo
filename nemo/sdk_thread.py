@@ -41,7 +41,8 @@ from typing import Callable
 
 from claude_agent_sdk import CLIConnectionError as _CLIConnectionError
 
-from .turn import TurnEvent, run_turn
+from .claude_turn import run_turn
+from .turn import TurnEvent
 from .types import ClaudeSDKClientLike, JsonObject
 
 log = logging.getLogger(__name__)
@@ -266,7 +267,7 @@ class SDKThread:
     preserves conversation context. Falls back to the static `options`
     parameter when not provided.
     """
-    from .turn import (
+    from .claude_turn import (
       NonRetryableAPIError, StaleLeakError, TransientAPIError,
     )  # avoid import cycle
     self._cancelled.clear()

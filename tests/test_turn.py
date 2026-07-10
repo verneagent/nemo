@@ -7,11 +7,12 @@ from unittest import mock
 import pytest
 
 from nemo.turn import (
-  run_turn, ProgressEvent, AnswerEvent,
+  ProgressEvent, AnswerEvent,
   TaskStartedEvent, TaskDoneEvent, DoneEvent, ErrorEvent,
   RateLimitNoticeEvent, CompactNoticeEvent, TurnEvent,
-  canonical_usage, normalize_claude_usage,
+  canonical_usage,
 )
+from nemo.claude_turn import run_turn, normalize_claude_usage
 
 
 def test_canonical_usage_sums_total():
@@ -284,7 +285,7 @@ def test_stale_leak_raises_for_reconnect_resume():
   StaleLeakError (a TransientAPIError) so SDKThread.run_turn_with_reconnect
   recovers via reconnect-with-resume — NOT an in-band drain.
   """
-  from nemo.turn import StaleLeakError, TransientAPIError
+  from nemo.claude_turn import StaleLeakError, TransientAPIError
 
   assert issubclass(StaleLeakError, TransientAPIError), \
     "StaleLeakError must subclass TransientAPIError so the existing " \
@@ -345,7 +346,8 @@ def test_stale_leak_detected_after_some_clean_output():
   """The leak guard fires wherever the stale appears — even after some
   legitimate output — still raising StaleLeakError and stopping the turn.
   """
-  from nemo.turn import StaleLeakError, StaleLeakNoticeEvent
+  from nemo.claude_turn import StaleLeakError
+  from nemo.turn import StaleLeakNoticeEvent
 
   messages = [
     FakeAssistantMessage(content=[FakeTextBlock(text="partial work")]),
@@ -417,7 +419,7 @@ def test_transient_api_error_in_assistant_message_raises_and_suppresses():
   It should instead raise TransientAPIError from _single_turn so
   SDKThread.run_turn_with_reconnect can reconnect and retry.
   """
-  from nemo.turn import TransientAPIError
+  from nemo.claude_turn import TransientAPIError
   messages = [
     FakeAssistantMessage(content=[FakeTextBlock(
       text="API Error: Unable to connect to API (ECONNRESET)")]),
@@ -441,7 +443,7 @@ def test_transient_api_error_in_assistant_message_raises_and_suppresses():
 
 def test_non_retryable_402_api_error_raises_and_suppresses():
   """402/billing failures are provider/account state, not transient network."""
-  from nemo.turn import NonRetryableAPIError
+  from nemo.claude_turn import NonRetryableAPIError
   messages = [
     FakeAssistantMessage(content=[FakeTextBlock(
       text=(
@@ -470,7 +472,7 @@ def test_non_retryable_402_api_error_raises_and_suppresses():
 
 def test_transient_api_error_via_result_is_error_flag():
   """ResultMessage.is_error + transient-signal body → TransientAPIError."""
-  from nemo.turn import TransientAPIError
+  from nemo.claude_turn import TransientAPIError
   messages = [
     FakeResultMessage(
       total_cost_usd=0.0,
@@ -586,7 +588,7 @@ def test_leaked_tool_call_guard_no_false_positive_on_fenced_explanation():
 def test_leaked_tool_call_guard_ignores_incomplete_fragment():
   """Prose that merely names `<invoke` without a closing `</invoke>` is not a
   balanced invocation and must not trip the guard."""
-  from nemo.turn import _looks_like_leaked_tool_call
+  from nemo.claude_turn import _looks_like_leaked_tool_call
   assert not _looks_like_leaked_tool_call(
     "The <invoke name= opener starts an Anthropic tool call.")
   assert not _looks_like_leaked_tool_call("just a normal answer")
@@ -639,7 +641,7 @@ def test_progress_timeout_fires_on_systemmessage_storm(monkeypatch):
   HEARTBEAT_TIMEOUT, so the turn was never declared stuck. Progress-only
   timeout should trigger after PROGRESS_TIMEOUT seconds regardless.
   """
-  from nemo import turn as turn_module
+  from nemo import claude_turn as turn_module
 
   # Shrink both timeouts so the test runs fast.
   monkeypatch.setattr(turn_module, "PROGRESS_TIMEOUT", 0.5)
@@ -693,7 +695,7 @@ def test_watchdog_defers_while_prompt_awaits_user(monkeypatch):
   With ``is_paused`` reporting True the watchdog stands down, and the turn
   completes normally once the user answers and the message stream resumes.
   """
-  from nemo import turn as turn_module
+  from nemo import claude_turn as turn_module
 
   # Shrink so the silent (paused) stretch spans several watchdog ticks fast.
   monkeypatch.setattr(turn_module, "PROGRESS_TIMEOUT", 0.3)
@@ -743,7 +745,7 @@ def test_watchdog_still_fires_when_not_paused(monkeypatch):
   Guards against is_paused accidentally disabling the watchdog for genuine
   hangs — only an actually-pending prompt (is_paused True) should defer it.
   """
-  from nemo import turn as turn_module
+  from nemo import claude_turn as turn_module
 
   monkeypatch.setattr(turn_module, "PROGRESS_TIMEOUT", 0.3)
   monkeypatch.setattr(turn_module, "HEARTBEAT_TIMEOUT", 5)
@@ -1209,7 +1211,7 @@ def test_late_steer_continuation_drained_into_same_turn():
 
   async def _run():
     with mock.patch.dict("sys.modules", _sdk_modules()), \
-         mock.patch("nemo.turn.QUIESCENCE_TIMEOUT", 0.05):
+         mock.patch("nemo.claude_turn.QUIESCENCE_TIMEOUT", 0.05):
       return await run_turn(client, "prompt", events.append, steered=steered)
 
   cost, _usage = asyncio.run(_run())
@@ -1236,7 +1238,7 @@ def test_folded_steer_single_result_completes_without_hang():
 
   async def _run():
     with mock.patch.dict("sys.modules", _sdk_modules()), \
-         mock.patch("nemo.turn.QUIESCENCE_TIMEOUT", 0.05):
+         mock.patch("nemo.claude_turn.QUIESCENCE_TIMEOUT", 0.05):
       return await run_turn(client, "prompt", events.append, steered=steered)
 
   cost, _usage = asyncio.run(asyncio.wait_for(_run(), timeout=5))
@@ -1254,7 +1256,7 @@ def test_no_lag_next_turn_gets_its_own_answer():
 
   async def _run():
     with mock.patch.dict("sys.modules", _sdk_modules()), \
-         mock.patch("nemo.turn.QUIESCENCE_TIMEOUT", 0.05):
+         mock.patch("nemo.claude_turn.QUIESCENCE_TIMEOUT", 0.05):
       # Turn 1: a steer fired mid-turn (sets the flag) → continuation drained.
       steered[0] = True
       client.feed(

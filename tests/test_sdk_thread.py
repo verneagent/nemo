@@ -209,7 +209,7 @@ class TestRunTurnWithReconnect:
     and reconnect with the options_factory result (resume=<session_id>),
     then retry the SAME real prompt — no interrupt anywhere.
     """
-    from nemo.turn import StaleLeakError, TransientAPIError
+    from nemo.claude_turn import StaleLeakError, TransientAPIError
 
     assert issubclass(StaleLeakError, TransientAPIError)
 
@@ -357,7 +357,7 @@ class TestRunTurnWithReconnect:
 
   def test_non_retryable_api_error_closes_without_retry(self, sdk_thread: SDKThread):
     """402/billing failures should close the wedged CLI and not reconnect."""
-    from nemo.turn import NonRetryableAPIError
+    from nemo.claude_turn import NonRetryableAPIError
 
     call_count = 0
 
