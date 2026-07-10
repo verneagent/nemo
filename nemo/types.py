@@ -17,7 +17,7 @@ class TurnClient(Protocol):
   async def query(self, prompt: str) -> None:
     ...
 
-  def receive_response(self) -> AsyncIterator[object]:
+  def receive_messages(self) -> AsyncIterator[object]:
     ...
 
   async def stop_task(self, task_id: str) -> None:

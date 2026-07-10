@@ -262,7 +262,7 @@ def _looks_like_leaked_tool_call(text: str) -> bool:
   return bool(_LEAKED_INVOKE_OPEN_RE.search(text)) and bool(
     _LEAKED_INVOKE_CLOSE_RE.search(text))
 
-# If receive_response() yields nothing for this long, assume the turn is stuck.
+# If receive_messages() yields nothing for this long, assume the turn is stuck.
 # SDK docs: "If no ResultMessage is received, the iterator continues indefinitely."
 # Must be generous — Agent spawning and complex edits can go quiet for minutes.
 HEARTBEAT_TIMEOUT = 300  # seconds
@@ -276,6 +276,18 @@ HEARTBEAT_TIMEOUT = 300  # seconds
 # enters a rate-limit retry loop that emits SystemMessage every ~1 min
 # indefinitely.
 PROGRESS_TIMEOUT = 240  # seconds — 4 minutes without real work = stuck
+
+# After a ResultMessage arrives on a turn that had a steer injected, the CLI
+# may process that steer as its OWN follow-on turn with its OWN ResultMessage.
+# We must NOT stop reading at the first Result (that strands the steer's answer
+# + Result in the receive buffer, where the NEXT turn drains it → permanent +1
+# turn lag: every question gets the previous turn's answer). Instead we keep
+# consuming until the CLI goes quiescent — i.e. no new message for
+# QUIESCENCE_TIMEOUT. Any steer-continuation Result is thus folded into the
+# SAME run_turn and nothing is left to strand. A steer that was *folded* (0
+# extra Result) simply idles out this window; a *late* steer streams its
+# continuation within it. This is Result-as-event, not Result-as-return.
+QUIESCENCE_TIMEOUT = 8  # seconds of CLI silence after a Result = turn complete
 
 # Messages that do NOT count as real progress. Anything outside this set
 # refreshes the progress clock. Checked by class name to avoid importing
@@ -438,8 +450,9 @@ async def _single_turn(
   stale_tasks: set[str],
   stop_task_disabled: list[bool],
   is_paused: Callable[[], bool] | None = None,
+  steered: list[bool] | None = None,
 ) -> _TurnResult:
-  """Issue one query() and consume its receive_response() stream.
+  """Issue one query() and consume the client's receive_messages() stream.
 
   If a stale TaskNotification (id in ``stale_tasks``) appears anywhere in
   the stream, raise ``StaleLeakError`` immediately (SDK #788). It subclasses
@@ -457,11 +470,23 @@ async def _single_turn(
   paused the progress/heartbeat watchdog is held off so it never force-
   reconnects mid-prompt (which would tear down the in-flight question and
   re-ask it, discarding the user's selections).
+
+  ``steered`` is a one-element mutable flag set True by ``SDKThread.steer``
+  when a user message is injected into THIS running turn. When set, we do not
+  treat the first ResultMessage as end-of-turn: the CLI may run the steer as a
+  separate turn with its own Result, so we keep consuming until the stream goes
+  quiescent (QUIESCENCE_TIMEOUT). This folds the steer's answer into the same
+  run_turn and prevents the "+1 turn lag" desync (see QUIESCENCE_TIMEOUT note).
+  We stream ``receive_messages()`` (the raw stream) rather than
+  ``receive_response()`` precisely because the latter returns at the first
+  Result — which is what strands the steer continuation.
   """
   from claude_agent_sdk import (
     AssistantMessage, TextBlock, ThinkingBlock, ToolUseBlock, ResultMessage,
     TaskStartedMessage, TaskNotificationMessage, TaskProgressMessage,
   )
+
+  steered_flag: list[bool] = steered if steered is not None else [False]
 
   import anyio as _anyio
   import time as _time
@@ -483,8 +508,9 @@ async def _single_turn(
 
   FIRST_MSG_TIMEOUT = 30
   msg_count = 0
+  saw_result = False  # a ResultMessage arrived → in quiescence/steer-drain mode
   last_progress_at = _time.monotonic()
-  response = client.receive_response()
+  response = client.receive_messages()
   # The pending receive future persists across watchdog ticks. While a prompt
   # is awaiting the user (is_paused) we must NOT cancel it — the SDK is
   # legitimately mid-``can_use_tool`` and a fresh ``__anext__`` would race the
@@ -500,14 +526,23 @@ async def _single_turn(
     paused = bool(is_paused()) if is_paused is not None else False
     if paused:
       last_progress_at = _time.monotonic()
-    heartbeat_budget = FIRST_MSG_TIMEOUT if msg_count == 0 else HEARTBEAT_TIMEOUT
-    progress_budget = PROGRESS_TIMEOUT - (_time.monotonic() - last_progress_at)
-    if progress_budget <= 0 and not paused:
-      log.error("no progress for %ds (msgs=%d) — forcing reconnect",
-                PROGRESS_TIMEOUT, msg_count)
-      timed_out = True
-      break
-    iter_timeout = max(1, min(heartbeat_budget, progress_budget))
+    if saw_result and not paused:
+      # Quiescence / steer-drain mode: a Result already arrived on a steered
+      # turn. We are only waiting to see whether the CLI emits a steer
+      # continuation (its own follow-on turn). Bound the wait to
+      # QUIESCENCE_TIMEOUT; an idle tick means the CLI has gone silent → the
+      # turn (including any steer follow-on) is genuinely complete. Never force
+      # a reconnect here — silence after a Result is the normal end of a turn.
+      iter_timeout = QUIESCENCE_TIMEOUT
+    else:
+      heartbeat_budget = FIRST_MSG_TIMEOUT if msg_count == 0 else HEARTBEAT_TIMEOUT
+      progress_budget = PROGRESS_TIMEOUT - (_time.monotonic() - last_progress_at)
+      if progress_budget <= 0 and not paused:
+        log.error("no progress for %ds (msgs=%d) — forcing reconnect",
+                  PROGRESS_TIMEOUT, msg_count)
+        timed_out = True
+        break
+      iter_timeout = max(1, min(heartbeat_budget, progress_budget))
     if next_task is None:
       next_task = asyncio.ensure_future(response.__anext__())
     done, _ = await asyncio.wait({next_task}, timeout=iter_timeout)
@@ -519,12 +554,21 @@ async def _single_turn(
         continue
       next_task.cancel()
       next_task = None
+      if saw_result:
+        # Quiescent after a Result: the CLI produced nothing more within
+        # QUIESCENCE_TIMEOUT, so any injected steer was either folded (no extra
+        # Result) or its continuation has already been drained above. The turn
+        # is genuinely complete — end cleanly, NOT via reconnect. Nothing is
+        # left buffered to strand into the next turn.
+        log.info("turn quiescent %ds after result (steer continuation drained)",
+                 QUIESCENCE_TIMEOUT)
+        break
       since_progress = _time.monotonic() - last_progress_at
       if since_progress >= PROGRESS_TIMEOUT:
         log.error("no progress for %.0fs (msgs=%d) — forcing reconnect",
                   since_progress, msg_count)
       else:
-        log.error("receive_response() heartbeat timeout (%ds, msgs=%d) — forcing reconnect",
+        log.error("receive_messages() heartbeat timeout (%ds, msgs=%d) — forcing reconnect",
                   heartbeat_budget, msg_count)
       timed_out = True
       break
@@ -683,7 +727,9 @@ async def _single_turn(
       ))
 
     elif isinstance(message, ResultMessage):
-      cost = getattr(message, "total_cost_usd", 0) or 0.0
+      # Accumulate cost across Results (a late steer adds a second Result whose
+      # cost belongs to this same run_turn); keep the latest usage/session id.
+      cost += getattr(message, "total_cost_usd", 0) or 0.0
       usage = getattr(message, "usage", None) or {}
       sdk_session_id = getattr(message, "session_id", "") or ""
 
@@ -733,11 +779,20 @@ async def _single_turn(
             stop_task_disabled[0] = True
             log.warning("stop_task control channel wedged — skipping further stops")
       pending_tasks.clear()
-      break
+      saw_result = True
+      if not steered_flag[0]:
+        # No steer this turn → exactly one Result → done. (Unchanged behavior;
+        # zero added latency for the common case.)
+        break
+      # A steer was injected this turn: do NOT break here or we strand the
+      # steer's follow-on Result in the receive buffer. Keep looping — the
+      # quiescence window (top of loop) ends the turn once the CLI is silent,
+      # after consuming any steer continuation into THIS run_turn.
+      last_progress_at = _time.monotonic()
 
   if timed_out:
     on_event(ErrorEvent(message="Turn timed out — SDK stopped responding"))
-    raise TimeoutError("receive_response() heartbeat timeout")
+    raise TimeoutError("receive_messages() heartbeat timeout")
 
   return _TurnResult(
     cost=cost,
@@ -754,6 +809,7 @@ async def run_turn(
   on_event: Callable[[TurnEvent], None],
   stale_tasks: set[str] | None = None,
   is_paused: Callable[[], bool] | None = None,
+  steered: list[bool] | None = None,
 ) -> tuple[float, JsonObject]:
   """Send prompt to SDK client, stream responses, emit events.
 
@@ -776,6 +832,7 @@ async def run_turn(
   # straight through; the reconnect layer owns recovery.
   result = await _single_turn(
     client, prompt, on_event, stale_tasks, stop_task_disabled, is_paused,
+    steered,
   )
 
   total_cost = result.cost

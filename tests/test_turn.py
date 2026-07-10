@@ -161,8 +161,41 @@ class FakeClient:
   async def query(self, prompt):
     self._queried = True
 
-  async def receive_response(self):
+  async def receive_messages(self):
     for msg in self._messages:
+      yield msg
+
+  async def stop_task(self, task_id):
+    pass
+
+
+class QueueClient:
+  """Models the real SDK client's SINGLE underlying message stream.
+
+  ``receive_messages()`` pulls from one shared asyncio.Queue and blocks when it
+  is empty (exactly as the CLI stream goes silent between turns). Messages left
+  unconsumed by one run_turn therefore persist into the NEXT run_turn's
+  receive_messages() — this is what lets the test detect the "+1 turn lag"
+  stranding bug. ``query()`` sets the steer flag it was given, mirroring
+  SDKThread.steer.
+  """
+
+  def __init__(self, steered):
+    self.q: asyncio.Queue = asyncio.Queue()
+    self._steered = steered
+    self.queried: list[str] = []
+
+  def feed(self, *messages):
+    for m in messages:
+      self.q.put_nowait(m)
+
+  async def query(self, prompt):
+    self.queried.append(prompt)
+    self._steered[0] = True
+
+  async def receive_messages(self):
+    while True:
+      msg = await self.q.get()
       yield msg
 
   async def stop_task(self, task_id):
@@ -270,7 +303,7 @@ def test_stale_leak_raises_for_reconnect_resume():
     async def query(self, prompt):
       sent_prompts.append(prompt)
 
-    async def receive_response(self):
+    async def receive_messages(self):
       nonlocal call_count
       call_count += 1
       for msg in stale_messages:
@@ -355,7 +388,7 @@ def test_stop_task_circuit_breaker_on_control_timeout():
     async def query(self, prompt):
       pass
 
-    async def receive_response(self):
+    async def receive_messages(self):
       for msg in messages:
         yield msg
 
@@ -629,7 +662,7 @@ def test_progress_timeout_fires_on_systemmessage_storm(monkeypatch):
     async def query(self, prompt):
       pass
 
-    def receive_response(self):
+    def receive_messages(self):
       return forever_system()
 
     async def stop_task(self, task_id):
@@ -681,7 +714,7 @@ def test_watchdog_defers_while_prompt_awaits_user(monkeypatch):
     async def query(self, prompt):
       pass
 
-    def receive_response(self):
+    def receive_messages(self):
       return gen
 
     async def stop_task(self, task_id):
@@ -725,7 +758,7 @@ def test_watchdog_still_fires_when_not_paused(monkeypatch):
     async def query(self, prompt):
       pass
 
-    def receive_response(self):
+    def receive_messages(self):
       return gen
 
     async def stop_task(self, task_id):
@@ -1035,7 +1068,7 @@ def test_first_message_timeout():
     async def query(self, _prompt):
       pass
 
-    async def receive_response(self):
+    async def receive_messages(self):
       # Yield nothing — the async iterator hangs forever
       await asyncio.Future()  # never resolves
       # Make this a generator
@@ -1076,7 +1109,7 @@ def test_heartbeat_timeout():
     async def query(self, _prompt):
       pass
 
-    async def receive_response(self):
+    async def receive_messages(self):
       yield FakeAssistantMessage(content=[FakeTextBlock(text="thinking...")])
       # Second message hangs forever
       await asyncio.Future()
@@ -1124,7 +1157,7 @@ def test_query_timeout():
     async def query(self, _prompt):
       await asyncio.sleep(60)  # way longer than 15s limit
 
-    async def receive_response(self):
+    async def receive_messages(self):
       yield FakeResultMessage()  # pragma: no cover
 
     async def stop_task(self, _task_id):
@@ -1142,3 +1175,109 @@ def test_query_timeout():
         assert "timed out" in str(type(exc).__name__).lower() or isinstance(exc, TimeoutError) or "cancel" in str(type(exc).__name__).lower(), f"Unexpected: {exc!r}"
 
   asyncio.run(_run())
+
+
+# ---------------------------------------------------------------------------
+# Steer double-Result desync ("答上一个问题" +1 turn lag) regression
+#
+# A steer injected mid-turn can be run by the CLI as its OWN follow-on turn
+# with its OWN ResultMessage. If run_turn stops at the FIRST Result, that
+# second Result + its answer strand in the receive buffer and the NEXT turn
+# drains them — every question then gets the previous turn's answer. Fix B:
+# once steered, keep consuming until the CLI is quiescent so the continuation
+# folds into THIS run_turn and nothing is stranded.
+# ---------------------------------------------------------------------------
+
+def _answers(events):
+  return [e.text for e in events if isinstance(e, AnswerEvent)]
+
+
+def test_late_steer_continuation_drained_into_same_turn():
+  """Late steer → second Result. Both answers belong to THIS run_turn and the
+  shared stream is left EMPTY (nothing stranded for the next turn)."""
+  steered = [True]  # a steer was injected into this turn (SDKThread.steer)
+  client = QueueClient(steered)
+  # The CLI emitted the prompt's answer + Result, then processed the steer as
+  # its own turn: continuation answer + a second Result.
+  client.feed(
+    FakeAssistantMessage(content=[FakeTextBlock(text="first")]),
+    FakeResultMessage(total_cost_usd=0.02, usage={"input_tokens": 100}),
+    FakeAssistantMessage(content=[FakeTextBlock(text="second")]),
+    FakeResultMessage(total_cost_usd=0.03, usage={"input_tokens": 100}),
+  )
+  events: list = []
+
+  async def _run():
+    with mock.patch.dict("sys.modules", _sdk_modules()), \
+         mock.patch("nemo.turn.QUIESCENCE_TIMEOUT", 0.05):
+      return await run_turn(client, "prompt", events.append, steered=steered)
+
+  cost, _usage = asyncio.run(_run())
+  # BOTH answers surfaced in this single turn (the steer's answer was NOT
+  # stranded for the next turn).
+  assert _answers(events) == ["first", "second"]
+  # Cost accumulated across both Results.
+  assert abs(cost - 0.05) < 1e-9
+  # The shared stream is drained: no leftover Result to lag the next turn.
+  assert client.q.empty(), "steer continuation left messages stranded in buffer"
+
+
+def test_folded_steer_single_result_completes_without_hang():
+  """Folded steer → only ONE Result ever arrives. The turn must still complete
+  (via quiescence) rather than hang waiting for a second Result — the failure
+  mode of the reverted fixed-counter approach."""
+  steered = [True]
+  client = QueueClient(steered)
+  client.feed(
+    FakeAssistantMessage(content=[FakeTextBlock(text="only")]),
+    FakeResultMessage(total_cost_usd=0.01),
+  )
+  events: list = []
+
+  async def _run():
+    with mock.patch.dict("sys.modules", _sdk_modules()), \
+         mock.patch("nemo.turn.QUIESCENCE_TIMEOUT", 0.05):
+      return await run_turn(client, "prompt", events.append, steered=steered)
+
+  cost, _usage = asyncio.run(asyncio.wait_for(_run(), timeout=5))
+  assert _answers(events) == ["only"]
+  assert abs(cost - 0.01) < 1e-9
+  assert client.q.empty()
+
+
+def test_no_lag_next_turn_gets_its_own_answer():
+  """End-to-end: over ONE shared stream, a steered turn that drains its
+  continuation leaves the NEXT (unsteered) turn to answer its OWN prompt — no
+  +1 turn lag."""
+  steered = [False]
+  client = QueueClient(steered)
+
+  async def _run():
+    with mock.patch.dict("sys.modules", _sdk_modules()), \
+         mock.patch("nemo.turn.QUIESCENCE_TIMEOUT", 0.05):
+      # Turn 1: a steer fired mid-turn (sets the flag) → continuation drained.
+      steered[0] = True
+      client.feed(
+        FakeAssistantMessage(content=[FakeTextBlock(text="t1-answer")]),
+        FakeResultMessage(total_cost_usd=0.01),
+        FakeAssistantMessage(content=[FakeTextBlock(text="t1-steer-answer")]),
+        FakeResultMessage(total_cost_usd=0.01),
+      )
+      ev1: list = []
+      await run_turn(client, "q1", ev1.append, steered=steered)
+      assert client.q.empty(), "turn 1 stranded a Result into turn 2's stream"
+
+      # Turn 2: no steer (SDKThread resets the flag per turn).
+      steered[0] = False
+      client.feed(
+        FakeAssistantMessage(content=[FakeTextBlock(text="t2-answer")]),
+        FakeResultMessage(total_cost_usd=0.01),
+      )
+      ev2: list = []
+      await run_turn(client, "q2", ev2.append, steered=steered)
+      return _answers(ev1), _answers(ev2)
+
+  a1, a2 = asyncio.run(_run())
+  assert a1 == ["t1-answer", "t1-steer-answer"]
+  # The crux: turn 2 answers q2, NOT the stranded t1-steer-answer.
+  assert a2 == ["t2-answer"]

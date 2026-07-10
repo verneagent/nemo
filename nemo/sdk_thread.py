@@ -66,6 +66,10 @@ class SDKThread:
     # Lifecycle command queue (asyncio.Queue created on the SDK loop).
     self._lifecycle_q: asyncio.Queue | None = None
     self._lifecycle_started = threading.Event()
+    # One-element mutable flag: set True by steer() when a user message is
+    # injected into the running turn, read by turn._single_turn so it drains
+    # any steer-continuation Result instead of stranding it. Reset per turn.
+    self._steer_holder: list[bool] = [False]
 
   def start(self) -> None:
     """Start the SDK thread. Blocks until the event loop is ready."""
@@ -225,10 +229,14 @@ class SDKThread:
     if self._client is None:
       raise RuntimeError("SDK client not connected")
 
+    # Fresh steer flag per turn: only steers injected into THIS turn count.
+    self._steer_holder[0] = False
+
     async def _turn():
       return await run_turn(
         self._client, prompt, on_event,
-        stale_tasks=stale_tasks, is_paused=is_paused)
+        stale_tasks=stale_tasks, is_paused=is_paused,
+        steered=self._steer_holder)
 
     return await self.run_on_sdk_loop(_turn())
 
@@ -322,12 +330,16 @@ class SDKThread:
   async def steer(self, text: str) -> bool:
     """Inject a user message into the RUNNING turn via the bidirectional
     stream. The SDK speaks ``claude --input-format stream-json``; a user
-    message written while a turn is in flight is folded into that turn (the
-    live ``receive_response`` loop keeps yielding and still ends at the single
-    Result). Returns True if the message was written, False if no client.
+    message written while a turn is in flight reaches the running turn. Returns
+    True if the message was written, False if no client.
 
-    NB: this does NOT spawn a second turn and there is no extra Result to
-    absorb — a mid-turn ``query()`` is consumed by the turn already running.
+    Timing-dependent outcome: if the steer lands before the model commits to
+    finishing, the CLI FOLDS it into the current turn (one Result). If it lands
+    late, the CLI processes it as a SEPARATE turn with its OWN ResultMessage.
+    We therefore set ``_steer_holder`` so turn._single_turn keeps consuming
+    past the first Result (until the CLI is quiescent) and drains that extra
+    Result into the same run_turn — otherwise it strands in the receive buffer
+    and the next turn replies with the previous turn's answer (+1 turn lag).
     """
     if self._client is None:
       return False
@@ -335,6 +347,9 @@ class SDKThread:
     async def _steer():
       try:
         await self._client.query(text)
+        # Mark this turn as steered so _single_turn drains any follow-on
+        # Result rather than stranding it (both fold and late-steer cases).
+        self._steer_holder[0] = True
         return True
       except Exception as e:
         log.warning("steer query() error: %s", e)
