@@ -2716,8 +2716,6 @@ async def main_loop(
 
       async def _update_interrupt_card(phase: str) -> None:
         nonlocal _turn_card_id, _turn_interrupt_phase
-        if not _turn_card_id:
-          return
         _turn_interrupt_phase = phase
         try:
           card = cards.build_turn_card(
@@ -2729,6 +2727,17 @@ async def main_loop(
             compact_notice=_turn_compact_notice,
             answered_questions=list(channel.turn_ctx.answered_questions),
           )
+          if not _turn_card_id:
+            # esc landed before the first assistant token, so no working
+            # card exists yet. Create one so an early interrupt still
+            # surfaces a "stopped" card instead of a silent no-op.
+            _turn_card_id = await channel.send_card(chat_id, card)
+            _turn_card_segments.append(_TurnCardSegment(
+              message_id=_turn_card_id, start_index=_turn_active_start))
+            db.set_working(session_id, _turn_card_id)
+            _register_msg(_turn_card_id, chat_id)
+            channel.turn_ctx.turn_card_id = _turn_card_id
+            return
           prev_id = _turn_card_id
           _turn_card_id = await channel.update_card(_turn_card_id, card)
           if _turn_card_id != prev_id:

@@ -1340,6 +1340,80 @@ def test_stranded_steer_after_stop_is_not_requeued(tmp_path):
     c.args for c in remove_reaction.await_args_list]
 
 
+def test_early_esc_before_first_token_still_shows_stopped_card(tmp_path):
+  """If Stop lands before the first assistant token, no working card exists yet
+  (_turn_card_id is None). The interrupt path must still CREATE a "Stopped" card
+  instead of a silent no-op, so the user sees that the esc landed. Without the
+  fix _update_interrupt_card early-returns and zero cards are sent."""
+  interrupted = asyncio.Event()
+  sent_cards: list = []
+  updated_cards: list = []
+
+  class _SilentTurnAgent(_FakeAgent):
+    async def interrupt(self):
+      interrupted.set()  # unblock run_turn so it winds down after Stop
+
+    async def run_turn(self, _prompt, _on_event):
+      # Emit NOTHING before the interrupt — no ProgressEvent/AnswerEvent, so
+      # the working card is never created and _turn_card_id stays None.
+      await interrupted.wait()
+      return 0.0, {"input_tokens": 1}
+
+  class _EarlyStopChannel(_QueuedChannel):
+    def __init__(self):
+      super().__init__("oc_test", [
+        IncomingMessage(event_type="im.message.receive_v1", chat_id="oc_test",
+                        sender_id="ou_user", message_id="om_work",
+                        msg_type="text", text="work on it", create_time="1"),
+        IncomingMessage(event_type="card.action.trigger", chat_id="oc_test",
+                        operator_id="ou_user", sender_id="ou_user",
+                        message_id="om_stop", action_value={"action": "stop"},
+                        create_time="2"),
+        IncomingMessage(event_type="im.message.receive_v1", chat_id="oc_test",
+                        sender_id="ou_user", message_id="om_exit",
+                        msg_type="text", text="/exit", create_time="3"),
+      ])
+
+    async def receive(self, timeout=300):
+      nxt = self._messages[0] if self._messages else None
+      if nxt is not None and nxt.event_type == "card.action.trigger":
+        await asyncio.sleep(0.05)  # let the turn establish before stopping
+      return await super().receive(timeout)
+
+    async def send_card(self, _chat_id, card):
+      sent_cards.append(card)
+      return "om_stopped_card"
+
+    async def update_card(self, card_id, card):
+      updated_cards.append(card)
+      return card_id
+
+  channel = _EarlyStopChannel()
+
+  with mock.patch("nemo.agent.load_credentials", return_value={
+    "app_id": "app_id", "app_secret": "app_secret",
+    "email": "user@example.com",
+  }), \
+       mock.patch("nemo.agent.Database", _FakeDB), \
+       mock.patch("nemo.agent.LarkChannel", return_value=channel), \
+       mock.patch("nemo.agent.build_coding_agent", return_value=_SilentTurnAgent()), \
+       mock.patch("nemo.group_config.load_config", return_value={}), \
+       mock.patch("nemo.config.load_relay_config", return_value=("", "")), \
+       mock.patch("signal.signal"):
+    result = asyncio.run(main_loop("oc_test", str(tmp_path), "claude-opus-4-6"))
+
+  assert result == 0
+  # The fix CREATES an interrupt card even with no working card (without it,
+  # _update_interrupt_card early-returns and this "Stopping..." card is absent).
+  sent_titles = [
+    c.get("header", {}).get("title", {}).get("content") for c in sent_cards]
+  assert "Stopping..." in sent_titles
+  # ...and the same card is then transitioned to the final "Stopped" state.
+  updated_titles = [
+    c.get("header", {}).get("title", {}).get("content") for c in updated_cards]
+  assert "Stopped" in updated_titles
+
+
 def test_pacing_hint_prepended_after_timeout(tmp_path):
   """After a TimeoutError the next turn's prompt is prefixed with a pacing hint;
   the hint is not applied to subsequent turns."""
