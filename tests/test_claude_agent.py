@@ -774,6 +774,37 @@ def test_fork_build_env_exports_reply_thread_file(tmp_path):
   assert "NEMO_REPLY_THREAD_FILE" not in agent._build_env(str(tmp_path), "model-x")
 
 
+def test_build_env_prepends_nemo_script_dir(tmp_path, monkeypatch):
+  """The agent subprocess must be able to find nemo-vision / nemo-send even
+  when the daemon's inherited PATH omits the pip --user scripts dir. Regression
+  for the deepseek group: nemo-vision was off the daemon PATH, so the text-only
+  model could not run it and hallucinated the image contents instead."""
+  from nemo.claude_agent import ClaudeCodingAgent
+  from nemo.coding_agent import EndpointConfig
+
+  script_dir = tmp_path / "userbin"
+  script_dir.mkdir()
+  (script_dir / "nemo-vision").write_text("#!/bin/sh\n")
+  monkeypatch.setattr(
+    "nemo.claude_agent._nemo_script_dir", lambda: str(script_dir))
+  monkeypatch.setenv("PATH", "/usr/bin:/bin")
+
+  agent = ClaudeCodingAgent.__new__(ClaudeCodingAgent)
+  agent._chat_id = "oc_chat"
+  agent._endpoint = EndpointConfig()
+  agent._read_only = False
+  agent._scratch_dir = ""
+
+  env = agent._build_env(str(tmp_path), "model-x")
+  assert env["PATH"].split(os.pathsep)[0] == str(script_dir)
+  assert "/usr/bin" in env["PATH"]
+
+  # Idempotent: already-present dir isn't duplicated.
+  monkeypatch.setenv("PATH", f"{script_dir}{os.pathsep}/usr/bin")
+  env2 = agent._build_env(str(tmp_path), "model-x")
+  assert env2["PATH"].count(str(script_dir)) == 1
+
+
 def test_fork_bind_reply_anchor_writes_file(tmp_path):
   """bind_reply_anchor persists the anchor where _build_env points nemo-send."""
   import asyncio

@@ -133,6 +133,17 @@ def test_image_no_vision_adds_nemo_vision_hint(mock_dl):
 
 
 @mock.patch("nemo.lark_channel.lark_api.download_image", return_value="/tmp/img.png")
+def test_image_hint_forbids_guessing(mock_dl):
+  """Anti-hallucination guard: the hint must tell the model to admit it can't
+  see the image rather than fabricate a description if nemo-vision fails (the
+  deepseek group guessed the photo's contents when nemo-vision was off PATH)."""
+  ev = _make_event(msg_type="image", image_key="ik_1", text="")
+  msg = _to_incoming(ev, token=TOKEN, model_sees_images=False)
+  assert "NEVER guess" in msg.text
+  assert "cannot see the" in msg.text
+
+
+@mock.patch("nemo.lark_channel.lark_api.download_image", return_value="/tmp/img.png")
 def test_image_with_vision_has_no_hint(mock_dl):
   """A vision-capable model (default) sees the image itself — no hint."""
   ev = _make_event(msg_type="image", image_key="ik_1", text="")

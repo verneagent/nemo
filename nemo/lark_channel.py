@@ -37,7 +37,9 @@ def _video_block(path: str, model_sees_video: bool, vision_helper: bool) -> str:
     return marker
   return (
     f'{marker}\n(To understand this video, run the shell command: nemo-vision '
-    f'"{path}" "the question to ask about it" — it prints a text description.)')
+    f'"{path}" "the question to ask about it" — it prints a text description. '
+    "If nemo-vision is missing or fails, tell the user you cannot see the "
+    "video — never guess its contents.)")
 
 
 def _to_incoming(
@@ -116,7 +118,9 @@ def _to_incoming(
         f"{text}\n(This model cannot see images directly. To read any "
         f"[image: ...] path above, run the shell command: nemo-vision "
         f'"the-image-path" "the question to ask about it" — it prints a '
-        f"text description. Do not use the Read tool on these images.)")
+        f"text description. Do not use the Read tool on these images. If "
+        f"nemo-vision is missing or fails, tell the user you cannot see the "
+        f"image — NEVER guess or describe its contents from context.)")
 
   # Enrich: fetch reply parent context.
   # Prefer the parent_lookup callback (nemo's own DB) first — Lark's

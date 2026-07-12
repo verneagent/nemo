@@ -7,6 +7,8 @@ import json
 import logging
 import os
 import re
+import sys
+import sysconfig
 from collections import deque
 from dataclasses import dataclass
 from typing import Awaitable, Callable, cast
@@ -36,6 +38,30 @@ _CLAUDE_ENDPOINT_ENV_KEYS = (
 )
 
 log = logging.getLogger(__name__)
+
+
+def _nemo_script_dir() -> str:
+  """Directory holding nemo's sibling console scripts (nemo-vision / nemo-send).
+
+  The agent subprocess inherits the daemon's PATH. When the daemon was launched
+  from a non-interactive/login shell, that PATH can omit the pip ``--user``
+  scripts dir (e.g. ``~/Library/Python/3.14/bin``) — it lives only in an
+  interactive rc file. Then ``nemo-vision`` is not found and a text-only model,
+  told to run it, silently falls back to guessing an image's contents. Return
+  the dir that actually contains ``nemo-vision`` so ``_build_env`` can prepend
+  it to PATH, or ``""`` if none is found.
+  """
+  candidates: list[str] = []
+  argv0 = sys.argv[0] if sys.argv else ""
+  if argv0:
+    candidates.append(os.path.dirname(os.path.abspath(argv0)))
+  script_dir = sysconfig.get_path("scripts")
+  if script_dir:
+    candidates.append(script_dir)
+  for d in candidates:
+    if d and os.path.isfile(os.path.join(d, "nemo-vision")):
+      return d
+  return ""
 
 
 # claude-agent-sdk exposes a native `effort` literal on ClaudeAgentOptions.
@@ -960,8 +986,16 @@ class ClaudeCodingAgent(CodingAgent):
     from .db import _db_path
     db_path = _db_path(project_dir)
 
+    # Prepend nemo's own console-scripts dir so the agent can always find
+    # nemo-vision / nemo-send even if the daemon's inherited PATH omits the
+    # pip --user scripts dir (see _nemo_script_dir).
+    path = os.environ.get("PATH", "/usr/bin:/bin")
+    script_dir = _nemo_script_dir()
+    if script_dir and script_dir not in path.split(os.pathsep):
+      path = f"{script_dir}{os.pathsep}{path}"
+
     env = {
-      "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+      "PATH": path,
       "HOME": os.environ.get("HOME", ""),
       "USER": os.environ.get("USER", ""),
       "NEMO_CHAT_ID": self._chat_id,

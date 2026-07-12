@@ -166,6 +166,16 @@ def test_standing_hint_textonly_with_helper():
   assert "Read tool" in note
 
 
+def test_standing_hint_forbids_guessing_when_helper_fails():
+  """Anti-hallucination guard: the note must tell the model to admit it can't
+  see the file rather than fabricate a description if nemo-vision fails/missing
+  (the deepseek daemon hit exactly this — nemo-vision off PATH → it guessed)."""
+  with mock.patch("nemo.vision_cli.helper_available", return_value=True):
+    note = standing_hint(model_sees_images=False)
+  assert "NEVER guess" in note
+  assert "cannot see" in note
+
+
 def test_standing_hint_vision_model_empty():
   """A model that sees images natively needs no note, even with a helper."""
   with mock.patch("nemo.vision_cli.helper_available", return_value=True):

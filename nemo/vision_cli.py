@@ -133,7 +133,9 @@ def standing_hint(model_sees_images: bool, path: str = _CONFIG_PATH) -> str:
     "file you obtain during a task — downloaded, fetched from a URL, scraped "
     "from a page, or screenshotted — get a text description by running the "
     'shell command: nemo-vision "the-file-path" "the question to ask about '
-    'it". Do not use the Read tool on image or video files.')
+    'it". Do not use the Read tool on image or video files. If nemo-vision '
+    "is missing or fails, tell the user you cannot see the file — NEVER guess "
+    "or describe its contents from surrounding context.")
 
 
 def describe(path: str, question: str) -> str:
