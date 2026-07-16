@@ -71,6 +71,10 @@ class SDKThread:
     # injected into the running turn, read by turn._single_turn so it drains
     # any steer-continuation Result instead of stranding it. Reset per turn.
     self._steer_holder: list[bool] = [False]
+    # Texts steered into the CURRENT turn (reset per turn). Fed to the
+    # steer_probe so the turn runner can ask the transcript how many steer
+    # continuations (extra Results) the stream still owes before it may end.
+    self._steer_texts: list[str] = []
 
   def start(self) -> None:
     """Start the SDK thread. Blocks until the event loop is ready."""
@@ -218,6 +222,7 @@ class SDKThread:
     on_event: Callable[[TurnEvent], None],
     stale_tasks: set[str] | None = None,
     is_paused: Callable[[], bool] | None = None,
+    steer_probe: Callable[[str, list[str]], int] | None = None,
   ) -> tuple[float, JsonObject]:
     """Run a single SDK turn on the SDK thread.
 
@@ -226,18 +231,32 @@ class SDKThread:
 
     ``is_paused`` lets the turn watchdog stand down while an interactive
     prompt is awaiting the user (see turn._single_turn).
+
+    ``steer_probe`` is ``(session_id, steered_texts) -> continuation
+    batches`` (transcript-derived; see
+    ``ClaudeCodingAgent.steer_continuation_batches``). It is bound to THIS
+    turn's steered texts and handed to the turn runner so quiescence cannot
+    end the turn while a steer continuation is still running.
     """
     if self._client is None:
       raise RuntimeError("SDK client not connected")
 
-    # Fresh steer flag per turn: only steers injected into THIS turn count.
+    # Fresh steer flag/texts per turn: only steers injected into THIS turn
+    # count.
     self._steer_holder[0] = False
+    self._steer_texts.clear()
+
+    def _bound_probe(session_id: str) -> int:
+      if steer_probe is None or not self._steer_texts:
+        return 0
+      return steer_probe(session_id, list(self._steer_texts))
 
     async def _turn():
       return await run_turn(
         self._client, prompt, on_event,
         stale_tasks=stale_tasks, is_paused=is_paused,
-        steered=self._steer_holder)
+        steered=self._steer_holder,
+        steer_probe=_bound_probe)
 
     return await self.run_on_sdk_loop(_turn())
 
@@ -254,6 +273,7 @@ class SDKThread:
     options_factory: Callable[[], object] | None = None,
     max_attempts: int = 3,
     is_paused: Callable[[], bool] | None = None,
+    steer_probe: Callable[[str, list[str]], int] | None = None,
   ) -> tuple[float, JsonObject]:
     """Run turn with automatic reconnect on timeout or disconnection.
 
@@ -276,7 +296,8 @@ class SDKThread:
         raise asyncio.CancelledError("SDK turn cancelled")
       try:
         return await self.run_turn(
-          prompt, on_event, stale_tasks=stale_tasks, is_paused=is_paused)
+          prompt, on_event, stale_tasks=stale_tasks, is_paused=is_paused,
+          steer_probe=steer_probe)
       except NonRetryableAPIError:
         log.warning("SDK turn non-retryable API error — closing client")
         await self.close_client()
@@ -351,6 +372,7 @@ class SDKThread:
         # Mark this turn as steered so _single_turn drains any follow-on
         # Result rather than stranding it (both fold and late-steer cases).
         self._steer_holder[0] = True
+        self._steer_texts.append(text)
         return True
       except Exception as e:
         log.warning("steer query() error: %s", e)

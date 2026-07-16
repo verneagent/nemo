@@ -193,6 +193,28 @@ def _unconsumed_steers(
     rows: list[JsonObject], texts: list[str]) -> list[str]:
   """Pure detection core for ``ClaudeCodingAgent.unconsumed_steers``.
 
+  Thin wrapper over ``_steer_fold_state`` — see it for the full detection
+  contract (content-anchored claiming, the two fold shapes, and why FIFO
+  replay is forbidden).
+  """
+  return _steer_fold_state(rows, texts)[0]
+
+
+def _steer_fold_state(
+    rows: list[JsonObject], texts: list[str]) -> tuple[list[str], list[int]]:
+  """Classify each steered text against the session transcript.
+
+  Returns ``(unconsumed, fold_user_rows)``:
+
+  - ``unconsumed`` — the subset of ``texts`` the turn never folded in
+    (stranded), for the host to re-queue;
+  - ``fold_user_rows`` — transcript row indexes of the ``user`` rows that
+    consumed steers via the user-row fold (the dequeue path). Each such row
+    marks a steer the CLI injected as its own follow-on continuation, which
+    ends with its OWN ResultMessage — callers use this to know how many
+    extra Results the live turn stream still owes
+    (see ``_steer_continuation_batches``).
+
   ``rows`` are the parsed session-transcript jsonl events; ``texts`` are the
   follow-ups steered into the just-finished turn. Returns the subset whose
   injection the turn never folded in (stranded by an end-of-turn / reconnect
@@ -266,6 +288,7 @@ def _unconsumed_steers(
   enq_used = [False] * len(enqueues)
   user_used = [False] * len(user_rows)
   unconsumed: list[str] = []
+  fold_user_rows: list[int] = []
   for t in texts:
     enq_idx = None
     for k in range(len(enqueues) - 1, -1, -1):
@@ -281,13 +304,40 @@ def _unconsumed_steers(
     for k, (row_idx, text) in enumerate(user_rows):
       if not user_used[k] and row_idx > enq_row and text == t:
         user_used[k] = True
+        fold_user_rows.append(row_idx)
         consumed = True
         break
     if not consumed:
       consumed = _remove_folded(rows, enq_row)
     if not consumed:
       unconsumed.append(t)
-  return unconsumed
+  return unconsumed, fold_user_rows
+
+
+def _steer_continuation_batches(
+    rows: list[JsonObject], texts: list[str]) -> int:
+  """Number of steer CONTINUATIONS the CLI has started for ``texts``.
+
+  A user-row fold means the CLI dequeued the steer at a Result boundary and
+  is running it as a follow-on turn that will end with its own
+  ResultMessage. The live turn stream must therefore consume
+  ``1 + batches`` Results before the turn is really over — ending earlier
+  strands the continuation in the receive buffer and every later turn
+  replies to the PREVIOUS message (+1 turn lag; incident 2026-07-16 18:33).
+
+  Steers dequeued together are injected into ONE continuation (one extra
+  Result), so adjacent fold user rows with no assistant row between them
+  count as a single batch. Remove-folds and still-pending steers add no
+  extra Result and are not counted.
+  """
+  fold_rows = sorted(_steer_fold_state(rows, texts)[1])
+  if not fold_rows:
+    return 0
+  batches = 1
+  for prev, cur in zip(fold_rows, fold_rows[1:]):
+    if any(rows[j].get("type") == "assistant" for j in range(prev + 1, cur)):
+      batches += 1
+  return batches
 
 
 def _remove_folded(rows: list[JsonObject], enq_row: int) -> bool:
@@ -521,7 +571,8 @@ class ClaudeCodingAgent(CodingAgent):
         stale_tasks=self._stale_tasks,
         options=self._options,
         options_factory=_options_factory,
-        is_paused=_is_paused)
+        is_paused=_is_paused,
+        steer_probe=self.steer_continuation_batches)
     finally:
       self._current_on_event = None
 
@@ -587,7 +638,37 @@ class ClaudeCodingAgent(CodingAgent):
     """
     if not texts or not self._latest_session_id:
       return list(texts)  # can't introspect → safest is re-queue all
-    path = _session_jsonl_path(self._project_dir, self._latest_session_id)
+    rows = self._load_transcript_rows(self._latest_session_id)
+    if rows is None:
+      return list(texts)
+    return _unconsumed_steers(rows, texts)
+
+  def steer_continuation_batches(
+      self, session_id: str, texts: list[str]) -> int:
+    """How many steer continuations (extra Results) the live turn still owes.
+
+    Called by the turn runner at quiescence expiry (see
+    ``claude_turn._single_turn``): if the transcript shows a steered text was
+    dequeued into a follow-on continuation (user-row fold), the turn must
+    keep consuming until that continuation's own ResultMessage instead of
+    ending on the 8s silence window — the continuation's first message can
+    lag the first Result by well over 8s (observed 15s), and ending early
+    strands it in the receive buffer → permanent +1 turn lag.
+
+    Returns 0 on any failure — the caller then falls back to plain
+    quiescence, which is the pre-existing behavior.
+    """
+    sid = session_id or self._latest_session_id
+    if not texts or not sid:
+      return 0
+    rows = self._load_transcript_rows(sid)
+    if rows is None:
+      return 0
+    return _steer_continuation_batches(rows, texts)
+
+  def _load_transcript_rows(self, session_id: str) -> list[JsonObject] | None:
+    """Parse the session transcript jsonl, or None if unreadable."""
+    path = _session_jsonl_path(self._project_dir, session_id)
     try:
       rows: list[JsonObject] = []
       with open(path, encoding="utf-8") as fh:
@@ -595,11 +676,10 @@ class ClaudeCodingAgent(CodingAgent):
           line = line.strip()
           if line:
             rows.append(json.loads(line))
+      return rows
     except (OSError, ValueError) as exc:
-      log.warning("unconsumed_steers: cannot read transcript %s: %s",
-                  path, _short_error(exc))
-      return list(texts)
-    return _unconsumed_steers(rows, texts)
+      log.warning("cannot read transcript %s: %s", path, _short_error(exc))
+      return None
 
   async def reset(self, project_dir: str, model: str, resume: str = "") -> None:
     # Reconnecting spawns a new CLI / SDK session. Any task ids previously

@@ -185,7 +185,8 @@ class TestRunTurnWithReconnect:
     expected = (0.5, {})
     call_count = 0
 
-    async def fake_turn(prompt, on_event, stale_tasks=None, is_paused=None):
+    async def fake_turn(prompt, on_event, stale_tasks=None, is_paused=None,
+                      steer_probe=None):
       nonlocal call_count
       call_count += 1
       if call_count < 2:
@@ -217,7 +218,8 @@ class TestRunTurnWithReconnect:
     call_count = 0
     seen_prompts: list[str] = []
 
-    async def fake_turn(prompt, on_event, stale_tasks=None, is_paused=None):
+    async def fake_turn(prompt, on_event, stale_tasks=None, is_paused=None,
+                      steer_probe=None):
       nonlocal call_count
       call_count += 1
       seen_prompts.append(prompt)
@@ -265,7 +267,8 @@ class TestRunTurnWithReconnect:
     """If options is None, TimeoutError propagates immediately."""
     sdk_thread._client = mock.MagicMock()
 
-    async def fake_turn(prompt, on_event, stale_tasks=None, is_paused=None):
+    async def fake_turn(prompt, on_event, stale_tasks=None, is_paused=None,
+                      steer_probe=None):
       raise TimeoutError("hung")
 
     with mock.patch.object(sdk_thread, "run_turn", side_effect=fake_turn):
@@ -287,7 +290,8 @@ class TestRunTurnWithReconnect:
     turn_calls = 0
     reconnect_calls = 0
 
-    async def fake_turn(prompt, on_event, stale_tasks=None, is_paused=None):
+    async def fake_turn(prompt, on_event, stale_tasks=None, is_paused=None,
+                      steer_probe=None):
       nonlocal turn_calls
       turn_calls += 1
       raise TimeoutError("hung")
@@ -314,7 +318,8 @@ class TestRunTurnWithReconnect:
     turn_calls = 0
     expected = (1.0, {"ok": True})
 
-    async def fake_turn(prompt, on_event, stale_tasks=None, is_paused=None):
+    async def fake_turn(prompt, on_event, stale_tasks=None, is_paused=None,
+                      steer_probe=None):
       nonlocal turn_calls
       turn_calls += 1
       if turn_calls < 3:
@@ -336,7 +341,8 @@ class TestRunTurnWithReconnect:
     expected = (0.5, {})
     call_count = 0
 
-    async def fake_turn(prompt, on_event, stale_tasks=None, is_paused=None):
+    async def fake_turn(prompt, on_event, stale_tasks=None, is_paused=None,
+                      steer_probe=None):
       nonlocal call_count
       call_count += 1
       if call_count < 2:
@@ -361,7 +367,8 @@ class TestRunTurnWithReconnect:
 
     call_count = 0
 
-    async def fake_turn(prompt, on_event, stale_tasks=None, is_paused=None):
+    async def fake_turn(prompt, on_event, stale_tasks=None, is_paused=None,
+                      steer_probe=None):
       nonlocal call_count
       call_count += 1
       raise NonRetryableAPIError("API Error: 402 Insufficient Balance")
@@ -383,7 +390,8 @@ class TestRunTurnWithReconnect:
 
   def test_not_connected_raises_after_max_attempts(self, sdk_thread: SDKThread):
     """Should raise after exhausting all reconnect attempts for not-connected."""
-    async def fake_turn(prompt, on_event, stale_tasks=None, is_paused=None):
+    async def fake_turn(prompt, on_event, stale_tasks=None, is_paused=None,
+                      steer_probe=None):
       raise RuntimeError("SDK client not connected")
 
     with mock.patch.object(sdk_thread, "run_turn", side_effect=fake_turn):
@@ -398,7 +406,8 @@ class TestRunTurnWithReconnect:
     """cancel() should abort the reconnect loop between attempts."""
     call_count = 0
 
-    async def fake_turn(prompt, on_event, stale_tasks=None, is_paused=None):
+    async def fake_turn(prompt, on_event, stale_tasks=None, is_paused=None,
+                      steer_probe=None):
       nonlocal call_count
       call_count += 1
       raise TimeoutError("hung")
@@ -423,7 +432,8 @@ class TestRunTurnWithReconnect:
     expected = (0.5, {})
     call_count = 0
 
-    async def fake_turn(prompt, on_event, stale_tasks=None, is_paused=None):
+    async def fake_turn(prompt, on_event, stale_tasks=None, is_paused=None,
+                      steer_probe=None):
       nonlocal call_count
       call_count += 1
       if call_count < 2:
@@ -452,7 +462,8 @@ class TestRunTurnWithReconnect:
     turn_calls = 0
     factory_calls = 0
 
-    async def fake_turn(prompt, on_event, stale_tasks=None, is_paused=None):
+    async def fake_turn(prompt, on_event, stale_tasks=None, is_paused=None,
+                      steer_probe=None):
       nonlocal turn_calls
       turn_calls += 1
       if turn_calls < 2:
@@ -482,7 +493,8 @@ class TestRunTurnWithReconnect:
 
   def test_factory_returning_none_raises_immediately(self, sdk_thread: SDKThread):
     """If options_factory returns None, treat it like no-options and raise."""
-    async def fake_turn(prompt, on_event, stale_tasks=None, is_paused=None):
+    async def fake_turn(prompt, on_event, stale_tasks=None, is_paused=None,
+                      steer_probe=None):
       raise TimeoutError("hung")
 
     with mock.patch.object(sdk_thread, "run_turn", side_effect=fake_turn):
@@ -499,7 +511,8 @@ class TestRunTurnWithReconnect:
     """RuntimeError without 'not connected' should not be retried."""
     call_count = 0
 
-    async def fake_turn(prompt, on_event, stale_tasks=None, is_paused=None):
+    async def fake_turn(prompt, on_event, stale_tasks=None, is_paused=None,
+                      steer_probe=None):
       nonlocal call_count
       call_count += 1
       raise RuntimeError("some other error")

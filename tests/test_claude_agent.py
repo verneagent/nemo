@@ -9,6 +9,7 @@ from nemo.claude_agent import (
   _SESSION_SIZE_STRONG,
   _format_size_warning,
   _session_jsonl_path,
+  _steer_continuation_batches,
   _unconsumed_steers,
 )
 
@@ -210,6 +211,106 @@ def test_unconsumed_steers_duplicate_text_consumed_once():
   assert _unconsumed_steers(rows, ["怎样了", "怎样了"]) == ["怎样了"]
 
 
+def test_steer_continuation_batches_user_row_fold_counts_one():
+  """Incident 2026-07-16 18:33 shape: the CLI dequeues the steer at the
+  Result boundary (user-row fold) and runs it as a continuation with its own
+  Result. The probe must report 1 so the turn runner waits past the
+  quiescence window instead of stranding the continuation."""
+  rows = [
+    {"type": "queue-operation", "operation": "enqueue",
+     "content": "不符合的话，反成draft"},
+    {"type": "assistant", "message": {"role": "assistant", "content": [
+      {"type": "text", "text": "answering the original prompt"}]}},
+    {"type": "queue-operation", "operation": "dequeue"},
+    {"type": "user", "message": {"role": "user",
+                                 "content": "不符合的话，反成draft"}},
+  ]
+
+  assert _steer_continuation_batches(rows, ["不符合的话，反成draft"]) == 1
+
+
+def test_steer_continuation_batches_remove_fold_counts_zero():
+  """Remove-fold: absorbed into the running turn — no extra Result owed."""
+  rows = [
+    {"type": "queue-operation", "operation": "enqueue", "content": "好的"},
+    {"type": "queue-operation", "operation": "remove"},
+    {"type": "assistant", "message": {"role": "assistant", "content": [
+      {"type": "text", "text": "acting on the steer inline"}]}},
+  ]
+
+  assert _steer_continuation_batches(rows, ["好的"]) == 0
+
+
+def test_steer_continuation_batches_pending_counts_zero():
+  """A still-pending steer (no fold at all) owes no extra Result — the
+  host's re-queue path handles it after the turn ends."""
+  rows = [
+    {"type": "queue-operation", "operation": "enqueue", "content": "later"},
+  ]
+
+  assert _steer_continuation_batches(rows, ["later"]) == 0
+
+
+def test_steer_continuation_batches_adjacent_folds_are_one_batch():
+  """Two steers dequeued together (adjacent user rows, no assistant between)
+  are injected into ONE continuation → one extra Result, not two. Counting
+  two would make the turn wait for a Result that never comes."""
+  rows = [
+    {"type": "queue-operation", "operation": "enqueue", "content": "s1"},
+    {"type": "queue-operation", "operation": "enqueue", "content": "s2"},
+    {"type": "queue-operation", "operation": "dequeue"},
+    {"type": "queue-operation", "operation": "dequeue"},
+    {"type": "user", "message": {"role": "user", "content": "s1"}},
+    {"type": "user", "message": {"role": "user", "content": "s2"}},
+  ]
+
+  assert _steer_continuation_batches(rows, ["s1", "s2"]) == 1
+
+
+def test_steer_continuation_batches_separate_folds_are_two_batches():
+  """Folds separated by assistant activity are distinct continuations, each
+  ending with its own Result."""
+  rows = [
+    {"type": "queue-operation", "operation": "enqueue", "content": "s1"},
+    {"type": "queue-operation", "operation": "dequeue"},
+    {"type": "user", "message": {"role": "user", "content": "s1"}},
+    {"type": "assistant", "message": {"role": "assistant", "content": [
+      {"type": "text", "text": "continuation 1 answer"}]}},
+    {"type": "queue-operation", "operation": "enqueue", "content": "s2"},
+    {"type": "queue-operation", "operation": "dequeue"},
+    {"type": "user", "message": {"role": "user", "content": "s2"}},
+  ]
+
+  assert _steer_continuation_batches(rows, ["s1", "s2"]) == 2
+
+
+def test_agent_steer_continuation_batches_reads_transcript(tmp_path, monkeypatch):
+  """Agent-level probe: reads the session jsonl and returns the batch count;
+  0 on missing session/texts/file (fall back to plain quiescence)."""
+  import json as _json
+  from nemo.claude_agent import ClaudeCodingAgent
+
+  monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+  agent = ClaudeCodingAgent.__new__(ClaudeCodingAgent)
+  agent._project_dir = "/proj/a"
+  agent._latest_session_id = ""
+
+  jsonl = tmp_path / "projects" / "-proj-a" / "sess-1.jsonl"
+  jsonl.parent.mkdir(parents=True)
+  rows = [
+    {"type": "queue-operation", "operation": "enqueue", "content": "反成draft"},
+    {"type": "queue-operation", "operation": "dequeue"},
+    {"type": "user", "message": {"role": "user", "content": "反成draft"}},
+  ]
+  jsonl.write_text("\n".join(_json.dumps(r) for r in rows), encoding="utf-8")
+
+  assert agent.steer_continuation_batches("sess-1", ["反成draft"]) == 1
+  # Fallbacks: no texts / no session id / unreadable transcript → 0.
+  assert agent.steer_continuation_batches("sess-1", []) == 0
+  assert agent.steer_continuation_batches("", ["反成draft"]) == 0
+  assert agent.steer_continuation_batches("missing", ["反成draft"]) == 0
+
+
 def test_run_turn_resumes_latest_session_after_done_event():
   """Regression for the chat-amnesia bug: when a watchdog-forced reconnect
   fires mid-turn, the new CLI must be launched with `resume=<latest session>`
@@ -240,7 +341,8 @@ def test_run_turn_resumes_latest_session_after_done_event():
   captured: dict[str, object] = {}
 
   async def fake_rwrc(prompt, on_event, stale_tasks=None, options=None,
-                       options_factory=None, max_attempts=3, is_paused=None):
+                       options_factory=None, max_attempts=3, is_paused=None,
+                       steer_probe=None):
     captured["options"] = options
     captured["options_factory"] = options_factory
     # Simulate the SDK reporting a session id at end of turn.
@@ -292,7 +394,8 @@ def test_run_turn_factory_uses_initial_resume_before_first_done_event():
   captured: dict[str, object] = {}
 
   async def fake_rwrc(prompt, on_event, stale_tasks=None, options=None,
-                       options_factory=None, max_attempts=3, is_paused=None):
+                       options_factory=None, max_attempts=3, is_paused=None,
+                       steer_probe=None):
     captured["factory"] = options_factory
     return (0.0, {})
 

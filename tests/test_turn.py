@@ -1283,3 +1283,99 @@ def test_no_lag_next_turn_gets_its_own_answer():
   assert a1 == ["t1-answer", "t1-steer-answer"]
   # The crux: turn 2 answers q2, NOT the stranded t1-steer-answer.
   assert a2 == ["t2-answer"]
+
+
+def test_slow_steer_continuation_survives_quiescence_window():
+  """Incident 2026-07-16 18:33: the CLI dequeued the steer at the Result
+  boundary but its continuation stayed SILENT for longer than
+  QUIESCENCE_TIMEOUT (15s observed vs the 8s window). Pure quiescence ended
+  the turn and stranded the whole continuation → permanent +1 turn lag.
+  With the transcript probe reporting one started continuation batch, the
+  turn must wait past the quiescence window and drain the late continuation
+  into THIS run_turn."""
+  steered = [True]
+  client = QueueClient(steered)
+  client.feed(
+    FakeAssistantMessage(content=[FakeTextBlock(text="first")]),
+    FakeResultMessage(total_cost_usd=0.02, usage={"input_tokens": 100}),
+    # NOTE: continuation NOT fed yet — it arrives after the quiescence window.
+  )
+  events: list = []
+  probe_calls: list[str] = []
+
+  def probe(session_id: str) -> int:
+    probe_calls.append(session_id)
+    return 1  # transcript shows a user-row fold → one continuation running
+
+  async def _run():
+    with mock.patch.dict("sys.modules", _sdk_modules()), \
+         mock.patch("nemo.claude_turn.QUIESCENCE_TIMEOUT", 0.05):
+      async def _late_continuation():
+        # Continuation first message lags 4x the quiescence window.
+        await asyncio.sleep(0.2)
+        client.feed(
+          FakeAssistantMessage(content=[FakeTextBlock(text="steer-answer")]),
+          FakeResultMessage(total_cost_usd=0.03, usage={"input_tokens": 100}),
+        )
+      feeder = asyncio.ensure_future(_late_continuation())
+      try:
+        return await run_turn(
+          client, "prompt", events.append, steered=steered, steer_probe=probe)
+      finally:
+        await feeder
+
+  cost, _usage = asyncio.run(asyncio.wait_for(_run(), timeout=5))
+  assert probe_calls, "probe was never consulted at quiescence expiry"
+  # BOTH answers folded into this turn — the late continuation was NOT
+  # stranded for the next turn.
+  assert _answers(events) == ["first", "steer-answer"]
+  assert abs(cost - 0.05) < 1e-9
+  assert client.q.empty(), "late steer continuation left messages stranded"
+
+
+def test_steer_probe_zero_ends_turn_at_quiescence():
+  """Probe says no continuation started (remove-fold or still-pending steer)
+  → the turn ends at the quiescence window exactly as before, no hang."""
+  steered = [True]
+  client = QueueClient(steered)
+  client.feed(
+    FakeAssistantMessage(content=[FakeTextBlock(text="only")]),
+    FakeResultMessage(total_cost_usd=0.01),
+  )
+  events: list = []
+
+  async def _run():
+    with mock.patch.dict("sys.modules", _sdk_modules()), \
+         mock.patch("nemo.claude_turn.QUIESCENCE_TIMEOUT", 0.05):
+      return await run_turn(
+        client, "prompt", events.append, steered=steered,
+        steer_probe=lambda sid: 0)
+
+  asyncio.run(asyncio.wait_for(_run(), timeout=5))
+  assert _answers(events) == ["only"]
+  assert client.q.empty()
+
+
+def test_steer_probe_failure_falls_back_to_quiescence():
+  """A probe that raises must not wedge the turn — fall back to plain
+  quiescence (the pre-probe behavior)."""
+  steered = [True]
+  client = QueueClient(steered)
+  client.feed(
+    FakeAssistantMessage(content=[FakeTextBlock(text="only")]),
+    FakeResultMessage(total_cost_usd=0.01),
+  )
+  events: list = []
+
+  def probe(session_id: str) -> int:
+    raise OSError("transcript unreadable")
+
+  async def _run():
+    with mock.patch.dict("sys.modules", _sdk_modules()), \
+         mock.patch("nemo.claude_turn.QUIESCENCE_TIMEOUT", 0.05):
+      return await run_turn(
+        client, "prompt", events.append, steered=steered, steer_probe=probe)
+
+  asyncio.run(asyncio.wait_for(_run(), timeout=5))
+  assert _answers(events) == ["only"]
+  assert client.q.empty()

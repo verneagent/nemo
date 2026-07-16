@@ -301,6 +301,7 @@ async def _single_turn(
   stop_task_disabled: list[bool],
   is_paused: Callable[[], bool] | None = None,
   steered: list[bool] | None = None,
+  steer_probe: Callable[[str], int] | None = None,
 ) -> _TurnResult:
   """Issue one query() and consume the client's receive_messages() stream.
 
@@ -330,6 +331,18 @@ async def _single_turn(
   We stream ``receive_messages()`` (the raw stream) rather than
   ``receive_response()`` precisely because the latter returns at the first
   Result — which is what strands the steer continuation.
+
+  ``steer_probe`` (optional) is ``session_id -> number of steer continuation
+  batches`` derived from the session transcript (see
+  ``ClaudeCodingAgent.steer_continuation_batches``). Quiescence alone is
+  RACY: the CLI dequeues a steer at the Result boundary and its continuation
+  may stay silent for longer than QUIESCENCE_TIMEOUT (observed 15s — model
+  latency + tool call), so the 8s window declares the turn done and strands
+  the whole continuation → permanent +1 turn lag (incident 2026-07-16
+  18:33). At every quiescence expiry we therefore ask the transcript how
+  many Results this turn owes (1 + started continuation batches) and, if
+  Results are still outstanding, drop back to the normal heartbeat/progress
+  budgets until the next Result instead of ending the turn.
   """
   from claude_agent_sdk import (
     AssistantMessage, TextBlock, ThinkingBlock, ToolUseBlock, ResultMessage,
@@ -359,6 +372,7 @@ async def _single_turn(
   FIRST_MSG_TIMEOUT = 30
   msg_count = 0
   saw_result = False  # a ResultMessage arrived → in quiescence/steer-drain mode
+  results_seen = 0  # ResultMessages consumed (steer continuations add more)
   last_progress_at = _time.monotonic()
   response = client.receive_messages()
   # The pending receive future persists across watchdog ticks. While a prompt
@@ -402,17 +416,40 @@ async def _single_turn(
       if is_paused is not None and is_paused():
         last_progress_at = _time.monotonic()
         continue
-      next_task.cancel()
-      next_task = None
       if saw_result:
-        # Quiescent after a Result: the CLI produced nothing more within
-        # QUIESCENCE_TIMEOUT, so any injected steer was either folded (no extra
-        # Result) or its continuation has already been drained above. The turn
-        # is genuinely complete — end cleanly, NOT via reconnect. Nothing is
-        # left buffered to strand into the next turn.
+        # Quiescent after a Result. Before ending, ask the transcript whether
+        # a steer continuation is still RUNNING: the CLI dequeues a steer at
+        # the Result boundary (user-row fold) and runs it as a follow-on turn
+        # with its own Result, whose first message can lag well past
+        # QUIESCENCE_TIMEOUT (observed 15s). Ending here would strand that
+        # continuation in the receive buffer → every later turn answers the
+        # PREVIOUS message (+1 turn lag).
+        expected_results = 1
+        if steer_probe is not None and steered_flag[0]:
+          try:
+            expected_results = 1 + steer_probe(sdk_session_id)
+          except Exception as exc:
+            log.warning("steer continuation probe failed: %s", exc)
+        if results_seen < expected_results:
+          # Keep the pending receive future alive (like the paused path):
+          # cancelling __anext__ mid-await can tear down the stream.
+          log.info(
+            "steer continuation pending (results=%d expected=%d) — "
+            "waiting past quiescence", results_seen, expected_results)
+          saw_result = False  # back to heartbeat/progress budgets
+          last_progress_at = _time.monotonic()
+          continue
+        # Genuinely complete: any injected steer was folded (no extra
+        # Result) or its continuation Result has been drained above. End
+        # cleanly, NOT via reconnect. Nothing is left buffered to strand
+        # into the next turn.
+        next_task.cancel()
+        next_task = None
         log.info("turn quiescent %ds after result (steer continuation drained)",
                  QUIESCENCE_TIMEOUT)
         break
+      next_task.cancel()
+      next_task = None
       since_progress = _time.monotonic() - last_progress_at
       if since_progress >= PROGRESS_TIMEOUT:
         log.error("no progress for %.0fs (msgs=%d) — forcing reconnect",
@@ -630,6 +667,7 @@ async def _single_turn(
             log.warning("stop_task control channel wedged — skipping further stops")
       pending_tasks.clear()
       saw_result = True
+      results_seen += 1
       if not steered_flag[0]:
         # No steer this turn → exactly one Result → done. (Unchanged behavior;
         # zero added latency for the common case.)
@@ -660,6 +698,7 @@ async def run_turn(
   stale_tasks: set[str] | None = None,
   is_paused: Callable[[], bool] | None = None,
   steered: list[bool] | None = None,
+  steer_probe: Callable[[str], int] | None = None,
 ) -> tuple[float, JsonObject]:
   """Send prompt to SDK client, stream responses, emit events.
 
@@ -682,7 +721,7 @@ async def run_turn(
   # straight through; the reconnect layer owns recovery.
   result = await _single_turn(
     client, prompt, on_event, stale_tasks, stop_task_disabled, is_paused,
-    steered,
+    steered, steer_probe,
   )
 
   total_cost = result.cost
