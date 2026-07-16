@@ -129,6 +129,54 @@ def test_unconsumed_steers_treats_matching_user_row_as_consumed():
   assert _unconsumed_steers(rows, ["next question"]) == []
 
 
+def test_unconsumed_steers_survives_queue_fifo_desync():
+  """Regression: 2026-07-16 chat oc_283ee413. Long sessions permanently
+  desync the queue-op FIFO (concurrent steers + host re-queues leave phantom
+  pending entries), after which FIFO-based attribution pops the wrong content
+  for every dequeue/remove. A steer the turn HAD folded in (enqueue → dequeue
+  → matching user row) was then reported unconsumed and replayed, so the bot
+  answered the user's previous message twice. Detection must anchor on
+  content (enqueue + matching user row), never on FIFO order.
+  """
+  rows = [
+    # -- prior turns: three enqueues, one dequeue, one remove → the FIFO
+    # backlog never drains again (mirrors rows 1836-1854 of the real jsonl).
+    {"type": "queue-operation", "operation": "enqueue", "content": "steer A"},
+    {"type": "queue-operation", "operation": "enqueue", "content": "steer B"},
+    {"type": "queue-operation", "operation": "enqueue", "content": "steer C"},
+    {"type": "queue-operation", "operation": "dequeue"},
+    {"type": "user", "message": {"role": "user", "content": "steer C"}},
+    {"type": "queue-operation", "operation": "remove"},
+    # -- this turn: the checked steer, folded in via dequeue + user row.
+    {"type": "queue-operation", "operation": "enqueue",
+     "content": "carbonci 也是在我家里"},
+    {"type": "assistant", "message": {"role": "assistant", "content": [
+      {"type": "text", "text": "answering current turn"}]}},
+    {"type": "queue-operation", "operation": "dequeue"},
+    {"type": "user", "message": {"role": "user",
+                                 "content": "carbonci 也是在我家里"}},
+    # -- a second steer that landed after the Result: genuinely stranded.
+    {"type": "queue-operation", "operation": "enqueue",
+     "content": "carbonci 通过 32g 的代理为啥不行"},
+  ]
+
+  assert _unconsumed_steers(
+    rows, ["carbonci 也是在我家里", "carbonci 通过 32g 的代理为啥不行"],
+  ) == ["carbonci 通过 32g 的代理为啥不行"]
+
+
+def test_unconsumed_steers_duplicate_text_consumed_once():
+  """Two steers with identical text, only one folded in → exactly one
+  re-queue (the user-row claim must be one-shot)."""
+  rows = [
+    {"type": "queue-operation", "operation": "enqueue", "content": "怎样了"},
+    {"type": "user", "message": {"role": "user", "content": "怎样了"}},
+    {"type": "queue-operation", "operation": "enqueue", "content": "怎样了"},
+  ]
+
+  assert _unconsumed_steers(rows, ["怎样了", "怎样了"]) == ["怎样了"]
+
+
 def test_run_turn_resumes_latest_session_after_done_event():
   """Regression for the chat-amnesia bug: when a watchdog-forced reconnect
   fires mid-turn, the new CLI must be launched with `resume=<latest session>`

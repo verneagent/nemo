@@ -198,21 +198,25 @@ def _unconsumed_steers(
   injection the turn never folded in (stranded by an end-of-turn / reconnect
   race), so the host can re-queue them.
 
-  The CLI's transcript shape is not fully stable across Claude Code versions
-  and endpoints. A mid-turn injection may terminate as ``remove`` (classic
-  queue-cleanup path) or ``dequeue`` (observed with DeepSeek-compatible Claude
-  sessions after the injected message is actually folded into the turn). It is
-  consumed if either:
+  Detection is content-anchored, NOT queue-FIFO based. An earlier version
+  replayed the CLI's ``enqueue``/``dequeue``/``remove`` stream as a FIFO to
+  attribute the content-less ``dequeue``/``remove`` rows back to their
+  enqueues. Real long sessions desync that FIFO permanently (concurrent
+  steers + host re-queues leave phantom pending entries), after which every
+  terminal op is attributed to the wrong text and *consumed* steers get
+  re-queued — the bot answers the user's previous message twice.
 
-  - the terminal op is ``dequeue``;
-  - a matching ``user`` transcript row appears before the next queue op;
-  - an assistant message appears after ``remove`` before the next queue op.
+  The ground truth is simpler: whenever the CLI actually folds an injection
+  into the turn — via the classic ``remove`` path or the ``dequeue`` path
+  seen on DeepSeek-compatible sessions — it appends a ``user`` transcript row
+  whose text equals the injected content. So, per steered text:
 
-  We collect every injection in order as ``(content, consumed)`` then, for each
-  requested text, claim its most-recent unused matching injection — most-recent
-  because identical text may have been steered in an earlier turn too. A text
-  with no matching injection was never even enqueued, so it counts as
-  unconsumed.
+  - claim its most-recent unclaimed ``enqueue`` row (most-recent because the
+    same text may have been steered in an earlier turn); no enqueue at all
+    means the injection never happened → unconsumed, re-queue to be safe;
+  - the steer is consumed iff an unclaimed matching ``user`` row appears
+    after that enqueue. Host re-queues wrap texts in a synthetic banner, so
+    the exact-equality match cannot false-positive on a later replay.
   """
   def _user_text(row: JsonObject) -> str:
     if row.get("type") != "user":
@@ -234,47 +238,39 @@ def _unconsumed_steers(
         parts.append(text)
     return "\n".join(parts)
 
-  pairs: list[tuple[str, bool]] = []  # (enqueued content, consumed)
-  pending: list[str] = []  # FIFO of enqueued contents awaiting their terminal
-  n = len(rows)
+  enqueues: list[tuple[int, str]] = []  # (row index, content)
+  user_rows: list[tuple[int, str]] = []  # (row index, text)
   for i, r in enumerate(rows):
-    if r.get("type") != "queue-operation":
-      continue
-    op = r.get("operation")
-    if op == "enqueue":
-      pending.append(str(r.get("content") or ""))
-    elif op == "dequeue":
-      if pending:
-        content = pending.pop(0)
-        pairs.append((content, True))
-    elif op == "remove":
-      content = pending.pop(0) if pending else ""
-      consumed = False
-      for j in range(i + 1, n):
-        tj = rows[j].get("type")
-        if tj == "queue-operation":
-          break
-        if _user_text(rows[j]) == content:
-          consumed = True
-          break
-        if tj == "assistant":
-          consumed = True
-          break
-      pairs.append((content, consumed))
-  used = [False] * len(pairs)
+    if r.get("type") == "queue-operation":
+      if r.get("operation") == "enqueue":
+        enqueues.append((i, str(r.get("content") or "")))
+    else:
+      text = _user_text(r)
+      if text:
+        user_rows.append((i, text))
+
+  enq_used = [False] * len(enqueues)
+  user_used = [False] * len(user_rows)
   unconsumed: list[str] = []
   for t in texts:
-    match = None
-    for k in range(len(pairs) - 1, -1, -1):
-      if not used[k] and pairs[k][0] == t:
-        match = k
+    enq_idx = None
+    for k in range(len(enqueues) - 1, -1, -1):
+      if not enq_used[k] and enqueues[k][1] == t:
+        enq_idx = k
         break
-    if match is None:
+    if enq_idx is None:
       unconsumed.append(t)  # never injected → re-queue to be safe
-    else:
-      used[match] = True
-      if not pairs[match][1]:
-        unconsumed.append(t)
+      continue
+    enq_used[enq_idx] = True
+    enq_row = enqueues[enq_idx][0]
+    consumed = False
+    for k, (row_idx, text) in enumerate(user_rows):
+      if not user_used[k] and row_idx > enq_row and text == t:
+        user_used[k] = True
+        consumed = True
+        break
+    if not consumed:
+      unconsumed.append(t)
   return unconsumed
 
 
@@ -546,11 +542,10 @@ class ClaudeCodingAgent(CodingAgent):
     """Report which of ``texts`` the just-finished turn never folded in.
 
     The CLI records queue lifecycle into the session transcript: a mid-turn
-    injection is an ``enqueue`` whose terminal op is ``remove`` (vs
-    ``dequeue`` for a normal between-turn pull). A *consumed* injection is
-    followed by an ``assistant`` message before the next queue-operation; a
-    *stranded* one (end-of-turn / reconnect race) is immediately followed by
-    the next queue-op with no assistant in between. See ``_unconsumed_steers``.
+    injection appears as an ``enqueue`` row (with content), and — iff the
+    turn actually folded it in — a later ``user`` row with the same text.
+    A *stranded* injection (end-of-turn / reconnect race) has the enqueue
+    but no matching user row. See ``_unconsumed_steers``.
     """
     if not texts or not self._latest_session_id:
       return list(texts)  # can't introspect → safest is re-queue all
