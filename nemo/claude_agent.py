@@ -206,17 +206,31 @@ def _unconsumed_steers(
   terminal op is attributed to the wrong text and *consumed* steers get
   re-queued — the bot answers the user's previous message twice.
 
-  The ground truth is simpler: whenever the CLI actually folds an injection
-  into the turn — via the classic ``remove`` path or the ``dequeue`` path
-  seen on DeepSeek-compatible sessions — it appends a ``user`` transcript row
-  whose text equals the injected content. So, per steered text:
+  Two fold shapes exist in real transcripts (both verified against live
+  session jsonls):
+
+  - **user-row fold** — the CLI appends a ``user`` row whose text equals the
+    injected content (classic path, and the ``dequeue`` path seen on
+    DeepSeek-compatible sessions);
+  - **remove fold** — the injection is absorbed straight into the assistant
+    continuation with NO user row: the enqueue is followed by a ``remove``
+    and then assistant output (e.g. "好的，两个任务一起推进…" acting on the
+    steer's content).
+
+  So, per steered text:
 
   - claim its most-recent unclaimed ``enqueue`` row (most-recent because the
     same text may have been steered in an earlier turn); no enqueue at all
     means the injection never happened → unconsumed, re-queue to be safe;
-  - the steer is consumed iff an unclaimed matching ``user`` row appears
-    after that enqueue. Host re-queues wrap texts in a synthetic banner, so
-    the exact-equality match cannot false-positive on a later replay.
+  - consumed if an unclaimed matching ``user`` row appears after that
+    enqueue (host re-queues wrap texts in a synthetic banner, so the
+    exact-equality match cannot false-positive on a later replay);
+  - else consumed if the first queue-op after that enqueue is a ``remove``
+    followed by an assistant row before the next queue-op — the remove-fold
+    shape, attributed *locally* to this enqueue rather than via global FIFO
+    (dequeue is deliberately excluded here: observed dequeue folds always
+    write a user row, and a desync-phantom dequeue landing right after a
+    stranded enqueue must not mask the strand).
   """
   def _user_text(row: JsonObject) -> str:
     if row.get("type") != "user":
@@ -270,8 +284,32 @@ def _unconsumed_steers(
         consumed = True
         break
     if not consumed:
+      consumed = _remove_folded(rows, enq_row)
+    if not consumed:
       unconsumed.append(t)
   return unconsumed
+
+
+def _remove_folded(rows: list[JsonObject], enq_row: int) -> bool:
+  """True if the enqueue at ``enq_row`` was absorbed via the remove-fold
+  shape: the first queue-op after it is a ``remove``, and an assistant row
+  follows that remove before the next queue-op."""
+  remove_row = None
+  for j in range(enq_row + 1, len(rows)):
+    if rows[j].get("type") != "queue-operation":
+      continue
+    if rows[j].get("operation") == "remove":
+      remove_row = j
+    break  # only the FIRST queue-op after the enqueue counts
+  if remove_row is None:
+    return False
+  for j in range(remove_row + 1, len(rows)):
+    tj = rows[j].get("type")
+    if tj == "queue-operation":
+      return False
+    if tj == "assistant":
+      return True
+  return False
 
 
 def _stderr_tail(lines: "deque[str] | list[str]", limit: int = 20) -> str:

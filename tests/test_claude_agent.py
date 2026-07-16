@@ -165,6 +165,39 @@ def test_unconsumed_steers_survives_queue_fifo_desync():
   ) == ["carbonci 通过 32g 的代理为啥不行"]
 
 
+def test_unconsumed_steers_remove_fold_without_user_row_is_consumed():
+  """Real shape (session d11c264a row 78 / 8c8917df row 940): the CLI absorbs
+  a steer straight into the assistant continuation — enqueue → remove →
+  assistant, with NO user row ever written. Must not be re-queued, or the
+  bot replays an already-answered message."""
+  rows = [
+    {"type": "queue-operation", "operation": "enqueue",
+     "content": "再帮我下载安装一些经典的 FC 游戏"},
+    {"type": "user", "message": {"role": "user", "content": [
+      {"type": "tool_result", "content": ""}]}},
+    {"type": "queue-operation", "operation": "remove"},
+    {"type": "assistant", "message": {"role": "assistant", "content": [
+      {"type": "text", "text": "好的，两个任务一起推进。"}]}},
+  ]
+
+  assert _unconsumed_steers(rows, ["再帮我下载安装一些经典的 FC 游戏"]) == []
+
+
+def test_unconsumed_steers_phantom_dequeue_does_not_mask_strand():
+  """A desync-phantom dequeue right after a stranded enqueue must NOT count
+  as consumption: observed dequeue folds always write a user row, so
+  dequeue-without-user-row means the text never reached the model."""
+  rows = [
+    {"type": "queue-operation", "operation": "enqueue",
+     "content": "stranded steer"},
+    {"type": "queue-operation", "operation": "dequeue"},
+    {"type": "assistant", "message": {"role": "assistant", "content": [
+      {"type": "text", "text": "unrelated continuation"}]}},
+  ]
+
+  assert _unconsumed_steers(rows, ["stranded steer"]) == ["stranded steer"]
+
+
 def test_unconsumed_steers_duplicate_text_consumed_once():
   """Two steers with identical text, only one folded in → exactly one
   re-queue (the user-row claim must be one-shot)."""
