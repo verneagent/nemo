@@ -144,10 +144,9 @@ def test_claude_shell_env_passthrough_overlay():
   # should reach the SDK subprocess and survive even when --base-url
   # triggers fan-out (setdefault preserves existing values).
   async def _run():
-    with mock.patch.dict(
+    with _strip_anthropic_env(), mock.patch.dict(
       os.environ,
       {
-        "ANTHROPIC_BASE_URL": "",  # cleared so flag wins
         "ANTHROPIC_DEFAULT_HAIKU_MODEL": "deepseek-v4-flash",
       },
       clear=False,
