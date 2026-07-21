@@ -245,15 +245,17 @@ def _format_token_snapshot(ctx: AgentContext) -> str:
 def try_dispatch(text: str, ctx: AgentContext) -> tuple[bool, str | None]:
   """Check text against all commands. Returns (handled, response)."""
   t = text.strip().lower()
+  if not t.startswith("/"):
+    return False, None
 
   # /clear
-  if t in ("/clear", "clear", "清空", "重置"):
+  if t == "/clear":
     return True, "__clear__"
 
   # /undo-clear — restore the SDK session id that was active just before
   # the most recent /clear. Only works while the daemon is alive (the
   # previous id is held in process memory; not persisted to DB).
-  if t in ("/undo-clear", "/undoclear", "/undo", "撤销清空", "恢复"):
+  if t in ("/undo-clear", "/undoclear", "/undo"):
     return True, "__undo_clear__"
 
   # /model
@@ -364,7 +366,7 @@ def try_dispatch(text: str, ctx: AgentContext) -> tuple[bool, str | None]:
   # /esc — bare cancels the current turn; with trailing text, cancel then
   # send the text as a new message (case preserved from the original input).
   esc_m = re.match(
-    r"^(?:/esc|esc|cancel|取消)(?:\s+(.+))?$",
+    r"^/esc(?:\s+(.+))?$",
     text.strip(),
     re.IGNORECASE | re.DOTALL,
   )
@@ -402,7 +404,7 @@ def try_dispatch(text: str, ctx: AgentContext) -> tuple[bool, str | None]:
     return True, None
 
   # /ping
-  if t in ("/ping", "ping"):
+  if t == "/ping":
     uptime = int(time.time() - ctx.start_time)
     h, m = divmod(uptime, 3600)
     mins, secs = divmod(m, 60)
@@ -416,7 +418,7 @@ def try_dispatch(text: str, ctx: AgentContext) -> tuple[bool, str | None]:
     )
 
   # /cost
-  if t in ("/cost", "cost"):
+  if t == "/cost":
     return True, (
       f"💰 Session Cost\n"
       f"- Total: **${ctx.total_cost:.4f}**\n"
@@ -425,7 +427,7 @@ def try_dispatch(text: str, ctx: AgentContext) -> tuple[bool, str | None]:
     )
 
   # /usage
-  if t in ("/usage", "usage"):
+  if t == "/usage":
     # claude-cli drives the real interactive TUI, which has a rich /usage
     # dashboard — forward to it (handled in agent.py via the __forward__ sentinel).
     if ctx.agent == "claude-cli":
@@ -438,38 +440,38 @@ def try_dispatch(text: str, ctx: AgentContext) -> tuple[bool, str | None]:
 
   # /compact — only the claude-cli agent can forward to the CLI's native
   # context-compaction command; others have no equivalent host action.
-  if t in ("/compact", "compact"):
+  if t == "/compact":
     if ctx.agent == "claude-cli":
       return True, "__forward__:/compact"
     return True, ("`/compact` is only available with the `claude-cli` agent "
                   "(it forwards to the CLI's own context compaction).")
 
   # /tokens
-  if t in ("/tokens", "tokens"):
+  if t == "/tokens":
     return True, _format_token_snapshot(ctx)
 
   # /version
-  if t in ("/version", "version"):
+  if t == "/version":
     return True, format_version_report()
 
   # /pid
-  if t in ("/pid", "pid"):
+  if t == "/pid":
     return True, f"Nemo PID: `{os.getpid()}`"
 
   # /restart — replace this daemon process with a fresh nemo invocation.
-  if t in ("/restart", "restart"):
+  if t == "/restart":
     return True, "__restart__"
 
   # /upgrade check — check PyPI without installing.
-  if t in ("/upgrade check", "upgrade check"):
+  if t == "/upgrade check":
     return True, "__upgrade_check__"
 
   # /upgrade — pipx upgrade captain-nemo, then restart if successful.
-  if t in ("/upgrade", "upgrade"):
+  if t == "/upgrade":
     return True, "__upgrade__"
 
   # /help
-  if t in ("/help", "help", "帮助"):
+  if t == "/help":
     from .agent_factory import AGENT_KINDS
     _agent_opts = "\\|".join(sorted(AGENT_KINDS))
     return True, (
@@ -537,11 +539,11 @@ def try_dispatch(text: str, ctx: AgentContext) -> tuple[bool, str | None]:
     )
 
   # /mention
-  if t in ("/mention", "mention"):
+  if t == "/mention":
     return True, "__mention_toggle__"
-  if t in ("/mention on", "mention on"):
+  if t == "/mention on":
     return True, "__mention__:on"
-  if t in ("/mention off", "mention off"):
+  if t == "/mention off":
     return True, "__mention__:off"
 
   # /name <new name>
@@ -553,21 +555,21 @@ def try_dispatch(text: str, ctx: AgentContext) -> tuple[bool, str | None]:
     return True, f"__name__:{new_name}"
 
   # /diag
-  if t in ("/diag", "diag"):
+  if t == "/diag":
     return True, "__diag__"
 
   # /autoapprove
-  if t in ("/autoapprove", "autoapprove"):
+  if t == "/autoapprove":
     return True, "__autoapprove_toggle__"
-  if re.match(r"/?(?:auto[\s\-]*approve|autoapprove)\s+(on|off)", t):
+  if re.match(r"/(?:auto[\s\-]*approve|autoapprove)\s+(on|off)", t):
     enabled = "on" in t.split()[-1]
     return True, f"__autoapprove__:{'on' if enabled else 'off'}"
 
   # /autoesc — when on, a new user message during an in-flight turn
   # automatically cancels (esc) the running turn and starts a new one.
-  if t in ("/autoesc", "autoesc"):
+  if t == "/autoesc":
     return True, "__autoesc_toggle__"
-  if re.match(r"/?(?:auto[\s\-]*esc|autoesc)\s+(on|off)", t):
+  if re.match(r"/(?:auto[\s\-]*esc|autoesc)\s+(on|off)", t):
     enabled = "on" in t.split()[-1]
     return True, f"__autoesc__:{'on' if enabled else 'off'}"
 
@@ -639,11 +641,11 @@ def try_dispatch(text: str, ctx: AgentContext) -> tuple[bool, str | None]:
     )
 
   # /dissolve — stop agent, dissolve group (check before /exit to avoid prefix match)
-  if t in ("/dissolve", "dissolve"):
+  if t == "/dissolve":
     return True, "__dissolve__"
 
   # /exit — stop agent, keep group
-  if t in ("/exit", "exit"):
+  if t == "/exit":
     return True, "__exit__"
 
   return False, None

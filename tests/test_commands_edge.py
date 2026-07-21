@@ -16,14 +16,14 @@ def test_autoapprove_tone_not_matched():
 
 def test_autoapprove_on_with_spaces():
   handled, resp = try_dispatch("auto approve on", _ctx())
-  assert handled
-  assert resp == "__autoapprove__:on"
+  assert not handled
+  assert resp is None
 
 
 def test_autoapprove_hyphen():
   handled, resp = try_dispatch("auto-approve off", _ctx())
-  assert handled
-  assert resp == "__autoapprove__:off"
+  assert not handled
+  assert resp is None
 
 
 def test_exit_not_in_sentence():

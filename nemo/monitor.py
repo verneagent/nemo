@@ -26,7 +26,7 @@ def parse_esc(
 
   Returns:
     - None  : not an esc command
-    - ""    : bare `/esc` (or `esc`, `cancel`, `取消`)
+    - ""    : bare `/esc`
     - "<x>" : `/esc <x>` — original case preserved
   """
   stripped = _strip_mentions_preserving_case(text, mentions)
@@ -37,7 +37,7 @@ def parse_esc(
 
 
 _ESC_PATTERN = re.compile(
-  r"^(?:/esc|esc|cancel|取消)(?:\s+(.+))?$",
+  r"^/esc(?:\s+(.+))?$",
   re.IGNORECASE | re.DOTALL,
 )
 
@@ -56,13 +56,13 @@ def _strip_mentions_preserving_case(
 def is_exit(text: str, mentions: list[dict[str, str]] | None = None) -> bool:
   """Check if a message is an /exit command."""
   t = _strip_mentions(text, mentions)
-  return t in ("/exit", "exit")
+  return t == "/exit"
 
 
 def is_dissolve(text: str, mentions: list[dict[str, str]] | None = None) -> bool:
   """Check if a message is a /dissolve command."""
   t = _strip_mentions(text, mentions)
-  return t in ("/dissolve", "dissolve")
+  return t == "/dissolve"
 
 
 def is_permission_reply(text: str) -> str | None:

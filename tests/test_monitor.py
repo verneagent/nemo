@@ -7,23 +7,23 @@ from nemo.monitor import (
 
 def test_is_esc():
   assert is_esc("/esc")
-  assert is_esc("esc")
-  assert is_esc("cancel")
-  assert is_esc("取消")
+  assert not is_esc("esc")
+  assert not is_esc("cancel")
+  assert not is_esc("取消")
   assert not is_esc("hello")
   assert not is_esc("escape")
 
 
 def test_is_esc_with_mentions():
   assert is_esc("@bot /esc", [{"key": "@bot"}])
-  assert is_esc("@bot esc", [{"key": "@bot"}])
+  assert not is_esc("@bot esc", [{"key": "@bot"}])
 
 
 def test_parse_esc_bare():
   assert parse_esc("/esc") == ""
-  assert parse_esc("esc") == ""
-  assert parse_esc("cancel") == ""
-  assert parse_esc("取消") == ""
+  assert parse_esc("esc") is None
+  assert parse_esc("cancel") is None
+  assert parse_esc("取消") is None
 
 
 def test_parse_esc_not_esc():
@@ -51,19 +51,19 @@ def test_parse_esc_with_mentions_and_text():
 
 def test_parse_esc_is_case_insensitive_prefix():
   assert parse_esc("/ESC continue") == "continue"
-  assert parse_esc("Cancel keep going") == "keep going"
+  assert parse_esc("Cancel keep going") is None
 
 
 def test_is_exit():
   assert is_exit("/exit")
-  assert is_exit("exit")
+  assert not is_exit("exit")
   assert not is_exit("hello")
   assert not is_exit("/dissolve")
 
 
 def test_is_dissolve():
   assert is_dissolve("/dissolve")
-  assert is_dissolve("dissolve")
+  assert not is_dissolve("dissolve")
   assert not is_dissolve("exit")
   assert not is_dissolve("hello")
 

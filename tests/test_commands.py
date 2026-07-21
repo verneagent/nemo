@@ -12,14 +12,24 @@ def _ctx():
 
 
 def test_clear_commands():
-  for cmd in ("/clear", "clear", "清空", "重置"):
-    handled, resp = try_dispatch(cmd, _ctx())
-    assert handled
-    assert resp == "__clear__"
+  handled, resp = try_dispatch("/clear", _ctx())
+  assert handled
+  assert resp == "__clear__"
+
+
+def test_bare_words_are_not_commands():
+  for text in (
+      "clear", "清空", "重置", "restart", "upgrade", "ping", "cost",
+      "usage", "tokens", "version", "pid", "help", "帮助", "diag",
+      "dissolve", "exit", "autoapprove on", "autoesc on",
+  ):
+    handled, resp = try_dispatch(text, _ctx())
+    assert not handled, text
+    assert resp is None
 
 
 def test_undo_clear_commands():
-  for cmd in ("/undo-clear", "/undoclear", "/undo", "撤销清空", "恢复"):
+  for cmd in ("/undo-clear", "/undoclear", "/undo"):
     handled, resp = try_dispatch(cmd, _ctx())
     assert handled, f"{cmd!r} should be handled"
     assert resp == "__undo_clear__", f"{cmd!r} → {resp!r}"
@@ -361,10 +371,9 @@ def test_model_switch_for_opencode_accepts_provider_slug_model():
 
 
 def test_esc():
-  for cmd in ("/esc", "esc", "cancel", "取消"):
-    handled, resp = try_dispatch(cmd, _ctx())
-    assert handled
-    assert resp == "__esc__"
+  handled, resp = try_dispatch("/esc", _ctx())
+  assert handled
+  assert resp == "__esc__"
 
 
 def test_esc_with_follow_up_text():
@@ -509,7 +518,7 @@ def test_tokens_prefers_total_tokens_when_present():
     "context_window": 10000,
   }, updated_at=0)
 
-  handled, resp = try_dispatch("tokens", ctx)
+  handled, resp = try_dispatch("/tokens", ctx)
 
   assert handled
   assert resp is not None
@@ -558,7 +567,7 @@ def test_help():
 
 
 def test_autoapprove_on():
-  handled, resp = try_dispatch("autoapprove on", _ctx())
+  handled, resp = try_dispatch("/autoapprove on", _ctx())
   assert handled
   assert resp == "__autoapprove__:on"
 
@@ -570,7 +579,7 @@ def test_autoapprove_slash_on():
 
 
 def test_autoapprove_off():
-  handled, resp = try_dispatch("autoapprove off", _ctx())
+  handled, resp = try_dispatch("/autoapprove off", _ctx())
   assert handled
   assert resp == "__autoapprove__:off"
 
@@ -582,7 +591,7 @@ def test_autoapprove_toggle():
 
 
 def test_autoesc_on():
-  handled, resp = try_dispatch("autoesc on", _ctx())
+  handled, resp = try_dispatch("/autoesc on", _ctx())
   assert handled
   assert resp == "__autoesc__:on"
 
@@ -594,7 +603,7 @@ def test_autoesc_slash_on():
 
 
 def test_autoesc_off():
-  handled, resp = try_dispatch("autoesc off", _ctx())
+  handled, resp = try_dispatch("/autoesc off", _ctx())
   assert handled
   assert resp == "__autoesc__:off"
 
@@ -619,8 +628,8 @@ def test_dissolve():
 
 def test_dissolve_plain():
   handled, resp = try_dispatch("dissolve", _ctx())
-  assert handled
-  assert resp == "__dissolve__"
+  assert not handled
+  assert resp is None
 
 
 def test_not_a_command():
@@ -703,8 +712,8 @@ def test_diag():
 
 def test_diag_bare():
   handled, resp = try_dispatch("diag", _ctx())
-  assert handled
-  assert resp == "__diag__"
+  assert not handled
+  assert resp is None
 
 
 # ---------------------------------------------------------------------------
