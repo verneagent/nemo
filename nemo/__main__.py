@@ -526,8 +526,17 @@ def main():
   from .presets import resolve_preset
   endpoint = EndpointConfig()
   endpoint_key = ""
+  startup_notice = ""
   preset = resolve_preset(model)
-  if preset is not None:
+  if preset is None:
+    # Not a preset — validate the raw slug against the agent's catalog so
+    # a model that was retired upstream degrades to the agent default
+    # instead of failing on the first turn. See resolve_boot_model.
+    from .agent_factory import resolve_boot_model
+    model, startup_notice = resolve_boot_model(args.agent, model, project_dir)
+    if startup_notice:
+      log.warning("%s", startup_notice)
+  else:
     if not preset.supports(args.agent):
       return _startup_fail(
         f"Error: model {model!r} has no endpoint configured for "
@@ -555,7 +564,8 @@ def main():
                                  effort=args.effort,
                                  system_prompt=system_prompt,
                                  endpoint=endpoint,
-                                 endpoint_key=endpoint_key))
+                                 endpoint_key=endpoint_key,
+                                 startup_notice=startup_notice))
   except KeyboardInterrupt:
     return 0
   except BaseException as e:

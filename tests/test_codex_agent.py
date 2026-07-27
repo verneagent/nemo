@@ -15,6 +15,7 @@ from nemo.agent_factory import (
   default_model_for_agent,
   is_model_compatible,
   ModelCatalog,
+  model_catalog_for_agent,
   query_codex_model_catalog,
 )
 from nemo.claude_agent import ClaudeCodingAgent
@@ -84,12 +85,29 @@ class _FakeProc:
 
 
 def test_default_model_for_agent():
-  assert default_model_for_agent("claude") == "claude-opus-4-8"
+  assert default_model_for_agent("claude") == "claude-opus-5"
   # Startup default stays stable; /model gets the live catalog from Codex.
   assert default_model_for_agent("codex") == "gpt-5.5"
 
 
+def test_claude_model_catalog_tracks_current_aliases():
+  catalog = model_catalog_for_agent("claude")
+  assert catalog.visible[:5] == (
+    "claude-fable-5",
+    "claude-opus-5",
+    "claude-sonnet-5",
+    "claude-haiku-4-5",
+    "opusplan",
+  )
+  assert catalog.aliases["opus"] == "claude-opus-5"
+  assert catalog.aliases["sonnet"] == "claude-sonnet-5"
+  assert "claude-opus-4-8" in catalog.hidden
+  assert "claude-sonnet-4-6" in catalog.hidden
+
+
 def test_is_model_compatible():
+  assert is_model_compatible("claude", "claude-opus-5")
+  assert is_model_compatible("claude", "claude-sonnet-5")
   assert is_model_compatible("claude", "claude-opus-4-7")
   assert is_model_compatible("claude", "claude-opus-4-6")
   assert not is_model_compatible("claude", "gpt-5.5")

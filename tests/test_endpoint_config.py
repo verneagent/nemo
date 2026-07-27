@@ -419,3 +419,42 @@ def test_cli_unknown_model_passes_through_unchanged(tmp_path):
   assert frame.f_locals["model"] == "claude-opus-4-7"
   assert frame.f_locals["endpoint"].base_url == ""
   assert frame.f_locals["endpoint"].api_key == ""
+
+
+def test_cli_retired_model_warns_and_falls_back(tmp_path):
+  """A slug that has since been retired upstream (restart reusing the old
+  `--model`) must degrade to the agent default with a start-card notice,
+  not boot "successfully" and then fail on the first turn."""
+  from nemo.__main__ import main
+  from nemo.agent_factory import default_model_for_agent
+  project = str(tmp_path)
+  captured: dict[str, object] = {}
+  argv = [
+    "nemo", "--chat-id", "oc_1", "--project-dir", project,
+    "--agent", "claude", "--model", "claude-opus-3-9",
+  ]
+  with mock.patch("sys.argv", argv), \
+       mock.patch("nemo.__main__._ensure_agent_runtime"), \
+       mock.patch("nemo.config.load_credentials",
+                  return_value={"app_id": "a", "app_secret": "s", "email": ""}), \
+       mock.patch("nemo.preflight.run_preflight", return_value=[]), \
+       mock.patch("nemo.__main__.asyncio") as mock_asyncio:
+    mock_asyncio.run.side_effect = _fake_asyncio_run_capture(captured)
+    rc = main()
+  assert rc == 0
+  frame = captured["frame"]
+  assert frame.f_locals["model"] == default_model_for_agent("claude")
+  assert "claude-opus-3-9" in frame.f_locals["startup_notice"]
+
+
+def test_boot_model_kept_when_catalog_unreadable():
+  """`codex debug models` unreachable → the catalog degrades to just the
+  models.json presets. That is not evidence the slug is gone, so the
+  daemon must keep it rather than silently downgrading to gpt-5.5."""
+  from nemo import agent_factory
+  empty = agent_factory.ModelCatalog(note="Codex model catalog unavailable")
+  with mock.patch.object(
+      agent_factory, "query_codex_model_catalog", return_value=empty):
+    model, notice = agent_factory.resolve_boot_model("codex", "gpt-6-turbo")
+  assert model == "gpt-6-turbo"
+  assert notice == ""

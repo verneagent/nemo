@@ -40,14 +40,15 @@ __all__ = [
   "is_model_compatible",
   "model_catalog_for_agent",
   "query_codex_model_catalog",
+  "resolve_boot_model",
   "MediaVision",
   "model_media_vision",
 ]
 
 _DEFAULT_MODEL_BY_AGENT: dict[AgentKind, str] = {
-  "claude": "claude-opus-4-8",
+  "claude": "claude-opus-5",
   # claude-cli drives the interactive TUI; same model slugs as claude.
-  "claude-cli": "claude-opus-4-8",
+  "claude-cli": "claude-opus-5",
   # Kept as the startup default. The interactive /model catalog is read
   # dynamically from `codex debug models`.
   "codex": "gpt-5.5",
@@ -64,7 +65,7 @@ class ModelCatalog:
     can't use these — e.g. codex-specialized variants). Still accepted
     by the picker; rendered in a separate help section.
   - ``hidden``: full slugs accepted but not shown (legacy / experimental).
-  - ``aliases``: short name → canonical full slug (e.g. ``opus`` → ``claude-opus-4-8``).
+  - ``aliases``: short name → canonical full slug (e.g. ``opus`` → ``claude-opus-5``).
   """
   visible: tuple[str, ...] = ()
   api_only: tuple[str, ...] = ()
@@ -84,19 +85,22 @@ _CATALOG_BY_AGENT: dict[AgentKind, ModelCatalog] = {
   "claude": ModelCatalog(
     visible=(
       "claude-fable-5",
-      "claude-opus-4-8",
-      "claude-sonnet-4-6",
+      "claude-opus-5",
+      "claude-sonnet-5",
       "claude-haiku-4-5",
       "opusplan",
     ),
     hidden=(
+      "claude-opus-4-8",
       "claude-opus-4-7",
       "claude-opus-4-6",
+      "claude-sonnet-4-6",
+      "claude-sonnet-4-5",
     ),
     aliases={
       "fable": "claude-fable-5",
-      "opus": "claude-opus-4-8",
-      "sonnet": "claude-sonnet-4-6",
+      "opus": "claude-opus-5",
+      "sonnet": "claude-sonnet-5",
       "haiku": "claude-haiku-4-5",
     },
   ),
@@ -249,6 +253,50 @@ def is_model_compatible(
     agent,
     project_dir,
   ).all_names()
+
+
+def _catalog_is_authoritative(agent: AgentKind, project_dir: str = "") -> bool:
+  """Whether ``agent``'s model list can be trusted to be complete.
+
+  claude / claude-cli ship a static compiled-in catalog, so it always is.
+  codex and opencode read theirs from an external CLI (`codex debug
+  models`, the opencode config); when that call fails the catalog
+  degrades to just the models.json presets, which says nothing about
+  whether a native slug still exists.
+  """
+  if agent in ("claude", "claude-cli"):
+    return True
+  if agent == "codex":
+    return bool(query_codex_model_catalog().visible)
+  if agent == "opencode":
+    from .opencode_agent import query_opencode_model_catalog_data
+    models, _ = query_opencode_model_catalog_data(project_dir)
+    return bool(models)
+  return False
+
+
+def resolve_boot_model(
+  agent: AgentKind,
+  model: str,
+  project_dir: str = "",
+) -> tuple[str, str]:
+  """Resolve the model a daemon should actually boot with.
+
+  Returns ``(model, notice)``. A model retired upstream (Claude/Codex
+  rotate slugs) otherwise boots fine and only fails on the first turn,
+  which reads as "restart succeeded, then the bot went silent" — so fall
+  back to the agent default and hand back a notice for the start card.
+  Only downgrades when the catalog is authoritative; an unreadable
+  catalog is not evidence that the model is gone.
+  """
+  if is_model_compatible(agent, model, project_dir):
+    return model, ""
+  if not _catalog_is_authoritative(agent, project_dir):
+    return model, ""
+  fallback = default_model_for_agent(agent)
+  return fallback, (
+    f"Model `{model}` is unavailable for {agent} — fell back to `{fallback}`"
+  )
 
 
 @dataclass(frozen=True)

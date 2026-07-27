@@ -1497,6 +1497,7 @@ async def main_loop(
   system_prompt: str = "",
   endpoint: EndpointConfig | None = None,
   endpoint_key: str = "",
+  startup_notice: str = "",
 ) -> int:
   """Run the agent main loop."""
   session_id = str(uuid.uuid4())
@@ -1599,6 +1600,8 @@ async def main_loop(
   start_lines = [f"📂 `{folder}`  ·  pid `{os.getpid()}`"]
   if _resume_sdk_id:
     start_lines.append(f"Session `{_resume_sdk_id[:8]}` resumed")
+  if startup_notice:
+    start_lines.append(f"⚠️ {startup_notice}")
   start_note = project_dir
   start_card = cards.build_card(
     f"Nemo v{__version__} ({agent} · {model})",
