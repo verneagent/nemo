@@ -351,6 +351,44 @@ def test_find_session_prefers_exact_over_prefix():
   assert find_session("nope", [a, b]) == []
 
 
+def _search_info(path, uuid="u"):
+  from nemo.sessions import SessionInfo
+  return SessionInfo(uuid=uuid, agent="claude", path=str(path), mtime=0,
+                     first_user_text="", model="")
+
+
+def test_search_sessions_greps_transcript_bodies(tmp_path):
+  """`/session recall <keyword>` must match anywhere in the transcript —
+  including assistant/tool text the picker previews never show."""
+  from nemo.sessions import search_sessions
+  hit = tmp_path / "hit.jsonl"
+  hit.write_text('{"type":"assistant","message":'
+                 '{"content":"the Parser CRASHED on unicode"}}\n')
+  miss = tmp_path / "miss.jsonl"
+  miss.write_text('{"type":"user","message":{"content":"hello"}}\n')
+  a, b = _search_info(hit, "aaa"), _search_info(miss, "bbb")
+  # Case-insensitive substring, input order preserved.
+  assert search_sessions([a, b], "crashed") == [a]
+  assert search_sessions([a, b], "Parser") == [a]
+  assert search_sessions([a, b], "nothing here") == []
+  # Empty query matches everything (picker shows the unfiltered list).
+  assert search_sessions([a, b], "  ") == [a, b]
+
+
+def test_search_sessions_matches_across_chunk_boundary(tmp_path):
+  """A needle straddling the streaming read boundary must still match."""
+  path = tmp_path / "big.jsonl"
+  path.write_text("x" * 14 + "needle" + "y" * 40)
+  with mock.patch.object(sessions, "_SEARCH_CHUNK", 16):
+    assert sessions.search_sessions([_search_info(path)], "needle")
+
+
+def test_search_sessions_skips_unreadable_transcript(tmp_path):
+  from nemo.sessions import search_sessions
+  gone = _search_info(tmp_path / "does-not-exist.jsonl")
+  assert search_sessions([gone], "anything") == []
+
+
 def test_list_claude_sessions_captures_last_three_user_prompts(tmp_path):
   home = str(tmp_path / "home")
   project = str(tmp_path / "project")

@@ -508,7 +508,7 @@ def try_dispatch(text: str, ctx: AgentContext) -> tuple[bool, str | None]:
       "| `/diag` | Run diagnostics |\n"
       "| `/session list` | List past sessions in this project |\n"
       "| `/session info [uuid]` | Show session metadata plus first and last messages |\n"
-      "| `/session recall [uuid]` | Recall a past session (no uuid → pick from a list) |\n"
+      "| `/session recall [uuid\\|keyword]` | Recall a past session (uuid → direct; keyword → pick from sessions mentioning it; nothing → pick from all) |\n"
       "| `/session rm <uuid>` | Remove one past session |\n"
       "| `/session purge [uuid]` | Remove sessions older than uuid, or all except current |\n"
       "| `/exit` | Stop agent, keep group |\n"
@@ -618,9 +618,12 @@ def try_dispatch(text: str, ctx: AgentContext) -> tuple[bool, str | None]:
         target = parts[2].strip() if len(parts) >= 3 else ""
         return True, f"__session_info__:{target}"
       if sub == "recall":
-        # With a uuid: recall it directly. Without: emit an interactive
-        # session picker card (one Recall button per session), routed
-        # through the session_recall:<uuid> card action on submit.
+        # With a uuid: recall it directly. With anything else: the arg is
+        # treated as a keyword and the transcripts are grepped (resolved in
+        # `_handle_session_recall`, which needs the on-disk sessions).
+        # Without an arg: emit an interactive session picker card (one
+        # Recall button per session), routed through the
+        # session_recall:<uuid> card action on submit.
         if len(parts) >= 3 and parts[2].strip():
           return True, f"__session_recall__:{parts[2].strip()}"
         return True, "__session_picker__"
@@ -635,7 +638,7 @@ def try_dispatch(text: str, ctx: AgentContext) -> tuple[bool, str | None]:
       "|---|---|\n"
       "| `/session list` | List past sessions in this project (Claude + Codex) |\n"
       "| `/session info [uuid]` | Show session metadata plus first and last messages |\n"
-      "| `/session recall [uuid]` | Recall a past session (no uuid → pick from a list) |\n"
+      "| `/session recall [uuid\\|keyword]` | Recall a past session (uuid → direct; keyword → pick from sessions mentioning it; nothing → pick from all) |\n"
       "| `/session rm <uuid>` | Remove one past session |\n"
       "| `/session purge [uuid]` | Remove sessions older than uuid, or all except current |"
     )

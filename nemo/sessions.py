@@ -510,6 +510,47 @@ def list_sessions(project_dir: str) -> list[SessionInfo]:
   return sessions
 
 
+_SEARCH_CHUNK = 1 << 20
+
+
+def _file_contains(path: str, needle: str) -> bool:
+  """Case-insensitive substring search over a transcript, streamed.
+
+  Read in chunks with a needle-sized overlap so a match straddling a chunk
+  boundary is still found without holding a whole (possibly huge) transcript
+  in memory. An unreadable file is simply not a match.
+  """
+  overlap = max(0, len(needle) - 1)
+  tail = ""
+  try:
+    with open(path, "rb") as f:
+      while chunk := f.read(_SEARCH_CHUNK):
+        text = tail + chunk.decode("utf-8", errors="replace").lower()
+        if needle in text:
+          return True
+        tail = text[-overlap:] if overlap else ""
+  except OSError:
+    return False
+  return False
+
+
+def search_sessions(
+  sessions: Iterable[SessionInfo], query: str,
+) -> list[SessionInfo]:
+  """Filter ``sessions`` to those whose transcript mentions ``query``.
+
+  Case-insensitive substring grep over the raw JSONL, so it matches user
+  prompts, assistant replies and tool output alike — the point of
+  `/session recall <keyword>` is "find the session where we talked about
+  X", which the picker's short prompt previews can't answer. Input order
+  (newest first) is preserved; an empty query matches everything.
+  """
+  needle = query.strip().lower()
+  if not needle:
+    return list(sessions)
+  return [s for s in sessions if _file_contains(s.path, needle)]
+
+
 def find_session(
   uuid_or_prefix: str, sessions: Iterable[SessionInfo],
 ) -> list[SessionInfo]:

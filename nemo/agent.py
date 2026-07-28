@@ -738,6 +738,7 @@ async def _handle_session_recall(
   target: str,
   coding_agent: CodingAgent,
   db: Database,
+  current_sdk_session_id: str = "",
 ) -> str:
   """Resolve ``target`` to a past session and recall it into context.
 
@@ -755,6 +756,10 @@ async def _handle_session_recall(
     (Codex / OpenCode, or the digest came back empty) the live agent is
     handed the path and asked to Read it itself — the original behavior.
 
+  When ``target`` matches no uuid it is treated as a keyword instead: the
+  transcripts are grepped and a filtered picker is sent, so
+  `/session recall crash` means "which session was about the crash?".
+
   Returns an ERROR/usage string for the caller to send (no match,
   ambiguous, …), or "" on success (this function sends its own progress
   ack and injects the recall turn). Never touches ``_sdk_session_id`` —
@@ -768,8 +773,12 @@ async def _handle_session_recall(
   all_sessions = _sessions.list_sessions(project_dir)
   matches = _sessions.find_session(target, all_sessions)
   if not matches:
-    return (f"No session matches `{target}` in this project. "
-            f"Run `/session list` to see what's available.")
+    # Not a uuid prefix — fall back to a keyword search over the
+    # transcripts and let the user pick from what mentions it.
+    await _send_session_picker(
+      channel, chat_id, project_dir, db, current_sdk_session_id,
+      query=target.strip())
+    return ""
   if len(matches) > 1:
     ambig = ", ".join(f"`{m.uuid[:8]}`" for m in matches[:5])
     return (f"`{target}` is ambiguous — matches {ambig}. "
@@ -1316,7 +1325,7 @@ _SESSION_PICKER_LIMIT = 18
 
 
 def _session_picker_options(
-  project_dir: str, current_sdk_session_id: str = "",
+  project_dir: str, current_sdk_session_id: str = "", query: str = "",
 ) -> list[tuple[str, str]]:
   """Flatten past sessions into ``(description_markdown, uuid)`` pairs,
   newest first, for the recall picker.
@@ -1329,6 +1338,9 @@ def _session_picker_options(
   bare "hi" would otherwise be unrecognisable even though later turns carry
   the real topic. Internal recall/digest sub-sessions are filtered out so
   they don't eat picker slots. The card renders one Recall button per block.
+
+  With ``query`` set, only sessions whose transcript mentions it are listed
+  (grep over the whole JSONL, not just the previews).
   """
   from . import sessions as _sessions
   now = time.time()
@@ -1337,6 +1349,8 @@ def _session_picker_options(
     s for s in _sessions.list_sessions(project_dir)
     if _sessions.is_recallable(s)
   ]
+  if query:
+    recallable = _sessions.search_sessions(recallable, query)
   for s in recallable[:_SESSION_PICKER_LIMIT]:
     age = max(0, int(now - s.mtime))
     if age < 3600:
@@ -1373,21 +1387,25 @@ async def _send_session_picker(
   project_dir: str,
   db: Database,
   current_sdk_session_id: str = "",
+  query: str = "",
 ) -> None:
   """Send the interactive `/session recall` picker card.
 
-  Falls back to the plain-text `/session list` when there are no sessions
-  to pick (so the user still gets a useful answer instead of an empty
-  list)."""
-  options = _session_picker_options(project_dir, current_sdk_session_id)
+  With ``query`` only sessions whose transcript mentions it are offered.
+  Falls back to a plain-text message when there is nothing to pick (so the
+  user still gets a useful answer instead of an empty list)."""
+  options = _session_picker_options(project_dir, current_sdk_session_id, query)
   if not options:
-    await _send_response(
-      channel, chat_id,
-      f"No past sessions found in `{project_dir}`.",
-      db,
-    )
+    where = f"No past sessions found in `{project_dir}`."
+    if query:
+      where = (f"No past session in `{project_dir}` mentions `{query}`. "
+               f"Run `/session recall` to browse them all.")
+    await _send_response(channel, chat_id, where, db)
     return
-  hint = "Pick a session and click Recall. Or type `/session recall UUID`."
+  if query:
+    hint = f"Sessions mentioning `{query}`. Pick one and click Recall."
+  else:
+    hint = "Pick a session and click Recall. Or type `/session recall UUID`."
   card = cards.build_session_picker_card(options, chat_id=chat_id, hint=hint)
   try:
     msg_id = await channel.send_card(chat_id, card)
@@ -2651,7 +2669,8 @@ async def main_loop(
           # 400 across endpoints, see the per-endpoint isolation comment in
           # db.py). Sends its own progress ack; returns only error text.
           err = await _handle_session_recall(
-            channel, chat_id, project_dir, target, coding_agent, db)
+            channel, chat_id, project_dir, target, coding_agent, db,
+            _sdk_session_id)
           if err:
             await _send_response(channel, chat_id, err, db)
         elif response and response.startswith("__session_rm__:"):

@@ -3802,6 +3802,84 @@ def test_session_picker_respects_limit_after_filtering():
   assert all(uuid.startswith("real") for _d, uuid in options)
 
 
+def test_session_picker_query_filters_by_transcript_grep(tmp_path):
+  """`/session recall <keyword>` narrows the picker to sessions whose
+  transcript mentions the keyword."""
+  from nemo import sessions
+  hit = tmp_path / "hit.jsonl"
+  hit.write_text('{"type":"user","message":{"content":"the parser crashed"}}\n')
+  miss = tmp_path / "miss.jsonl"
+  miss.write_text('{"type":"user","message":{"content":"unrelated"}}\n')
+  infos = [
+    sessions.SessionInfo(uuid="aaaa1111", agent="claude", path=str(hit),
+                         mtime=200.0, first_user_text="the parser crashed",
+                         model="m"),
+    sessions.SessionInfo(uuid="bbbb2222", agent="claude", path=str(miss),
+                         mtime=100.0, first_user_text="unrelated", model="m"),
+  ]
+  with mock.patch("nemo.sessions.list_sessions", return_value=infos):
+    assert [u for _d, u in _session_picker_options("/proj", "", "CRASHED")] == [
+      "aaaa1111"]
+    # No query → unfiltered.
+    assert len(_session_picker_options("/proj")) == 2
+
+
+def test_session_recall_keyword_sends_filtered_picker(tmp_path):
+  """A non-uuid arg falls back to a grep-filtered picker instead of erroring."""
+  from nemo import sessions
+
+  hit = tmp_path / "hit.jsonl"
+  hit.write_text('{"type":"user","message":{"content":"fix the parser"}}\n')
+  miss = tmp_path / "miss.jsonl"
+  miss.write_text('{"type":"user","message":{"content":"buy a tv"}}\n')
+  infos = [
+    sessions.SessionInfo(
+      uuid="01fe69c7-5793-4ad7-9ba6-7d1aa1e01f90", agent="claude",
+      path=str(hit), mtime=hit.stat().st_mtime,
+      first_user_text="fix the parser", model="m"),
+    sessions.SessionInfo(
+      uuid="02aa11b2-5793-4ad7-9ba6-7d1aa1e01f91", agent="claude",
+      path=str(miss), mtime=miss.stat().st_mtime,
+      first_user_text="buy a tv", model="m"),
+  ]
+
+  sent_cards = []
+
+  class _CardChannel(_RecallReplayChannel):
+    async def send_card(self, chat_id, card):
+      sent_cards.append(card)
+      return "om_picker_sent"
+
+  agent = _FakeAgent()
+  queued = _CardChannel("oc_test", [
+    IncomingMessage(
+      event_type="im.message.receive_v1", chat_id="oc_test",
+      sender_id="ou_user", message_id="om1", msg_type="text",
+      text="/session recall parser", create_time="1"),
+    IncomingMessage(
+      event_type="im.message.receive_v1", chat_id="oc_test",
+      sender_id="ou_user", message_id="om_exit", msg_type="text",
+      text="/exit", create_time="2"),
+  ])
+
+  with mock.patch("nemo.sessions.list_sessions", return_value=infos):
+    rc = _run_recall_loop(tmp_path, agent, queued)
+
+  assert rc == 0
+  # No recall turn was injected — the keyword only narrowed the picker.
+  assert not queued.pushed, queued.pushed
+  import json as _json
+  picker = next(
+    (c for c in sent_cards
+     if c.get("header", {}).get("title", {}).get("content") == "Recall Session"),
+    None)
+  assert picker is not None, sent_cards
+  blob = _json.dumps(picker, ensure_ascii=False)
+  assert "session_recall:01fe69c7-5793-4ad7-9ba6-7d1aa1e01f90" in blob
+  assert "02aa11b2" not in blob
+  assert "parser" in blob
+
+
 def test_session_picker_submit_recalls_with_digest(tmp_path):
   """Submitting the /session recall picker fires a card.action.trigger with
   action='session_recall:<uuid>'. The daemon must run the digest sub-session,
