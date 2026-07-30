@@ -27,6 +27,7 @@ Lark-connected coding agent daemon. Repo focus:
 - Do not use `pipx install captain-nemo` on the dev machine. `pipx` is only for end-user installs.
 - Profile config lives in `~/.nemo/<profile>.json`.
 - Relay config can come from config or `NEMO_RELAY_URL` / `NEMO_RELAY_API_KEY`.
+- Claude CLI selection: claude-agent-sdk's `_find_cli` returns its own bundled binary before it ever looks at PATH, so a stale bundle can shadow a newer installed `claude`. `nemo/claude_agent.py:_resolve_cli_path` version-compares bundled vs PATH vs `~/.local/bin` and pins the newest via `ClaudeAgentOptions(cli_path=…)` — a CLI older than the running model mis-names it (self-reports the wrong Opus generation, and fills the git `Co-Authored-By` trailer from its stale model table). Every options builder must pass `cli_path`.
 
 ## Architecture
 

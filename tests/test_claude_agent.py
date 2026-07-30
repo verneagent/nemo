@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
+import sys
 
 from nemo.claude_agent import (
   _SESSION_SIZE_NUDGE,
@@ -987,6 +989,115 @@ def test_build_env_prepends_nemo_script_dir(tmp_path, monkeypatch):
   monkeypatch.setenv("PATH", f"{script_dir}{os.pathsep}/usr/bin")
   env2 = agent._build_env(str(tmp_path), "model-x")
   assert env2["PATH"].count(str(script_dir)) == 1
+
+
+def _fake_cli(path, version: str):
+  """Write an executable stub that prints `<version> (Claude Code)`."""
+  path.parent.mkdir(parents=True, exist_ok=True)
+  path.write_text(f"#!/bin/sh\necho '{version} (Claude Code)'\n")
+  path.chmod(0o755)
+  return str(path)
+
+
+def test_resolve_cli_path_prefers_newer_system_cli(tmp_path, monkeypatch):
+  """The SDK returns its bundled CLI before ever consulting PATH, so a stale
+  bundle wins even when a newer `claude` is installed — and a CLI older than
+  the running model mis-names it (self-reported "Opus 4.5" on claude-opus-5,
+  hardcoded "Co-Authored-By: Claude Opus 4.6" in commits). Pick by version."""
+  import nemo.claude_agent as ca
+
+  sdk_pkg = tmp_path / "sdk"
+  bundled = _fake_cli(sdk_pkg / "_bundled" / "claude", "2.1.81")
+  newer = _fake_cli(tmp_path / "bin" / "claude", "2.1.220")
+
+  monkeypatch.setitem(sys.modules, "claude_agent_sdk", _FakeSdkModule(sdk_pkg))
+  monkeypatch.setattr(ca.shutil, "which", lambda name: newer)
+  monkeypatch.setattr(ca.Path, "home", staticmethod(lambda: tmp_path / "home"))
+
+  ca._resolve_cli_path.cache_clear()
+  try:
+    assert ca._resolve_cli_path() == newer
+  finally:
+    ca._resolve_cli_path.cache_clear()
+
+  assert ca._cli_version(bundled) == (2, 1, 81)
+  assert ca._cli_version(newer) == (2, 1, 220)
+
+
+def test_resolve_cli_path_keeps_bundled_when_it_is_newest(tmp_path, monkeypatch):
+  """Don't downgrade: a stale system install must not beat a newer bundle."""
+  import nemo.claude_agent as ca
+
+  sdk_pkg = tmp_path / "sdk"
+  bundled = _fake_cli(sdk_pkg / "_bundled" / "claude", "2.1.220")
+  _fake_cli(tmp_path / "bin" / "claude", "2.0.9")
+
+  monkeypatch.setitem(sys.modules, "claude_agent_sdk", _FakeSdkModule(sdk_pkg))
+  monkeypatch.setattr(
+    ca.shutil, "which", lambda name: str(tmp_path / "bin" / "claude"))
+  monkeypatch.setattr(ca.Path, "home", staticmethod(lambda: tmp_path / "home"))
+
+  ca._resolve_cli_path.cache_clear()
+  try:
+    assert ca._resolve_cli_path() == bundled
+  finally:
+    ca._resolve_cli_path.cache_clear()
+
+
+def test_cli_version_unparseable_is_empty(tmp_path):
+  """A missing / broken binary must not crash resolution."""
+  import nemo.claude_agent as ca
+
+  assert ca._cli_version(str(tmp_path / "nope")) == ()
+  broken = _fake_cli(tmp_path / "broken", "not-a-version")
+  assert ca._cli_version(broken) == ()
+
+
+class _FakeSdkModule:
+  """Stand-in for the claude_agent_sdk package (only __file__ is read)."""
+
+  def __init__(self, pkg_dir):
+    self.__file__ = str(pkg_dir / "__init__.py")
+
+
+def test_build_options_pins_resolved_cli(tmp_path, monkeypatch):
+  """Every options builder must carry cli_path, or the SDK silently reverts to
+  its bundled CLI for that code path."""
+  import nemo.claude_agent as ca
+  from nemo.claude_agent import ClaudeCodingAgent
+  from nemo.coding_agent import EndpointConfig
+
+  import nemo.db
+
+  pinned = str(tmp_path / "bin" / "claude")
+  monkeypatch.setattr(ca, "_resolve_cli_path", lambda: pinned)
+  monkeypatch.setattr(nemo.db, "DB_BASE", str(tmp_path / "dbs"))
+
+  agent = ClaudeCodingAgent.__new__(ClaudeCodingAgent)
+  agent._chat_id = "oc_chat"
+  agent._endpoint = EndpointConfig()
+  agent._read_only = False
+  agent._scratch_dir = ""
+  agent._model = "claude-opus-5"
+  agent._project_dir = str(tmp_path)
+  agent._effort = ""
+  agent._permission_mode = "bypassPermissions"
+  agent._credentials = None
+  agent._db = None
+  agent._channel = None
+  agent._fork_parent_id = ""
+  agent._system_prompt = ""
+
+  # _build_options grabs the running loop for the askq handler.
+  async def _run():
+    assert agent._build_options(str(tmp_path), "claude-opus-5").cli_path == pinned
+
+    agent._read_only = True
+    agent._scratch_dir = str(tmp_path / "scratch")
+    os.makedirs(agent._scratch_dir, exist_ok=True)
+    assert agent._build_options(str(tmp_path), "claude-opus-5").cli_path == pinned
+
+  asyncio.run(_run())
 
 
 def test_fork_bind_reply_anchor_writes_file(tmp_path):

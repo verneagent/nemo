@@ -3,14 +3,18 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
 import logging
 import os
 import re
+import shutil
+import subprocess
 import sys
 import sysconfig
 from collections import deque
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Awaitable, Callable, cast
 
 from .channel import Channel
@@ -62,6 +66,76 @@ def _nemo_script_dir() -> str:
     if d and os.path.isfile(os.path.join(d, "nemo-vision")):
       return d
   return ""
+
+
+def _cli_version(path: str) -> tuple[int, ...]:
+  """Return ``claude --version`` as a comparable tuple, () if undeterminable."""
+  try:
+    proc = subprocess.run(
+      [path, "--version"], capture_output=True, text=True, timeout=60, check=False)
+  except (OSError, subprocess.SubprocessError) as exc:
+    log.warning("claude CLI version probe failed for %s: %s", path, exc)
+    return ()
+  m = re.search(r"(\d+)\.(\d+)\.(\d+)", proc.stdout or "")
+  if not m:
+    log.warning(
+      "claude CLI at %s reported no parseable version: %r", path, proc.stdout)
+    return ()
+  return tuple(int(g) for g in m.groups())
+
+
+@functools.lru_cache(maxsize=1)
+def _resolve_cli_path() -> str:
+  """Pick the NEWEST available Claude Code CLI, or "" to let the SDK choose.
+
+  claude-agent-sdk's ``_find_cli`` returns its own bundled binary
+  unconditionally, before it ever looks at PATH. That bundle only refreshes
+  when the SDK is upgraded, so a machine with a current ``claude`` install
+  can still run a months-old CLI — and a CLI that predates the running
+  model mis-describes it: the model-name table has no entry for the new
+  slug, so the system prompt degrades to the bare id while the same prompt
+  hardcodes an older "most recent model family" hint (the model then guesses
+  its own name wrong), and the git-commit ``Co-Authored-By`` trailer is
+  filled from that same stale table. Compare versions and pass the winner
+  as ``cli_path`` so the SDK's preference is overridden when it is older.
+  """
+  import claude_agent_sdk
+
+  candidates: list[str] = []
+  # A namespace/synthetic module has no __file__ — then there is no bundle to
+  # consider and only the installed CLIs are candidates.
+  sdk_file = getattr(claude_agent_sdk, "__file__", None)
+  if sdk_file:
+    bundled = Path(sdk_file).parent / "_bundled" / (
+      "claude.exe" if sys.platform == "win32" else "claude")
+    if bundled.is_file():
+      candidates.append(str(bundled))
+  # PATH first, then the locations the SDK itself falls back to — a daemon
+  # launched from a non-interactive shell can have ~/.local/bin missing from
+  # PATH even though the newest CLI lives there.
+  if which := shutil.which("claude"):
+    candidates.append(which)
+  for p in (Path.home() / ".local/bin/claude", Path.home() / ".claude/local/claude"):
+    if p.is_file():
+      candidates.append(str(p))
+
+  best_path = ""
+  best_ver: tuple[int, ...] = ()
+  seen: set[str] = set()
+  for path in candidates:
+    real = os.path.realpath(path)
+    if real in seen:
+      continue
+    seen.add(real)
+    ver = _cli_version(path)
+    if ver > best_ver:
+      best_path, best_ver = path, ver
+  if not best_path:
+    return ""
+  log.info(
+    "Claude CLI selected: %s (v%s)",
+    best_path, ".".join(str(n) for n in best_ver))
+  return best_path
 
 
 # claude-agent-sdk exposes a native `effort` literal on ClaudeAgentOptions.
@@ -766,6 +840,7 @@ class ClaudeCodingAgent(CodingAgent):
       cwd=self._project_dir,
       model=self._model,
       env=self._build_env(self._project_dir, self._model),
+      cli_path=_resolve_cli_path() or None,
       system_prompt={
         "type": "preset",
         "preset": "claude_code",
@@ -934,6 +1009,7 @@ class ClaudeCodingAgent(CodingAgent):
       cwd=self._project_dir,
       model=self._model,
       env=self._build_env(self._project_dir, self._model),
+      cli_path=_resolve_cli_path() or None,
       system_prompt=_DIGEST_DIRECTIVE,
       max_buffer_size=16 * 1024 * 1024,
     )
@@ -1198,6 +1274,7 @@ class ClaudeCodingAgent(CodingAgent):
       cwd=self._scratch_dir,
       model=model,
       env=self._build_env(project_dir, model),
+      cli_path=_resolve_cli_path() or None,
       stderr=_stderr_handler,
       hooks={
         "PreCompact": [HookMatcher(hooks=[self._on_pre_compact])],
@@ -1275,6 +1352,7 @@ class ClaudeCodingAgent(CodingAgent):
       cwd=project_dir,
       model=model,
       env=env,
+      cli_path=_resolve_cli_path() or None,
       stderr=_stderr_handler,
       # PreCompact fires before the CLI starts summarising context. Without
       # it, the user sees a silent 10-60s working-card stall mid-turn; with
