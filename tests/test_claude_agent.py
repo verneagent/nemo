@@ -1060,9 +1060,34 @@ class _FakeSdkModule:
     self.__file__ = str(pkg_dir / "__init__.py")
 
 
+def test_every_sdk_options_site_pins_cli_path():
+  """Static guard: any ClaudeAgentOptions payload (identified by carrying both
+  cwd= and model=) must also pass cli_path, or that code path silently falls
+  back to the SDK's bundled CLI. Covers main / fork / btw / digest at once, so
+  a future builder can't forget it."""
+  import ast
+  import pathlib
+
+  src = pathlib.Path(ca_module_path()).read_text()
+  sites = []
+  for node in ast.walk(ast.parse(src)):
+    if not isinstance(node, ast.Call):
+      continue
+    kwargs = [k.arg for k in node.keywords]
+    if "cwd" in kwargs and "model" in kwargs:
+      sites.append((node.lineno, "cli_path" in kwargs))
+  assert len(sites) >= 4, f"expected the 4 known options sites, found {sites}"
+  missing = [line for line, has in sites if not has]
+  assert not missing, f"ClaudeAgentOptions payload without cli_path at line(s) {missing}"
+
+
+def ca_module_path() -> str:
+  import nemo.claude_agent as ca
+  return ca.__file__
+
+
 def test_build_options_pins_resolved_cli(tmp_path, monkeypatch):
-  """Every options builder must carry cli_path, or the SDK silently reverts to
-  its bundled CLI for that code path."""
+  """The live main / fork builders hand the resolved CLI to the SDK."""
   import nemo.claude_agent as ca
   from nemo.claude_agent import ClaudeCodingAgent
   from nemo.coding_agent import EndpointConfig
