@@ -41,6 +41,23 @@ A model is **callable under a given agent kind** iff its parent provider
 declares the matching protocol block. A model's per-protocol ``remote``
 override falls back to the model id itself when omitted.
 
+An optional ``agents`` allowlist gates which agent kinds can reach a
+provider's models — ``{ "agents": ["opencode"] }``. Without it, a preset is
+reachable iff the matching protocol URL is populated; with it, the list wins
+outright. This exists because URL-presence is necessary but not sufficient:
+opencode.ai/zen/go/v1 fills both the anthropic and openai blocks yet is a
+chat-only proxy that breaks agentic tool use (claude: 422 on Anthropic tools,
+codex: 404 on /responses), so its models must be hidden from those pickers.
+May sit at the provider level (a default for its models) and/or per-model
+(a replacement; an empty ``[]`` opts back out to URL-based reachability)::
+
+        "opencode-go": {
+          "anthropic": { "baseURL": "…" },
+          "openai":    { "baseURL": "…" },
+          "agents": ["opencode"],
+          "models": { "oc-kimi-k3": {} }
+        }
+
 An optional ``vision`` block declares the native media input the model
 accepts — ``{ "image": bool, "video": bool }`` — so incoming media that the
 model can't see gets routed to the ``nemo-vision`` shell tool instead. It may
@@ -124,8 +141,21 @@ class Preset:
   # block to opt a VL model out of the hint.
   sees_image: bool = False
   sees_video: bool = False
+  # Explicit agent-kind allowlist, from the `agents` block. Non-empty →
+  # the model is reachable ONLY via these agents, regardless of which
+  # protocol URLs are populated (see supports). Empty → URL-based
+  # reachability.
+  agents: tuple[str, ...] = ()
 
   def supports(self, agent: str) -> bool:
+    # An explicit allowlist gates reachability outright. This matters
+    # because URL-presence is necessary but not sufficient: a chat-only
+    # proxy like opencode.ai/zen/go/v1 fills both protocol blocks yet
+    # breaks agentic tool use (claude: 422 on Anthropic tools, codex:
+    # 404 on /responses) — so its models must be hidden from those
+    # pickers even though the URLs exist.
+    if self.agents:
+      return agent in self.agents
     if agent == "claude":
       return bool(self.anthropic_url)
     if agent == "codex":
@@ -250,6 +280,32 @@ def _parse_vision(
   return image, video
 
 
+_KNOWN_AGENT_KINDS: frozenset[str] = frozenset(
+  ("claude", "codex", "opencode", "claude-cli"))
+
+
+def _parse_agents(raw: object, default: tuple[str, ...]) -> tuple[str, ...]:
+  """Parse an ``agents`` allowlist into a tuple of agent kinds.
+
+  Absent or non-list → ``default`` (a provider's allowlist, or ``()``).
+  Entries are kept only when they name a known agent kind; unknown ones
+  are dropped with a warning so a typo can't silently change a model's
+  reachability.
+  """
+  if not isinstance(raw, list):
+    return default
+  kept = tuple(a for a in raw if isinstance(a, str) and a in _KNOWN_AGENT_KINDS)
+  dropped = tuple(
+    a for a in raw if not (isinstance(a, str) and a in _KNOWN_AGENT_KINDS))
+  if dropped:
+    log.warning(
+      "agents contains unknown agent kinds %s — only %s are known",
+      ", ".join(repr(d) for d in dropped),
+      ", ".join(sorted(_KNOWN_AGENT_KINDS)),
+    )
+  return kept
+
+
 def _flatten_providers(providers: dict) -> dict[str, Preset]:
   """Expand provider-grouped JSON into a flat {model_name: Preset} table."""
   out: dict[str, Preset] = {}
@@ -280,6 +336,9 @@ def _flatten_providers(providers: dict) -> dict[str, Preset]:
     # Provider-level media defaults (text-only unless declared); a model's
     # own `vision` block overrides field-by-field.
     prov_image, prov_video = _parse_vision(pdata.get("vision"), False, False)
+    # Provider-level agent allowlist; a model's own `agents` block replaces
+    # it (an empty list opts the model back out to URL-based reachability).
+    prov_agents = _parse_agents(pdata.get("agents"), ())
 
     models = pdata.get("models", {})
     if not isinstance(models, dict):
@@ -293,6 +352,9 @@ def _flatten_providers(providers: dict) -> dict[str, Preset]:
       sees_image, sees_video = _parse_vision(
         mdata.get("vision") if isinstance(mdata, dict) else None,
         prov_image, prov_video)
+      model_agents = _parse_agents(
+        mdata.get("agents") if isinstance(mdata, dict) else None,
+        prov_agents)
       out[model_name] = Preset(
         name=str(model_name),
         api_key_env=api_key_env,
@@ -303,6 +365,7 @@ def _flatten_providers(providers: dict) -> dict[str, Preset]:
         openai_remote=_model_remote(mdata, "openai") or model_name,
         sees_image=sees_image,
         sees_video=sees_video,
+        agents=model_agents,
       )
   return out
 

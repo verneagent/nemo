@@ -30,6 +30,71 @@ def test_supports_only_when_protocol_url_is_set():
   assert p_neither.supports("opencode") is False
 
 
+def test_supports_agents_allowlist_gates_reachability():
+  # A provider that fills BOTH protocol URLs but is only usable by one
+  # agent kind (e.g. opencode.ai/zen/go/v1 is a chat-only proxy — claude
+  # needs Anthropic tools, codex needs /responses, so both 422/404 there).
+  # The explicit allowlist must hide it from the other pickers even though
+  # the URLs are populated.
+  p = Preset(
+    name="oc-kimi-k3",
+    anthropic_url="https://opencode.ai/zen/go/v1",
+    openai_url="https://opencode.ai/zen/go/v1",
+    agents=("opencode",),
+  )
+  assert p.supports("claude") is False
+  assert p.supports("codex") is False
+  assert p.supports("opencode") is True
+
+  # No allowlist → unchanged URL-presence behavior (backward compat).
+  p2 = Preset(
+    name="oc-kimi-k3",
+    anthropic_url="https://opencode.ai/zen/go/v1",
+    openai_url="https://opencode.ai/zen/go/v1",
+  )
+  assert p2.supports("claude") is True
+  assert p2.supports("codex") is True
+  assert p2.supports("opencode") is True
+
+
+def test_flatten_providers_carries_agents_allowlist(caplog):
+  import logging
+  with caplog.at_level(logging.WARNING, logger="nemo.presets"):
+    presets = _flatten_providers({
+      "opencode-go": {
+        "anthropic": {"baseURL": "https://opencode.ai/zen/go/v1"},
+        "openai": {"baseURL": "https://opencode.ai/zen/go/v1"},
+        "agents": ["opencode"],
+        "models": {
+          "oc-kimi-k3": {},
+          # Explicit empty list opts out of the provider allowlist.
+          "oc-hy3": {"agents": []},
+          # Unknown kind is dropped with a warning.
+          "oc-bad": {"agents": ["deepseek"]},
+        },
+      },
+      "deepseek": {
+        "anthropic": {"baseURL": "https://api.deepseek.com/anthropic"},
+        "models": {"deepseek-v4-flash": {}},
+      },
+    })
+  oc = presets["oc-kimi-k3"]
+  assert oc.agents == ("opencode",)
+  assert oc.supports("claude") is False
+  assert oc.supports("codex") is False
+  assert oc.supports("opencode") is True
+  # Empty model-level list overrides the provider default.
+  assert presets["oc-hy3"].agents == ()
+  assert presets["oc-hy3"].supports("claude") is True
+  # Unknown agent kind dropped → back to the provider default (empty), warned.
+  assert presets["oc-bad"].agents == ()
+  assert any("unknown agent kinds" in r.getMessage() for r in caplog.records)
+  # Provider without an allowlist is untouched.
+  ds = presets["deepseek-v4-flash"]
+  assert ds.agents == ()
+  assert ds.supports("claude") is True
+
+
 def test_remote_for_falls_back_to_model_name():
   # Per-protocol override → preset name itself.
   p = Preset(
