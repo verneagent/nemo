@@ -4,6 +4,7 @@ import { stdin, stdout, stderr, exit, argv, env } from "node:process";
 import { createOpencodeClient } from "@opencode-ai/sdk/client";
 import { createOpencodeServer } from "@opencode-ai/sdk/server";
 import { createEventMapper } from "./events.mjs";
+import { modelBody, resolvableModel, injectedProvider } from "./model.mjs";
 
 function parseArgs(rawArgs) {
   const options = {
@@ -53,24 +54,21 @@ function unwrap(result) {
   return result;
 }
 
-function modelBody(model) {
-  if (!model || model === "default") {
-    return undefined;
-  }
-  const slash = model.indexOf("/");
-  if (slash <= 0 || slash >= model.length - 1) {
-    return undefined;
-  }
-  return {
-    providerID: model.slice(0, slash),
-    modelID: model.slice(slash + 1),
-  };
-}
-
 async function main() {
   const options = parseArgs(argv.slice(2));
   const prompt = await readPrompt();
   const systemPrompt = env.NEMO_OPENCODE_SYSTEM_PROMPT || undefined;
+  const model = modelBody(options.model);
+  if (!resolvableModel(options.model)) {
+    await emit({
+      type: "turn.failed",
+      error: {
+        message: `Unresolvable model: ${options.model} (expected provider/model, e.g. deepseek/deepseek-v4-flash)`,
+      },
+    });
+    exit(1);
+  }
+  const provider = injectedProvider(env, model ? model.modelID : "");
   const server = await createOpencodeServer({
     port: 0,
     config: {
@@ -81,6 +79,7 @@ async function main() {
         doom_loop: "allow",
         external_directory: "allow",
       },
+      ...(provider ? { provider } : {}),
     },
   });
   const client = createOpencodeClient({
@@ -91,6 +90,11 @@ async function main() {
   const directory = options.cwd || undefined;
   let sessionID = options.resume || "";
   let events;
+  // A turn is only complete once the server emits turn.completed / session.idle.
+  // If the event stream ends without either (e.g. an unusable cwd silently
+  // kills the session), exit 0 with zero events would look like a successful
+  // empty turn to the daemon — fail loudly instead.
+  let completed = false;
   const eventsAbort = new AbortController();
   try {
     events = await client.event.subscribe({
@@ -112,7 +116,7 @@ async function main() {
       path: { id: sessionID },
       query: { directory },
       body: {
-        model: modelBody(options.model),
+        model,
         system: systemPrompt,
         parts: [{ type: "text", text: prompt }],
       },
@@ -147,6 +151,7 @@ async function main() {
       if (mapped) {
         await emit(mapped);
         if (mapped.type === "turn.completed") {
+          completed = true;
           eventsAbort.abort();
           server.close();
           exit(0);
@@ -157,10 +162,18 @@ async function main() {
         if (event.properties?.sessionID !== sessionID) {
           continue;
         }
+        completed = true;
         eventsAbort.abort();
         server.close();
         exit(0);
       }
+    }
+    if (!completed) {
+      await emit({
+        type: "turn.failed",
+        error: { message: "OpenCode turn ended without a completion event" },
+      });
+      exit(1);
     }
   } finally {
     eventsAbort.abort();

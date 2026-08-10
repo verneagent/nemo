@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from pathlib import Path
 from unittest import mock
 
@@ -13,6 +14,7 @@ from nemo.opencode_agent import (
   _build_agent_prompt,
   query_opencode_model_catalog_data,
 )
+from nemo.presets import Preset
 from nemo.turn import AnswerEvent, DoneEvent, ProgressEvent
 
 
@@ -123,6 +125,102 @@ def test_opencode_build_command_resume():
   assert cmd[-2:] == ["--resume", "sess-123"]
 
 
+def test_opencode_sidecar_model_passthrough():
+  agent = OpenCodeCodingAgent({}, "oc_1", _DummyDB(), _DummyChannel())
+  for model in ("", "default", "deepseek/deepseek-v4-flash"):
+    agent._model = model
+    assert agent._sidecar_model() == (model, None)
+
+
+def test_opencode_sidecar_model_unresolvable_passthrough():
+  agent = OpenCodeCodingAgent({}, "oc_1", _DummyDB(), _DummyChannel())
+  agent._model = "some-garbage"
+  with mock.patch("nemo.presets.resolve_preset", return_value=None):
+    assert agent._sidecar_model() == ("some-garbage", None)
+
+
+def test_opencode_sidecar_model_translates_single_name_preset():
+  agent = OpenCodeCodingAgent({}, "oc_1", _DummyDB(), _DummyChannel())
+  agent._model = "oc-deepseek-v4-flash"
+  preset = Preset(
+    name="oc-deepseek-v4-flash",
+    openai_url="https://opencode.ai/zen/go/v1",
+    openai_remote="deepseek-v4-flash",
+    api_key_env="OPENCODE_GO_API_KEY",
+  )
+  with mock.patch("nemo.presets.resolve_preset", return_value=preset), \
+       mock.patch.dict(os.environ, {"OPENCODE_GO_API_KEY": "sk-zen"}):
+    model_arg, provider = agent._sidecar_model()
+  assert model_arg == "nemo/deepseek-v4-flash"
+  assert provider == (
+    "@ai-sdk/openai-compatible",
+    "https://opencode.ai/zen/go/v1",
+    "sk-zen",
+  )
+
+
+def test_opencode_sidecar_model_anthropic_only_preset():
+  # Kimi For Coding has no OpenAI endpoint → the injected provider must use
+  # the Anthropic AI-SDK package against the anthropic URL.
+  agent = OpenCodeCodingAgent({}, "oc_1", _DummyDB(), _DummyChannel())
+  agent._model = "kimi-for-coding"
+  preset = Preset(
+    name="kimi-for-coding",
+    anthropic_url="https://api.kimi.com/coding",
+    anthropic_remote="kimi-for-coding",
+    api_key_env="KIMI_CODE_API_KEY",
+  )
+  with mock.patch("nemo.presets.resolve_preset", return_value=preset), \
+       mock.patch.dict(os.environ, {"KIMI_CODE_API_KEY": "sk-kimi"}):
+    model_arg, provider = agent._sidecar_model()
+  assert model_arg == "nemo/kimi-for-coding"
+  assert provider == (
+    "@ai-sdk/anthropic",
+    "https://api.kimi.com/coding",
+    "sk-kimi",
+  )
+
+
+def test_opencode_build_command_translates_single_name_preset():
+  agent = OpenCodeCodingAgent({}, "oc_1", _DummyDB(), _DummyChannel())
+  agent._project_dir = "/tmp/project"
+  agent._model = "oc-deepseek-v4-flash"
+  preset = Preset(
+    name="oc-deepseek-v4-flash",
+    openai_url="https://opencode.ai/zen/go/v1",
+    openai_remote="deepseek-v4-flash",
+  )
+  with mock.patch("nemo.presets.resolve_preset", return_value=preset):
+    cmd = agent._build_command()
+  assert cmd[cmd.index("--model") + 1] == "nemo/deepseek-v4-flash"
+
+
+def test_opencode_build_env_injects_provider_for_single_name_preset():
+  agent = OpenCodeCodingAgent(
+    {}, "oc_1", _DummyDB(), _DummyChannel(),
+    system_prompt="Follow the house style guide.",
+  )
+  agent._project_dir = "/tmp/project"
+  agent._model = "oc-deepseek-v4-flash"
+  preset = Preset(
+    name="oc-deepseek-v4-flash",
+    openai_url="https://opencode.ai/zen/go/v1",
+    openai_remote="deepseek-v4-flash",
+    api_key_env="OPENCODE_GO_API_KEY",
+  )
+  with mock.patch("nemo.presets.resolve_preset", return_value=preset), \
+       mock.patch.dict(os.environ, {"OPENCODE_GO_API_KEY": "sk-zen"}):
+    env = agent._build_env()
+  assert env["NEMO_OPENCODE_PROVIDER_URL"] == "https://opencode.ai/zen/go/v1"
+  assert env["NEMO_OPENCODE_PROVIDER_API_KEY"] == "sk-zen"
+  assert env["NEMO_OPENCODE_PROVIDER_NPM"] == "@ai-sdk/openai-compatible"
+  # The injected provider carries the endpoint; the legacy blanket
+  # base-url override must NOT also be set (it could redirect OpenCode's
+  # native providers).
+  assert "OPENAI_BASE_URL" not in env
+  assert "ANTHROPIC_BASE_URL" not in env
+
+
 def test_opencode_prepare_prompt_injects_effort_only():
   agent = OpenCodeCodingAgent(
     {}, "oc_1", _DummyDB(), _DummyChannel(),
@@ -133,6 +231,14 @@ def test_opencode_prepare_prompt_injects_effort_only():
   assert "Reason more carefully" in out
   assert "system_instructions" not in out
   assert "Follow the house style guide." not in out
+
+
+def test_opencode_prepare_prompt_medium_effort_prefix():
+  # /effort medium was a silent no-op (prefix map only had low/high).
+  agent = OpenCodeCodingAgent({}, "oc_1", _DummyDB(), _DummyChannel())
+  agent.set_effort("medium")
+  out = agent._prepare_prompt("hello")
+  assert "moderate care" in out
 
 
 def test_opencode_build_env_exports_nemo_system_prompt():

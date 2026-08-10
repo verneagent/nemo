@@ -3,6 +3,6 @@
   "private": true,
   "type": "module",
   "dependencies": {
-    "@opencode-ai/sdk": "^1.4.7"
+    "@opencode-ai/sdk": "^1.18.16"
   }
 }

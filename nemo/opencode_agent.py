@@ -33,11 +33,25 @@ _EFFORT_PREFIX: dict[str, str] = {
     "Reason tersely. Prefer the smallest sufficient amount of deliberation "
     "before acting."
   ),
+  "medium": (
+    "Reason with moderate care: balance speed against correctness. Check "
+    "assumptions when cheap to do so, but don't over-deliberate."
+  ),
   "high": (
     "Reason more carefully than usual. Double-check assumptions, edge cases, "
     "and tool choices before acting."
   ),
 }
+
+
+def _preset_api_key(preset: object) -> str:
+  """Resolve a preset's API key (literal wins, else the env var at use-time)."""
+  key = getattr(preset, "api_key_literal", "") or (
+    os.environ.get(getattr(preset, "api_key_env", ""), "")
+    if getattr(preset, "api_key_env", "")
+    else ""
+  )
+  return key
 
 
 def _build_agent_prompt(system_prompt: str, vision_note: str = "") -> str:
@@ -243,14 +257,52 @@ class OpenCodeCodingAgent(CodingAgent):
     parts.append(prompt)
     return "\n\n".join(part for part in parts if part)
 
+  def _sidecar_model(self) -> tuple[str, tuple[str, str, str] | None]:
+    """Translate the selected model into an OpenCode ``provider/model`` slug.
+
+    OpenCode only resolves ``provider/model`` slugs against providers it
+    knows. A bare nemo preset name (no slash — oc-*, deepseek-v4-flash,
+    kimi-for-coding, ...) used to be silently dropped by the sidecar
+    (undefined model → OpenCode's DEFAULT model). Translate such presets
+    into ``nemo/<remote>`` and hand the target endpoint to the sidecar via
+    env so the requested model actually runs. Catalog slugs
+    (``deepseek/deepseek-v4-flash``) and ``default`` pass through unchanged.
+
+    Returns ``(model_arg, provider_env)``; ``provider_env`` is a
+    ``(npm, base_url, api_key)`` triple when the sidecar must inject a
+    provider, else ``None``.
+    """
+    if "/" in self._model or self._model in ("", "default"):
+      return self._model, None
+    from .presets import resolve_preset
+    preset = resolve_preset(self._model)
+    if preset is None:
+      return self._model, None  # unresolvable → sidecar fails loudly
+    # Prefer the OpenAI protocol when present: OpenCode sends OpenAI-format
+    # tools, which is also what chat-only proxies (opencode.ai/zen/go) accept
+    # — Anthropic-format tools 422 there. Fall back to anthropic for
+    # anthropic-only providers (kimi).
+    if preset.openai_url:
+      remote = preset.openai_remote or preset.name
+      provider = ("@ai-sdk/openai-compatible", preset.openai_url,
+                  _preset_api_key(preset))
+    elif preset.anthropic_url:
+      remote = preset.anthropic_remote or preset.name
+      provider = ("@ai-sdk/anthropic", preset.anthropic_url,
+                  _preset_api_key(preset))
+    else:
+      return self._model, None
+    return f"nemo/{remote}", provider
+
   def _build_command(self) -> list[str]:
     if self._permission_mode != "bypassPermissions":
       raise RuntimeError("OpenCode provider currently supports only bypassPermissions mode")
 
     args = ["node", str(_SIDE_CAR_SCRIPT)]
     args.extend(["--cwd", self._project_dir])
-    if self._model:
-      args.extend(["--model", self._model])
+    model_arg, _ = self._sidecar_model()
+    if model_arg:
+      args.extend(["--model", model_arg])
     if self._session_id:
       args.extend(["--resume", self._session_id])
     return args
@@ -268,8 +320,21 @@ class OpenCodeCodingAgent(CodingAgent):
     env["NEMO_OPENCODE_SYSTEM_PROMPT"] = _build_agent_prompt(
       self._system_prompt, vision_note)
 
-    # OpenCode is multi-provider — a single base_url is ambiguous. Dispatch
-    # by the model's `provider/` prefix:
+    # A single-name preset gets its endpoint handed over for the sidecar to
+    # inject as an `nemo` provider — the sidecar must NOT also see a blanket
+    # OPENAI_BASE_URL/ANTHROPIC_BASE_URL override that could redirect
+    # OpenCode's native providers.
+    _, provider = self._sidecar_model()
+    if provider:
+      npm, url, key = provider
+      env["NEMO_OPENCODE_PROVIDER_NPM"] = npm
+      env["NEMO_OPENCODE_PROVIDER_URL"] = url
+      if key:
+        env["NEMO_OPENCODE_PROVIDER_API_KEY"] = key
+      return env
+
+    # Otherwise OpenCode is multi-provider — a single base_url is ambiguous.
+    # Dispatch by the model's `provider/` prefix:
     #   anthropic/* → only ANTHROPIC_*
     #   openai/*    → only OPENAI_*
     #   anything else (no slash, "default", or third-party prefix) → set
