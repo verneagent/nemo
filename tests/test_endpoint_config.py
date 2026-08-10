@@ -322,19 +322,13 @@ def test_cli_preset_expands_to_endpoint_and_remote_model(tmp_path):
 
 
 def test_cli_preset_picks_protocol_for_provider(tmp_path):
-  """Same preset, codex provider → OpenAI-protocol fields.
-
-  Uses deepseek-v4-flash — the deepseek preset whose Codex integration
-  is live. deepseek-v4-pro is gated on DeepSeek's /responses endpoint
-  until early August 2026, so it must fail fast under codex instead
-  (see test_cli_deepseek_pro_under_codex_agent_fails_fast).
-  """
+  """Same preset, codex provider → OpenAI-protocol fields."""
   from nemo.__main__ import main
   project = str(tmp_path)
   captured: dict[str, object] = {}
   argv = [
     "nemo", "--chat-id", "oc_1", "--project-dir", project,
-    "--agent", "codex", "--model", "deepseek-v4-flash",
+    "--agent", "codex", "--model", "deepseek-v4-pro",
   ]
   with mock.patch.dict(os.environ, {"DEEPSEEK_API_KEY": "sk-test"}), \
        mock.patch("sys.argv", argv), \
@@ -349,7 +343,7 @@ def test_cli_preset_picks_protocol_for_provider(tmp_path):
   frame = captured["frame"]
   endpoint = frame.f_locals["endpoint"]
   assert endpoint.base_url == "https://api.deepseek.com"  # no /anthropic
-  assert frame.f_locals["model"] == "deepseek-v4-flash"   # no [1m] suffix
+  assert frame.f_locals["model"] == "deepseek-v4-pro"     # no [1m] suffix
 
 
 def test_cli_kimi_under_codex_agent_fails_fast(tmp_path):
@@ -372,32 +366,6 @@ def test_cli_kimi_under_codex_agent_fails_fast(tmp_path):
     "--agent", "codex", "--model", "kimi-for-coding",
   ]
   with mock.patch.dict(os.environ, {"KIMI_API_KEY": "sk-fake"}), \
-       mock.patch("sys.argv", argv), \
-       mock.patch("nemo.__main__._ensure_agent_runtime"), \
-       mock.patch("nemo.config.load_credentials",
-                  return_value={"app_id": "a", "app_secret": "s", "email": ""}), \
-       mock.patch("nemo.preflight.run_preflight", return_value=[]):
-    rc = main()
-  assert rc == 1
-
-
-def test_cli_deepseek_pro_under_codex_agent_fails_fast(tmp_path):
-  """`--agent codex --model deepseek-v4-pro` must fail at startup, not
-  launch and fail on the first turn. DeepSeek's /responses endpoint
-  gates its Codex integration for deepseek-v4-pro ("available starting
-  early August 2026; use deepseek-v4-flash instead"), so the preset's
-  agents allowlist excludes codex — supports("codex") False →
-  _startup_fail. deepseek-v4-flash stays codex-compatible (verified
-  live: /responses non-stream + stream + tools, and a full codex
-  sidecar turn completes via the HTTPS fallback).
-  """
-  from nemo.__main__ import main
-  project = str(tmp_path)
-  argv = [
-    "nemo", "--chat-id", "oc_1", "--project-dir", project,
-    "--agent", "codex", "--model", "deepseek-v4-pro",
-  ]
-  with mock.patch.dict(os.environ, {"DEEPSEEK_API_KEY": "sk-fake"}), \
        mock.patch("sys.argv", argv), \
        mock.patch("nemo.__main__._ensure_agent_runtime"), \
        mock.patch("nemo.config.load_credentials",
