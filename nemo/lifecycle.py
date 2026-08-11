@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
+import re
 import subprocess
 import sys
 import time
@@ -15,6 +17,8 @@ from importlib.metadata import PackageNotFoundError, distribution
 
 
 PACKAGE_NAME = "captain-nemo"
+
+_LOG = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -120,6 +124,62 @@ def helper_log_path(parent_pid: int) -> str:
   return os.path.join(log_dir, f"nemo-lifecycle-{parent_pid}.log")
 
 
+# Env vars that must keep the running daemon's own values on restart. A
+# freshly sourced shell may rebuild PATH from its profile (brew, pyenv, nvm
+# shims, …) or carry per-invocation noise (PWD/SHLVL/_); those are never
+# overlaid — only profile-defined credential/setting vars are.
+_PROTECTED_RESTART_ENV: frozenset[str] = frozenset({
+  "HOME", "PATH", "PWD", "OLDPWD", "SHLVL", "_", "TMPDIR", "TERM",
+  "TERM_PROGRAM",
+})
+
+_ENV_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def shell_profile_env(timeout_s: float = 5.0) -> dict[str, str]:
+  """Re-read user env vars from the zsh profile files (e.g. ~/.zshenv).
+
+  ``/restart`` spawns the replacement Nemo with the *current* process env
+  (subprocess inherits os.environ), so a key added or rotated in a shell
+  profile after the daemon started never reaches the restarted daemon — e.g.
+  "Preset oc-… needs $OPENCODE_GO_API_KEY in the daemon env" after a mid-run
+  ``/restart``. Re-source the profile files in a non-interactive zsh and
+  return exactly the profile-defined vars so the caller can layer them over
+  the process env. Returns {} if zsh or the profile is unavailable, so a
+  restart never blocks on it.
+  """
+  home = os.environ.get("HOME")
+  if not home:
+    return {}
+  try:
+    result = subprocess.run(
+      ["/bin/zsh", "-c",
+       '[[ -f "$HOME/.zprofile" ]] && source "$HOME/.zprofile" 2>/dev/null; env'],
+      capture_output=True,
+      text=True,
+      timeout=timeout_s,
+      check=False,
+    )
+  except (OSError, subprocess.TimeoutExpired) as exc:
+    _LOG.warning("Skipping shell profile env on restart: %s", exc)
+    return {}
+  if result.returncode != 0:
+    _LOG.warning(
+      "Skipping shell profile env on restart (zsh rc=%d): %s",
+      result.returncode, result.stderr.strip(),
+    )
+    return {}
+  overlay: dict[str, str] = {}
+  for line in result.stdout.splitlines():
+    if "=" not in line:
+      continue
+    key, _, value = line.partition("=")
+    if key in _PROTECTED_RESTART_ENV or not _ENV_KEY_RE.match(key):
+      continue
+    overlay[key] = value
+  return overlay
+
+
 def spawn_lifecycle_helper(
   spec: RestartSpec,
   *,
@@ -143,6 +203,10 @@ def spawn_lifecycle_helper(
     helper_args.append("--upgrade")
   helper_args.append("--")
   helper_args.extend(restart_args)
+  # Layer the current shell profile's env over the daemon's env so the
+  # replacement picks up keys added or rotated since the daemon started.
+  env = dict(os.environ)
+  env.update(shell_profile_env())
   with open(log_path, "ab", buffering=0) as log_file:
     subprocess.Popen(
       helper_args,
@@ -151,6 +215,7 @@ def spawn_lifecycle_helper(
       stderr=log_file,
       start_new_session=True,
       close_fds=True,
+      env=env,
     )
   return log_path
 

@@ -145,6 +145,7 @@ def test_spawn_lifecycle_helper_returns_log_path(tmp_path):
     permission_mode="bypassPermissions",
   )
   with mock.patch("nemo.lifecycle.helper_log_path", return_value=str(tmp_path / "life.log")), \
+       mock.patch("nemo.lifecycle.shell_profile_env", return_value={}), \
        mock.patch("nemo.lifecycle.subprocess.Popen") as popen:
     log_path = lifecycle.spawn_lifecycle_helper(spec, original_args=[])
 
@@ -155,6 +156,26 @@ def test_spawn_lifecycle_helper_returns_log_path(tmp_path):
   assert "--chat-id" in cmd
 
 
+def test_spawn_lifecycle_helper_overlays_profile_env(tmp_path):
+  spec = lifecycle.RestartSpec(
+    chat_id="oc_real",
+    project_dir="/repo",
+    agent="opencode",
+    model="oc-deepseek-v4-flash",
+    permission_mode="bypassPermissions",
+  )
+  with mock.patch("nemo.lifecycle.helper_log_path", return_value=str(tmp_path / "life.log")), \
+       mock.patch("nemo.lifecycle.shell_profile_env",
+                  return_value={"OPENCODE_GO_API_KEY": "sk-new"}), \
+       mock.patch("nemo.lifecycle.subprocess.Popen") as popen:
+    lifecycle.spawn_lifecycle_helper(spec, original_args=[])
+
+  _, kwargs = popen.call_args
+  assert kwargs["env"]["OPENCODE_GO_API_KEY"] == "sk-new"
+  assert kwargs["env"]["HOME"]  # base os.environ is preserved
+  assert "--model" in popen.call_args.args[0]
+
+
 def test_run_helper_does_not_restart_when_upgrade_fails(tmp_path):
   failed = mock.Mock(returncode=1, stdout="bad\n")
   with mock.patch("nemo.lifecycle.subprocess.run", return_value=failed), \
@@ -163,3 +184,64 @@ def test_run_helper_does_not_restart_when_upgrade_fails(tmp_path):
 
   assert rc == 1
   popen.assert_not_called()
+
+
+def _env_output(stdout: str, rc: int = 0) -> mock.Mock:
+  return mock.Mock(returncode=rc, stdout=stdout, stderr="")
+
+
+def test_shell_profile_env_returns_profile_keys(monkeypatch):
+  out = (
+    "HOME=/Users/x\n"
+    "PATH=/opt/homebrew/bin:/usr/bin:/bin\n"
+    "PWD=/Users/x\n"
+    "SHLVL=1\n"
+    "OPENCODE_GO_API_KEY=sk-new\n"
+    "DEEPSEEK_API_KEY=sk-rotated\n"
+    "FOO=bar\n"
+  )
+  monkeypatch.setenv("HOME", "/Users/x")
+  with mock.patch("nemo.lifecycle.subprocess.run",
+                  return_value=_env_output(out)) as run:
+    overlay = lifecycle.shell_profile_env()
+
+  assert overlay == {
+    "OPENCODE_GO_API_KEY": "sk-new",
+    "DEEPSEEK_API_KEY": "sk-rotated",
+    "FOO": "bar",
+  }
+  # Runtime/session vars are excluded so the daemon's own values win.
+  assert "PATH" not in overlay
+  assert "PWD" not in overlay
+  assert "SHLVL" not in overlay
+  assert run.call_args.args[0] == [
+    "/bin/zsh", "-c",
+    '[[ -f "$HOME/.zprofile" ]] && source "$HOME/.zprofile" 2>/dev/null; env',
+  ]
+
+
+def test_shell_profile_env_skips_malformed_lines(monkeypatch):
+  out = "OPENCODE_GO_API_KEY=sk-new\nnot-a-key=???\nFOO\n=x\n"
+  monkeypatch.setenv("HOME", "/Users/x")
+  with mock.patch("nemo.lifecycle.subprocess.run",
+                  return_value=_env_output(out)):
+    assert lifecycle.shell_profile_env() == {"OPENCODE_GO_API_KEY": "sk-new"}
+
+
+def test_shell_profile_env_empty_without_home(monkeypatch):
+  monkeypatch.delenv("HOME", raising=False)
+  assert lifecycle.shell_profile_env() == {}
+
+
+def test_shell_profile_env_falls_back_when_zsh_missing(monkeypatch):
+  monkeypatch.setenv("HOME", "/Users/x")
+  with mock.patch("nemo.lifecycle.subprocess.run",
+                  side_effect=FileNotFoundError):
+    assert lifecycle.shell_profile_env() == {}
+
+
+def test_shell_profile_env_falls_back_when_profile_errors(monkeypatch):
+  monkeypatch.setenv("HOME", "/Users/x")
+  with mock.patch("nemo.lifecycle.subprocess.run",
+                  return_value=_env_output("", rc=127)):
+    assert lifecycle.shell_profile_env() == {}
