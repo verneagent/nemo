@@ -3757,6 +3757,80 @@ def test_display_model_passes_plain_default_model_through():
   assert _display_model("claude-opus-4-7", "", "claude") == "claude-opus-4-7"
 
 
+def test_ctx_model_holds_display_name_so_model_commands_distinguish(tmp_path):
+  """Regression: `ctx.model` feeds the `/model` picker highlight, its
+  fallback text, `/ping`, and `/cost`. It must hold the DISPLAY name
+  (preset name recovered from the endpoint URL), not the shared resolved
+  remote id — otherwise `oc-deepseek-v4-flash` and official
+  `deepseek-v4-flash` both print `deepseek-v4-flash` and can't be told
+  apart. After switching to each, `/ping` must show the distinct name."""
+  import os as _os
+  from nemo.channel import IncomingMessage
+
+  send_spy = mock.AsyncMock()
+
+  class _SpyAgent(_FakeAgent):
+    def set_endpoint(self, endpoint):
+      pass
+
+  agent = _SpyAgent()
+  queued = _QueuedChannel("oc_test", [
+    IncomingMessage(
+      event_type="im.message.receive_v1", chat_id="oc_test",
+      sender_id="ou_user", message_id="om_to_oc", msg_type="text",
+      text="/model oc-deepseek-v4-flash", create_time="1",
+    ),
+    IncomingMessage(
+      event_type="im.message.receive_v1", chat_id="oc_test",
+      sender_id="ou_user", message_id="om_ping_oc", msg_type="text",
+      text="/ping", create_time="2",
+    ),
+    IncomingMessage(
+      event_type="im.message.receive_v1", chat_id="oc_test",
+      sender_id="ou_user", message_id="om_to_official", msg_type="text",
+      text="/model deepseek-v4-flash", create_time="3",
+    ),
+    IncomingMessage(
+      event_type="im.message.receive_v1", chat_id="oc_test",
+      sender_id="ou_user", message_id="om_ping_official", msg_type="text",
+      text="/ping", create_time="4",
+    ),
+    IncomingMessage(
+      event_type="im.message.receive_v1", chat_id="oc_test",
+      sender_id="ou_user", message_id="om_exit", msg_type="text",
+      text="/exit", create_time="5",
+    ),
+  ])
+
+  with mock.patch.dict(_os.environ, {
+    "OPENCODE_GO_API_KEY": "sk-test-oc",
+    "DEEPSEEK_API_KEY": "sk-test",
+  }), \
+       mock.patch("nemo.agent.load_credentials", return_value={
+         "app_id": "a", "app_secret": "s", "email": "u@e.com",
+       }), \
+       mock.patch("nemo.agent.Database", _FakeDB), \
+       mock.patch("nemo.agent.LarkChannel", return_value=queued), \
+       mock.patch("nemo.agent.build_coding_agent", return_value=agent), \
+       mock.patch("nemo.agent._send_response", new=send_spy), \
+       mock.patch("nemo.group_config.load_config", return_value={}), \
+       mock.patch("nemo.config.load_relay_config", return_value=("", "")), \
+       mock.patch("signal.signal"):
+    rc = asyncio.run(
+      main_loop("oc_test", str(tmp_path), "claude-opus-4-7", agent="claude")
+    )
+  assert rc == 0
+  # `_send_response(channel, chat_id, text, db)` → text is args[2].
+  pongs = [c.args[2] for c in send_spy.call_args_list if "Pong" in c.args[2]]
+  assert len(pongs) == 2, pongs
+  # After oc-deepseek-v4-flash → the oc- prefix is visible, so the
+  # opencode-go provider is distinguishable from the official one.
+  assert "oc-deepseek-v4-flash" in pongs[0], pongs[0]
+  # After switching back to the official endpoint → plain name again.
+  assert "deepseek-v4-flash" in pongs[1], pongs[1]
+  assert "oc-" not in pongs[1], pongs[1]
+
+
 # ---------------------------------------------------------------------------
 # Stop/esc must interrupt the turn, never kill the daemon
 # ---------------------------------------------------------------------------

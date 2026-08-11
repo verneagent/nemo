@@ -1715,7 +1715,8 @@ async def main_loop(
     raise
 
   # Context
-  ctx = commands.AgentContext(model, project_dir, time.time())
+  ctx = commands.AgentContext(
+    _display_model(model, _endpoint_key, agent), project_dir, time.time())
   ctx.agent = agent
   ctx.effort = effort
   main_loop_ref = asyncio.get_running_loop()
@@ -1869,7 +1870,7 @@ async def main_loop(
           # the switch logic — and the stale dropdown can't be retried.
           if not is_model_compatible(agent, model_name):
             await _lock_model_picker(
-              channel, reply.message_id, agent=agent, model=model,
+              channel, reply.message_id, agent=agent, model=ctx.model,
               project_dir=project_dir, ok=False, attempted=model_name,
               reason=(
                 f"`{model_name}` isn't available for agent **{agent}** "
@@ -1935,7 +1936,7 @@ async def main_loop(
             # Should be unreachable (the dropdown only offers valid kinds),
             # but defend in case the wire delivers something weird.
             await _lock_agent_picker(
-              channel, reply.message_id, agent=agent, model=model,
+              channel, reply.message_id, agent=agent, model=ctx.model,
               ok=False, attempted=agent_name,
               reason=f"Unknown agent `{agent_name}`.",
             )
@@ -1950,7 +1951,7 @@ async def main_loop(
             # (which is skipped by commands.py when arg == ctx.agent and
             # would leave the picker live).
             await _lock_agent_picker(
-              channel, reply.message_id, agent=agent, model=model, ok=True)
+              channel, reply.message_id, agent=agent, model=ctx.model, ok=True)
             await _send_response(
               channel, chat_id, f"Already on agent **{agent}**.", db)
             continue
@@ -2192,7 +2193,7 @@ async def main_loop(
               )
               await _lock_model_picker(
                 channel, _pending_picker_msg_id,
-                agent=agent, model=model, project_dir=project_dir,
+                agent=agent, model=ctx.model, project_dir=project_dir,
               ok=False, attempted=new_model,
                 reason=f"Preset **{new_model}** has no endpoint for "
                        f"agent **{agent}**.")
@@ -2208,7 +2209,7 @@ async def main_loop(
               )
               await _lock_model_picker(
                 channel, _pending_picker_msg_id,
-                agent=agent, model=model, project_dir=project_dir,
+                agent=agent, model=ctx.model, project_dir=project_dir,
               ok=False, attempted=new_model,
                 reason=f"Preset **{new_model}** needs "
                        f"`${preset.api_key_env}` in the daemon env.")
@@ -2232,7 +2233,7 @@ async def main_loop(
                      preset.name, switched_to, _endpoint_key,
                      _sdk_session_id[:8] if _sdk_session_id else "none")
             model = switched_to
-            ctx.model = model
+            ctx.model = _display_model(model, _endpoint_key, agent)
             await _restart_client(resume=_sdk_session_id)
             await channel.update_status(
               _display_model(model, _endpoint_key, agent), "idle", agent)
@@ -2246,7 +2247,7 @@ async def main_loop(
             )
             await _lock_model_picker(
               channel, _pending_picker_msg_id,
-              agent=agent, model=model, project_dir=project_dir, ok=True)
+              agent=agent, model=ctx.model, project_dir=project_dir, ok=True)
             _pending_picker_msg_id = ""
             continue
           if not is_model_compatible(agent, new_model):
@@ -2258,7 +2259,7 @@ async def main_loop(
             )
             await _lock_model_picker(
               channel, _pending_picker_msg_id,
-              agent=agent, model=model, project_dir=project_dir,
+              agent=agent, model=ctx.model, project_dir=project_dir,
               ok=False, attempted=new_model,
               reason=f"`{new_model}` isn't available for agent **{agent}**.")
             _pending_picker_msg_id = ""
@@ -2275,7 +2276,7 @@ async def main_loop(
           _sdk_session_id = db.get_sdk_session_id(
             chat_id, agent, _endpoint_key)
           model = new_model
-          ctx.model = model
+          ctx.model = _display_model(model, _endpoint_key, agent)
           log.info("Model switch to %s (endpoint=default resume=%s)",
                    model, _sdk_session_id[:8] if _sdk_session_id else "none")
           await _restart_client(resume=_sdk_session_id)
@@ -2289,7 +2290,7 @@ async def main_loop(
           )
           await _lock_model_picker(
             channel, _pending_picker_msg_id,
-            agent=agent, model=model, project_dir=project_dir, ok=True)
+            agent=agent, model=ctx.model, project_dir=project_dir, ok=True)
           _pending_picker_msg_id = ""
         elif response and response.startswith("__agent__:"):
           # Format: "__agent__:<name>:<default_model>"
@@ -2312,7 +2313,7 @@ async def main_loop(
           endpoint = EndpointConfig()
           _endpoint_key = ""
           ctx.agent = agent
-          ctx.model = model
+          ctx.model = _display_model(model, _endpoint_key, agent)
           _sdk_session_id = db.get_sdk_session_id(chat_id, agent, _endpoint_key)
           coding_agent = build_coding_agent(
             agent, credentials, chat_id, db, channel,
@@ -2337,7 +2338,7 @@ async def main_loop(
             )
             await _lock_agent_picker(
               channel, _pending_agent_picker_msg_id,
-              agent=agent, model=model, ok=False, attempted=new_agent,
+              agent=agent, model=ctx.model, ok=False, attempted=new_agent,
               reason=f"Starting **{new_agent}** failed: {exc}")
             _pending_agent_picker_msg_id = ""
             await _clear_ack()
@@ -2371,7 +2372,7 @@ async def main_loop(
           )
           await _lock_agent_picker(
             channel, _pending_agent_picker_msg_id,
-            agent=agent, model=model, ok=True)
+            agent=agent, model=ctx.model, ok=True)
           _pending_agent_picker_msg_id = ""
         elif response and response.startswith("__effort__:"):
           new_effort = response.split(":", 1)[1]
