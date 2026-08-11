@@ -177,6 +177,10 @@ class OpenCodeCodingAgent(CodingAgent):
     # True while a tool part is in "running" state — disarm the idle clock so a
     # long tool execution isn't mistaken for a stalled model.
     tool_in_flight = False
+    # True once the sidecar relays any completion (turn.completed or the
+    # session.idle relay). Lets the EOF path distinguish a normal idle finish
+    # from a silent answer-drop (server/sidecar died before completing).
+    saw_completion = False
 
     try:
       while True:
@@ -215,10 +219,17 @@ class OpenCodeCodingAgent(CodingAgent):
           self._session_id = str(event.get("session_id", "") or "")
           continue
         if event_type == "turn.completed":
+          saw_completion = True
           usage = self._normalize_usage(self._coerce_json_object(event.get("usage")))
           event_cost = event.get("cost")
           if isinstance(event_cost, int | float):
             cost = float(event_cost)
+          continue
+        if event_type == "session.idle":
+          # Sidecar relays this when the server goes idle — a normal turn
+          # finish. Mark the turn complete so a bare stream-end without any
+          # completion event isn't misread as a silent answer-drop.
+          saw_completion = True
           continue
         if event_type == "turn.failed":
           error = self._coerce_json_object(event.get("error"))
@@ -253,7 +264,25 @@ class OpenCodeCodingAgent(CodingAgent):
             ProgressEvent(kind=kind, summary=summary, first=is_first),
           )
 
-      rc = await proc.wait()
+      # Bound the wait with the hard deadline: a pathological proc.wait() — the
+      # sidecar died but the asyncio child watcher never resolved it (the exact
+      # oc_623b wedge) — must not hang the group until an external SIGKILL.
+      try:
+        rc = await asyncio.wait_for(
+          proc.wait(), timeout=max(0.0, hard_deadline - loop.time()))
+      except asyncio.TimeoutError:
+        await self._force_stop()
+        raise TimeoutError(
+          f"OpenCode turn exceeded {_TURN_TIMEOUT:.0f}s ceiling"
+        ) from None
+      if failure is None and rc == 0 and not saw_completion and not self._interrupted:
+        # Stream ended but no completion ever relayed (no turn.completed, no
+        # session.idle). The answer is lost — the sidecar/server died mid-round
+        # or the server silently killed the session. Recoverable: the main loop
+        # treats TimeoutError as "context preserved, re-send".
+        failure = "OpenCode ended the turn without a completion event"
+        await self._emit_event(on_event, ErrorEvent(message=failure))
+        raise TimeoutError(f"{failure} — context preserved, send another message to continue") from None
       if failure is None and rc != 0 and not self._interrupted:
         failure = f"OpenCode sidecar exited with status {rc}"
         await self._emit_event(on_event, ErrorEvent(message=failure))

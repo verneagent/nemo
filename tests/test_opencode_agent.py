@@ -15,7 +15,7 @@ from nemo.opencode_agent import (
   query_opencode_model_catalog_data,
 )
 from nemo.presets import Preset
-from nemo.turn import AnswerEvent, DoneEvent, ProgressEvent
+from nemo.turn import AnswerEvent, DoneEvent, ErrorEvent, ProgressEvent
 
 
 class _DummyDB:
@@ -92,6 +92,23 @@ class _FakeProc:
   def kill(self) -> None:
     self.killed = True
     self.returncode = -9
+
+
+class _HangingWaitProc(_FakeProc):
+  """Fake proc whose wait() never resolves (cancellable).
+
+  Simulates the pathological case where the sidecar died but the asyncio child
+  watcher never resolves the wait — the exact oc_623b wedge. run_turn must hit
+  the hard ceiling instead of hanging the group.
+  """
+
+  def __init__(self, *args, **kwargs):
+    super().__init__(*args, **kwargs)
+    self._wait_event = asyncio.Event()
+
+  async def wait(self) -> int:
+    await self._wait_event.wait()  # never set
+    return 0
 
 
 def test_default_model_for_agent():
@@ -406,6 +423,117 @@ def test_opencode_run_turn_hard_ceiling_while_tool_in_flight():
       b'{"type":"item.completed","item":{"type":"tool_call","tool":"bash","title":"Build","status":"running"}}\n',
     ]
     proc = _FakeProc(stdout=_BlockingStream(lines))
+    agent = OpenCodeCodingAgent({}, "oc_1", _DummyDB(), _DummyChannel())
+    await agent.start("/tmp/project", "anthropic/claude-sonnet-4-5")
+
+    events = []
+
+    async def _fake_spawn(*args, **kwargs):
+      return proc
+
+    with mock.patch("shutil.which", side_effect=lambda name: f"/usr/bin/{name}"), \
+         mock.patch("nemo.opencode_agent._SIDE_CAR_SCRIPT", Path("/tmp/run_turn.mjs")), \
+         mock.patch("nemo.opencode_agent._SIDE_CAR_PACKAGE", Path("/tmp/package.json")), \
+         mock.patch.object(Path, "is_file", return_value=True), \
+         mock.patch.object(Path, "is_dir", return_value=True), \
+         mock.patch("asyncio.create_subprocess_exec", side_effect=_fake_spawn), \
+         mock.patch("nemo.opencode_agent._IDLE_TIMEOUT", 30.0), \
+         mock.patch("nemo.opencode_agent._TURN_TIMEOUT", 0.05):
+      try:
+        await agent.run_turn("fix it", events.append)
+      except TimeoutError as exc:
+        assert "ceiling" in str(exc)
+      else:
+        raise AssertionError("expected TimeoutError")
+
+    assert proc.terminated
+
+  asyncio.run(_run())
+
+
+def test_opencode_run_turn_eof_without_completion_raises_recoverable():
+  # Regression for the oc_623b `task`-tool recurrence: the sidecar died
+  # mid-turn and the stream ended (EOF) WITHOUT any completion event. run_turn
+  # must raise a recoverable TimeoutError (→ "context preserved, re-send"),
+  # never emit a silent empty DoneEvent.
+  async def _run():
+    lines = [
+      b'{"type":"session.started","session_id":"sess-1"}\n',
+      b'{"type":"item.completed","item":{"type":"reasoning","text":"Inspect"}}\n',
+      b'{"type":"item.completed","item":{"type":"tool_call","tool":"task","title":"research aptos","status":"completed"}}\n',
+    ]
+    proc = _FakeProc(lines)  # rc=0, stream ends (EOF) after the lines
+    agent = OpenCodeCodingAgent({}, "oc_1", _DummyDB(), _DummyChannel())
+    await agent.start("/tmp/project", "anthropic/claude-sonnet-4-5")
+
+    events = []
+
+    async def _fake_spawn(*args, **kwargs):
+      return proc
+
+    with mock.patch("shutil.which", side_effect=lambda name: f"/usr/bin/{name}"), \
+         mock.patch("nemo.opencode_agent._SIDE_CAR_SCRIPT", Path("/tmp/run_turn.mjs")), \
+         mock.patch("nemo.opencode_agent._SIDE_CAR_PACKAGE", Path("/tmp/package.json")), \
+         mock.patch.object(Path, "is_file", return_value=True), \
+         mock.patch.object(Path, "is_dir", return_value=True), \
+         mock.patch("asyncio.create_subprocess_exec", side_effect=_fake_spawn):
+      try:
+        await agent.run_turn("fix it", events.append)
+      except TimeoutError as exc:
+        assert "without a completion event" in str(exc)
+      else:
+        raise AssertionError("expected TimeoutError")
+
+    # Events before the drop were surfaced; no DoneEvent was invented.
+    assert any(isinstance(e, ErrorEvent) for e in events)
+    assert not any(isinstance(e, DoneEvent) for e in events)
+
+  asyncio.run(_run())
+
+
+def test_opencode_run_turn_session_idle_relay_is_a_completion():
+  # The sidecar relays session.idle on a normal idle finish. That must be
+  # treated as a completion (not a silent drop), so the turn emits DoneEvent.
+  async def _run():
+    lines = [
+      b'{"type":"session.started","session_id":"sess-1"}\n',
+      b'{"type":"item.completed","item":{"type":"agent_message","text":"Aptos news"}}\n',
+      b'{"type":"session.idle","session_id":"sess-1"}\n',
+    ]
+    proc = _FakeProc(lines)  # rc=0
+    agent = OpenCodeCodingAgent({}, "oc_1", _DummyDB(), _DummyChannel())
+    await agent.start("/tmp/project", "anthropic/claude-sonnet-4-5")
+
+    events = []
+
+    async def _fake_spawn(*args, **kwargs):
+      return proc
+
+    with mock.patch("shutil.which", side_effect=lambda name: f"/usr/bin/{name}"), \
+         mock.patch("nemo.opencode_agent._SIDE_CAR_SCRIPT", Path("/tmp/run_turn.mjs")), \
+         mock.patch("nemo.opencode_agent._SIDE_CAR_PACKAGE", Path("/tmp/package.json")), \
+         mock.patch.object(Path, "is_file", return_value=True), \
+         mock.patch.object(Path, "is_dir", return_value=True), \
+         mock.patch("asyncio.create_subprocess_exec", side_effect=_fake_spawn):
+      cost, usage = await agent.run_turn("Aptos 近况怎样", events.append)
+
+    assert any(isinstance(e, AnswerEvent) and e.text == "Aptos news" for e in events)
+    assert any(isinstance(e, DoneEvent) for e in events)
+    assert not any(isinstance(e, ErrorEvent) for e in events)
+
+  asyncio.run(_run())
+
+
+def test_opencode_run_turn_wedged_proc_wait_hits_ceiling():
+  # The sidecar died and readline hit EOF, but proc.wait() never resolves (the
+  # pathological asyncio child-watcher wedge). The hard ceiling must fire
+  # instead of hanging the group until an external SIGKILL.
+  async def _run():
+    lines = [
+      b'{"type":"session.started","session_id":"sess-1"}\n',
+      b'{"type":"item.completed","item":{"type":"reasoning","text":"Inspect"}}\n',
+    ]
+    proc = _HangingWaitProc(stdout=_FakeStream(lines))
     agent = OpenCodeCodingAgent({}, "oc_1", _DummyDB(), _DummyChannel())
     await agent.start("/tmp/project", "anthropic/claude-sonnet-4-5")
 

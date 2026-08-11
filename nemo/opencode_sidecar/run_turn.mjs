@@ -162,6 +162,10 @@ async function main() {
         if (event.properties?.sessionID !== sessionID) {
           continue;
         }
+        // Relay the completion so the daemon can distinguish a normal idle
+        // finish from a silent stream drop (sidecar/server died mid-turn before
+        // emitting turn.completed/session.idle).
+        await emit({ type: "session.idle", session_id: sessionID });
         completed = true;
         eventsAbort.abort();
         server.close();
