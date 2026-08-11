@@ -43,6 +43,9 @@ function handlePart(part, delta) {
           tool: typeof part.tool === "string" ? part.tool : "",
           title: typeof state.title === "string" ? state.title : "",
           input: state.input && typeof state.input === "object" ? state.input : {},
+          // Lets the daemon disarm its idle-stall timeout while a tool is in
+          // flight (a long bash run produces no events until it returns).
+          status: state.status,
         },
       };
     }

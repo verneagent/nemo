@@ -51,10 +51,30 @@ class _FakeStdin:
     self.closed = True
 
 
+class _BlockingStream:
+  """Stream that yields lines then blocks forever (cancellable).
+
+  Simulates a sidecar that produced events but whose model follow-up round
+  never arrives — the exact oc_623b stall (reasoning + skill tool, then
+  silence). ``asyncio.wait_for`` cancels the pending ``readline``.
+  """
+
+  def __init__(self, lines: list[bytes]):
+    self._lines = list(lines)
+    self._block = asyncio.Event()
+
+  async def readline(self) -> bytes:
+    if self._lines:
+      return self._lines.pop(0)
+    await self._block.wait()
+    return b""
+
+
 class _FakeProc:
-  def __init__(self, stdout_lines: list[bytes], returncode: int = 0):
+  def __init__(self, stdout_lines: list[bytes] | None = None,
+               returncode: int = 0, stdout=None):
     self.stdin = _FakeStdin()
-    self.stdout = _FakeStream(stdout_lines)
+    self.stdout = stdout if stdout is not None else _FakeStream(stdout_lines or [])
     self.stderr = _FakeStream([])
     self.returncode = None
     self._final_returncode = returncode
@@ -328,6 +348,88 @@ def test_opencode_run_turn_maps_events():
     assert usage["input_tokens"] == 8
     assert usage["cache_read_input_tokens"] == 2
     assert usage["total_tokens"] == 15
+
+  asyncio.run(_run())
+
+
+def test_opencode_run_turn_idle_timeout_on_silent_sidecar():
+  # Regression for the oc_623b hang: the model reasoned, called the native
+  # `skill` tool (completed), then the follow-up round never arrived. The
+  # sidecar went silent; run_turn must raise TimeoutError (→ the main loop's
+  # "Timed out — context preserved" card) instead of wedging the group.
+  async def _run():
+    lines = [
+      b'{"type":"session.started","session_id":"sess-1"}\n',
+      b'{"type":"item.completed","item":{"type":"reasoning","text":"Inspect"}}\n',
+      b'{"type":"item.completed","item":{"type":"tool_call","tool":"skill","title":"agent-reach","status":"completed"}}\n',
+    ]
+    proc = _FakeProc(stdout=_BlockingStream(lines))
+    agent = OpenCodeCodingAgent({}, "oc_1", _DummyDB(), _DummyChannel())
+    await agent.start("/tmp/project", "anthropic/claude-sonnet-4-5")
+
+    events = []
+
+    async def _fake_spawn(*args, **kwargs):
+      return proc
+
+    with mock.patch("shutil.which", side_effect=lambda name: f"/usr/bin/{name}"), \
+         mock.patch("nemo.opencode_agent._SIDE_CAR_SCRIPT", Path("/tmp/run_turn.mjs")), \
+         mock.patch("nemo.opencode_agent._SIDE_CAR_PACKAGE", Path("/tmp/package.json")), \
+         mock.patch.object(Path, "is_file", return_value=True), \
+         mock.patch.object(Path, "is_dir", return_value=True), \
+         mock.patch("asyncio.create_subprocess_exec", side_effect=_fake_spawn), \
+         mock.patch("nemo.opencode_agent._IDLE_TIMEOUT", 0.05), \
+         mock.patch("nemo.opencode_agent._TURN_TIMEOUT", 30.0):
+      try:
+        await agent.run_turn("fix it", events.append)
+      except TimeoutError as exc:
+        assert "stopped responding" in str(exc)
+      else:
+        raise AssertionError("expected TimeoutError")
+
+    # The sidecar was force-stopped on timeout.
+    assert proc.terminated
+    # Events up to the stall were surfaced before the timeout.
+    assert any(isinstance(e, ProgressEvent) and e.kind == "reasoning" for e in events)
+    assert any(isinstance(e, ProgressEvent) and e.kind == "tool" for e in events)
+
+  asyncio.run(_run())
+
+
+def test_opencode_run_turn_hard_ceiling_while_tool_in_flight():
+  # The idle clock is disarmed while a tool is running (a long bash produces no
+  # events), but the hard ceiling must still fire.
+  async def _run():
+    lines = [
+      b'{"type":"session.started","session_id":"sess-1"}\n',
+      b'{"type":"item.completed","item":{"type":"reasoning","text":"Inspect"}}\n',
+      b'{"type":"item.completed","item":{"type":"tool_call","tool":"bash","title":"Build","status":"running"}}\n',
+    ]
+    proc = _FakeProc(stdout=_BlockingStream(lines))
+    agent = OpenCodeCodingAgent({}, "oc_1", _DummyDB(), _DummyChannel())
+    await agent.start("/tmp/project", "anthropic/claude-sonnet-4-5")
+
+    events = []
+
+    async def _fake_spawn(*args, **kwargs):
+      return proc
+
+    with mock.patch("shutil.which", side_effect=lambda name: f"/usr/bin/{name}"), \
+         mock.patch("nemo.opencode_agent._SIDE_CAR_SCRIPT", Path("/tmp/run_turn.mjs")), \
+         mock.patch("nemo.opencode_agent._SIDE_CAR_PACKAGE", Path("/tmp/package.json")), \
+         mock.patch.object(Path, "is_file", return_value=True), \
+         mock.patch.object(Path, "is_dir", return_value=True), \
+         mock.patch("asyncio.create_subprocess_exec", side_effect=_fake_spawn), \
+         mock.patch("nemo.opencode_agent._IDLE_TIMEOUT", 30.0), \
+         mock.patch("nemo.opencode_agent._TURN_TIMEOUT", 0.05):
+      try:
+        await agent.run_turn("fix it", events.append)
+      except TimeoutError as exc:
+        assert "ceiling" in str(exc)
+      else:
+        raise AssertionError("expected TimeoutError")
+
+    assert proc.terminated
 
   asyncio.run(_run())
 

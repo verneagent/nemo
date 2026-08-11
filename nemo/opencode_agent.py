@@ -43,6 +43,18 @@ _EFFORT_PREFIX: dict[str, str] = {
   ),
 }
 
+# A stalled opencode turn used to wedge the group forever: the sidecar emits
+# `step-finish`/tool events, the model's follow-up round never arrives (or the
+# sidecar dies without a completion), and run_turn's readline/wait blocks
+# indefinitely. Guard with a hard ceiling (matches claude_cli_agent._TURN_TIMEOUT)
+# plus an idle window that fires when the model owes us output but has gone
+# silent — the clock is disarmed while a tool is in flight, since a long bash
+# run legitimately produces no events until it returns. Either raises
+# TimeoutError, which the main loop turns into a recoverable "Timed out —
+# context preserved" card (nemo/agent.py).
+_TURN_TIMEOUT = 1800.0    # hard ceiling on a single turn
+_IDLE_TIMEOUT = 300.0     # silence awaiting model output → stalled
+
 
 def _preset_api_key(preset: object) -> str:
   """Resolve a preset's API key (literal wins, else the env var at use-time)."""
@@ -159,10 +171,36 @@ class OpenCodeCodingAgent(CodingAgent):
     cost = 0.0
     progress_started = False
     failure: str | None = None
+    loop = asyncio.get_running_loop()
+    hard_deadline = loop.time() + _TURN_TIMEOUT
+    idle_deadline = loop.time() + _IDLE_TIMEOUT
+    # True while a tool part is in "running" state — disarm the idle clock so a
+    # long tool execution isn't mistaken for a stalled model.
+    tool_in_flight = False
 
     try:
       while True:
-        raw = await proc.stdout.readline()
+        now = loop.time()
+        if now >= hard_deadline:
+          await self._force_stop()
+          raise TimeoutError(
+            f"OpenCode turn exceeded {_TURN_TIMEOUT:.0f}s ceiling"
+          ) from None
+        timeout = hard_deadline - now
+        if not tool_in_flight:
+          timeout = min(timeout, idle_deadline - now)
+        try:
+          raw = await asyncio.wait_for(proc.stdout.readline(), timeout=timeout)
+        except asyncio.TimeoutError:
+          await self._force_stop()
+          if loop.time() >= hard_deadline:
+            raise TimeoutError(
+              f"OpenCode turn exceeded {_TURN_TIMEOUT:.0f}s ceiling"
+            ) from None
+          raise TimeoutError(
+            "OpenCode stopped responding (no events for "
+            f"{_IDLE_TIMEOUT:.0f}s)"
+          ) from None
         if not raw:
           break
         line = raw.decode(errors="replace").strip()
@@ -192,6 +230,13 @@ class OpenCodeCodingAgent(CodingAgent):
 
         item = self._coerce_json_object(event.get("item"))
         item_type = str(item.get("type", ""))
+        if item_type == "tool_call":
+          tool_in_flight = item.get("status") == "running"
+        else:
+          tool_in_flight = False
+        # Any event is evidence the turn is alive — refresh the idle clock.
+        idle_deadline = loop.time() + _IDLE_TIMEOUT
+
         if item_type == "agent_message":
           text = str(item.get("text", "") or "")
           if text:
@@ -239,6 +284,29 @@ class OpenCodeCodingAgent(CodingAgent):
     except asyncio.TimeoutError:
       proc.kill()
       await proc.wait()
+
+  async def _force_stop(self) -> None:
+    """Best-effort sidecar kill for the timeout path.
+
+    Never blocks: a pathological ``proc.wait()`` (child died but the asyncio
+    watcher never resolved it — the exact wedge behind the oc_623b hang) must
+    not swallow the TimeoutError we're about to raise.
+    """
+    proc = self._proc
+    if proc is None or proc.returncode is not None:
+      return
+    proc.terminate()
+    try:
+      await asyncio.wait_for(proc.wait(), timeout=5)
+    except asyncio.TimeoutError:
+      try:
+        proc.kill()
+      except ProcessLookupError:
+        pass
+      try:
+        await asyncio.wait_for(proc.wait(), timeout=3)
+      except asyncio.TimeoutError:
+        pass  # give up — the turn is failing regardless
 
   async def reset(self, project_dir: str, model: str, resume: str = "") -> None:
     await self.interrupt()

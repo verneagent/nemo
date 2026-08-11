@@ -48,6 +48,55 @@ process.stdout.write(JSON.stringify({ ignored, accepted }));
   }
 
 
+def test_event_mapper_carries_tool_status() -> None:
+  # The daemon disarms its idle-stall timeout while a tool is in flight, so the
+  # mapped tool item must expose the part's state.status ("running" vs
+  # "completed") — a bare tool_call without it would look stalled to the daemon.
+  sidecar_dir = Path(__file__).resolve().parents[1] / "nemo" / "opencode_sidecar"
+  program = """
+import { createEventMapper } from "./events.mjs";
+
+const mapEvent = createEventMapper("sess-1");
+mapEvent({
+  type: "message.updated",
+  properties: {
+    info: { id: "msg-a", sessionID: "sess-1", role: "assistant" },
+  },
+});
+const running = mapEvent({
+  type: "message.part.updated",
+  properties: {
+    part: {
+      sessionID: "sess-1", messageID: "msg-a", type: "tool",
+      tool: "bash", state: { status: "running", title: "Run tests" },
+    },
+  },
+});
+const completed = mapEvent({
+  type: "message.part.updated",
+  properties: {
+    part: {
+      sessionID: "sess-1", messageID: "msg-a", type: "tool",
+      tool: "skill", state: { status: "completed", title: "agent-reach" },
+    },
+  },
+});
+process.stdout.write(JSON.stringify({ running, completed }));
+"""
+  result = subprocess.run(
+    ["node", "--input-type=module", "-e", program],
+    cwd=sidecar_dir,
+    capture_output=True,
+    text=True,
+    check=True,
+  )
+  parsed = json.loads(result.stdout)
+  assert parsed["running"]["item"]["status"] == "running"
+  assert parsed["running"]["item"]["tool"] == "bash"
+  assert parsed["completed"]["item"]["status"] == "completed"
+  assert parsed["completed"]["item"]["tool"] == "skill"
+
+
 def test_model_resolution_and_provider_injection() -> None:
   sidecar_dir = Path(__file__).resolve().parents[1] / "nemo" / "opencode_sidecar"
   program = """
