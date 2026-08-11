@@ -16,6 +16,7 @@ from nemo.agent import (
   _session_picker_options,
   _format_turn_error_message,
   _format_rate_limit_notice,
+  _display_model,
   _in_turn_filtered_out,
   _interrupt_and_drain,
   _is_user_message_event,
@@ -3726,6 +3727,34 @@ def test_restart_model_arg_passes_plain_default_model_through():
   """No preset active (default endpoint, empty key) → the plain model id is
   already a valid --model, pass it through untouched."""
   assert _restart_model_arg("claude-opus-4-7", "", "claude") == "claude-opus-4-7"
+
+
+def test_display_model_reverses_shared_remote_to_distinct_preset_names():
+  """The daemon's ``model`` is the resolved remote id, so oc-deepseek-v4-flash
+  and official deepseek-v4-flash both hold ``deepseek-v4-flash``. The model
+  tab must reverse-resolve via the endpoint URL so providers that share a
+  remote id stay distinguishable."""
+  # opencode-go proxy → oc- prefix recovered
+  assert _display_model(
+    "deepseek-v4-flash", "https://opencode.ai/zen/go", "claude") \
+    == "oc-deepseek-v4-flash"
+  assert _display_model(
+    "deepseek-v4-pro", "https://opencode.ai/zen/go", "claude") \
+    == "oc-deepseek-v4-pro"
+  # official DeepSeek endpoint → stays the plain name
+  assert _display_model(
+    "deepseek-v4-flash", "https://api.deepseek.com/anthropic", "claude") \
+    == "deepseek-v4-flash"
+  # [1m] context-length suffix is a remote-side detail, not user-facing
+  assert _display_model(
+    "deepseek-v4-pro[1m]", "https://api.deepseek.com/anthropic", "claude") \
+    == "deepseek-v4-pro"
+
+
+def test_display_model_passes_plain_default_model_through():
+  """No preset active (default endpoint, empty key) → the raw model id is
+  already what the user picked; pass it through untouched."""
+  assert _display_model("claude-opus-4-7", "", "claude") == "claude-opus-4-7"
 
 
 # ---------------------------------------------------------------------------

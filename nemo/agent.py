@@ -1448,17 +1448,15 @@ async def _lock_session_picker(
 # Main loop
 # ---------------------------------------------------------------------------
 
-def _restart_model_arg(model: str, endpoint_key: str, agent: str) -> str:
-  """The value to pass as ``--model`` when relaunching the daemon.
+def _preset_name_or_remote(model: str, endpoint_key: str, agent: str) -> str:
+  """Map a live (remote id, endpoint URL) back to the preset NAME, if any.
 
-  Once a preset is active ``model`` is the resolved *remote id* (e.g.
-  ``deepseek-v4-pro[1m]``) and ``endpoint_key`` is its base URL — but
-  ``--model`` at startup only routes preset *names* through the endpoint
-  registry. Reverse-resolve so /restart and /upgrade relaunch with a name
-  the next boot can route; otherwise the new daemon sends the remote id to
-  the default endpoint and every turn fails "model not found" (including
-  the forked /btw CLI exiting 1). Plain models on the default endpoint
-  (no ``endpoint_key``) pass through unchanged.
+  ``preset_name_for_endpoint`` is the inverse of preset resolution: once a
+  preset is active ``model`` holds the resolved *remote id* (e.g.
+  ``deepseek-v4-flash`` — any ``oc-`` prefix lost) and ``endpoint_key`` the
+  preset's base URL. Reverse-resolving recovers the name the user picked in
+  /model. Plain models on the default endpoint (no ``endpoint_key``) pass
+  through unchanged.
   """
   if endpoint_key:
     from .presets import preset_name_for_endpoint
@@ -1466,6 +1464,30 @@ def _restart_model_arg(model: str, endpoint_key: str, agent: str) -> str:
     if name:
       return name
   return model
+
+
+def _restart_model_arg(model: str, endpoint_key: str, agent: str) -> str:
+  """The value to pass as ``--model`` when relaunching the daemon.
+
+  ``--model`` at startup only routes preset *names* through the endpoint
+  registry, so /restart and /upgrade must relaunch with the preset NAME —
+  handing the resolved remote id straight to the next boot makes it send the
+  remote id to the default endpoint and every turn fails "model not found"
+  (including the forked /btw CLI exiting 1).
+  """
+  return _preset_name_or_remote(model, endpoint_key, agent)
+
+
+def _display_model(model: str, endpoint_key: str, agent: str) -> str:
+  """User-facing model label for tabs and start cards.
+
+  The daemon's ``model`` is the SDK-facing *remote* id, which drops the
+  preset's prefix — ``oc-deepseek-v4-flash`` and official ``deepseek-v4-flash``
+  both become ``deepseek-v4-flash``, so the model tab can't tell providers
+  apart. Reverse-resolve to the preset NAME (what the user actually picked)
+  so the tab / start card distinguish presets that share a remote id.
+  """
+  return _preset_name_or_remote(model, endpoint_key, agent)
 
 
 async def _interrupt_and_drain(
@@ -1622,7 +1644,7 @@ async def main_loop(
     start_lines.append(f"⚠️ {startup_notice}")
   start_note = project_dir
   start_card = cards.build_card(
-    f"Nemo v{__version__} ({agent} · {model})",
+    f"Nemo v{__version__} ({agent} · {_display_model(model, endpoint_key, agent)})",
     body="\n".join(start_lines),
     color="blue",
     note=start_note,
@@ -1636,8 +1658,11 @@ async def main_loop(
     if "230002" in err_msg or "NOT be out of the chat" in err_msg:
       return 1
 
-  # Status tab — green idle, with agent name next to the dot.
-  await channel.update_status(model, "idle", agent)
+  # Status tab — green idle, with agent name next to the dot. The model tab
+  # shows the preset NAME (oc-deepseek-v4-flash vs deepseek-v4-flash), not
+  # the resolved remote id, so providers that share a remote id stay
+  # distinguishable.
+  await channel.update_status(_display_model(model, endpoint_key, agent), "idle", agent)
 
   # Periodic heartbeat (relay-based idle detection)
   _heartbeat_task: asyncio.Task | None = None
@@ -2209,7 +2234,8 @@ async def main_loop(
             model = switched_to
             ctx.model = model
             await _restart_client(resume=_sdk_session_id)
-            await channel.update_status(model, "idle", agent)
+            await channel.update_status(
+              _display_model(model, _endpoint_key, agent), "idle", agent)
             note = _endpoint_change_note(
               old_endpoint_key, _endpoint_key, _sdk_session_id)
             await _send_response(
@@ -2253,7 +2279,8 @@ async def main_loop(
           log.info("Model switch to %s (endpoint=default resume=%s)",
                    model, _sdk_session_id[:8] if _sdk_session_id else "none")
           await _restart_client(resume=_sdk_session_id)
-          await channel.update_status(model, "idle", agent)
+          await channel.update_status(
+            _display_model(model, _endpoint_key, agent), "idle", agent)
           note = _endpoint_change_note(
             old_endpoint_key, _endpoint_key, _sdk_session_id)
           await _send_response(
@@ -2315,7 +2342,8 @@ async def main_loop(
             _pending_agent_picker_msg_id = ""
             await _clear_ack()
             continue
-          await channel.update_status(model, "idle", agent)
+          await channel.update_status(
+            _display_model(model, _endpoint_key, agent), "idle", agent)
           # Tell the user explicitly what happened to their context.
           # Each agent keeps its own session id (per-agent DB columns),
           # so the new agent either resumes its OWN prior history on
@@ -3757,7 +3785,8 @@ async def main_loop(
   loop = asyncio.get_event_loop()
   cleanup: list = [shell_manager.close(), coding_agent.stop(), channel.stop()]
   cleanup.append(channel.release_workspace())
-  cleanup.append(channel.update_status(model, "stopped", agent))
+  cleanup.append(channel.update_status(
+    _display_model(model, _endpoint_key, agent), "stopped", agent))
   await asyncio.gather(*cleanup, return_exceptions=True)
   db.deactivate(session_id)
   db.close()
