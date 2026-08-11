@@ -136,6 +136,23 @@ _PROTECTED_RESTART_ENV: frozenset[str] = frozenset({
 _ENV_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
+def is_supervised() -> bool:
+  """Return True when an external supervisor respawns us on exit.
+
+  A supervisor (launchd ``KeepAlive``, systemd, supervisord, …) sets
+  ``NEMO_SUPERVISED`` in the daemon's environment — e.g. a launchd wrapper
+  script does ``export NEMO_SUPERVISED=launchd`` before ``exec``ing nemo.
+  When set, ``/restart`` and ``/upgrade`` must NOT spawn their own
+  replacement: the supervisor already restarts us on exit, and a second
+  replacement races it over the group claim / pid file — both boot, one
+  evicts the other, and the user sees two start cards.
+  """
+  value = os.environ.get("NEMO_SUPERVISED", "").strip().lower()
+  if value in ("", "0", "false", "no", "off", "none"):
+    return False
+  return True
+
+
 def shell_profile_env(timeout_s: float = 5.0) -> dict[str, str]:
   """Re-read user env vars from the zsh profile files (e.g. ~/.zshenv).
 

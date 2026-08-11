@@ -2534,7 +2534,22 @@ async def main_loop(
         elif response == "__diag__":
           await _handle_diag(channel, chat_id, project_dir, db)
         elif response == "__restart__":
-          from .lifecycle import RestartSpec, spawn_lifecycle_helper
+          from .lifecycle import RestartSpec, is_supervised, spawn_lifecycle_helper
+
+          if is_supervised():
+            # A supervisor (launchd KeepAlive, systemd, …) respawns us on
+            # exit. Spawning our own replacement here would race it — two
+            # daemons boot, fight over the group claim / pid file, and the
+            # user sees two start cards. Just exit and let the supervisor
+            # restart us with its own args.
+            await _send_response(
+              channel, chat_id,
+              "Restarting Nemo — an external supervisor will respawn me.",
+              db,
+            )
+            running = False
+            await _clear_ack()
+            break
 
           spec = RestartSpec(
             chat_id=chat_id,
@@ -2565,7 +2580,7 @@ async def main_loop(
           break
         elif response == "__upgrade__":
           from .lifecycle import (
-            RestartSpec, is_editable_install, run_pipx_upgrade,
+            RestartSpec, is_editable_install, is_supervised, run_pipx_upgrade,
             spawn_lifecycle_helper,
           )
 
@@ -2594,6 +2609,19 @@ async def main_loop(
             )
             await _clear_ack()
             continue
+          if is_supervised():
+            # Upgrade installed the new version; a supervisor (launchd
+            # KeepAlive, …) respawns us on exit with the freshly upgraded
+            # binary. Spawning our own helper would race it — just exit.
+            await _send_response(
+              channel, chat_id,
+              "Upgrade succeeded. Restarting Nemo — an external supervisor "
+              "will respawn me.",
+              db,
+            )
+            running = False
+            await _clear_ack()
+            break
           spec = RestartSpec(
             chat_id=chat_id,
             project_dir=project_dir,

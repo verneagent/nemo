@@ -245,3 +245,17 @@ def test_shell_profile_env_falls_back_when_profile_errors(monkeypatch):
   with mock.patch("nemo.lifecycle.subprocess.run",
                   return_value=_env_output("", rc=127)):
     assert lifecycle.shell_profile_env() == {}
+
+
+def test_is_supervised_false_when_unset_or_explicit_off(monkeypatch):
+  monkeypatch.delenv("NEMO_SUPERVISED", raising=False)
+  assert not lifecycle.is_supervised()
+  for value in ("0", "false", "no", "off", "none"):
+    monkeypatch.setenv("NEMO_SUPERVISED", value)
+    assert not lifecycle.is_supervised(), value
+
+
+def test_is_supervised_true_for_any_truthy_value(monkeypatch):
+  for value in ("1", "true", "yes", "launchd", "systemd", "supervisord", " 1 "):
+    monkeypatch.setenv("NEMO_SUPERVISED", value)
+    assert lifecycle.is_supervised(), value
