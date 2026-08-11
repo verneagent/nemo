@@ -99,6 +99,107 @@ def test_claude_endpoint_sets_anthropic_env():
   asyncio.run(_run())
 
 
+def test_claude_endpoint_strips_trailing_v1_from_base_url():
+  # The claude CLI appends /v1/messages to ANTHROPIC_BASE_URL, so a base
+  # that already ends in /v1 (e.g. opencode.ai/zen/go, whose anthropic base
+  # is shared with OpenAI-style SDKs that include the version prefix) would
+  # double the segment and 404. Bases without /v1 are left alone.
+  async def _run():
+    with _strip_anthropic_env():
+      ep = EndpointConfig(
+        base_url="https://opencode.ai/zen/go/v1",
+        api_key="sk-zen",
+      )
+      agent = ClaudeCodingAgent(
+        {}, "oc_1", _DummyDB(), _DummyChannel(), endpoint=ep)
+      env = agent._build_options("/tmp/project", "deepseek-v4-flash").env
+      assert env["ANTHROPIC_BASE_URL"] == "https://opencode.ai/zen/go"
+
+      ep2 = EndpointConfig(
+        base_url="https://api.deepseek.com/anthropic",
+        api_key="sk-deepseek",
+      )
+      agent2 = ClaudeCodingAgent(
+        {}, "oc_1", _DummyDB(), _DummyChannel(), endpoint=ep2)
+      env2 = agent2._build_options("/tmp/project", "deepseek-v4-pro").env
+      assert env2["ANTHROPIC_BASE_URL"] == "https://api.deepseek.com/anthropic"
+
+  asyncio.run(_run())
+
+
+def test_claude_endpoint_api_key_auth_style_sets_x_api_key():
+  # zen/go only accepts x-api-key (ANTHROPIC_API_KEY); the default bearer
+  # style (ANTHROPIC_AUTH_TOKEN) would 401 there. The default stays bearer.
+  async def _run():
+    with _strip_anthropic_env():
+      ep = EndpointConfig(
+        base_url="https://opencode.ai/zen/go",
+        api_key="sk-zen",
+        anthropic_auth="api_key",
+      )
+      agent = ClaudeCodingAgent(
+        {}, "oc_1", _DummyDB(), _DummyChannel(), endpoint=ep)
+      env = agent._build_options("/tmp/project", "deepseek-v4-flash").env
+      assert env["ANTHROPIC_API_KEY"] == "sk-zen"
+      assert "ANTHROPIC_AUTH_TOKEN" not in env
+
+      ep2 = EndpointConfig(
+        base_url="https://api.deepseek.com/anthropic",
+        api_key="sk-deepseek",
+      )
+      agent2 = ClaudeCodingAgent(
+        {}, "oc_1", _DummyDB(), _DummyChannel(), endpoint=ep2)
+      env2 = agent2._build_options("/tmp/project", "deepseek-v4-pro").env
+      assert env2["ANTHROPIC_AUTH_TOKEN"] == "sk-deepseek"
+      assert "ANTHROPIC_API_KEY" not in env2
+
+  asyncio.run(_run())
+
+
+def test_claude_endpoint_auth_style_drops_stale_shell_token():
+  # A daemon that started with a Bearer endpoint then /model-switched to a
+  # zen/go-style x-api-key endpoint would otherwise carry a stale shell
+  # ANTHROPIC_AUTH_TOKEN along with the new ANTHROPIC_API_KEY — the CLI
+  # sends both headers and the gateway 401s on the Bearer even though the
+  # x-api-key is correct. The declared auth style must win and drop the
+  # opposite env var.
+  async def _run():
+    with _strip_anthropic_env(), mock.patch.dict(
+      os.environ,
+      {"ANTHROPIC_AUTH_TOKEN": "sk-stale-bearer"},
+      clear=False,
+    ):
+      ep = EndpointConfig(
+        base_url="https://opencode.ai/zen/go",
+        api_key="sk-zen",
+        anthropic_auth="api_key",
+      )
+      agent = ClaudeCodingAgent(
+        {}, "oc_1", _DummyDB(), _DummyChannel(), endpoint=ep)
+      env = agent._build_options("/tmp/project", "deepseek-v4-flash").env
+      assert env["ANTHROPIC_API_KEY"] == "sk-zen"
+      assert "ANTHROPIC_AUTH_TOKEN" not in env
+
+    # And the reverse: switching a shell with a stale x-api-key to a Bearer
+    # endpoint drops the API_KEY.
+    with _strip_anthropic_env(), mock.patch.dict(
+      os.environ,
+      {"ANTHROPIC_API_KEY": "sk-stale-xapikey"},
+      clear=False,
+    ):
+      ep2 = EndpointConfig(
+        base_url="https://api.deepseek.com/anthropic",
+        api_key="sk-deepseek",
+      )
+      agent2 = ClaudeCodingAgent(
+        {}, "oc_1", _DummyDB(), _DummyChannel(), endpoint=ep2)
+      env2 = agent2._build_options("/tmp/project", "deepseek-v4-pro").env
+      assert env2["ANTHROPIC_AUTH_TOKEN"] == "sk-deepseek"
+      assert "ANTHROPIC_API_KEY" not in env2
+
+  asyncio.run(_run())
+
+
 def test_claude_endpoint_fans_model_out_to_routing_env():
   # When base_url is set, the user-supplied model must reach every
   # internal Claude Code routing env so subagents / preset slugs all use

@@ -31,11 +31,11 @@ def test_supports_only_when_protocol_url_is_set():
 
 
 def test_supports_agents_allowlist_gates_reachability():
-  # A provider that fills BOTH protocol URLs but is only usable by one
-  # agent kind (e.g. opencode.ai/zen/go/v1 is a chat-only proxy — claude
-  # needs Anthropic tools, codex needs /responses, so both 422/404 there).
-  # The explicit allowlist must hide it from the other pickers even though
-  # the URLs are populated.
+  # An explicit allowlist can restrict a provider that fills BOTH protocol
+  # URLs to a subset of agent kinds. Previously zen/go was gated to opencode
+  # alone as a "chat-only proxy"; codex and claude are now verified
+  # compatible, but the allowlist MECHANISM must still hide the model from
+  # any agent kind that is not listed.
   p = Preset(
     name="oc-kimi-k3",
     anthropic_url="https://opencode.ai/zen/go/v1",
@@ -181,6 +181,37 @@ def test_literal_key_flows_from_models_json(tmp_path):
   ep = p.endpoint_for("claude")
   assert ep.base_url == "http://127.0.0.1:8000"
   assert ep.api_key == "blacktree@"
+
+
+def test_anthropic_auth_style_flows_from_models_json(tmp_path):
+  # zen/go's Anthropic path only accepts x-api-key; the `auth` block on the
+  # protocol section must reach the claude EndpointConfig so the adapter
+  # sets ANTHROPIC_API_KEY instead of the default ANTHROPIC_AUTH_TOKEN.
+  user = tmp_path / "models.json"
+  user.write_text(json.dumps({
+    "providers": {
+      "zen": {
+        "anthropic": {
+          "baseURL": "https://opencode.ai/zen/go/v1",
+          "apiKey": "sk-zen",
+          "auth": "api_key",
+        },
+        "models": {"oc-deepseek-v4-flash": {}},
+      },
+      "deepseek": {
+        "anthropic": {"baseURL": "https://api.deepseek.com/anthropic", "apiKey": "k"},
+        "models": {"deepseek-v4-pro": {}},
+      },
+    },
+  }))
+  presets = load_presets(builtin_path="/nonexistent", user_path=str(user))
+  zen = presets["oc-deepseek-v4-flash"]
+  assert zen.anthropic_auth == "api_key"
+  assert zen.endpoint_for("claude").anthropic_auth == "api_key"
+  # Providers that don't declare `auth` keep the bearer default.
+  ds = presets["deepseek-v4-pro"]
+  assert ds.anthropic_auth == "bearer"
+  assert ds.endpoint_for("claude").anthropic_auth == "bearer"
 
 
 def test_vision_block_provider_default_and_model_override(tmp_path):

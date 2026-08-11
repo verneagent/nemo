@@ -44,6 +44,21 @@ _CLAUDE_ENDPOINT_ENV_KEYS = (
 log = logging.getLogger(__name__)
 
 
+def _claude_base_url(base_url: str) -> str:
+  """Normalize an anthropic-protocol base URL for the claude CLI.
+
+  The CLI appends ``/v1/messages`` to ``ANTHROPIC_BASE_URL``, so a base
+  that already ends in ``/v1`` (configs written for SDKs that expect the
+  version prefix included, e.g. the opencode.ai/zen/go gateway) would
+  double the version segment and 404. Strip a trailing ``/v1``; drop any
+  trailing slash so the append stays single-segment.
+  """
+  stripped = base_url.rstrip("/")
+  if stripped.endswith("/v1"):
+    return stripped[:-3]
+  return stripped
+
+
 def _nemo_script_dir() -> str:
   """Directory holding nemo's sibling console scripts (nemo-vision / nemo-send).
 
@@ -1214,9 +1229,20 @@ class ClaudeCodingAgent(CodingAgent):
 
     # Explicit --base-url / --api-key flags overlay on top of shell env.
     if self._endpoint.base_url:
-      env["ANTHROPIC_BASE_URL"] = self._endpoint.base_url
+      env["ANTHROPIC_BASE_URL"] = _claude_base_url(self._endpoint.base_url)
     if self._endpoint.api_key:
-      env["ANTHROPIC_AUTH_TOKEN"] = self._endpoint.api_key
+      # Most Anthropic-compatible endpoints accept Bearer (AUTH_TOKEN), but
+      # some gateways (opencode.ai/zen/go) only accept `x-api-key` — the
+      # preset declares that via `anthropic_auth: "api_key"`.
+      if self._endpoint.anthropic_auth == "api_key":
+        env["ANTHROPIC_API_KEY"] = self._endpoint.api_key
+        # Drop a shell-stale Bearer token from the previous endpoint: when
+        # both env vars are set the CLI sends both headers, and zen/go
+        # rejects the Bearer with 401 even though x-api-key is correct.
+        env.pop("ANTHROPIC_AUTH_TOKEN", None)
+      else:
+        env["ANTHROPIC_AUTH_TOKEN"] = self._endpoint.api_key
+        env.pop("ANTHROPIC_API_KEY", None)
 
     # When pointing at a third-party Anthropic-compatible endpoint, the
     # remote almost certainly does not understand the canonical Claude

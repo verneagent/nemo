@@ -31,6 +31,13 @@ class EndpointConfig:
   """
   base_url: str = ""
   api_key: str = ""
+  # Anthropic-protocol auth header style when api_key is set: "bearer"
+  # (ANTHROPIC_AUTH_TOKEN → ``Authorization: Bearer``, the default) or
+  # "api_key" (ANTHROPIC_API_KEY → ``x-api-key``, for gateways like
+  # opencode.ai/zen/go that reject Bearer with 401). Only the claude
+  # adapter reads this; the codex/openai and opencode paths already use
+  # the x-api-key form natively.
+  anthropic_auth: str = "bearer"
 
 
 class CodingAgent(ABC):

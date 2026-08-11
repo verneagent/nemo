@@ -131,6 +131,10 @@ class Preset:
   # (or via opencode against an anthropic/* model).
   anthropic_url: str = ""
   anthropic_remote: str = ""
+  # Anthropic-protocol auth header style ("bearer" | "api_key"), from the
+  # ``anthropic.auth`` block. Gateways like opencode.ai/zen/go only accept
+  # ``x-api-key``, which the claude adapter reads off ``anthropic_auth``.
+  anthropic_auth: str = "bearer"
   # OpenAI-protocol endpoint. Empty → not callable via --agent codex
   # (or via opencode against an openai/* model).
   openai_url: str = ""
@@ -194,7 +198,8 @@ class Preset:
     # A literal key wins; otherwise resolve the env var at use-time.
     api_key = self.api_key_literal or (
       os.environ.get(self.api_key_env, "") if self.api_key_env else "")
-    return EndpointConfig(base_url=base, api_key=api_key)
+    return EndpointConfig(
+      base_url=base, api_key=api_key, anthropic_auth=self.anthropic_auth)
 
 
 # ---------------------------------------------------------------------------
@@ -227,11 +232,11 @@ def _parse_api_key(raw: object, *, where: str) -> tuple[str, str]:
   return "", raw
 
 
-def _protocol_block(provider_data: dict, key: str) -> tuple[str, str, str]:
-  """Pull (baseURL, api_key_env, api_key_literal) out of one protocol section."""
+def _protocol_block(provider_data: dict, key: str) -> tuple[str, str, str, str]:
+  """Pull (baseURL, api_key_env, api_key_literal, auth) out of one protocol section."""
   raw = provider_data.get(key)
   if not isinstance(raw, dict):
-    return "", "", ""
+    return "", "", "", ""
   base = raw.get("baseURL", "")
   if not isinstance(base, str):
     log.warning("provider.%s.baseURL must be a string, got %s",
@@ -239,7 +244,12 @@ def _protocol_block(provider_data: dict, key: str) -> tuple[str, str, str]:
     base = ""
   api_key_env, api_key_literal = _parse_api_key(
     raw.get("apiKey"), where=f"provider.{key}.apiKey")
-  return base, api_key_env, api_key_literal
+  auth = raw.get("auth", "")
+  if not isinstance(auth, str):
+    log.warning("provider.%s.auth must be a string, got %s",
+                key, type(auth).__name__)
+    auth = ""
+  return base, api_key_env, api_key_literal, auth
 
 
 def _model_remote(model_data: object, protocol: str) -> str:
@@ -314,8 +324,15 @@ def _flatten_providers(providers: dict) -> dict[str, Preset]:
       log.warning("provider %r: expected object, got %s — skipping",
                   provider_name, type(pdata).__name__)
       continue
-    anthropic_url, anthropic_key_env, anthropic_key_lit = _protocol_block(pdata, "anthropic")
-    openai_url, openai_key_env, openai_key_lit = _protocol_block(pdata, "openai")
+    (anthropic_url, anthropic_key_env, anthropic_key_lit,
+     anthropic_auth) = _protocol_block(pdata, "anthropic")
+    openai_url, openai_key_env, openai_key_lit, _ = _protocol_block(pdata, "openai")
+    if anthropic_auth and anthropic_auth not in ("bearer", "api_key"):
+      log.warning(
+        "provider %r: anthropic.auth must be \"bearer\" or \"api_key\", "
+        "got %r — using bearer", provider_name, anthropic_auth)
+      anthropic_auth = ""
+    anthropic_auth = anthropic_auth or "bearer"
     if not anthropic_url and not openai_url:
       # Provider declares models but no protocol blocks — flattening
       # would produce Presets with empty URLs that supports() rejects
@@ -361,6 +378,7 @@ def _flatten_providers(providers: dict) -> dict[str, Preset]:
         api_key_literal=api_key_literal,
         anthropic_url=anthropic_url,
         anthropic_remote=_model_remote(mdata, "anthropic") or model_name,
+        anthropic_auth=anthropic_auth,
         openai_url=openai_url,
         openai_remote=_model_remote(mdata, "openai") or model_name,
         sees_image=sees_image,
