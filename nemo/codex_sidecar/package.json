@@ -3,7 +3,7 @@
   "private": true,
   "type": "module",
   "dependencies": {
-    "@openai/codex": "0.142.4",
-    "@openai/codex-sdk": "0.142.4"
+    "@openai/codex": "0.147.0",
+    "@openai/codex-sdk": "0.147.0"
   }
 }
