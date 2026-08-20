@@ -153,6 +153,15 @@ def _format_turn_error_message(message: str) -> str:
       "the previous session.\n\n"
       f"Original error: {message}"
     )
+  if "empty response" in lower:
+    return (
+      "The model returned an empty response (no text, thinking, or tool use) "
+      "on both attempts. This is usually a transient model/provider hiccup, "
+      "not a problem with your request.\n\n"
+      "Please send your message again to retry; if it keeps happening, try "
+      "switching to a different model with `/model`.\n\n"
+      f"Original error: {message}"
+    )
   if any(marker in lower for marker in _CODEX_BACKEND_FAILURE_MARKERS):
     return (
       "Codex could not connect to the ChatGPT Codex backend. This is usually "

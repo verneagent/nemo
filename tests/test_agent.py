@@ -277,6 +277,20 @@ def test_turn_error_message_adds_codex_backend_recovery_hint():
   assert "Original error" in out
 
 
+def test_turn_error_message_adds_empty_response_recovery_hint():
+  """An empty-response turn error (the CLI's "No response requested."
+  placeholder) surfaces operator guidance instead of a bare/technical message
+  or a misleading empty Done card."""
+  msg = "Model returned an empty response (no text, thinking, or tool use)"
+
+  out = _format_turn_error_message(msg)
+
+  assert "empty response" in out
+  assert "send your message again to retry" in out
+  assert "/model" in out
+  assert "Original error" in out
+
+
 def test_idle_esc_is_silent(tmp_path):
   from nemo.channel import IncomingMessage
 

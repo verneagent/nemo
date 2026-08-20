@@ -186,7 +186,7 @@ class TestRunTurnWithReconnect:
     call_count = 0
 
     async def fake_turn(prompt, on_event, stale_tasks=None, is_paused=None,
-                      steer_probe=None):
+                      steer_probe=None, resumed=False):
       nonlocal call_count
       call_count += 1
       if call_count < 2:
@@ -219,7 +219,7 @@ class TestRunTurnWithReconnect:
     seen_prompts: list[str] = []
 
     async def fake_turn(prompt, on_event, stale_tasks=None, is_paused=None,
-                      steer_probe=None):
+                      steer_probe=None, resumed=False):
       nonlocal call_count
       call_count += 1
       seen_prompts.append(prompt)
@@ -268,7 +268,7 @@ class TestRunTurnWithReconnect:
     sdk_thread._client = mock.MagicMock()
 
     async def fake_turn(prompt, on_event, stale_tasks=None, is_paused=None,
-                      steer_probe=None):
+                      steer_probe=None, resumed=False):
       raise TimeoutError("hung")
 
     with mock.patch.object(sdk_thread, "run_turn", side_effect=fake_turn):
@@ -291,7 +291,7 @@ class TestRunTurnWithReconnect:
     reconnect_calls = 0
 
     async def fake_turn(prompt, on_event, stale_tasks=None, is_paused=None,
-                      steer_probe=None):
+                      steer_probe=None, resumed=False):
       nonlocal turn_calls
       turn_calls += 1
       raise TimeoutError("hung")
@@ -319,7 +319,7 @@ class TestRunTurnWithReconnect:
     expected = (1.0, {"ok": True})
 
     async def fake_turn(prompt, on_event, stale_tasks=None, is_paused=None,
-                      steer_probe=None):
+                      steer_probe=None, resumed=False):
       nonlocal turn_calls
       turn_calls += 1
       if turn_calls < 3:
@@ -342,7 +342,7 @@ class TestRunTurnWithReconnect:
     call_count = 0
 
     async def fake_turn(prompt, on_event, stale_tasks=None, is_paused=None,
-                      steer_probe=None):
+                      steer_probe=None, resumed=False):
       nonlocal call_count
       call_count += 1
       if call_count < 2:
@@ -368,7 +368,7 @@ class TestRunTurnWithReconnect:
     call_count = 0
 
     async def fake_turn(prompt, on_event, stale_tasks=None, is_paused=None,
-                      steer_probe=None):
+                      steer_probe=None, resumed=False):
       nonlocal call_count
       call_count += 1
       raise NonRetryableAPIError("API Error: 402 Insufficient Balance")
@@ -391,7 +391,7 @@ class TestRunTurnWithReconnect:
   def test_not_connected_raises_after_max_attempts(self, sdk_thread: SDKThread):
     """Should raise after exhausting all reconnect attempts for not-connected."""
     async def fake_turn(prompt, on_event, stale_tasks=None, is_paused=None,
-                      steer_probe=None):
+                      steer_probe=None, resumed=False):
       raise RuntimeError("SDK client not connected")
 
     with mock.patch.object(sdk_thread, "run_turn", side_effect=fake_turn):
@@ -407,7 +407,7 @@ class TestRunTurnWithReconnect:
     call_count = 0
 
     async def fake_turn(prompt, on_event, stale_tasks=None, is_paused=None,
-                      steer_probe=None):
+                      steer_probe=None, resumed=False):
       nonlocal call_count
       call_count += 1
       raise TimeoutError("hung")
@@ -433,7 +433,7 @@ class TestRunTurnWithReconnect:
     call_count = 0
 
     async def fake_turn(prompt, on_event, stale_tasks=None, is_paused=None,
-                      steer_probe=None):
+                      steer_probe=None, resumed=False):
       nonlocal call_count
       call_count += 1
       if call_count < 2:
@@ -463,7 +463,7 @@ class TestRunTurnWithReconnect:
     factory_calls = 0
 
     async def fake_turn(prompt, on_event, stale_tasks=None, is_paused=None,
-                      steer_probe=None):
+                      steer_probe=None, resumed=False):
       nonlocal turn_calls
       turn_calls += 1
       if turn_calls < 2:
@@ -494,7 +494,7 @@ class TestRunTurnWithReconnect:
   def test_factory_returning_none_raises_immediately(self, sdk_thread: SDKThread):
     """If options_factory returns None, treat it like no-options and raise."""
     async def fake_turn(prompt, on_event, stale_tasks=None, is_paused=None,
-                      steer_probe=None):
+                      steer_probe=None, resumed=False):
       raise TimeoutError("hung")
 
     with mock.patch.object(sdk_thread, "run_turn", side_effect=fake_turn):
@@ -512,7 +512,7 @@ class TestRunTurnWithReconnect:
     call_count = 0
 
     async def fake_turn(prompt, on_event, stale_tasks=None, is_paused=None,
-                      steer_probe=None):
+                      steer_probe=None, resumed=False):
       nonlocal call_count
       call_count += 1
       raise RuntimeError("some other error")
@@ -528,6 +528,68 @@ class TestRunTurnWithReconnect:
           ))
 
     assert call_count == 1
+    mock_reconn.assert_not_awaited()
+
+  def test_empty_response_retried_on_same_client_without_reconnect(
+      self, sdk_thread: SDKThread):
+    """An EmptyResponseError (the model returned nothing — the CLI's "No
+    response requested." placeholder) is retried on the SAME client WITHOUT
+    a reconnect: the subprocess is healthy, and reconnecting would replay the
+    session and re-introduce the same empty completion."""
+    from nemo.claude_turn import EmptyResponseError
+
+    calls: list[tuple[str, bool]] = []
+
+    async def fake_turn(prompt, on_event, stale_tasks=None, is_paused=None,
+                        steer_probe=None, resumed=False):
+      calls.append((prompt, resumed))
+      if len(calls) == 1:
+        raise EmptyResponseError("Model returned an empty response")
+      return (0.02, {})
+
+    sdk_thread._client = mock.MagicMock()
+
+    with mock.patch.object(sdk_thread, "run_turn", side_effect=fake_turn), \
+         mock.patch.object(sdk_thread, "reconnect",
+                           new_callable=mock.AsyncMock) as mock_reconn:
+      result = _run(sdk_thread.run_turn_with_reconnect(
+        "hello", on_event=lambda e: None,
+        options=mock.MagicMock(), max_attempts=3,
+      ))
+
+    # First attempt empty → retried once (attempt 1, now "resumed" since a
+    # retry pass must drain past an empty first Result), then succeeded.
+    assert [c[0] for c in calls] == ["hello", "hello"]
+    assert [c[1] for c in calls] == [False, True]
+    assert result == (0.02, {})
+    mock_reconn.assert_not_awaited()
+
+  def test_empty_response_twice_gives_up_without_reconnect(
+      self, sdk_thread: SDKThread):
+    """Two consecutive empty completions give up (bounded) so the host can
+    surface an explicit empty-response error card — never a reconnect."""
+    from nemo.claude_turn import EmptyResponseError
+
+    calls: list[tuple[str, bool]] = []
+
+    async def fake_turn(prompt, on_event, stale_tasks=None, is_paused=None,
+                        steer_probe=None, resumed=False):
+      calls.append((prompt, resumed))
+      raise EmptyResponseError("Model returned an empty response")
+
+    sdk_thread._client = mock.MagicMock()
+
+    with mock.patch.object(sdk_thread, "run_turn", side_effect=fake_turn), \
+         mock.patch.object(sdk_thread, "reconnect",
+                           new_callable=mock.AsyncMock) as mock_reconn:
+      with pytest.raises(EmptyResponseError):
+        _run(sdk_thread.run_turn_with_reconnect(
+          "hello", on_event=lambda e: None,
+          options=mock.MagicMock(), max_attempts=3,
+        ))
+
+    # Bounded: initial + one retry, then give up. No reconnect.
+    assert [c[0] for c in calls] == ["hello", "hello"]
     mock_reconn.assert_not_awaited()
 
 

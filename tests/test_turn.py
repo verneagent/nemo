@@ -376,12 +376,16 @@ def test_stop_task_circuit_breaker_on_control_timeout():
   every pending id. After the first occurrence we should short-circuit all
   further stop_task invocations within the same run_turn orchestration.
   """
-  # Turn yields two pending tasks then ResultMessage. No stale is marked,
-  # so the turn is "clean" — the pending tasks are both promoted to stale.
+  # Turn yields two pending tasks, a real output, then ResultMessage. No
+  # stale is marked, so the turn is "clean" — the pending tasks are both
+  # promoted to stale. (The output keeps the turn non-empty; this test is
+  # about the stop_task breaker, not empty responses.)
   messages = [
+    FakeAssistantMessage(content=[FakeToolUseBlock(name="Agent", input={"description": "x"})]),
     FakeTaskStartedMessage(task_id="t1"),
     FakeTaskStartedMessage(task_id="t2"),
     FakeTaskStartedMessage(task_id="t3"),
+    FakeAssistantMessage(content=[FakeTextBlock(text="done")]),
     FakeResultMessage(total_cost_usd=0.01),
   ]
   stop_calls: list[str] = []
@@ -704,10 +708,13 @@ def test_watchdog_defers_while_prompt_awaits_user(monkeypatch):
   paused = {"v": True}
 
   # Stay silent well past PROGRESS_TIMEOUT (simulating the SDK blocked in
-  # can_use_tool), then "the user answers": clear the pause and yield.
+  # can_use_tool), then "the user answers": clear the pause and yield a real
+  # output + result. (The output keeps the turn non-empty; this test is about
+  # the watchdog deferral, not empty responses.)
   async def blocked_then_answer():
     await asyncio.sleep(1.0)
     paused["v"] = False
+    yield FakeAssistantMessage(content=[FakeTextBlock(text="Here you go")])
     yield FakeResultMessage(total_cost_usd=0.05)
 
   gen = blocked_then_answer()
@@ -805,18 +812,46 @@ def test_reset_clears_stale_tasks_on_claude_adapter():
     "reset() must clear _stale_tasks since old session ids are dead"
 
 
-def test_empty_turn():
-  """A turn with only ResultMessage."""
+def test_empty_turn_raises_empty_response_error():
+  """A turn that completes (ResultMessage) with no real output must NOT be
+  finalized as a misleading empty Done card — it raises EmptyResponseError so
+  the reconnect layer retries once and the host surfaces an explicit
+  empty-response error card (observed: empty Done card from the CLI's
+  "No response requested." placeholder).
+  """
+  from nemo.claude_turn import EmptyResponseError
+
   messages = [FakeResultMessage(total_cost_usd=0.0, usage={})]
   events = []
   async def _run():
     with mock.patch.dict("sys.modules", _sdk_modules()):
       client = FakeClient(messages)
-      cost, _usage = await run_turn(client, "", events.append)
-      assert cost == 0.0
-  asyncio.run(_run())
-  assert len(events) == 1
-  assert isinstance(events[0], DoneEvent)
+      await run_turn(client, "", events.append)
+  with pytest.raises(EmptyResponseError):
+    asyncio.run(_run())
+  # The turn must never emit a DoneEvent for an empty completion.
+  assert not any(isinstance(e, DoneEvent) for e in events)
+
+
+def test_empty_placeholder_text_is_not_an_answer():
+  """The CLI's "No response requested." placeholder as an AssistantMessage
+  text must be ignored (not emitted as an AnswerEvent, not marked as the
+  answer) so the turn is treated as empty and raises EmptyResponseError.
+  """
+  from nemo.claude_turn import EmptyResponseError
+
+  messages = [
+    FakeAssistantMessage(content=[FakeTextBlock(text="No response requested.")]),
+    FakeResultMessage(total_cost_usd=0.0, usage={}),
+  ]
+  events = []
+  async def _run():
+    with mock.patch.dict("sys.modules", _sdk_modules()):
+      await run_turn(FakeClient(messages), "", events.append)
+  with pytest.raises(EmptyResponseError):
+    asyncio.run(_run())
+  assert not any(isinstance(e, AnswerEvent) for e in events), \
+    "the empty-response placeholder must not be surfaced as an answer"
 
 
 def test_task_progress_event():
@@ -986,6 +1021,7 @@ def test_compact_boundary_with_partial_metadata():
         "compact_metadata": {"trigger": "manual", "pre_tokens": 30_000},
       },
     ),
+    FakeAssistantMessage(content=[FakeTextBlock(text="resuming")]),
     FakeResultMessage(),
   ]
   events: list = []
@@ -1014,6 +1050,7 @@ def test_microcompact_boundary_is_suppressed():
 
   messages = [
     SystemMessage(subtype="microcompact_boundary", data={}),
+    FakeAssistantMessage(content=[FakeTextBlock(text="back")]),
     FakeResultMessage(),
   ]
   events: list = []
@@ -1032,6 +1069,7 @@ def test_rate_limit_event_with_missing_info_is_skipped():
 
   messages = [
     RateLimitEvent(),
+    FakeAssistantMessage(content=[FakeTextBlock(text="proceeding")]),
     FakeResultMessage(),
   ]
   events: list = []
@@ -1282,6 +1320,131 @@ def test_no_lag_next_turn_gets_its_own_answer():
   a1, a2 = asyncio.run(_run())
   assert a1 == ["t1-answer", "t1-steer-answer"]
   # The crux: turn 2 answers q2, NOT the stranded t1-steer-answer.
+  assert a2 == ["t2-answer"]
+
+
+# ---------------------------------------------------------------------------
+# Resumed-turn drain regression (empty Done card incident 2026-08-20)
+#
+# A turn resumed after a reconnect-with-resume (run_turn_with_reconnect
+# attempt > 0) replays session history; the model can first finalize a
+# SPURIOUS EMPTY ResultMessage (the CLI's "No response requested."
+# placeholder) before processing the re-sent prompt for real. If run_turn
+# stops at that first Result the real answer strands in the receive buffer →
+# the NEXT turn drains it (+1 turn lag), AND the current turn finalizes a
+# misleading empty "Done ✓". Fix 2: resumed turns don't break at the first
+# Result; they drain past an empty first Result (bounded by
+# RESUME_DRAIN_TIMEOUT) so the real continuation folds into THIS run_turn.
+# ---------------------------------------------------------------------------
+
+def test_resumed_turn_drains_past_empty_first_result():
+  """Resumed turn: empty first Result, then the real continuation. The real
+  answer is surfaced and the shared stream is left EMPTY (nothing stranded
+  for the next turn)."""
+  client = QueueClient(steered=[False])
+  client.feed(
+    # Spurious empty Result from the replayed session state.
+    FakeResultMessage(total_cost_usd=0.0, usage={},
+                      result="No response requested."),
+    # The real answer to the re-sent prompt.
+    FakeAssistantMessage(content=[FakeTextBlock(text="real answer")]),
+    FakeResultMessage(total_cost_usd=0.02, usage={"input_tokens": 100}),
+  )
+  events: list = []
+
+  async def _run():
+    with mock.patch.dict("sys.modules", _sdk_modules()), \
+         mock.patch("nemo.claude_turn.QUIESCENCE_TIMEOUT", 0.05):
+      return await run_turn(client, "prompt", events.append, resumed=True)
+
+  cost, _usage = asyncio.run(asyncio.wait_for(_run(), timeout=5))
+  # The real answer surfaced — NOT an empty Done card, and the empty first
+  # Result's placeholder was NOT emitted as the answer.
+  assert _answers(events) == ["real answer"]
+  assert any(isinstance(e, DoneEvent) for e in events)
+  assert client.q.empty(), "resumed turn stranded its real continuation"
+  assert abs(cost - 0.02) < 1e-9
+
+
+def test_resumed_turn_with_real_first_result_completes_normally():
+  """A resumed turn whose first Result already carries the real answer ends
+  immediately — the drain only engages when the first Result is empty (no
+  hang, no spurious EmptyResponseError)."""
+  client = QueueClient(steered=[False])
+  client.feed(
+    FakeAssistantMessage(content=[FakeTextBlock(text="normal answer")]),
+    FakeResultMessage(total_cost_usd=0.02, usage={"input_tokens": 100}),
+  )
+  events: list = []
+
+  async def _run():
+    with mock.patch.dict("sys.modules", _sdk_modules()), \
+         mock.patch("nemo.claude_turn.QUIESCENCE_TIMEOUT", 0.05):
+      return await run_turn(client, "prompt", events.append, resumed=True)
+
+  cost, _usage = asyncio.run(asyncio.wait_for(_run(), timeout=5))
+  assert _answers(events) == ["normal answer"]
+  assert any(isinstance(e, DoneEvent) for e in events)
+  assert client.q.empty()
+
+
+def test_resumed_turn_empty_first_result_no_continuation_raises():
+  """Resumed turn whose empty first Result has NO continuation within
+  RESUME_DRAIN_TIMEOUT is genuinely empty → EmptyResponseError (bounded
+  same-client retry) instead of spinning the progress budget."""
+  from nemo.claude_turn import EmptyResponseError
+
+  client = QueueClient(steered=[False])
+  client.feed(
+    FakeResultMessage(total_cost_usd=0.0, usage={},
+                      result="No response requested."),
+  )
+  events: list = []
+
+  async def _run():
+    with mock.patch.dict("sys.modules", _sdk_modules()), \
+         mock.patch("nemo.claude_turn.QUIESCENCE_TIMEOUT", 0.05), \
+         mock.patch("nemo.claude_turn.RESUME_DRAIN_TIMEOUT", 0.2):
+      await run_turn(client, "prompt", events.append, resumed=True)
+
+  with pytest.raises(EmptyResponseError):
+    asyncio.run(asyncio.wait_for(_run(), timeout=5))
+  assert not any(isinstance(e, DoneEvent) for e in events), \
+    "an empty resumed turn must not finalize a Done card"
+
+
+def test_no_lag_after_resumed_turn_next_turn_gets_its_own_answer():
+  """End-to-end over ONE shared stream: a resumed turn that drains its real
+  continuation leaves the NEXT turn to answer its OWN prompt — no +1 turn
+  lag (the observed failure before Fix 2)."""
+  client = QueueClient(steered=[False])
+
+  async def _run():
+    with mock.patch.dict("sys.modules", _sdk_modules()), \
+         mock.patch("nemo.claude_turn.QUIESCENCE_TIMEOUT", 0.05):
+      # Turn 1: resumed (attempt > 0 after a reconnect).
+      client.feed(
+        FakeResultMessage(total_cost_usd=0.0, usage={},
+                          result="No response requested."),
+        FakeAssistantMessage(content=[FakeTextBlock(text="t1-real-answer")]),
+        FakeResultMessage(total_cost_usd=0.01),
+      )
+      ev1: list = []
+      await run_turn(client, "q1", ev1.append, resumed=True)
+      assert client.q.empty(), "resumed turn 1 stranded a Result into turn 2's stream"
+
+      # Turn 2: fresh (attempt 0, NOT resumed).
+      client.feed(
+        FakeAssistantMessage(content=[FakeTextBlock(text="t2-answer")]),
+        FakeResultMessage(total_cost_usd=0.01),
+      )
+      ev2: list = []
+      await run_turn(client, "q2", ev2.append)
+      return _answers(ev1), _answers(ev2)
+
+  a1, a2 = asyncio.run(_run())
+  assert a1 == ["t1-real-answer"]
+  # The crux: turn 2 answers q2, NOT the stranded t1 continuation.
   assert a2 == ["t2-answer"]
 
 

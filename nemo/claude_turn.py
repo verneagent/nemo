@@ -132,6 +132,19 @@ class StaleLeakError(TransientAPIError):
   """
 
 
+class EmptyResponseError(RuntimeError):
+  """The turn completed (a ResultMessage arrived) but produced no real output.
+
+  The claude CLI's empty-completion placeholder ("No response requested.")
+  finalizes a ResultMessage with empty content and zero cost — the model
+  returned nothing. Finalizing the card as a misleading empty "Done ✓" is
+  worse than surfacing the failure: ``SDKThread.run_turn_with_reconnect``
+  retries the SAME prompt on the SAME client (no reconnect — the CLI is
+  healthy; a reconnect replay would re-introduce the same empty completion),
+  and if it repeats, the host shows an explicit empty-response error card.
+  """
+
+
 # The claude CLI surfaces API/network failures with a hard-coded "API Error:"
 # prefix at the START of the result text. We only match that exact prefix to
 # avoid false positives when the model is legitimately discussing these error
@@ -244,6 +257,34 @@ def _looks_like_leaked_tool_call(text: str) -> bool:
   return bool(_LEAKED_INVOKE_OPEN_RE.search(text)) and bool(
     _LEAKED_INVOKE_CLOSE_RE.search(text))
 
+
+# The claude CLI's empty-completion placeholder: when the model decides no
+# response is needed it finalizes the turn with a ResultMessage whose result
+# (or assistant text) is exactly this. Treating it as content would present a
+# misleading empty "Done ✓" card. Matched case-insensitively after trimming
+# surrounding quotes.
+_EMPTY_RESPONSE_PLACEHOLDERS: frozenset[str] = frozenset({
+  "no response requested",
+  "no response requested.",
+  "no response required",
+  "no response required.",
+  "no response needed",
+  "no response needed.",
+})
+
+
+def _is_empty_response_text(text: str) -> bool:
+  """True when text is the CLI's empty-completion placeholder, not an answer.
+
+  Also true for the all-whitespace / quote-wrapped variants the CLI emits for
+  the same "model returned nothing" state.
+  """
+  if not text:
+    return True
+  stripped = text.strip().strip("'\"`")
+  return stripped.lower() in _EMPTY_RESPONSE_PLACEHOLDERS
+
+
 # If receive_messages() yields nothing for this long, assume the turn is stuck.
 # SDK docs: "If no ResultMessage is received, the iterator continues indefinitely."
 # Must be generous — Agent spawning and complex edits can go quiet for minutes.
@@ -270,6 +311,21 @@ PROGRESS_TIMEOUT = 240  # seconds — 4 minutes without real work = stuck
 # extra Result) simply idles out this window; a *late* steer streams its
 # continuation within it. This is Result-as-event, not Result-as-return.
 QUIESCENCE_TIMEOUT = 8  # seconds of CLI silence after a Result = turn complete
+
+# On a turn resumed after a reconnect (SDKThread.run_turn_with_reconnect
+# attempt > 0), the CLI replays session history and may first finalize a
+# SPURIOUS EMPTY ResultMessage: the model, seeing its own prior work in the
+# replayed history, emits the "No response requested." placeholder and only
+# then processes the re-sent prompt for real (observed: empty Result at
+# 10:56:57, real answer streaming ~14s later). Breaking at that first Result
+# (as a normal turn does) strands the real answer in the receive buffer →
+# the NEXT turn drains it → permanent +1 turn lag. So resumed turns do NOT
+# break at the first Result; they drain. This bounds that drain: if the real
+# continuation's first message hasn't arrived within RESUME_DRAIN_TIMEOUT of
+# the empty first Result, the resumed turn is genuinely empty — we end it
+# cleanly (no 240s progress-budget spin) so the empty-response detection
+# raises EmptyResponseError and the prompt is retried.
+RESUME_DRAIN_TIMEOUT = 90  # seconds
 
 # Messages that do NOT count as real progress. Anything outside this set
 # refreshes the progress clock. Checked by class name to avoid importing
@@ -302,6 +358,7 @@ async def _single_turn(
   is_paused: Callable[[], bool] | None = None,
   steered: list[bool] | None = None,
   steer_probe: Callable[[str], int] | None = None,
+  resumed: bool = False,
 ) -> _TurnResult:
   """Issue one query() and consume the client's receive_messages() stream.
 
@@ -343,6 +400,18 @@ async def _single_turn(
   many Results this turn owes (1 + started continuation batches) and, if
   Results are still outstanding, drop back to the normal heartbeat/progress
   budgets until the next Result instead of ending the turn.
+
+  ``resumed`` is True when this turn is the retry of a previous turn after a
+  reconnect-with-resume (``SDKThread.run_turn_with_reconnect`` attempt > 0).
+  A resumed turn does NOT break at its first ResultMessage: the CLI replays
+  session history first and may finalize a spurious EMPTY Result (the model
+  emits the "No response requested." placeholder on the replayed state)
+  before processing the re-sent prompt for real. Breaking there strands the
+  real answer → permanent +1 turn lag. Instead we drain past the empty first
+  Result with a bounded window (RESUME_DRAIN_TIMEOUT); a continuation that
+  streams real content ends the turn normally, and a genuinely-empty resumed
+  turn (no continuation within the bound) ends cleanly so the empty-response
+  check below raises ``EmptyResponseError`` for a bounded same-client retry.
   """
   from claude_agent_sdk import (
     AssistantMessage, TextBlock, ThinkingBlock, ToolUseBlock, ResultMessage,
@@ -368,6 +437,11 @@ async def _single_turn(
   last_thinking: str = ""
   transient_error_text: str = ""  # set if AssistantMessage body looked like API error
   non_retryable_error_text: str = ""
+  # Resumed-turn drain deadline (see RESUME_DRAIN_TIMEOUT note). Set when a
+  # resumed turn's first ResultMessage is empty; cleared the moment any real
+  # continuation message arrives; its expiry ends the turn so the
+  # empty-response check below fires instead of spinning the progress budget.
+  resume_drain_deadline: float | None = None
 
   FIRST_MSG_TIMEOUT = 30
   msg_count = 0
@@ -391,13 +465,31 @@ async def _single_turn(
     if paused:
       last_progress_at = _time.monotonic()
     if saw_result and not paused:
-      # Quiescence / steer-drain mode: a Result already arrived on a steered
-      # turn. We are only waiting to see whether the CLI emits a steer
-      # continuation (its own follow-on turn). Bound the wait to
-      # QUIESCENCE_TIMEOUT; an idle tick means the CLI has gone silent → the
-      # turn (including any steer follow-on) is genuinely complete. Never force
-      # a reconnect here — silence after a Result is the normal end of a turn.
-      iter_timeout = QUIESCENCE_TIMEOUT
+      # Quiescence / steer-drain mode: a Result already arrived. We are only
+      # waiting to see whether the CLI emits a follow-on continuation (a
+      # steer's own turn, or — on a resumed turn — the real answer behind an
+      # empty first Result). Bound the wait to QUIESCENCE_TIMEOUT; an idle
+      # tick means the CLI has gone silent → the turn (including any follow-on)
+      # is genuinely complete. Never force a reconnect here — silence after a
+      # Result is the normal end of a turn.
+      if resume_drain_deadline is not None:
+        remaining = resume_drain_deadline - _time.monotonic()
+        if remaining <= 0:
+          # The resumed turn produced only an empty first Result and no
+          # continuation arrived within RESUME_DRAIN_TIMEOUT — genuinely
+          # empty. End the turn so the empty-response check below raises
+          # EmptyResponseError (bounded same-client retry) instead of
+          # spinning to PROGRESS_TIMEOUT.
+          if next_task is not None:
+            next_task.cancel()
+            next_task = None
+          log.warning(
+            "resumed turn: empty first result with no continuation in %ds — "
+            "ending turn for empty-response handling", RESUME_DRAIN_TIMEOUT)
+          break
+        iter_timeout = min(QUIESCENCE_TIMEOUT, remaining)
+      else:
+        iter_timeout = QUIESCENCE_TIMEOUT
     else:
       heartbeat_budget = FIRST_MSG_TIMEOUT if msg_count == 0 else HEARTBEAT_TIMEOUT
       progress_budget = PROGRESS_TIMEOUT - (_time.monotonic() - last_progress_at)
@@ -425,12 +517,23 @@ async def _single_turn(
         # continuation in the receive buffer → every later turn answers the
         # PREVIOUS message (+1 turn lag).
         expected_results = 1
+        if resume_drain_deadline is not None:
+          # Resumed turn with an empty first Result — expect the real
+          # continuation's Result too.
+          expected_results = 2
         if steer_probe is not None and steered_flag[0]:
           try:
-            expected_results = 1 + steer_probe(sdk_session_id)
+            expected_results += steer_probe(sdk_session_id)
           except Exception as exc:
             log.warning("steer continuation probe failed: %s", exc)
         if results_seen < expected_results:
+          if resume_drain_deadline is not None:
+            # Resumed drain: keep saw_result=True so the loop-top deadline
+            # bound governs the wait (and ends it cleanly on expiry). Do NOT
+            # drop back to the heartbeat/progress budgets — that would
+            # bypass the bound and spin up to PROGRESS_TIMEOUT. Keep the
+            # pending receive future alive (like the paused path).
+            continue
           # Keep the pending receive future alive (like the paused path):
           # cancelling __anext__ mid-await can tear down the stream.
           log.info(
@@ -514,6 +617,10 @@ async def _single_turn(
     else:
       log.info("turn msg: %s", msg_type)
       last_progress_at = _time.monotonic()
+      # Any real message means a resumed continuation (if any) is underway —
+      # the drain deadline is no longer needed (its job was only to bound the
+      # gap between an empty first Result and the continuation's first message).
+      resume_drain_deadline = None
 
     # --- Stale task leak detection (SDK bug #788) ---
     # Deterministic: a TaskNotification whose id we already know is stale
@@ -567,10 +674,17 @@ async def _single_turn(
           on_event(ProgressEvent(kind="tool", summary=tool_summary, first=is_first))
           last_emitted = "progress"
       elif text:
+        if _is_empty_response_text(text):
+          # The CLI's empty-completion placeholder ("No response
+          # requested.") — not a real answer. Skip it: emitting it would
+          # mark the turn as answered and finalize a misleading empty Done
+          # card; leaving last_emitted empty lets the empty-response check
+          # below raise EmptyResponseError for a bounded same-client retry.
+          log.info("Ignoring empty-response placeholder from CLI: %r", text[:80])
         # Detect claude-CLI-surfaced API errors BEFORE emitting as a
         # user-facing AnswerEvent. Provider/account failures such as 402
         # balance are not retryable; network-ish failures are.
-        if _looks_like_non_retryable_api_error(text):
+        elif _looks_like_non_retryable_api_error(text):
           log.warning("Non-retryable API error in AssistantMessage: %r", text[:200])
           non_retryable_error_text = text
         elif _looks_like_transient_api_error(text):
@@ -668,19 +782,43 @@ async def _single_turn(
       pending_tasks.clear()
       saw_result = True
       results_seen += 1
-      if not steered_flag[0]:
-        # No steer this turn → exactly one Result → done. (Unchanged behavior;
-        # zero added latency for the common case.)
+      if not steered_flag[0] and (not resumed or last_emitted != ""):
+        # No steer, and this is not a resumed turn owing a continuation past
+        # an EMPTY first Result → exactly one Result → done. (For a non-empty
+        # first Result there is nothing after it, so this also covers a
+        # normal answer on a resumed turn with zero added latency.)
         break
-      # A steer was injected this turn: do NOT break here or we strand the
-      # steer's follow-on Result in the receive buffer. Keep looping — the
-      # quiescence window (top of loop) ends the turn once the CLI is silent,
-      # after consuming any steer continuation into THIS run_turn.
+      # A steer was injected this turn, OR this is a resumed turn whose first
+      # Result was empty and may owe a real continuation: do NOT break here or
+      # we strand the follow-on in the receive buffer. Keep looping — the
+      # quiescence / resumed-drain window (top of loop) ends the turn once
+      # the CLI is silent, after consuming any follow-on Result into THIS
+      # run_turn.
+      if (resumed and last_emitted == "" and results_seen == 1
+          and resume_drain_deadline is None):
+        # Resumed turn whose first Result is empty (e.g. the CLI's "No
+        # response requested." placeholder on the replayed session state).
+        # The real answer to the re-sent prompt may stream in as a follow-on
+        # continuation — bound a drain for it instead of stranding it.
+        resume_drain_deadline = _time.monotonic() + RESUME_DRAIN_TIMEOUT
+        log.info(
+          "resumed turn: first result empty (result=%r) — draining up to %ds "
+          "for the real continuation", result_text[:120], RESUME_DRAIN_TIMEOUT)
       last_progress_at = _time.monotonic()
 
   if timed_out:
     on_event(ErrorEvent(message="Turn timed out — SDK stopped responding"))
     raise TimeoutError("receive_messages() heartbeat timeout")
+
+  # A turn that COMPLETED (a ResultMessage arrived) but produced no real
+  # output — no text, no thinking, no tool use — e.g. the CLI's "No response
+  # requested." empty-completion placeholder. Presenting that as a successful
+  # "Done ✓" card is misleading (observed: empty Done card in the group).
+  # Raise so the reconnect layer retries the same prompt once on the SAME
+  # client, then the host surfaces an explicit empty-response error card.
+  if saw_result and last_emitted == "":
+    raise EmptyResponseError(
+      "Model returned an empty response (no text, thinking, or tool use)")
 
   return _TurnResult(
     cost=cost,
@@ -699,6 +837,7 @@ async def run_turn(
   is_paused: Callable[[], bool] | None = None,
   steered: list[bool] | None = None,
   steer_probe: Callable[[str], int] | None = None,
+  resumed: bool = False,
 ) -> tuple[float, JsonObject]:
   """Send prompt to SDK client, stream responses, emit events.
 
@@ -711,17 +850,21 @@ async def run_turn(
   do NOT catch it here — recovery requires tearing down the wedged
   subprocess, which only the reconnect layer can do.
 
+  ``resumed`` marks a reconnect-retry pass: pass it through to ``_single_turn``
+  so it drains past an empty first Result (see RESUME_DRAIN_TIMEOUT note)
+  instead of stranding the real continuation answer.
+
   Returns (cost, usage_dict).
   """
   if stale_tasks is None:
     stale_tasks = set()
   stop_task_disabled: list[bool] = [False]
 
-  # _single_turn raises (StaleLeakError / TimeoutError / TransientAPIError)
-  # straight through; the reconnect layer owns recovery.
+  # _single_turn raises (StaleLeakError / TimeoutError / TransientAPIError /
+  # EmptyResponseError) straight through; the reconnect layer owns recovery.
   result = await _single_turn(
     client, prompt, on_event, stale_tasks, stop_task_disabled, is_paused,
-    steered, steer_probe,
+    steered, steer_probe, resumed,
   )
 
   total_cost = result.cost

@@ -223,6 +223,7 @@ class SDKThread:
     stale_tasks: set[str] | None = None,
     is_paused: Callable[[], bool] | None = None,
     steer_probe: Callable[[str, list[str]], int] | None = None,
+    resumed: bool = False,
   ) -> tuple[float, JsonObject]:
     """Run a single SDK turn on the SDK thread.
 
@@ -237,6 +238,10 @@ class SDKThread:
     ``ClaudeCodingAgent.steer_continuation_batches``). It is bound to THIS
     turn's steered texts and handed to the turn runner so quiescence cannot
     end the turn while a steer continuation is still running.
+
+    ``resumed`` marks a reconnect-retry pass (run_turn_with_reconnect
+    attempt > 0): passed to the turn runner so it drains past an empty first
+    Result instead of stranding the real continuation answer.
     """
     if self._client is None:
       raise RuntimeError("SDK client not connected")
@@ -256,7 +261,7 @@ class SDKThread:
         self._client, prompt, on_event,
         stale_tasks=stale_tasks, is_paused=is_paused,
         steered=self._steer_holder,
-        steer_probe=_bound_probe)
+        steer_probe=_bound_probe, resumed=resumed)
 
     return await self.run_on_sdk_loop(_turn())
 
@@ -288,16 +293,34 @@ class SDKThread:
     parameter when not provided.
     """
     from .claude_turn import (
-      NonRetryableAPIError, StaleLeakError, TransientAPIError,
+      EmptyResponseError, NonRetryableAPIError, StaleLeakError,
+      TransientAPIError,
     )  # avoid import cycle
     self._cancelled.clear()
+    # A turn may complete with an EMPTY result (the CLI's "No response
+    # requested." placeholder — the model returned nothing). That is NOT a
+    # CLI failure: the subprocess is healthy, and reconnecting would replay
+    # the session and likely re-introduce the same empty completion. Retry
+    # the same prompt on the SAME client, bounded, then give up so the host
+    # surfaces an explicit empty-response error card instead of a misleading
+    # empty "Done ✓".
+    empty_retries = 1
     for attempt in range(max_attempts):
       if self._cancelled.is_set():
         raise asyncio.CancelledError("SDK turn cancelled")
       try:
         return await self.run_turn(
           prompt, on_event, stale_tasks=stale_tasks, is_paused=is_paused,
-          steer_probe=steer_probe)
+          steer_probe=steer_probe, resumed=(attempt > 0))
+      except EmptyResponseError as exc:
+        if empty_retries <= 0:
+          log.warning("SDK turn empty response (no retries left) — giving up")
+          raise
+        empty_retries -= 1
+        log.warning(
+          "SDK turn empty response — retrying same prompt on same client "
+          "(%d retry left): %s", empty_retries, str(exc)[:200])
+        continue
       except NonRetryableAPIError:
         log.warning("SDK turn non-retryable API error — closing client")
         await self.close_client()
