@@ -75,6 +75,12 @@ class SDKThread:
     # steer_probe so the turn runner can ask the transcript how many steer
     # continuations (extra Results) the stream still owes before it may end.
     self._steer_texts: list[str] = []
+    # One-element mutable flag: set True by interrupt() when the user stops
+    # the RUNNING turn, read by turn._single_turn so a user stop that ends the
+    # turn mid-generation (thinking-only tail) is NOT misread as an
+    # IncompleteTurnError (a retry would continue the job the user just told
+    # us to stop). Reset per turn.
+    self._interrupt_holder: list[bool] = [False]
 
   def start(self) -> None:
     """Start the SDK thread. Blocks until the event loop is ready."""
@@ -246,10 +252,12 @@ class SDKThread:
     if self._client is None:
       raise RuntimeError("SDK client not connected")
 
-    # Fresh steer flag/texts per turn: only steers injected into THIS turn
-    # count.
+    # Fresh steer flag/texts + interrupt flag per turn: only steers injected
+    # into THIS turn count, and a stop pressed during a PREVIOUS turn must not
+    # suppress this turn's incomplete-turn detection.
     self._steer_holder[0] = False
     self._steer_texts.clear()
+    self._interrupt_holder[0] = False
 
     def _bound_probe(session_id: str) -> int:
       if steer_probe is None or not self._steer_texts:
@@ -261,7 +269,8 @@ class SDKThread:
         self._client, prompt, on_event,
         stale_tasks=stale_tasks, is_paused=is_paused,
         steered=self._steer_holder,
-        steer_probe=_bound_probe, resumed=resumed)
+        steer_probe=_bound_probe, resumed=resumed,
+        interrupted=lambda: self._interrupt_holder[0])
 
     return await self.run_on_sdk_loop(_turn())
 
@@ -293,18 +302,22 @@ class SDKThread:
     parameter when not provided.
     """
     from .claude_turn import (
-      EmptyResponseError, NonRetryableAPIError, StaleLeakError,
-      TransientAPIError,
+      EmptyResponseError, IncompleteTurnError, NonRetryableAPIError,
+      StaleLeakError, TransientAPIError,
     )  # avoid import cycle
     self._cancelled.clear()
-    # A turn may complete with an EMPTY result (the CLI's "No response
-    # requested." placeholder — the model returned nothing). That is NOT a
-    # CLI failure: the subprocess is healthy, and reconnecting would replay
-    # the session and likely re-introduce the same empty completion. Retry
-    # the same prompt on the SAME client, bounded, then give up so the host
-    # surfaces an explicit empty-response error card instead of a misleading
-    # empty "Done ✓".
-    empty_retries = 1
+    # A turn may complete without a final answer:
+    #   - EmptyResponseError: the CLI's "No response requested." placeholder —
+    #     the model returned nothing.
+    #   - IncompleteTurnError: the turn ended on a thinking/tool-only tail —
+    #     the model's final text was cut off mid-generation.
+    # Neither is a CLI failure: the subprocess is healthy, and reconnecting
+    # would replay the session and likely re-introduce the same broken
+    # completion. Retry the same prompt on the SAME client, bounded, so the
+    # model continues the job (its partial work is preserved in history); then
+    # give up so the host surfaces an explicit error card instead of a
+    # misleading empty/fragment "Done ✓".
+    incomplete_retries = 1
     for attempt in range(max_attempts):
       if self._cancelled.is_set():
         raise asyncio.CancelledError("SDK turn cancelled")
@@ -312,14 +325,16 @@ class SDKThread:
         return await self.run_turn(
           prompt, on_event, stale_tasks=stale_tasks, is_paused=is_paused,
           steer_probe=steer_probe, resumed=(attempt > 0))
-      except EmptyResponseError as exc:
-        if empty_retries <= 0:
-          log.warning("SDK turn empty response (no retries left) — giving up")
+      except (EmptyResponseError, IncompleteTurnError) as exc:
+        if incomplete_retries <= 0:
+          log.warning("SDK turn %s (no retries left) — giving up",
+                      type(exc).__name__)
           raise
-        empty_retries -= 1
+        incomplete_retries -= 1
         log.warning(
-          "SDK turn empty response — retrying same prompt on same client "
-          "(%d retry left): %s", empty_retries, str(exc)[:200])
+          "SDK turn %s — retrying same prompt on same client "
+          "(%d retry left): %s", type(exc).__name__, incomplete_retries,
+          str(exc)[:200])
         continue
       except NonRetryableAPIError:
         log.warning("SDK turn non-retryable API error — closing client")
@@ -360,9 +375,15 @@ class SDKThread:
     raise RuntimeError(f"SDK turn failed after {max_attempts} attempts")
 
   async def interrupt(self) -> None:
-    """Interrupt the current SDK turn."""
+    """Interrupt the current SDK turn.
+
+    Sets the per-turn interrupt flag FIRST so ``turn._single_turn``, when it
+    processes the interrupted turn's ResultMessage, knows the thinking-only
+    tail is a user stop — not an IncompleteTurnError to retry.
+    """
     if self._client is None:
       return
+    self._interrupt_holder[0] = True
 
     async def _interrupt():
       try:

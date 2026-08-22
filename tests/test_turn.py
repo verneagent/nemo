@@ -268,6 +268,7 @@ def test_task_lifecycle():
     FakeAssistantMessage(content=[FakeToolUseBlock(name="Agent", input={"description": "search"})]),
     FakeTaskStartedMessage(task_id="task_1"),
     FakeTaskNotificationMessage(task_id="task_1", status="completed"),
+    FakeAssistantMessage(content=[FakeTextBlock(text="Task completed")]),
     FakeResultMessage(),
   ]
   events = []
@@ -859,6 +860,7 @@ def test_task_progress_event():
   messages = [
     FakeAssistantMessage(content=[FakeToolUseBlock(name="Bash", input={"command": "ls"})]),
     FakeTaskProgressMessage(description="Searching files..."),
+    FakeAssistantMessage(content=[FakeTextBlock(text="Searching...")]),
     FakeResultMessage(),
   ]
   events = []
@@ -892,8 +894,45 @@ def test_mixed_text_and_tool():
   assert answer_events[0].text == "Let me check"
 
 
-def test_trailing_thinking_compensation():
-  """When the last event is thinking (no text), an AnswerEvent should be synthesized."""
+def test_thinking_only_end_raises_incomplete_turn_error():
+  """A turn that COMPLETES (ResultMessage) but whose last emitted event is a
+  thinking-only tail — the model's final text answer never arrived (its
+  generation was cut off mid-stream, e.g. stop_reason=None on a proxied
+  model). This is the "stops halfway" bug: the old trailing-thinking
+  compensation posted the mid-work thinking fragment as a fake Done ✓ card.
+  It must raise IncompleteTurnError so the reconnect layer retries the same
+  prompt and the model continues the job.
+  """
+  from nemo.claude_turn import IncompleteTurnError
+
+  messages = [
+    FakeAssistantMessage(content=[
+      FakeThinkingBlock(thinking="Let me analyze this"),
+      FakeToolUseBlock(name="Read", input={"file_path": "/a.py"}),
+    ]),
+    FakeAssistantMessage(content=[
+      FakeThinkingBlock(thinking="Now let me look at how clicks are handled, "
+                                 "the CSS, and the server..."),
+    ]),
+    FakeResultMessage(),
+  ]
+  events = []
+  async def _run():
+    with mock.patch.dict("sys.modules", _sdk_modules()):
+      client = FakeClient(messages)
+      await run_turn(client, "fix bug", events.append)
+  with pytest.raises(IncompleteTurnError):
+    asyncio.run(_run())
+  # Never a fake Done ✓ for an incomplete turn.
+  assert not any(isinstance(e, DoneEvent) for e in events)
+  assert not any(isinstance(e, AnswerEvent) for e in events)
+
+
+def test_trailing_thinking_compensation_on_user_stop():
+  """A thinking-only end caused by a USER stop/esc (interrupted=True) is NOT
+  an incomplete-turn error — the user asked for the end. The trailing thinking
+  is still surfaced (compensation) and the turn completes cleanly.
+  """
   messages = [
     FakeAssistantMessage(content=[
       FakeThinkingBlock(thinking="Let me analyze this"),
@@ -908,7 +947,8 @@ def test_trailing_thinking_compensation():
   async def _run():
     with mock.patch.dict("sys.modules", _sdk_modules()):
       client = FakeClient(messages)
-      await run_turn(client, "fix bug", events.append)
+      await run_turn(client, "fix bug", events.append,
+                     interrupted=lambda: True)
   asyncio.run(_run())
   answer_events = [e for e in events if isinstance(e, AnswerEvent)]
   assert len(answer_events) == 1

@@ -162,6 +162,16 @@ def _format_turn_error_message(message: str) -> str:
       "switching to a different model with `/model`.\n\n"
       f"Original error: {message}"
     )
+  if "incomplete turn" in lower:
+    return (
+      "The model's turn stopped midway: it had started working (exploring, "
+      "editing, reasoning) but the response ended before it produced a final "
+      "answer — often an upstream cut on a proxied model. The work already "
+      "done is preserved, and it was retried once automatically.\n\n"
+      "Please send your message again to continue the job; if it keeps "
+      "stopping midway, try switching to a different model with `/model`.\n\n"
+      f"Original error: {message}"
+    )
   if any(marker in lower for marker in _CODEX_BACKEND_FAILURE_MARKERS):
     return (
       "Codex could not connect to the ChatGPT Codex backend. This is usually "

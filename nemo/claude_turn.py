@@ -145,6 +145,25 @@ class EmptyResponseError(RuntimeError):
   """
 
 
+class IncompleteTurnError(RuntimeError):
+  """The turn completed (a ResultMessage arrived) but ended on a thinking-only
+  or tool-only tail — the model's final TEXT answer never arrived.
+
+  A healthy Claude/DeepSeek/… turn always ends with a text block (the answer);
+  thinking precedes text. A turn whose last emitted event is a ProgressEvent
+  (thinking or tool use) with no following AnswerEvent means the generation was
+  CUT OFF mid-stream — observed as the model streaming its plan ("let me look
+  at 1. … 2. … 3. …") and then the turn ending with stop_reason=None, e.g. an
+  upstream output/token cut on a proxied model. The old behavior compensated
+  the thinking fragment into an AnswerEvent and finalized a misleading "Done ✓"
+  card the user reads as "stopped halfway". ``run_turn_with_reconnect`` retries
+  the SAME prompt on the SAME client so the model continues the job (its
+  partial work is preserved in the session history); a repeat surfaces an
+  explicit error card. Suppressed when ``interrupted()`` is true (the user
+  pressed stop — that end is intentional, not a bug).
+  """
+
+
 # The claude CLI surfaces API/network failures with a hard-coded "API Error:"
 # prefix at the START of the result text. We only match that exact prefix to
 # avoid false positives when the model is legitimately discussing these error
@@ -359,6 +378,7 @@ async def _single_turn(
   steered: list[bool] | None = None,
   steer_probe: Callable[[str], int] | None = None,
   resumed: bool = False,
+  interrupted: Callable[[], bool] | None = None,
 ) -> _TurnResult:
   """Issue one query() and consume the client's receive_messages() stream.
 
@@ -412,6 +432,14 @@ async def _single_turn(
   streams real content ends the turn normally, and a genuinely-empty resumed
   turn (no continuation within the bound) ends cleanly so the empty-response
   check below raises ``EmptyResponseError`` for a bounded same-client retry.
+
+  ``interrupted`` (optional) is a predicate returning True while the user has
+  pressed stop/esc and the SDK has been told to interrupt the RUNNING turn
+  (``SDKThread.interrupt()``). A user interrupt legitimately ends the turn
+  with whatever partial output exists — thinking-only or even empty. We must
+  NOT treat that as an ``IncompleteTurnError`` / ``EmptyResponseError`` (a
+  retry would continue the job the user just told us to stop). Only a NATURAL
+  completion with a progress-only tail is incomplete.
   """
   from claude_agent_sdk import (
     AssistantMessage, TextBlock, ThinkingBlock, ToolUseBlock, ResultMessage,
@@ -816,9 +844,27 @@ async def _single_turn(
   # "Done ✓" card is misleading (observed: empty Done card in the group).
   # Raise so the reconnect layer retries the same prompt once on the SAME
   # client, then the host surfaces an explicit empty-response error card.
+  user_stopped = interrupted is not None and interrupted()
   if saw_result and last_emitted == "":
     raise EmptyResponseError(
       "Model returned an empty response (no text, thinking, or tool use)")
+
+  # A turn that COMPLETED but ended on a thinking-only / tool-only tail: the
+  # model's final TEXT answer never arrived (its generation was cut off — e.g.
+  # stop_reason=None on a proxied model, or the answer was truncated upstream).
+  # The old "trailing thinking compensation" converted this into a misleading
+  # "Done ✓" card whose body is a mid-work thinking fragment — the user reads
+  # it as "stopped halfway" (observed: model streaming its plan then the turn
+  # dying with no text). A user stop/esc is the one legitimate way a turn ends
+  # mid-generation: suppressed when interrupted() is true so the turn just
+  # winds down with its partial output (compensation still applies).
+  if saw_result and last_emitted == "progress":
+    if user_stopped:
+      log.info("Turn interrupted mid-generation — ending cleanly")
+    else:
+      raise IncompleteTurnError(
+        "Incomplete turn: the model's response ended before a final text "
+        "answer (only thinking/tool output)")
 
   return _TurnResult(
     cost=cost,
@@ -838,6 +884,7 @@ async def run_turn(
   steered: list[bool] | None = None,
   steer_probe: Callable[[str], int] | None = None,
   resumed: bool = False,
+  interrupted: Callable[[], bool] | None = None,
 ) -> tuple[float, JsonObject]:
   """Send prompt to SDK client, stream responses, emit events.
 
@@ -854,6 +901,10 @@ async def run_turn(
   so it drains past an empty first Result (see RESUME_DRAIN_TIMEOUT note)
   instead of stranding the real continuation answer.
 
+  ``interrupted`` (optional) — see ``_single_turn``: a predicate that is true
+  while the user is stopping the RUNNING turn. Passed through so a user stop
+  ending the turn mid-generation is not misread as an IncompleteTurnError.
+
   Returns (cost, usage_dict).
   """
   if stale_tasks is None:
@@ -861,10 +912,11 @@ async def run_turn(
   stop_task_disabled: list[bool] = [False]
 
   # _single_turn raises (StaleLeakError / TimeoutError / TransientAPIError /
-  # EmptyResponseError) straight through; the reconnect layer owns recovery.
+  # EmptyResponseError / IncompleteTurnError) straight through; the reconnect
+  # layer owns recovery.
   result = await _single_turn(
     client, prompt, on_event, stale_tasks, stop_task_disabled, is_paused,
-    steered, steer_probe, resumed,
+    steered, steer_probe, resumed, interrupted,
   )
 
   total_cost = result.cost
@@ -874,7 +926,11 @@ async def run_turn(
   total_usage: JsonObject = normalize_claude_usage(result.usage or {})
 
   # Trailing thinking compensation: if the turn ended on a thinking-only
-  # tail shown as a ProgressEvent, surface it as the answer.
+  # tail shown as a ProgressEvent, surface it as the answer. Only reachable
+  # for ends `_single_turn` did NOT flag as incomplete — i.e. a user
+  # stop/esc (interrupted) or a stream that stopped without a ResultMessage.
+  # A NATURAL completion with a thinking-only tail already raised
+  # IncompleteTurnError in `_single_turn`, so it never gets a fake answer.
   if result.last_emitted == "progress" and result.last_thinking:
     log.info("Compensating trailing thinking (%d chars)",
              len(result.last_thinking))

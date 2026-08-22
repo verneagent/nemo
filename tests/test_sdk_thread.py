@@ -592,6 +592,70 @@ class TestRunTurnWithReconnect:
     assert [c[0] for c in calls] == ["hello", "hello"]
     mock_reconn.assert_not_awaited()
 
+  def test_incomplete_turn_retried_on_same_client_without_reconnect(
+      self, sdk_thread: SDKThread):
+    """An IncompleteTurnError (the model's response ended on a thinking/tool-
+    only tail — final text cut off mid-generation) is retried on the SAME
+    client WITHOUT a reconnect: the subprocess is healthy, the model's partial
+    work is already in session history, and reconnecting would replay the
+    session and re-introduce the same broken completion."""
+    from nemo.claude_turn import IncompleteTurnError
+
+    calls: list[tuple[str, bool]] = []
+
+    async def fake_turn(prompt, on_event, stale_tasks=None, is_paused=None,
+                        steer_probe=None, resumed=False):
+      calls.append((prompt, resumed))
+      if len(calls) == 1:
+        raise IncompleteTurnError("Incomplete turn: only thinking/tool output")
+      return (0.02, {})
+
+    sdk_thread._client = mock.MagicMock()
+
+    with mock.patch.object(sdk_thread, "run_turn", side_effect=fake_turn), \
+         mock.patch.object(sdk_thread, "reconnect",
+                           new_callable=mock.AsyncMock) as mock_reconn:
+      result = _run(sdk_thread.run_turn_with_reconnect(
+        "hello", on_event=lambda e: None,
+        options=mock.MagicMock(), max_attempts=3,
+      ))
+
+    # First attempt incomplete → retried once (attempt 1, now "resumed" since
+    # a retry pass must drain past a broken first Result), then succeeded.
+    assert [c[0] for c in calls] == ["hello", "hello"]
+    assert [c[1] for c in calls] == [False, True]
+    assert result == (0.02, {})
+    mock_reconn.assert_not_awaited()
+
+  def test_incomplete_turn_twice_gives_up_without_reconnect(
+      self, sdk_thread: SDKThread):
+    """Two consecutive incomplete turns give up (bounded) so the host can
+    surface an explicit incomplete-turn error card with recovery guidance —
+    never a reconnect."""
+    from nemo.claude_turn import IncompleteTurnError
+
+    calls: list[tuple[str, bool]] = []
+
+    async def fake_turn(prompt, on_event, stale_tasks=None, is_paused=None,
+                        steer_probe=None, resumed=False):
+      calls.append((prompt, resumed))
+      raise IncompleteTurnError("Incomplete turn: only thinking/tool output")
+
+    sdk_thread._client = mock.MagicMock()
+
+    with mock.patch.object(sdk_thread, "run_turn", side_effect=fake_turn), \
+         mock.patch.object(sdk_thread, "reconnect",
+                           new_callable=mock.AsyncMock) as mock_reconn:
+      with pytest.raises(IncompleteTurnError):
+        _run(sdk_thread.run_turn_with_reconnect(
+          "hello", on_event=lambda e: None,
+          options=mock.MagicMock(), max_attempts=3,
+        ))
+
+    # Bounded: initial + one retry, then give up. No reconnect.
+    assert [c[0] for c in calls] == ["hello", "hello"]
+    mock_reconn.assert_not_awaited()
+
 
 # ---------------------------------------------------------------------------
 # 7. interrupt dispatches to SDK thread

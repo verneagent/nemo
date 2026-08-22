@@ -291,6 +291,23 @@ def test_turn_error_message_adds_empty_response_recovery_hint():
   assert "Original error" in out
 
 
+def test_turn_error_message_adds_incomplete_turn_recovery_hint():
+  """An incomplete-turn error (the model started working — exploring, editing,
+  reasoning — but its response ended before a final answer) must surface
+  recovery guidance: resend to continue the job, or switch models."""
+  msg = (
+    "Incomplete turn: the model's response ended before a final text answer "
+    "(only thinking/tool output)"
+  )
+
+  out = _format_turn_error_message(msg)
+
+  assert "stopped midway" in out
+  assert "send your message again" in out
+  assert "/model" in out
+  assert "Original error" in out
+
+
 def test_idle_esc_is_silent(tmp_path):
   from nemo.channel import IncomingMessage
 
