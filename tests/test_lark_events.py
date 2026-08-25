@@ -85,6 +85,60 @@ def test_parse_message_image():
   assert ev.msg_type == "image"
 
 
+def test_parse_message_interactive():
+  """Interactive (card) message: extract title/body instead of empty text."""
+  payload = {
+    "header": {"event_type": "im.message.receive_v1"},
+    "event": {
+      "message": {
+        "chat_id": "oc_1",
+        "content": json.dumps({
+          "title": "Done ✓",
+          "elements": [[{"tag": "img", "image_key": "img_x"},
+                        {"tag": "text", "text": " "},
+                        {"tag": "text", "text": ""}]],
+        }),
+        "message_type": "interactive",
+        "message_id": "om_int",
+      },
+      "sender": {"sender_id": {"open_id": "ou_1"}},
+    },
+  }
+  ev = parse_event(payload)
+  assert ev.msg_type == "interactive"
+  assert ev.text == "Done ✓\n[image]"
+
+
+def test_parse_message_interactive_schema2():
+  """Interactive message in schema-2.0 shape → title + nested body text."""
+  payload = {
+    "header": {"event_type": "im.message.receive_v1"},
+    "event": {
+      "message": {
+        "chat_id": "oc_1",
+        "content": json.dumps({
+          "schema": "2.0",
+          "header": {"title": {"tag": "plain_text", "content": "Shell done"}},
+          "body": {"elements": [
+            {"tag": "markdown", "content": "`$ make build`"},
+            {"tag": "column_set", "columns": [
+              {"tag": "column", "elements": [
+                {"tag": "button", "text": {"tag": "plain_text", "content": "Abort"}},
+              ]},
+            ]},
+          ]},
+        }),
+        "message_type": "interactive",
+        "message_id": "om_int2",
+      },
+      "sender": {"sender_id": {"open_id": "ou_1"}},
+    },
+  }
+  ev = parse_event(payload)
+  assert ev.msg_type == "interactive"
+  assert ev.text == "Shell done\n`$ make build`\nAbort"
+
+
 def test_parse_message_bad_content():
   """Malformed content JSON should not crash."""
   payload = {

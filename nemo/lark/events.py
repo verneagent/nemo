@@ -22,6 +22,7 @@ from lark_oapi.event.callback.model.p2_card_action_trigger import (
 )
 
 from ..types import JsonObject, JsonValue
+from .interactive import extract_interactive_text
 
 log = logging.getLogger(__name__)
 
@@ -93,10 +94,16 @@ def _parse_message_event(payload: JsonObject) -> LarkEvent:
   content_str = msg.get("content", "{}")
   try:
     content = json.loads(content_str)
-    text = content.get("text", "")
-    image_key = content.get("image_key", "")
-    file_key = content.get("file_key", "")
-    file_name = content.get("file_name", "")
+    if msg.get("message_type") == "interactive":
+      # Interactive (card) messages carry no top-level "text"; extract the
+      # card title/body so a forwarded nemo card arrives as readable text
+      # instead of an empty string.
+      text = extract_interactive_text(content)
+    else:
+      text = content.get("text", "")
+      image_key = content.get("image_key", "")
+      file_key = content.get("file_key", "")
+      file_name = content.get("file_name", "")
   except (json.JSONDecodeError, TypeError) as e:
     log.debug("Malformed event content: %s", e)
 

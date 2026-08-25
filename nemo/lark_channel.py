@@ -15,6 +15,7 @@ from .channel import Channel, IncomingMessage
 from .config import load_credentials, load_relay_config
 from .lark import api as lark_api
 from .lark import auth as lark_auth
+from .lark import interactive as lark_interactive
 from .lark.events import LarkEvent, LarkEventStream
 from .relay_events import RelayEventStream
 from .types import JsonObject
@@ -161,6 +162,21 @@ def _to_incoming(
     except Exception as e:
       log.warning("Failed to expand merge_forward: %s", e)
 
+  # Enrich: recover card text for interactive (card) messages when the
+  # incoming text is empty or a bare placeholder. The relay may deliver
+  # '[interactive message]' (older relay without an interactive branch) and
+  # the direct event path may deliver '' — both lose the card content.
+  # get_message always returns the card in simplified form, so we can
+  # re-extract the title/text here regardless of what the relay forwarded.
+  if msg_type == "interactive" and event.message_id and token and (
+      text.strip() in ("", "[interactive message]", "[interactive]")):
+    try:
+      msg = lark_api.get_message(token, event.message_id)
+      text = _extract_message_text(msg) or text
+      log.info("Recovered card text via get_message: %s", text[:40])
+    except Exception as e:
+      log.warning("Failed to fetch interactive card content: %s", e)
+
   return IncomingMessage(
     event_type=event.event_type,
     chat_id=event.chat_id,
@@ -209,39 +225,13 @@ def _extract_message_text(msg: JsonObject) -> str:
 def _extract_interactive_text(content: JsonObject) -> str:
   """Extract readable text from an interactive card's body.content.
 
-  Format (as returned by im/v1/messages/{id} for non-template cards):
-    {"title": "...", "elements": [[{tag, ...}, ...], ...]}
-
-  Template-based cards (built via template_id / card_v2) don't expose
-  their rendered text here — those fall back to '[interactive]'.
+  Handles both the simplified shape (returned by get_message:
+  ``{title, elements: [[{tag, ...}, ...]]}``) and nemo's own schema-2.0 shape
+  (``{header: {title: ...}, body: {elements: [...]}}``). Shared logic lives in
+  ``nemo.lark.interactive``. Template-based cards (built via template_id /
+  card_v2) don't expose rendered text here — those fall back to '[interactive]'.
   """
-  title = content.get("title") or ""
-  elements = content.get("elements", [])
-  if not isinstance(elements, list):
-    return str(title) if title else "[interactive]"
-  lines: list[str] = []
-  for row in elements:
-    if not isinstance(row, list):
-      continue
-    parts: list[str] = []
-    for elem in row:
-      if not isinstance(elem, dict):
-        continue
-      tag = elem.get("tag", "")
-      if tag in ("text", "a", "md", "plain_text", "lark_md"):
-        t = elem.get("text") or elem.get("content") or ""
-        if t:
-          parts.append(str(t))
-      elif tag == "img":
-        parts.append("[image]")
-      elif tag == "hr":
-        continue
-    if parts:
-      lines.append("".join(parts))
-  body_text = "\n".join(line for line in lines if line.strip())
-  if title and body_text:
-    return f"{title}\n{body_text}"
-  return str(title) or body_text or "[interactive]"
+  return lark_interactive.extract_interactive_text(content)
 
 
 def _extract_post_text(content: JsonObject) -> str:

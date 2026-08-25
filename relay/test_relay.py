@@ -318,6 +318,64 @@ class RelayTestCase(unittest.TestCase):
     self.assertEqual(r["text"], "[merge_forward]")
     self.assertEqual(r["msg_type"], "merge_forward")
 
+  def test_interactive_card_message_simplified(self):
+    """Worker: forwarded interactive card (simplified shape, as delivered by
+    Lark's message store) → text = extracted title/body, not '[interactive
+    message]'."""
+    # Real content of a nemo "Done ✓" card forwarded into a group.
+    content = json.dumps({
+      "title": "Done ✓",
+      "elements": [[
+        {"tag": "img", "image_key": "img_v3_02al_51fc04fa-c3f4-453e-b914-26358bf6e48h"},
+        {"tag": "text", "text": " "},
+        {"tag": "text", "text": ""},
+      ]],
+    })
+    self._webhook({
+      "header": {"token": "tok1", "event_type": "im.message.receive_v1",
+                 "event_id": "evt_int_eq"},
+      "event": {
+        "message": {"chat_id": "oc_int_eq", "message_type": "interactive",
+                     "content": content, "create_time": "24100",
+                     "message_id": "msg_int_eq"},
+        "sender": {"sender_type": "user", "sender_id": {"open_id": "ou_int"}},
+      },
+    })
+    r = self._get("/replies/chat:oc_int_eq?since=")["replies"][0]
+    self.assertEqual(r["msg_type"], "interactive")
+    self.assertEqual(r["text"], "Done ✓\n[image]")
+
+  def test_interactive_card_message_schema2(self):
+    """Worker: interactive card in nemo's schema-2.0 shape → text extracted
+    from header.title + body blocks, nested blocks (column_set/button)."""
+    content = json.dumps({
+      "schema": "2.0",
+      "config": {"update_multi": True},
+      "header": {"title": {"tag": "plain_text", "content": "Shell done"}},
+      "body": {"direction": "vertical", "elements": [
+        {"tag": "markdown", "content": "`$ make build`"},
+        {"tag": "hr"},
+        {"tag": "column_set", "columns": [
+          {"tag": "column", "elements": [
+            {"tag": "button", "text": {"tag": "plain_text", "content": "Abort"}},
+          ]},
+        ]},
+      ]},
+    })
+    self._webhook({
+      "header": {"token": "tok1", "event_type": "im.message.receive_v1",
+                 "event_id": "evt_int2_eq"},
+      "event": {
+        "message": {"chat_id": "oc_int2_eq", "message_type": "interactive",
+                     "content": content, "create_time": "24110",
+                     "message_id": "msg_int2_eq"},
+        "sender": {"sender_type": "user", "sender_id": {"open_id": "ou_int2"}},
+      },
+    })
+    r = self._get("/replies/chat:oc_int2_eq?since=")["replies"][0]
+    self.assertEqual(r["msg_type"], "interactive")
+    self.assertEqual(r["text"], "Shell done\n`$ make build`\nAbort")
+
   def test_unknown_message_type(self):
     """Worker: unknown type → text='[{type} message]'."""
     self._webhook({

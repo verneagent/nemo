@@ -397,6 +397,89 @@ def test_reply_to_other_bot_card_includes_card_text(mock_get):
 
 
 # ---------------------------------------------------------------------------
+# Interactive card recovery
+# ---------------------------------------------------------------------------
+
+# Real content of a nemo "Done ✓" card forwarded into a group (as delivered by
+# Lark's message store via get_message / messages-list).
+_DONE_CARD = {
+  "msg_type": "interactive",
+  "body": {"content": json.dumps({
+    "title": "Done ✓",
+    "elements": [[
+      {"tag": "img", "image_key": "img_v3_02al_51fc04fa-c3f4-453e-b914-26358bf6e48h"},
+      {"tag": "text", "text": " "},
+      {"tag": "text", "text": ""},
+    ]],
+  })},
+}
+
+# Schema-2.0 shape — nemo's own card format sent through the card API.
+_SCHEMA2_CARD = {
+  "msg_type": "interactive",
+  "body": {"content": json.dumps({
+    "schema": "2.0",
+    "config": {"update_multi": True},
+    "header": {"title": {"tag": "plain_text", "content": "Shell done"}},
+    "body": {"direction": "vertical", "elements": [
+      {"tag": "markdown", "content": "`$ make build`"},
+      {"tag": "hr"},
+      {"tag": "column_set", "columns": [
+        {"tag": "column", "elements": [
+          {"tag": "button", "text": {"tag": "plain_text", "content": "Abort"}},
+        ]},
+      ]},
+    ]},
+  })},
+}
+
+
+def test_extract_interactive_card_schema2():
+  """Schema-2.0 card → title from header + text from nested body blocks."""
+  text = _extract_message_text(_SCHEMA2_CARD)
+  assert text == "Shell done\n`$ make build`\nAbort"
+
+
+@mock.patch("nemo.lark_channel.lark_api.get_message", return_value=_DONE_CARD)
+def test_interactive_forwarded_card_placeholder_recovers_text(mock_get):
+  """A forwarded nemo card arrives from the relay as text='[interactive
+  message]' (older relay without an interactive branch). The daemon must
+  re-fetch via get_message and present the card's real text to the model."""
+  ev = _make_event(msg_type="interactive", text="[interactive message]")
+  msg = _to_incoming(ev, token=TOKEN)
+  assert "Done ✓" in msg.text
+  assert "[interactive message]" not in msg.text
+  mock_get.assert_called_once()
+
+
+@mock.patch("nemo.lark_channel.lark_api.get_message", return_value=_DONE_CARD)
+def test_interactive_forwarded_card_empty_recovers_text(mock_get):
+  """Direct event path delivers empty text for interactive — same recovery."""
+  ev = _make_event(msg_type="interactive", text="")
+  msg = _to_incoming(ev, token=TOKEN)
+  assert "Done ✓" in msg.text
+  mock_get.assert_called_once()
+
+
+@mock.patch("nemo.lark_channel.lark_api.get_message", return_value=_DONE_CARD)
+def test_interactive_card_relay_text_not_overwritten(mock_get):
+  """When the relay already extracted real card text, do NOT re-fetch."""
+  ev = _make_event(msg_type="interactive", text="Done ✓\n[image]")
+  msg = _to_incoming(ev, token=TOKEN)
+  assert "Done ✓" in msg.text
+  mock_get.assert_not_called()
+
+
+@mock.patch("nemo.lark_channel.lark_api.get_message",
+            side_effect=urllib.error.URLError("boom"))
+def test_interactive_placeholder_get_message_fails_keeps_placeholder(mock_get):
+  """If the get_message re-fetch fails, degrade gracefully (keep placeholder)."""
+  ev = _make_event(msg_type="interactive", text="[interactive message]")
+  msg = _to_incoming(ev, token=TOKEN)
+  assert msg.text == "[interactive message]"
+
+
+# ---------------------------------------------------------------------------
 # Plain text — no enrichment
 # ---------------------------------------------------------------------------
 

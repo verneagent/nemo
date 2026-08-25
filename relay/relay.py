@@ -297,6 +297,73 @@ def _kv_delete(key: str):
 
 # --- Webhook handler ---
 
+def _extract_card_text(content: dict) -> str:
+    """Extract readable text from an interactive card content dict.
+
+    Handles both the simplified shape (returned by get_message: ``{title,
+    elements: [[{tag, ...}, ...]]}``) and nemo's schema-2.0 shape (``{header:
+    {title: ...}, body: {elements: [...]}}``) by walking elements recursively.
+
+    Mirror of ``nemo.lark.interactive.extract_interactive_text`` (stdlib-only
+    copy so the relay does not need nemo installed) — keep in sync.
+    """
+    _TEXT_TAGS = ("text", "plain_text", "lark_md", "markdown", "md", "a")
+    _IMG_TAGS = ("img", "image", "icon")
+    _CONTAINER_KEYS = (
+      "header", "title", "text", "content", "elements", "columns",
+      "children", "fields", "options",
+    )
+
+    def walk(node):
+        out = []
+        if isinstance(node, list):
+            for child in node:
+                out.extend(walk(child))
+        elif isinstance(node, dict):
+            tag = node.get("tag", "")
+            if tag in _TEXT_TAGS:
+                val = node.get("text") or node.get("content")
+                if val:
+                    out.append(str(val))
+                children = node.get("children")
+                if isinstance(children, list):
+                    out.extend(walk(children))
+            elif tag in _IMG_TAGS:
+                out.append("[image]")
+            else:
+                for key in _CONTAINER_KEYS:
+                    val = node.get(key)
+                    if isinstance(val, (list, dict)):
+                        out.extend(walk(val))
+                    elif isinstance(val, str) and val.strip():
+                        out.append(val)
+        elif isinstance(node, str) and node.strip():
+            out.append(node)
+        return out
+
+    title = ""
+    header = content.get("header")
+    if isinstance(header, dict):
+        t = header.get("title")
+        if isinstance(t, dict):
+            title = str(t.get("content") or t.get("text") or "")
+    if not title:
+        title = str(content.get("title") or "")
+
+    elements = content.get("elements")
+    if not isinstance(elements, list):
+        body = content.get("body")
+        if isinstance(body, dict):
+            elements = body.get("elements")
+    if not isinstance(elements, list):
+        elements = []
+
+    body_text = "\n".join(p for p in walk(elements) if p.strip())
+    if title and body_text:
+        return f"{title}\n{body_text}"
+    return str(title) or body_text or ""
+
+
 def _parse_message(event: dict) -> tuple[dict, str, str | None] | None:
     """Parse event into (reply_dict, chat_id, root_id)."""
     message = event.get("message", {})
@@ -377,6 +444,10 @@ def _parse_message(event: dict) -> tuple[dict, str, str | None] | None:
         text = f"[video: {file_name or 'video'}]"
     elif msg_type == "merge_forward":
         text = "[merge_forward]"
+    elif msg_type == "interactive":
+        # Card messages: extract the title/body text so a forwarded nemo card
+        # arrives as readable text instead of a bare "[interactive message]".
+        text = _extract_card_text(content) or "[interactive]"
     else:
         text = f"[{msg_type} message]"
 
