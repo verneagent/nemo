@@ -568,12 +568,30 @@ class ClaudeCodingAgent(CodingAgent):
     # current turn's callback. Set at the top of run_turn(), cleared on
     # exit. None means no turn is active — we drop the hook event.
     self._current_on_event: Callable[[TurnEvent], None] | None = None
+    # Idle-event notifier (between-turn background-task completions / Monitor
+    # fires surfaced by the SDKThread idle drainer). Set via set_idle_notifier;
+    # None → the drainer consumes the stream (fixing the #788 stale-leak) but
+    # discards the events.
+    self._on_idle_event: Callable[[TurnEvent], None] | None = None
 
   def set_effort(self, effort: str) -> None:
     self._effort = effort if effort in _CLAUDE_EFFORT_LEVELS else ""
 
   def set_endpoint(self, endpoint: EndpointConfig) -> None:
     self._endpoint = endpoint
+
+  def set_idle_notifier(self, handler: Callable[[TurnEvent], None]) -> None:
+    """Register the idle-event notifier and arm the between-turn drainer.
+
+    Called by the host once per agent (re)start. The drainer consumes the
+    SDK stream while no turn is running and routes surfaced events
+    (background-task completions, spontaneous Monitor-fired turns) through
+    ``handler``, which runs thread-safely on the SDK thread — the host
+    marshals the Lark send to the main loop internally, exactly like the
+    per-turn ``on_event``.
+    """
+    self._on_idle_event = handler
+    self._sdk.start_idle_drain(handler)
 
   async def start(
     self, project_dir: str, model: str, resume: str = "",
@@ -629,6 +647,9 @@ class ClaudeCodingAgent(CodingAgent):
       self._latest_session_id = ""
       self._options = self._build_options(project_dir, model, resume="")
       await self._sdk.create_client(self._options)
+    # Arm the between-turn idle drainer (if the host registered a notifier
+    # before start — otherwise set_idle_notifier arms it on its own).
+    self._sdk.start_idle_drain(self._on_idle_event)
 
   async def run_turn(
     self,
@@ -791,6 +812,8 @@ class ClaudeCodingAgent(CodingAgent):
       self._latest_session_id = ""
       self._options = self._build_options(project_dir, model, resume="")
       await self._sdk.reconnect(self._options)
+    # Re-arm the idle drainer against the freshly connected client.
+    self._sdk.start_idle_drain(self._on_idle_event)
 
   async def side_question(self, question: str, sdk_session_id: str) -> str:
     """Read-only ephemeral side question — see CodingAgent.side_question.
@@ -1133,6 +1156,7 @@ class ClaudeCodingAgent(CodingAgent):
 
   async def stop(self) -> None:
     await self._sdk.close_client()
+    self._sdk.stop_idle_drain()
     if self._sdk_started:
       self._sdk.stop()
       self._sdk_started = False

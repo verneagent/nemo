@@ -1,13 +1,16 @@
 """Tests for nemo.sdk_thread — dedicated SDK thread with its own event loop."""
 
 import asyncio
+import contextlib
 import sys
+import time
 from unittest import mock
 
 import pytest
 
 from claude_agent_sdk import CLIConnectionError
 from nemo.sdk_thread import SDKThread, MAX_CONNECT_ATTEMPTS
+from nemo.turn import BackgroundTaskDoneEvent, BackgroundTurnDoneEvent
 
 
 def _ensure_real_sdk():
@@ -858,3 +861,218 @@ class TestLifecycleSameTask:
     # All aenters and aexits run on the same single owner task.
     all_tasks = set(aenter_tasks + aexit_tasks)
     assert len(all_tasks) == 1, f"expected one owner task, got {all_tasks}"
+
+
+# ---------------------------------------------------------------------------
+# 11. Between-turn idle drainer (background completions / Monitor fires)
+# ---------------------------------------------------------------------------
+
+class TestIdleDrain:
+  """The idle drainer consumes the SDK stream between turns and surfaces
+  background-task completions / spontaneous (Monitor-fired) turns, instead of
+  letting them sit in the buffer and leak into the next turn (SDK #788).
+
+  These tests drive ``_idle_drain_loop`` directly on a fake client — they do
+  NOT need a real CLI subprocess or the anyio transport.
+  """
+
+  def _task_notification(self, task_id="task_x", summary="All tests passed"):
+    from claude_agent_sdk import TaskNotificationMessage
+    return TaskNotificationMessage(
+      subtype="task_notification",
+      data={"task_id": task_id, "status": "completed", "summary": summary},
+      task_id=task_id,
+      status="completed",
+      output_file="/tmp/x.log",
+      summary=summary,
+      uuid="u1",
+      session_id="s1",
+    )
+
+  def _assistant(self, text):
+    from claude_agent_sdk import AssistantMessage, TextBlock
+    return AssistantMessage(content=[TextBlock(text=text)], model="kimi-k3")
+
+  def _result(self, cost=0.01):
+    from claude_agent_sdk import ResultMessage
+    return ResultMessage(
+      subtype="success", duration_ms=100, duration_api_ms=100, is_error=False,
+      num_turns=1, session_id="s1", total_cost_usd=cost, result="",
+    )
+
+  def _run_loop_until(self, thread, events, stop):
+    """Run _idle_drain_loop; cancel it once ``stop(events)`` is truthy."""
+    async def scenario():
+      task = asyncio.ensure_future(thread._idle_drain_loop())
+      try:
+        for _ in range(300):  # 3s bound
+          if stop(events):
+            return
+          await asyncio.sleep(0.01)
+        raise AssertionError(f"drainer produced no events: {events}")
+      finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+          await task
+
+    _run(scenario())
+
+  def test_surfaces_task_notification_during_idle(self):
+    thread = SDKThread()
+    thread._client = _HangingClient([self._task_notification()])
+    thread._drain_enabled = True
+    events: list = []
+    thread._on_idle_event = events.append
+
+    self._run_loop_until(thread, events, lambda evs: bool(evs))
+
+    assert len(events) == 1
+    ev = events[0]
+    assert isinstance(ev, BackgroundTaskDoneEvent)
+    assert ev.task_id == "task_x"
+    assert ev.status == "completed"
+    assert ev.summary == "All tests passed"
+
+  def test_surfaces_spontaneous_turn_when_result_arrives(self):
+    thread = SDKThread()
+    thread._client = _HangingClient([
+      self._assistant("The monitor fired — DONE_MARKER appeared, reporting back."),
+      self._result(cost=0.02),
+    ])
+    thread._drain_enabled = True
+    events: list = []
+    thread._on_idle_event = events.append
+
+    self._run_loop_until(thread, events, lambda evs: bool(evs))
+
+    assert len(events) == 1
+    ev = events[0]
+    assert isinstance(ev, BackgroundTurnDoneEvent)
+    assert "DONE_MARKER" in ev.text
+    assert ev.cost == 0.02
+
+  def test_task_notification_does_not_double_surface_across_turns(self):
+    """A TaskNotification always resets any in-flight spontaneous text, so a
+    subsequent spontaneous turn's text gets its own event, not a merged blob."""
+    thread = SDKThread()
+    thread._client = _HangingClient([
+      self._task_notification(),
+      self._assistant("Acknowledging the completed task."),
+      self._result(cost=0.0),
+    ])
+    thread._drain_enabled = True
+    events: list = []
+    thread._on_idle_event = events.append
+
+    self._run_loop_until(thread, events, lambda evs: len(evs) >= 2)
+
+    assert len(events) == 2
+    assert isinstance(events[0], BackgroundTaskDoneEvent)
+    assert isinstance(events[1], BackgroundTurnDoneEvent)
+    assert events[1].text == "Acknowledging the completed task."
+
+  def test_turn_start_barrier_leaves_message_for_next_consumer(self):
+    """The run_turn barrier (drain_enabled=False + cancel pending receive)
+    must stop the drainer without stealing or losing a message: a message
+    that arrives after the barrier stays queued for the turn runner."""
+    thread = SDKThread()
+    client = _QueueClient()
+    thread._client = client
+    thread._drain_enabled = True
+    events: list = []
+    thread._on_idle_event = events.append
+
+    async def scenario():
+      q = asyncio.Queue()
+      client.bind(q)
+      task = asyncio.ensure_future(thread._idle_drain_loop())
+      try:
+        # drainer blocks awaiting a message; wait until it holds a pending receive
+        for _ in range(300):
+          if thread._drain_pending is not None:
+            break
+          await asyncio.sleep(0.01)
+        assert thread._drain_pending is not None, "drainer never armed a receive"
+
+        # run_turn barrier — the two synchronous statements from _turn()
+        thread._drain_enabled = False
+        thread._drain_pending.cancel()
+        thread._drain_pending = None
+
+        # a message arrives AFTER the barrier (the turn's own response must
+        # never be stolen by the drainer)
+        await q.put(self._task_notification(task_id="task_turn"))
+        await asyncio.sleep(0.3)
+
+        assert events == [], "drainer stole a message past the turn barrier"
+        # and it is still retrievable by a fresh consumer (no loss)
+        got = await client.receive_messages().__anext__()
+        assert got.task_id == "task_turn"
+      finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+          await task
+
+    _run(scenario())
+
+  def test_start_idle_drain_arms_drainer_on_real_loop(self):
+    """start_idle_drain must arm the drainer via the real _arm callback
+    without raising. Regression: _arm used asyncio.ensure_future(coro,
+    name=...), which is invalid on py3.14 (only create_task accepts name=) —
+    the TypeError killed the drainer at boot while the daemon kept running,
+    so the leak/stale-notification bug #788 silently persisted. This test goes
+    through start_idle_drain → call_soon_threadsafe(_arm) → create_task, i.e.
+    the exact boot path, not _idle_drain_loop() directly."""
+    _ensure_real_sdk()
+    thread = SDKThread()
+    thread.start()
+    try:
+      thread._client = _HangingClient([self._task_notification()])
+      events: list = []
+      thread.start_idle_drain(events.append)
+
+      deadline = time.time() + 5
+      while not events and time.time() < deadline:
+        time.sleep(0.05)
+
+      assert isinstance(events, list) and events, (
+        "drainer never surfaced an event — _arm likely failed to start it")
+      assert isinstance(events[0], BackgroundTaskDoneEvent)
+      assert events[0].task_id == "task_x"
+    finally:
+      thread.stop()
+
+
+class _HangingClient:
+  """receive_messages yields the given messages, then hangs forever — like a
+  real idle CLI stream that pushes a few spontaneous events and goes quiet."""
+
+  def __init__(self, messages):
+    self._messages = list(messages)
+
+  def receive_messages(self):
+    async def gen():
+      for message in self._messages:
+        yield message
+      await asyncio.Event().wait()  # quiet idle
+
+    return gen()
+
+
+class _QueueClient:
+  """receive_messages pulls from an asyncio.Queue, so a test can control when
+  messages arrive relative to the turn-start barrier."""
+
+  def __init__(self):
+    self._q: asyncio.Queue | None = None
+
+  def bind(self, q: asyncio.Queue) -> None:
+    self._q = q
+
+  def receive_messages(self):
+    async def gen():
+      assert self._q is not None
+      while True:
+        yield await self._q.get()
+
+    return gen()

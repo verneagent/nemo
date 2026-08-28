@@ -182,6 +182,9 @@ class _FakeAgent:
   def set_effort(self, _effort):
     pass
 
+  def set_idle_notifier(self, _handler):
+    pass
+
   async def interrupt(self):
     pass
 

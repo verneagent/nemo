@@ -799,10 +799,12 @@ def test_reset_clears_stale_tasks_on_claude_adapter():
   # Build a minimal adapter without touching the real SDK.
   adapter = ClaudeCodingAgent.__new__(ClaudeCodingAgent)
   adapter._stale_tasks = {"ghost_1", "ghost_2"}
+  adapter._on_idle_event = None  # reset() re-arms the idle drain with it
 
   # Patch the parts reset() touches so we don't actually spawn a CLI.
   adapter._sdk = mock.AsyncMock()
   adapter._sdk.reconnect = mock.AsyncMock()
+  adapter._sdk.start_idle_drain = mock.Mock()
   adapter._build_options = mock.Mock(return_value=object())
 
   async def _run():

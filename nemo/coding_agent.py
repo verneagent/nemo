@@ -98,6 +98,20 @@ class CodingAgent(ABC):
     """
     del endpoint
 
+  def set_idle_notifier(self, handler: Callable[[TurnEvent], None]) -> None:
+    """Register the between-turn idle-event notifier.
+
+    ``handler`` is invoked (thread-safely, from the adapter's worker
+    context) whenever the backend surfaces a spontaneous event while no
+    turn is running — e.g. a background task completing, or a Monitor
+    firing — so the host can proactively notify the user instead of
+    letting the event sit in a buffer and leak into the next turn.
+
+    Only the Claude adapter has a stream that carries such events; the
+    default is a no-op for adapters whose backend has no equivalent.
+    """
+    del handler
+
   async def side_question(self, question: str, sdk_session_id: str) -> str:
     """Answer a read-only, ephemeral side question ("by the way…").
 

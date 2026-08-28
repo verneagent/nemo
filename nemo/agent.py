@@ -33,7 +33,8 @@ from .db import Database
 from .lark_channel import LarkChannel
 from .types import JsonObject
 from .turn import (
-  AnswerEvent, CompactNoticeEvent, CompactStartedEvent, DoneEvent,
+  AnswerEvent, BackgroundTaskDoneEvent, BackgroundTurnDoneEvent,
+  CompactNoticeEvent, CompactStartedEvent, DoneEvent,
   ProgressEvent, RateLimitNoticeEvent, StaleLeakNoticeEvent,
 )
 
@@ -315,6 +316,49 @@ def _register_msg(msg_id: str, chat_id: str) -> None:
   if relay_url and msg_id:
     from . import relay as relay_client
     relay_client.register_message(msg_id, chat_id)
+
+
+def _idle_notifier_for(
+  channel: LarkChannel,
+  chat_id: str,
+  db: Database,
+  loop: asyncio.AbstractEventLoop,
+) -> Callable[[object], None]:
+  """Build the idle-event notifier handed to ``CodingAgent.set_idle_notifier``.
+
+  Invoked from the SDK thread when the backend surfaces a spontaneous event
+  between turns (a background task completing, a Monitor firing). Sends a
+  dedicated notification card to the chat — separate from any turn card —
+  by marshalling the Lark send onto the main loop (same pattern as the
+  per-turn ``_await_channel``). The return value is intentionally sync and
+  side-effect only, matching the on_event threading contract.
+  """
+  def _notify(event: object) -> None:
+    if isinstance(event, BackgroundTaskDoneEvent):
+      title = "✅ 后台任务完成"
+      lines = [f"任务 `{event.task_id[:12]}`"]
+      if event.status:
+        lines.append(f"状态：`{event.status}`")
+      if event.summary:
+        lines.append("")
+        lines.append(_truncate_for_preview(event.summary))
+      card = cards.build_markdown_card("\n".join(lines), title=title,
+                                       color="green")
+    elif isinstance(event, BackgroundTurnDoneEvent):
+      card = cards.build_markdown_card(
+        _truncate_for_preview(event.text), title="🔔 后台自动响应",
+        color="blue")
+    else:
+      return
+    try:
+      msg_id = asyncio.run_coroutine_threadsafe(
+        channel.send_card(chat_id, card), loop).result()
+      log.info("Idle notification sent chat=%s msg=%s", chat_id, msg_id)
+      _register_msg(msg_id, chat_id)
+    except Exception as exc:
+      log.warning("Idle notification send failed: %s", exc)
+
+  return _notify
 
 
 def _truncate_for_preview(text: str, limit: int = 2000) -> str:
@@ -1739,6 +1783,13 @@ async def main_loop(
   ctx.agent = agent
   ctx.effort = effort
   main_loop_ref = asyncio.get_running_loop()
+  # Proactive idle notifications: background-task completions / Monitor
+  # fires surfaced by the SDK's between-turn drainer (Claude only — the
+  # abstract no-op is harmless for codex/opencode). Registered once per
+  # agent instance; the /agent switch path re-registers on the rebuilt
+  # adapter below.
+  coding_agent.set_idle_notifier(
+    _idle_notifier_for(channel, chat_id, db, main_loop_ref))
   running = True
   _dissolve_on_exit = False
   # In-flight `/btw` side questions spawned during a running turn. Kept
@@ -2342,6 +2393,11 @@ async def main_loop(
           )
           if ctx.effort:
             coding_agent.set_effort(ctx.effort)
+          # The adapter was rebuilt — re-register the idle notifier so
+          # between-turn background notifications keep flowing (the new
+          # adapter's SDKThread starts its own drainer on start()).
+          coding_agent.set_idle_notifier(
+            _idle_notifier_for(channel, chat_id, db, main_loop_ref))
           log.info("Agent switch to %s (model=%s, resume=%s)",
                    agent, model,
                    _sdk_session_id[:8] if _sdk_session_id else "none")

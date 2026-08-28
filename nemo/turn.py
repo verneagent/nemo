@@ -174,9 +174,40 @@ class StaleLeakNoticeEvent:
   task_id: str
 
 
+@dataclass
+class BackgroundTaskDoneEvent:
+  """A background task (spawned in a prior turn) completed during idle.
+
+  Surfaced by the between-turn idle stream drainer (``SDKThread``) when the
+  CLI emits a ``TaskNotificationMessage`` while no turn is running. It is
+  delivered through the SAME thread-safe callback contract as ``on_event``,
+  but via the separate idle channel (``set_idle_notifier``) so the host
+  renders it as its own notification card rather than touching the turn
+  card. Without this the notification would sit unread in the SDK buffer
+  and leak into the front of the next turn (SDK #788), and the user would
+  never be told their background work finished.
+  """
+  task_id: str
+  status: str = ""
+  summary: str = ""
+
+
+@dataclass
+class BackgroundTurnDoneEvent:
+  """The CLI ran a spontaneous turn during idle (Monitor fire / self-directed).
+
+  The claude CLI pushes spontaneous turns onto the stream with zero stdin
+  (e.g. a Monitor that fired, or a background job the model chose to follow
+  up on). The idle drainer accumulates the assistant text and surfaces the
+  final answer as a notification card when the turn's ResultMessage arrives.
+  """
+  text: str
+  cost: float = 0.0
+
+
 TurnEvent = (
   ProgressEvent | AnswerEvent |
   TaskStartedEvent | TaskDoneEvent | DoneEvent | ErrorEvent |
   RateLimitNoticeEvent | CompactStartedEvent | CompactNoticeEvent |
-  StaleLeakNoticeEvent
+  StaleLeakNoticeEvent | BackgroundTaskDoneEvent | BackgroundTurnDoneEvent
 )

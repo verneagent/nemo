@@ -42,7 +42,9 @@ from typing import Callable
 from claude_agent_sdk import CLIConnectionError as _CLIConnectionError
 
 from .claude_turn import run_turn
-from .turn import TurnEvent
+from .turn import (
+  BackgroundTaskDoneEvent, BackgroundTurnDoneEvent, TurnEvent,
+)
 from .types import ClaudeSDKClientLike, JsonObject
 
 log = logging.getLogger(__name__)
@@ -81,6 +83,44 @@ class SDKThread:
     # IncompleteTurnError (a retry would continue the job the user just told
     # us to stop). Reset per turn.
     self._interrupt_holder: list[bool] = [False]
+    # ---- Between-turn idle stream drain ----
+    # The claude CLI pushes spontaneous events onto the SDK stream while no
+    # turn is running (a background task completing → TaskNotificationMessage,
+    # a Monitor firing → a self-directed assistant turn). Nemo's main loop
+    # never reads the stream between turns, so those messages used to sit
+    # unread in the SDK buffer and LEAK into the front of the next turn
+    # (SDK #788: StaleLeakError → reconnect-with-resume churn) with the user
+    # never told their background work finished. The idle drainer consumes
+    # the stream between turns and surfaces the completions.
+    #
+    # Concurrency contract — client.receive_messages() is a SINGLE-CONSUMER
+    # anyio memory object stream, so the turn runner and the drainer must
+    # never receive concurrently. run_turn's barrier is airtight because both
+    # sides run on the same event loop and the barrier statements are
+    # synchronous (no await between them):
+    #
+    #   run_turn (_turn, on the SDK loop):
+    #     self._drain_enabled = False
+    #     if self._drain_pending is not None:
+    #       self._drain_pending.cancel()
+    #
+    # The drainer only creates a receive future after checking _drain_enabled
+    # and re-checks it after every future completes. Either it sees the flag
+    # cleared before creating a future (and stops), or run_turn cancels the
+    # in-flight future — so no drainer receive can outlive the barrier and a
+    # turn's query response can never be stolen by the drainer. Cancelling an
+    # anyio memory-stream receive is transactional: the message stays queued
+    # for the next consumer (no message loss).
+    self._drain_enabled: bool = False      # written on the SDK loop only
+    self._drain_pending: asyncio.Future[object] | None = None
+    self._drain_task: asyncio.Task[object] | None = None
+    # Notifier for surfaced idle events (thread-safe callback, same contract
+    # as run_turn's on_event). None → the drainer consumes + discards (still
+    # fixes the #788 leak, just silently).
+    self._on_idle_event: Callable[[TurnEvent], None] | None = None
+    # Assistant text of the spontaneous turn currently being drained, flushed
+    # to a BackgroundTurnDoneEvent when its ResultMessage arrives.
+    self._idle_turn_texts: list[str] = []
 
   def start(self) -> None:
     """Start the SDK thread. Blocks until the event loop is ready."""
@@ -265,14 +305,187 @@ class SDKThread:
       return steer_probe(session_id, list(self._steer_texts))
 
     async def _turn():
-      return await run_turn(
-        self._client, prompt, on_event,
-        stale_tasks=stale_tasks, is_paused=is_paused,
-        steered=self._steer_holder,
-        steer_probe=_bound_probe, resumed=resumed,
-        interrupted=lambda: self._interrupt_holder[0])
+      # Idle-drain barrier (see _idle_drain_loop): stop the between-turn
+      # drainer BEFORE the turn runner opens the stream. Both statements are
+      # synchronous (no await between), so the drainer cannot interleave:
+      # either it sees the flag cleared before creating a receive future (and
+      # stops), or the in-flight future gets cancelled here. Either way the
+      # turn's query response can never be stolen by the drainer.
+      self._drain_enabled = False
+      if self._drain_pending is not None:
+        self._drain_pending.cancel()
+      try:
+        return await run_turn(
+          self._client, prompt, on_event,
+          stale_tasks=stale_tasks, is_paused=is_paused,
+          steered=self._steer_holder,
+          steer_probe=_bound_probe, resumed=resumed,
+          interrupted=lambda: self._interrupt_holder[0])
+      finally:
+        # Turn complete — resume draining. Any background-task completions /
+        # Monitor fires that landed during the turn (or arrive right after)
+        # are surfaced instead of leaking into the next turn (SDK #788).
+        self._drain_enabled = True
 
     return await self.run_on_sdk_loop(_turn())
+
+  def start_idle_drain(self, on_idle_event: Callable[[TurnEvent], None]) -> None:
+    """Start (or refresh the notifier of) the between-turn idle drainer.
+
+    Thread-safe; safe to call any number of times (e.g. after an /agent
+    switch rebuilds the adapter). The drain task is created lazily on the
+    SDK loop the first time and re-armed on every call so a fresh notifier
+    takes effect immediately.
+    """
+    self._on_idle_event = on_idle_event
+    if self._loop is None:
+      return
+
+    def _arm() -> None:
+      self._drain_enabled = True
+      if self._drain_task is None or self._drain_task.done():
+        # create_task (NOT ensure_future): only create_task accepts `name=`.
+        # ensure_future(coro, name=...) raises TypeError on py3.14 — which
+        # silently killed the drainer at boot (logged as an asyncio callback
+        # exception, daemon kept running with no drain).
+        self._drain_task = asyncio.create_task(
+          self._idle_drain_loop(), name="idle-drain")
+
+    try:
+      self._loop.call_soon_threadsafe(_arm)
+    except RuntimeError:
+      pass  # loop already stopped
+
+  def stop_idle_drain(self) -> None:
+    """Stop the idle drainer (shutdown). Consumes nothing further."""
+    self._on_idle_event = None
+    if self._loop is None:
+      return
+
+    def _stop() -> None:
+      self._drain_enabled = False
+      if self._drain_pending is not None:
+        self._drain_pending.cancel()
+        self._drain_pending = None
+      if self._drain_task is not None:
+        self._drain_task.cancel()
+        self._drain_task = None
+
+    try:
+      self._loop.call_soon_threadsafe(_stop)
+    except RuntimeError:
+      pass  # loop already stopped
+
+  async def _idle_drain_loop(self) -> None:
+    """Consume the SDK stream between turns; surface spontaneous events.
+
+    Runs on the SDK loop. Only touches ``client.receive_messages()`` while
+    ``_drain_enabled`` is True (i.e. no turn is running) — see the barrier
+    note in ``__init__``. Every receive future is bounded by the enable flag:
+    a turn start cancels the in-flight future, so the turn's query response
+    can never be stolen here.
+    """
+    gen: object | None = None
+    while not self._cancelled.is_set():
+      if self._client is None or not self._drain_enabled:
+        gen = None
+        await asyncio.sleep(0.2)
+        continue
+      if gen is None:
+        try:
+          gen = self._client.receive_messages()
+        except Exception as exc:
+          log.warning("idle drain: cannot open message stream: %s", exc)
+          gen = None
+          await asyncio.sleep(0.5)
+          continue
+      fut = asyncio.ensure_future(gen.__anext__())
+      self._drain_pending = fut
+      try:
+        try:
+          await asyncio.wait({fut})
+        except asyncio.CancelledError:
+          # Drain task itself cancelled (shutdown) — cancel the in-flight
+          # receive (transactional: any queued message stays for the next
+          # consumer) and let the cancellation propagate.
+          fut.cancel()
+          raise
+        if fut.cancelled():
+          # The turn-start barrier cancelled our in-flight receive. Stop
+          # draining; the turn runner will consume the stream from here.
+          gen = None
+          continue
+        message = fut.result()
+      except StopAsyncIteration:
+        gen = None
+        continue
+      except Exception as exc:
+        log.warning("idle drain receive failed: %s", exc)
+        gen = None
+        continue
+      finally:
+        self._drain_pending = None
+      try:
+        self._handle_idle_message(message)
+      except Exception as exc:
+        log.warning("idle drain handler failed: %s", exc)
+      if not self._drain_enabled:
+        # A turn started while we processed the message — stop consuming.
+        gen = None
+
+  def _handle_idle_message(self, message: object) -> None:
+    """Classify a spontaneous (idle) SDK message; surface it if visible.
+
+    Runs on the SDK loop. Surfacing goes through the synchronous
+    ``_on_idle_event`` callback (same threading contract as run_turn's
+    ``on_event``) — the host marshals the Lark send to the main loop
+    internally.
+    """
+    from claude_agent_sdk import (
+      AssistantMessage, ResultMessage, TaskNotificationMessage,
+    )
+
+    ev: TurnEvent | None = None
+    if isinstance(message, TaskNotificationMessage):
+      # A background task completed while idle — surface a "task done"
+      # notification. Clear any in-flight spontaneous-turn text so this
+      # notification is a clean breadcrumb (the CLI may then run a follow-up
+      # spontaneous turn whose own text gets its own card).
+      self._idle_turn_texts.clear()
+      ev = BackgroundTaskDoneEvent(
+        task_id=message.task_id,
+        status=getattr(message, "status", "") or "",
+        summary=getattr(message, "summary", "") or "",
+      )
+    elif isinstance(message, AssistantMessage):
+      text = "".join(
+        block.text for block in getattr(message, "content", [])
+        if getattr(block, "text", None))
+      if text:
+        self._idle_turn_texts.append(text)
+      return
+    elif isinstance(message, ResultMessage):
+      if self._idle_turn_texts:
+        ev = BackgroundTurnDoneEvent(
+          text="\n".join(self._idle_turn_texts),
+          cost=getattr(message, "total_cost_usd", 0) or 0.0,
+        )
+        self._idle_turn_texts.clear()
+    else:
+      # SystemMessage (thinking / compact / progress), TaskStarted /
+      # TaskProgress, stream events — nothing worth surfacing idle.
+      return
+
+    if ev is None:
+      return
+    if self._on_idle_event is None:
+      log.info("idle drain: discarding %s (no notifier configured)",
+               type(ev).__name__)
+      return
+    try:
+      self._on_idle_event(ev)
+    except Exception as exc:
+      log.warning("idle drain notifier failed: %s", exc)
 
   def cancel(self) -> None:
     """Signal the SDK thread to abort reconnect loops."""
@@ -426,6 +639,8 @@ class SDKThread:
 
   def stop(self) -> None:
     """Stop the SDK thread."""
+    self.stop_idle_drain()
+    self._cancelled.set()
     if self._loop and self._lifecycle_q is not None:
       # Ask the owner to clean up the active client (if any) and exit.
       # Bounded wait so a hung client cannot block shutdown indefinitely.

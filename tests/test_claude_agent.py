@@ -543,6 +543,7 @@ def _bare_claude_agent():
   """
   from nemo.claude_agent import ClaudeCodingAgent
   agent = ClaudeCodingAgent.__new__(ClaudeCodingAgent)
+  agent._on_idle_event = None  # start()/reset() re-arm the idle drain with it
   agent._sdk_started = True
   agent._stale_tasks = set()
   agent._project_dir = ""
@@ -681,6 +682,7 @@ def _bare_reset_agent():
   """Construct a ClaudeCodingAgent ready for reset() tests."""
   from nemo.claude_agent import ClaudeCodingAgent
   agent = ClaudeCodingAgent.__new__(ClaudeCodingAgent)
+  agent._on_idle_event = None  # reset() re-arms the idle drain with it
   agent._stale_tasks = set()
   agent._project_dir = ""
   agent._model = ""
