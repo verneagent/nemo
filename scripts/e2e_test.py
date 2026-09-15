@@ -14,6 +14,7 @@ Usage (run with `-u`, see "Running it" below):
     python3 -u scripts/e2e_test.py --topic       # topic-chat / thread_id
     python3 -u scripts/e2e_test.py --rollover    # one turn split into multiple cards
     python3 -u scripts/e2e_test.py --fork        # /fork sub-thread (local relay)
+    python3 -u scripts/e2e_test.py --idle        # idle bg-task notification → real turn
     python3 -u scripts/e2e_test.py --stress|--project|--dual|--media|--shell|--switch
     python3 -u scripts/e2e_test.py --chat-id <ID>  # reuse a chat (else a temp group)
     python3 -u scripts/e2e_test.py --verbose
@@ -65,6 +66,9 @@ LOG_DIR = os.path.join(HOME, ".nemo/logs")
 BOT_ID = "cli_a9583021bef89ed4"
 # Operator open_id — used when injecting messages via relay
 OPERATOR_OPEN_ID = "ou_1f03ce275afdf3486d658740a39d0d8a"
+
+# Path of the daemon's stderr file, set by start_nemo (see _nemo_stderr_tail).
+_NEMO_STDERR_PATH = ""
 
 # Add project to path for imports
 sys.path.insert(0, PROJECT_DIR)
@@ -744,19 +748,48 @@ def start_nemo(chat_id: str, verbose: bool = False,
   env = os.environ.copy()
   if extra_env:
     env.update(extra_env)
-  proc = subprocess.Popen(
-    cmd, cwd=PROJECT_DIR,
-    stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-    env=env,
-    text=True)
-  try:
-    line = proc.stderr.readline().strip() if proc.stderr else ""
-  except Exception:
-    line = ""
-  m = re.search(r"nemo started \(PID (\d+)\)", line)
-  if m:
-    return int(m.group(1))
+  # stderr goes to a FILE, never a PIPE. Nothing drains the pipe past the PID
+  # banner, so a chatty run fills the 64KB kernel buffer and nemo then blocks
+  # forever on its next stderr write — which looks exactly like a daemon wedge
+  # (silent log, no heartbeat, no traceback). The file also preserves the
+  # crash traceback when nemo really does die.
+  global _NEMO_STDERR_PATH
+  _NEMO_STDERR_PATH = os.path.join(
+    tempfile.gettempdir(), f"nemo-e2e-{chat_id[-10:]}.stderr.log")
+  with open(_NEMO_STDERR_PATH, "w") as err_file:
+    proc = subprocess.Popen(
+      cmd, cwd=PROJECT_DIR,
+      stdout=subprocess.DEVNULL, stderr=err_file,
+      env=env,
+      text=True)
+  # The child holds its own dup of the fd, so the parent's handle is closed.
+  deadline = time.time() + 10
+  while time.time() < deadline:
+    try:
+      with open(_NEMO_STDERR_PATH) as f:
+        line = f.readline().strip()
+    except OSError:
+      line = ""
+    m = re.search(r"nemo started \(PID (\d+)\)", line)
+    if m:
+      return int(m.group(1))
+    time.sleep(0.2)
   return proc.pid
+
+
+def _nemo_stderr_tail(n: int = 20) -> str:
+  """Last ``n`` lines of the launched daemon's stderr ('' if unavailable).
+
+  Without this a crash out of the daemon's logging path is invisible — the
+  traceback only ever lands on stderr.
+  """
+  if not _NEMO_STDERR_PATH:
+    return ""
+  try:
+    with open(_NEMO_STDERR_PATH, errors="replace") as f:
+      return "".join(f.readlines()[-n:]).strip()
+  except OSError:
+    return ""
 
 
 def wait_for_ready(pid: int, timeout: int = 30, agent: str = "claude") -> bool:
@@ -3052,6 +3085,123 @@ def run_steer_lag_test(pid: int, chat_id: str, result: "E2EResult") -> None:
   print()
 
 
+def run_idle_notification_tests(pid: int, chat_id: str,
+                                result: "E2EResult") -> None:
+  """Phase ID — a background task finishing during idle starts a REAL turn.
+
+  Regression guard for the "✅ 后台任务完成 card is a dead end" bug. The idle
+  drainer surfaced ``BackgroundTaskDoneEvent`` as a standalone card and never
+  fed the event back to the model, so no follow-up was ever possible; the card
+  title was also hardcoded to success for every status.
+
+  The fix re-injects the notification through ``channel.push_back(...,
+  is_internal=True)`` so ``main_loop`` runs an ordinary turn. So the assertion
+  is deliberately NOT "a notification card appeared" — it is that the
+  notification became work the model actually did:
+
+    ID01  the background task starts and the turn ENDS (the completion has to
+          land in the between-turn idle window to be a real idle event).
+    ID02  the daemon logs `Idle notification queued as turn` — the card-only
+          path logs `Idle notification sent` and nothing else, which is
+          exactly the regression.
+    ID03  a fresh Done card is posted AFTER that, i.e. the model ran a
+          follow-up and reported it. This is the user-visible half: the old
+          behaviour produced no card here at all.
+    ID04  the first notification is never the budget-exhaustion fallback.
+  """
+  print(f"{Colors.BOLD}Phase ID: Idle background-task notification{Colors.RESET}")
+  log = LogAnalyzer(pid)
+  marker = f"IDLE_E2E_{int(time.time())}"
+
+  # A real user message re-arms the idle auto-turn budget; start from idle so
+  # the start turn and its notification are the only things in flight.
+  wait_for_idle(pid, chat_id, timeout=30)
+
+  # Mark BEFORE the start turn: the notification can fire at any point after
+  # the task is spawned, including while that turn is still finishing.
+  mark = log.mark()
+  ts = str(int(time.time() * 1000))
+  print("  [ID01] Starting a background task that outlives the turn...")
+  send_msg(
+    "Start ONE background task using the Monitor tool, with the command "
+    f"`sleep 25; echo {marker}` and a short description. "
+    "Then END YOUR TURN IMMEDIATELY. Do not wait for it, do not poll it, do "
+    "not sleep, and do not start anything else. Reply with one short "
+    "sentence confirming you started it.",
+    chat_id)
+  start_msg, elapsed = wait_for_response(
+    chat_id, after=ts, timeout=180, require_done=True)
+  if not start_msg:
+    result.fail("ID01 background task started", "no Done card for start turn")
+    log.dump_tail(25, "ID01")
+    return
+  wait_for_idle(pid, chat_id, timeout=60)
+  result.ok("ID01 background task started", f"{elapsed:.1f}s")
+
+  # Wait for the drainer to surface
+  # it; `queued as turn` is the fix's signature (the bug logged `sent` only).
+  # NB: the CLI STOPS a turn's background tasks when the turn ends, and a
+  # stopped task notifies immediately — so the notification lands ~1s after the
+  # turn, not after the command's own 25s. That is why the follow-up card is
+  # found by COUNTING Done cards rather than by a timestamp: a timestamp taken
+  # after the turn cannot separate the two turns' cards when they are a second
+  # apart.
+  queued = log.wait_for_since(
+    r"Idle notification queued as turn", mark, timeout=150, poll=2)
+  if not queued:
+    card_only = log.wait_for_since(
+      r"Idle notification sent", mark, timeout=1, poll=1)
+    result.fail(
+      "ID02 idle notification starts a turn",
+      "no 'queued as turn' in log — "
+      + ("card-only path taken (the regression)" if card_only
+         else "no idle notification at all (did the model start the task?)"))
+    log.dump_tail(30, "ID02")
+    return
+  result.ok("ID02 idle notification starts a turn", "queued + pushed back")
+
+  print("  [ID03] Waiting for the follow-up turn's card...")
+  follow_msg = None
+  follow_elapsed = 0.0
+  started = time.time()
+  while time.time() - started < 180:
+    # Deadline is measured from the FIRST Done card (the start turn) so the
+    # budget is per-turn, not per-run.
+    done_cards = [m for m in get_bot_msgs(chat_id, after=ts, limit=10)
+                  if interactive_card_title(m).startswith("Done")]
+    if len(done_cards) >= 2:
+      follow_msg = done_cards[0]
+      follow_elapsed = time.time() - started
+      break
+    time.sleep(3)
+  if follow_msg:
+    body = follow_msg.get("body", "")
+    leaked = "[后台任务通知]" in body
+    if leaked:
+      result.fail("ID03 follow-up turn replies", "synthetic prompt leaked into card")
+    else:
+      result.ok("ID03 follow-up turn replies", f"{follow_elapsed:.1f}s")
+  else:
+    result.fail("ID03 follow-up turn replies", "no card after the notification")
+    log.dump_tail(30, "ID03")
+    stderr_tail = _nemo_stderr_tail(25)
+    if stderr_tail:
+      print(f"{Colors.DIM}    --- daemon stderr ---{Colors.RESET}")
+      print(stderr_tail)
+    else:
+      print(f"{Colors.DIM}    (daemon stderr empty — process died without a "
+            f"traceback){Colors.RESET}")
+
+  spent = log.wait_for_since(
+    r"auto-turn budget spent", mark, timeout=1, poll=1)
+  if spent:
+    result.fail("ID04 first notification not budget-capped",
+                "budget spent on the FIRST notification")
+  else:
+    result.ok("ID04 first notification not budget-capped", "within budget")
+  print()
+
+
 def main():
   import argparse
   parser = argparse.ArgumentParser(description="Nemo E2E test runner")
@@ -3095,6 +3245,9 @@ def main():
                            "discuss → plan → implement → skill review → bug fix")
   parser.add_argument("--steer", action="store_true",
                       help="Run only the mid-turn steer +1-lag guard (Phase SR)")
+  parser.add_argument("--idle", action="store_true",
+                      help="Run only the idle background-task notification test "
+                           "(Phase ID)")
   parser.add_argument("--verbose", "-v", action="store_true",
                       help="Verbose nemo logging")
   args = parser.parse_args()
@@ -3105,7 +3258,7 @@ def main():
                   or args.askq or args.picker or args.recall_picker
                   or args.dual or args.media or args.topic
                   or args.shell or args.switch or args.rollover or args.fork
-                  or args.workflow or args.steer)
+                  or args.workflow or args.steer or args.idle)
   run_all = not single_phase
   created_temp_chat = False
 
@@ -3192,6 +3345,8 @@ def main():
     print(f"  Mode: full-flow coding workflow only")
   elif args.steer:
     print(f"  Mode: mid-turn steer +1-lag guard only")
+  elif args.idle:
+    print(f"  Mode: idle background-task notification only")
   print()
 
   # Dual-instance manages its own processes
@@ -3308,6 +3463,13 @@ def main():
       else:
         result.skip("SR01 steer folded", "skipped by --skip-sdk")
         result.skip("SR02 no +1-lag", "skipped by --skip-sdk")
+
+      # ---- Phase ID: Idle background-task notification ----
+      if not args.skip_sdk:
+        run_idle_notification_tests(pid, chat_id, result)
+      else:
+        for n in ["ID01", "ID02", "ID03", "ID04"]:
+          result.skip(f"{n} idle notification", "skipped by --skip-sdk")
 
       # ---- Phase 3: Signals ----
       print(f"{Colors.BOLD}Phase 3: Signals & Control{Colors.RESET}")
@@ -3579,6 +3741,14 @@ def main():
     elif args.steer:
       try:
         run_steer_lag_test(pid, chat_id, result)
+      finally:
+        send_msg("/exit", chat_id)
+        if not wait_for_exit(pid, timeout=35):
+          kill_nemo(pid)
+
+    elif args.idle:
+      try:
+        run_idle_notification_tests(pid, chat_id, result)
       finally:
         send_msg("/exit", chat_id)
         if not wait_for_exit(pid, timeout=35):
