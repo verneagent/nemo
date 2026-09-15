@@ -11,8 +11,11 @@ from unittest import mock
 import pytest
 
 from nemo.agent import (
+  _IDLE_PROMPT_PREFIX,
   _RECALL_PROMPT_PREFIX,
   _SESSION_PICKER_LIMIT,
+  _idle_budget_card,
+  _idle_notifier_for,
   _session_picker_options,
   _format_turn_error_message,
   _format_rate_limit_notice,
@@ -26,11 +29,14 @@ from nemo.agent import (
   _send_response,
   _should_send_plain_text,
   _update_done_card_with_fallback,
+  IdleTurnBudget,
+  MAX_IDLE_AUTO_TURNS,
   main_loop,
 )
 from nemo.channel import IncomingMessage
 from nemo.turn import (
-  AnswerEvent, CompactNoticeEvent, CompactStartedEvent, DoneEvent,
+  AnswerEvent, BackgroundTaskDoneEvent, BackgroundTurnDoneEvent,
+  CompactNoticeEvent, CompactStartedEvent, DoneEvent,
   ProgressEvent, RateLimitNoticeEvent,
 )
 
@@ -4348,3 +4354,276 @@ def _card_json(card):
     return json.dumps(card, ensure_ascii=False)
   except Exception:
     return str(card)
+
+
+# ---------------------------------------------------------------------------
+# Idle notifications: between-turn background-task completions
+#
+# A task notification the CLI surfaces between turns used to dead-end in a
+# "✅ 后台任务完成" card that nothing acted on. It is now re-queued into the
+# channel as an internal message so the main loop runs a real turn.
+# ---------------------------------------------------------------------------
+
+
+class _IdleCaptureChannel(_FakeChannel):
+  """Records push_back'd messages and sent cards."""
+
+  def __init__(self, _chat_id):
+    super().__init__(_chat_id)
+    self.pushed: list[IncomingMessage] = []
+    self.sent_cards: list[tuple[str, object]] = []
+
+  def push_back(self, message):
+    self.pushed.append(message)
+
+  async def send_card(self, chat_id, card):
+    self.sent_cards.append((chat_id, card))
+    return "om_idle"
+
+
+def _run_idle_notifier(events):
+  """Drive ``_idle_notifier_for`` over ``events`` on a real loop."""
+  async def _main():
+    channel = _IdleCaptureChannel("oc_test")
+    budget = IdleTurnBudget()
+    pending: set[asyncio.Task[None]] = set()
+    notify = _idle_notifier_for(
+      channel, "oc_test", budget, pending, asyncio.get_running_loop())
+    for event in events:
+      notify(event)
+      # Let the call_soon_threadsafe'd handler run on this loop.
+      for _ in range(3):
+        await asyncio.sleep(0)
+    if pending:
+      await asyncio.gather(*list(pending))
+    return channel, budget
+
+  return asyncio.run(_main())
+
+
+def _idle_title(card):
+  return card["header"]["title"]["content"]
+
+
+def test_idle_task_done_is_queued_as_an_internal_turn():
+  channel, budget = _run_idle_notifier([
+    BackgroundTaskDoneEvent(
+      task_id="bl6kcn8f2abc", status="completed",
+      summary='Monitor "aligned re-verify" stream ended',
+      output_file="/tmp/tasks/bl6kcn8f2.output"),
+  ])
+
+  assert len(channel.pushed) == 1
+  message = channel.pushed[0]
+  assert message.is_internal is True
+  assert message.chat_id == "oc_test"
+  assert message.sender_id == ""
+  assert message.text.startswith(_IDLE_PROMPT_PREFIX)
+  assert "bl6kcn8f2abc" in message.text
+  assert "completed" in message.text
+  assert 'Monitor "aligned re-verify" stream ended' in message.text
+  assert "/tmp/tasks/bl6kcn8f2.output" in message.text
+  # The turn it starts owns the follow-up card — no standalone duplicate.
+  assert channel.sent_cards == []
+  assert budget.consecutive == 1
+
+
+def test_idle_auto_turns_are_capped_then_fall_back_to_a_card():
+  events = [
+    BackgroundTaskDoneEvent(task_id=f"task{i}", status="completed")
+    for i in range(MAX_IDLE_AUTO_TURNS + 2)
+  ]
+  channel, budget = _run_idle_notifier(events)
+
+  assert budget.consecutive == MAX_IDLE_AUTO_TURNS
+  assert len(channel.pushed) == MAX_IDLE_AUTO_TURNS
+  assert len(channel.sent_cards) == 2
+  # The fallback card says why nothing followed the notification.
+  assert "暂停自动响应" in json.dumps(
+    channel.sent_cards[0][1], ensure_ascii=False)
+
+
+def test_idle_budget_card_title_reflects_task_status():
+  # Regression: every status used to render as "✅ 后台任务完成", so a stopped
+  # or failed task read as a success.
+  for status, title in [
+      ("completed", "✅ 后台任务完成"),
+      ("failed", "❌ 后台任务失败"),
+      ("stopped", "⏹ 后台任务已停止"),
+      ("", "🔔 后台任务通知"),
+  ]:
+    card = _idle_budget_card(
+      BackgroundTaskDoneEvent(task_id="t", status=status), IdleTurnBudget())
+    assert _idle_title(card) == title, status
+
+
+def test_idle_spontaneous_turn_still_sends_its_own_card():
+  # BackgroundTurnDoneEvent already carries the CLI's finished answer —
+  # re-prompting would only duplicate it, and it must not eat the budget.
+  channel, budget = _run_idle_notifier([
+    BackgroundTurnDoneEvent(text="done!", cost=0.02)])
+
+  assert channel.pushed == []
+  assert len(channel.sent_cards) == 1
+  assert _idle_title(channel.sent_cards[0][1]) == "🔔 后台自动响应"
+  assert budget.consecutive == 0
+
+
+class _IdleSpyAgent(_FakeAgent):
+  """Captures the idle handler and every prompt handed to run_turn.
+
+  Toggles ``channel.turn_active`` so the fake channel can tell the main loop's
+  idle ``receive`` apart from the turn's signal-watcher ``receive`` — a real
+  background notification only ever surfaces while idle.
+  """
+
+  def __init__(self):
+    super().__init__()
+    self.turn_prompts: list[str] = []
+    self.idle_handler = None
+    self.channel = None
+
+  def set_idle_notifier(self, handler):
+    self.idle_handler = handler
+
+  def supports_steering(self):
+    return False
+
+  async def run_turn(self, prompt, on_event):
+    self.turn_prompts.append(prompt)
+    if self.channel is not None:
+      self.channel.turn_active = True
+    try:
+      return await super().run_turn(prompt, on_event)
+    finally:
+      if self.channel is not None:
+        self.channel.turn_active = False
+
+
+class _IdleLoopChannel(_FakeChannel):
+  """Inbox-backed channel whose idle ``receive`` can fire idle notifications.
+
+  ``triggers`` maps a 1-based *idle* ``receive`` call number to a callable
+  invoked just before that call returns — standing in for the SDK thread
+  surfacing a between-turn event.
+  """
+
+  def __init__(self, _chat_id, script, triggers=None):
+    super().__init__(_chat_id)
+    self._script = list(script)
+    self._inbox: list[IncomingMessage] = []
+    self._triggers = dict(triggers or {})
+    self._idle_receives = 0
+    self.turn_active = False
+    self.sent_cards: list[tuple[str, object]] = []
+
+  def push_back(self, message):
+    self._inbox.append(message)
+
+  async def send_card(self, chat_id, card):
+    self.sent_cards.append((chat_id, card))
+    return "om_card"
+
+  async def update_card(self, card_id, card):
+    self.sent_cards.append((card_id, card))
+    return card_id
+
+  async def receive(self, timeout=300):
+    del timeout
+    if self.turn_active:
+      # The turn's signal watcher. Messages "sent" while a turn runs are not
+      # what this test exercises, so it never sees the script or the inbox.
+      await asyncio.sleep(0.01)
+      return None
+    self._idle_receives += 1
+    fire = self._triggers.pop(self._idle_receives, None)
+    if fire is not None:
+      fire()
+      for _ in range(3):
+        await asyncio.sleep(0)
+    if self._inbox:
+      return self._inbox.pop(0)
+    if self._script:
+      return self._script.pop(0)
+    return None
+
+
+def _user_message(text, message_id):
+  return IncomingMessage(
+    event_type="im.message.receive_v1", chat_id="oc_test",
+    sender_id="ou_user", message_id=message_id, msg_type="text",
+    text=text, create_time="1",
+  )
+
+
+def test_idle_notifications_drive_real_turns_and_reset_on_user_message(
+    tmp_path,
+):
+  """End-to-end through main_loop: notification -> turn, capped, re-armed."""
+  agent = _IdleSpyAgent()
+  agent.channel = None
+  captured: dict[str, object] = {}
+  # Budget snapshot taken just before the post-user notification fires. It is
+  # the only unambiguous reading: /exit is itself a real user message, so the
+  # budget is re-zeroed again by the time main_loop returns.
+  budget_after_user: list[int] = []
+
+  def _burst():
+    for i in range(4):
+      agent.idle_handler(BackgroundTaskDoneEvent(
+        task_id=f"burst{i}", status="completed"))
+
+  def _after_user():
+    budget_after_user.append(captured["budget"].consecutive)
+    agent.idle_handler(BackgroundTaskDoneEvent(
+      task_id="after_user", status="completed"))
+
+  channel = _IdleLoopChannel(
+    "oc_test",
+    script=[
+      _user_message("hi", "om_1"),
+      _user_message("second", "om_2"),
+      _user_message("/exit", "om_3"),
+    ],
+    triggers={2: _burst, 6: _after_user},
+  )
+  agent.channel = channel
+  real_notifier_for = _idle_notifier_for
+
+  def _spy_notifier_for(channel_, chat_id, budget, pending, loop):
+    captured["budget"] = budget
+    return real_notifier_for(channel_, chat_id, budget, pending, loop)
+
+  with mock.patch("nemo.agent.load_credentials", return_value={
+    "app_id": "app_id", "app_secret": "app_secret",
+    "email": "user@example.com",
+  }), \
+       mock.patch("nemo.agent.Database", _FakeDB), \
+       mock.patch("nemo.agent.LarkChannel", return_value=channel), \
+       mock.patch("nemo.agent.build_coding_agent", return_value=agent), \
+       mock.patch("nemo.agent._idle_notifier_for",
+                  side_effect=_spy_notifier_for), \
+       mock.patch("nemo.group_config.load_config", return_value={}), \
+       mock.patch("nemo.config.load_relay_config", return_value=("", "")), \
+       mock.patch("signal.signal"):
+    rc = asyncio.run(main_loop("oc_test", str(tmp_path), "claude-opus-4-6"))
+
+  assert rc == 0
+  # "hi", the 3 budgeted notifications, "second", then one more notification
+  # (the 4th of the burst fell back to a card).
+  assert agent.turn_prompts[0] == "hi"
+  assert agent.turn_prompts[4] == "second"
+  idle_prompts = [
+    p for p in agent.turn_prompts if p.startswith(_IDLE_PROMPT_PREFIX)]
+  assert len(idle_prompts) == 4
+  assert "burst0" in idle_prompts[0]
+  assert "after_user" in idle_prompts[-1]
+  # The burst spent the whole budget, and "second" re-armed it: the
+  # notification that arrived after it saw 0 (and so ran a turn rather than
+  # falling back to a card).
+  assert budget_after_user == [0]
+  # One fallback card for the 4th notification of the burst.
+  fallback = [
+    c for _, c in channel.sent_cards
+    if c.get("header", {}).get("title", {}).get("content") == "✅ 后台任务完成"]
+  assert len(fallback) == 1

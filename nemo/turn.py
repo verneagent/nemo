@@ -190,6 +190,10 @@ class BackgroundTaskDoneEvent:
   task_id: str
   status: str = ""
   summary: str = ""
+  # Path to the task's captured stdout. Carried so the follow-up turn can
+  # read the actual output instead of working from ``summary`` alone (which
+  # for a Monitor is just `Monitor "<desc>" stream ended`).
+  output_file: str = ""
 
 
 @dataclass

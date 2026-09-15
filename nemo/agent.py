@@ -318,45 +318,176 @@ def _register_msg(msg_id: str, chat_id: str) -> None:
     relay_client.register_message(msg_id, chat_id)
 
 
+# Ceiling on consecutive notification-triggered turns. A background
+# notification starts a real turn, and that turn's own tool use can start
+# another background task — which notifies again. Two instant-firing Monitors
+# (``tail -F`` matching a line already in the log) would otherwise ping-pong
+# with no human in the loop. Any real user message resets the count.
+MAX_IDLE_AUTO_TURNS = 3
+
+# Header title + colour per SDK task status. The old notifier hardcoded
+# "✅ 后台任务完成" for every status, so a `stopped` / `failed` task read as a
+# success. Status is `completed` | `failed` | `stopped` in the SDK.
+_IDLE_STATUS_STYLES = {
+  "completed": ("✅ 后台任务完成", "green"),
+  "failed": ("❌ 后台任务失败", "red"),
+  "stopped": ("⏹ 后台任务已停止", "grey"),
+}
+_IDLE_STATUS_FALLBACK = ("🔔 后台任务通知", "blue")
+
+_IDLE_PROMPT_PREFIX = "[后台任务通知]"
+
+
+@dataclasses.dataclass
+class IdleTurnBudget:
+  """Counts consecutive turns started by idle notifications.
+
+  Daemon-scoped rather than turn-scoped, and handed to ``_idle_notifier_for``
+  so the count survives the adapter rebuild on ``/agent``. Owned by the main
+  loop: only ``_handle_idle_event`` bumps it and only the main loop resets it,
+  so it never needs a lock.
+  """
+  consecutive: int = 0
+  max_consecutive: int = MAX_IDLE_AUTO_TURNS
+
+
+def _idle_status_style(status: str) -> tuple[str, str]:
+  """Map an SDK task status to a (title, header colour) pair."""
+  return _IDLE_STATUS_STYLES.get(status, _IDLE_STATUS_FALLBACK)
+
+
+def _idle_prompt_message(
+  chat_id: str, event: BackgroundTaskDoneEvent,
+) -> IncomingMessage:
+  """Build the internal message that turns a task notification into a turn.
+
+  A notification the CLI surfaces *between* turns has nobody to act on it —
+  the host's notifier can only display it, which is why a completion used to
+  dead-end in a card with no follow-up. Re-queuing it through the channel
+  makes the main loop run an ordinary turn, so the result is either acted on
+  or explicitly dismissed.
+  """
+  now = time.time()
+  lines = [
+    f"{_IDLE_PROMPT_PREFIX} 任务 `{event.task_id}` "
+    f"状态：{event.status or 'unknown'}。",
+  ]
+  if event.summary:
+    lines += ["", event.summary]
+  if event.output_file:
+    lines += ["", f"输出文件：{event.output_file}"]
+  lines += [
+    "",
+    "这是 Nemo 自动转达的通知：上面这个后台任务在你上一个回合结束后才报出",
+    "结果，当时你没能看到它。请自行判断是否需要跟进——",
+    "- 有结果要汇报、或有后续动作要做，就直接做，然后给用户一段简短的更新；",
+    "- 如果无事可做（例如上一个回合已经汇报过），只回一句极简说明，"
+    "不要重复已经做过的工作。",
+    "不要复述这条通知本身。",
+  ]
+  return IncomingMessage(
+    event_type="im.message.receive_v1",
+    chat_id=chat_id,
+    sender_id="",  # synthetic — not from a real user
+    message_id=f"idle_{event.task_id[:12]}_{int(now)}",
+    msg_type="text",
+    text="\n".join(lines),
+    create_time=str(int(now * 1000)),
+    is_internal=True,
+  )
+
+
+def _idle_budget_card(
+  event: BackgroundTaskDoneEvent, budget: IdleTurnBudget,
+) -> JsonObject:
+  """Fallback card for once the auto-turn budget is spent.
+
+  Keeps the pre-existing "tell the user the task finished" behaviour, but
+  says why nothing followed it — the unexplained silence was the confusing
+  part.
+  """
+  title, color = _idle_status_style(event.status)
+  lines = [f"任务 `{event.task_id[:12]}`"]
+  if event.status:
+    lines.append(f"状态：`{event.status}`")
+  if event.summary:
+    lines += ["", _truncate_for_preview(event.summary)]
+  lines += [
+    "",
+    f"<font color='grey'>已连续自动跟进 {budget.max_consecutive} 次，"
+    "暂停自动响应；你发下一条消息后恢复。</font>",
+  ]
+  return cards.build_markdown_card("\n".join(lines), title=title, color=color)
+
+
+async def _send_idle_card(
+  channel: LarkChannel, chat_id: str, card: JsonObject,
+) -> None:
+  """Send one standalone idle-notification card. Best-effort."""
+  try:
+    msg_id = await channel.send_card(chat_id, card)
+  except Exception as exc:
+    log.warning("Idle notification send failed: %s", exc)
+    return
+  log.info("Idle notification sent chat=%s msg=%s", chat_id, msg_id)
+  _register_msg(msg_id, chat_id)
+
+
 def _idle_notifier_for(
   channel: LarkChannel,
   chat_id: str,
-  db: Database,
+  budget: IdleTurnBudget,
+  pending: set[asyncio.Task[None]],
   loop: asyncio.AbstractEventLoop,
 ) -> Callable[[object], None]:
   """Build the idle-event notifier handed to ``CodingAgent.set_idle_notifier``.
 
   Invoked from the SDK thread when the backend surfaces a spontaneous event
-  between turns (a background task completing, a Monitor firing). Sends a
-  dedicated notification card to the chat — separate from any turn card —
-  by marshalling the Lark send onto the main loop (same pattern as the
-  per-turn ``_await_channel``). The return value is intentionally sync and
-  side-effect only, matching the on_event threading contract.
+  between turns (a background task completing, a Monitor firing). The event is
+  hopped onto the main loop — which owns ``budget`` and the channel queue —
+  and then becomes either a real turn (``BackgroundTaskDoneEvent``) or a
+  notification card (``BackgroundTurnDoneEvent``: the CLI already ran that
+  turn itself, so re-prompting would only duplicate its text).
+
+  The return value is intentionally sync and side-effect only, matching the
+  on_event threading contract.
   """
   def _notify(event: object) -> None:
-    if isinstance(event, BackgroundTaskDoneEvent):
-      title = "✅ 后台任务完成"
-      lines = [f"任务 `{event.task_id[:12]}`"]
-      if event.status:
-        lines.append(f"状态：`{event.status}`")
-      if event.summary:
-        lines.append("")
-        lines.append(_truncate_for_preview(event.summary))
-      card = cards.build_markdown_card("\n".join(lines), title=title,
-                                       color="green")
-    elif isinstance(event, BackgroundTurnDoneEvent):
-      card = cards.build_markdown_card(
-        _truncate_for_preview(event.text), title="🔔 后台自动响应",
-        color="blue")
-    else:
+    if not isinstance(
+        event, (BackgroundTaskDoneEvent, BackgroundTurnDoneEvent)):
       return
     try:
-      msg_id = asyncio.run_coroutine_threadsafe(
-        channel.send_card(chat_id, card), loop).result()
-      log.info("Idle notification sent chat=%s msg=%s", chat_id, msg_id)
-      _register_msg(msg_id, chat_id)
-    except Exception as exc:
-      log.warning("Idle notification send failed: %s", exc)
+      loop.call_soon_threadsafe(_handle_idle_event, event)
+    except RuntimeError as exc:
+      # Main loop already closed (shutdown) — the drainer outlives it briefly.
+      log.warning("Idle notification dropped, main loop gone: %s", exc)
+
+  def _send(card: JsonObject) -> None:
+    """Schedule a card send, holding a strong ref so it isn't GC'd mid-send."""
+    task = asyncio.ensure_future(_send_idle_card(channel, chat_id, card))
+    pending.add(task)
+    task.add_done_callback(pending.discard)
+
+  def _handle_idle_event(event: object) -> None:
+    """Runs on the main loop — the only place ``budget`` is touched."""
+    if isinstance(event, BackgroundTaskDoneEvent):
+      if budget.consecutive >= budget.max_consecutive:
+        log.info(
+          "Idle notification: auto-turn budget spent (%d), card instead "
+          "chat=%s task=%s", budget.max_consecutive, chat_id,
+          event.task_id[:12])
+        _send(_idle_budget_card(event, budget))
+        return
+      budget.consecutive += 1
+      channel.push_back(_idle_prompt_message(chat_id, event))
+      log.info(
+        "Idle notification queued as turn chat=%s task=%s status=%s (%d/%d)",
+        chat_id, event.task_id[:12], event.status,
+        budget.consecutive, budget.max_consecutive)
+      return
+    _send(cards.build_markdown_card(
+      _truncate_for_preview(event.text), title="🔔 后台自动响应",
+      color="blue"))
 
   return _notify
 
@@ -1788,8 +1919,14 @@ async def main_loop(
   # abstract no-op is harmless for codex/opencode). Registered once per
   # agent instance; the /agent switch path re-registers on the rebuilt
   # adapter below.
+  # Idle-notification state, daemon-scoped so it survives the adapter rebuild
+  # on /agent: the auto-turn budget (reset by any real user message) and the
+  # strong refs to in-flight notification-card sends.
+  _idle_budget = IdleTurnBudget()
+  _idle_send_tasks: set[asyncio.Task[None]] = set()
   coding_agent.set_idle_notifier(
-    _idle_notifier_for(channel, chat_id, db, main_loop_ref))
+    _idle_notifier_for(
+      channel, chat_id, _idle_budget, _idle_send_tasks, main_loop_ref))
   running = True
   _dissolve_on_exit = False
   # In-flight `/btw` side questions spawned during a running turn. Kept
@@ -2151,6 +2288,8 @@ async def main_loop(
       ack_msg_id = "" if reply.is_internal else reply.message_id
       ack_reaction_id = ""
       if not reply.is_internal:
+        # A human is back in the loop — re-arm the idle auto-turn budget.
+        _idle_budget.consecutive = 0
         ack_reaction_id = await channel.add_reaction(ack_msg_id, "THINKING")
         db.record_received(
           chat_id=chat_id, text=text,
@@ -2397,7 +2536,8 @@ async def main_loop(
           # between-turn background notifications keep flowing (the new
           # adapter's SDKThread starts its own drainer on start()).
           coding_agent.set_idle_notifier(
-            _idle_notifier_for(channel, chat_id, db, main_loop_ref))
+            _idle_notifier_for(
+              channel, chat_id, _idle_budget, _idle_send_tasks, main_loop_ref))
           log.info("Agent switch to %s (model=%s, resume=%s)",
                    agent, model,
                    _sdk_session_id[:8] if _sdk_session_id else "none")

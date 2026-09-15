@@ -456,6 +456,7 @@ class SDKThread:
         task_id=message.task_id,
         status=getattr(message, "status", "") or "",
         summary=getattr(message, "summary", "") or "",
+        output_file=getattr(message, "output_file", "") or "",
       )
     elif isinstance(message, AssistantMessage):
       text = "".join(
