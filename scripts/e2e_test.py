@@ -578,6 +578,19 @@ def is_done_response(msg: dict | None) -> bool:
   return interactive_card_title(msg).startswith("Done")
 
 
+def done_cards(chat_id: str, after: str, limit: int = 10) -> list[dict]:
+  """Done-titled bot cards newer than ``after``, newest first.
+
+  Prefer this over `wait_for_response(after=<timestamp>)` whenever a phase has
+  to tell two turns' cards apart. Timestamps are the wrong key: Lark stamps
+  cards with second-resolution ``create_time``, and consecutive turns can land
+  in the SAME second. Counting Done cards identifies them structurally —
+  card #1 is the first turn, card #2 the follow-up — which survives that.
+  """
+  return [m for m in get_bot_msgs(chat_id, after=after, limit=limit)
+          if interactive_card_title(m).startswith("Done")]
+
+
 # ---------------------------------------------------------------------------
 # Phase 12b: Turn-card rollover
 # ---------------------------------------------------------------------------
@@ -732,6 +745,36 @@ class LogAnalyzer:
 # Process management
 # ---------------------------------------------------------------------------
 
+_spawn_seq = 0
+
+
+def spawn_logged(
+  cmd: list[str], cwd: str, env: dict[str, str], tag: str,
+) -> tuple[subprocess.Popen, str]:
+  """Spawn a child with stderr on a FILE, never a PIPE. Returns (proc, path).
+
+  This is the ONLY place the suite spawns a long-lived child, and it exists to
+  make an undrained pipe unrepresentable. ``stderr=subprocess.PIPE`` plus a
+  single ``readline()`` (what this used to do) deadlocks any child that writes
+  more than the 64KB kernel buffer to stderr: nothing ever drains the pipe, so
+  the child blocks forever on its next write. That is indistinguishable from a
+  daemon deadlock — the log goes silent and no heartbeat appears — and it also
+  swallows the traceback when the child genuinely crashes. A file has neither
+  failure mode. ``test_spawn_logged_survives_a_stderr_flood`` pins this.
+
+  The child holds its own dup of the fd, so the parent closes its handle here.
+  """
+  global _spawn_seq
+  _spawn_seq += 1
+  path = os.path.join(
+    tempfile.gettempdir(), f"nemo-e2e-{tag}-{os.getpid()}-{_spawn_seq}.stderr.log")
+  with open(path, "w") as err_file:
+    proc = subprocess.Popen(
+      cmd, cwd=cwd, stdout=subprocess.DEVNULL, stderr=err_file,
+      env=env, text=True)
+  return proc, path
+
+
 def start_nemo(chat_id: str, verbose: bool = False,
                permission_mode: str = "bypassPermissions",
                agent: str = "claude",
@@ -748,21 +791,10 @@ def start_nemo(chat_id: str, verbose: bool = False,
   env = os.environ.copy()
   if extra_env:
     env.update(extra_env)
-  # stderr goes to a FILE, never a PIPE. Nothing drains the pipe past the PID
-  # banner, so a chatty run fills the 64KB kernel buffer and nemo then blocks
-  # forever on its next stderr write — which looks exactly like a daemon wedge
-  # (silent log, no heartbeat, no traceback). The file also preserves the
-  # crash traceback when nemo really does die.
   global _NEMO_STDERR_PATH
-  _NEMO_STDERR_PATH = os.path.join(
-    tempfile.gettempdir(), f"nemo-e2e-{chat_id[-10:]}.stderr.log")
-  with open(_NEMO_STDERR_PATH, "w") as err_file:
-    proc = subprocess.Popen(
-      cmd, cwd=PROJECT_DIR,
-      stdout=subprocess.DEVNULL, stderr=err_file,
-      env=env,
-      text=True)
-  # The child holds its own dup of the fd, so the parent's handle is closed.
+  proc, _NEMO_STDERR_PATH = spawn_logged(
+    cmd, PROJECT_DIR, env, tag=chat_id[-10:] or "nemo")
+  # Wait for the PID banner the daemon prints on startup.
   deadline = time.time() + 10
   while time.time() < deadline:
     try:
@@ -3165,12 +3197,9 @@ def run_idle_notification_tests(pid: int, chat_id: str,
   follow_elapsed = 0.0
   started = time.time()
   while time.time() - started < 180:
-    # Deadline is measured from the FIRST Done card (the start turn) so the
-    # budget is per-turn, not per-run.
-    done_cards = [m for m in get_bot_msgs(chat_id, after=ts, limit=10)
-                  if interactive_card_title(m).startswith("Done")]
-    if len(done_cards) >= 2:
-      follow_msg = done_cards[0]
+    cards = done_cards(chat_id, after=ts)
+    if len(cards) >= 2:
+      follow_msg = cards[0]
       follow_elapsed = time.time() - started
       break
     time.sleep(3)

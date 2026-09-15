@@ -80,6 +80,9 @@ Lark-connected coding agent daemon. Repo focus:
 ## Validation
 
 - Bug fixes must include a test case that covers the fix.
+- Two e2e-harness rules, both learned from a run that wasted an afternoon chasing a phantom daemon crash:
+  - **Never `stdout/stderr=subprocess.PIPE` a long-lived child you don't drain.** Spawn through `scripts/e2e_test.py:spawn_logged`, which puts stderr on a file. A PIPE plus a single `readline()` (what `start_nemo` used to do) deadlocks any child that writes more than the 64KB kernel buffer — it looks EXACTLY like a daemon deadlock (silent log, no heartbeat) and also eats the traceback when the daemon really does die. `test_e2e_never_pipes_an_undrained_stream` (AST guard) and `test_spawn_logged_survives_a_stderr_flood` (behavioural) pin it.
+  - **Identify an artifact structurally, never by wall-clock timestamp.** Lark stamps cards with second-resolution `create_time`, and back-to-back turns routinely land in the SAME second. Use `done_cards(chat_id, after=...)` and count (card #1 = first turn, #2 = follow-up) instead of `wait_for_response(after=<timestamp>)` whenever a phase must tell two turns' cards apart.
 - Minimum regression pass after core changes:
   ```bash
   pytest tests/test_main.py tests/test_interfaces.py tests/test_permissions.py tests/test_turn.py -q
