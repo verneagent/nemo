@@ -13,7 +13,7 @@ from nemo.turn import (
   canonical_usage,
 )
 from nemo.claude_turn import (
-  run_turn, normalize_claude_usage, IncompleteTurnError)
+  run_turn, normalize_claude_usage, IncompleteTurnError, ResultLedger)
 
 
 def test_canonical_usage_sums_total():
@@ -1429,9 +1429,14 @@ def _feed_turn1_leftover_and_late_answer(client, gap_s):
 
 def test_same_client_retry_drains_past_leftover_result():
   """A same-client retry must not end on the leftover Result: the real answer
-  surfaces in THIS turn and nothing is stranded in the shared stream."""
+  surfaces in THIS turn and nothing is stranded in the shared stream.
+
+  "Same-client retry" is now expressed the only way the code expresses it: the
+  ledger still owes the PREVIOUS attempt's Result when this attempt queries."""
   client = _NoSteerQueueClient()
   events: list = []
+  ledger = ResultLedger()
+  ledger.owe()  # attempt 1's query, never consumed — the retry inherits it
 
   async def _run():
     feeder = _feed_turn1_leftover_and_late_answer(client, gap_s=0.3)
@@ -1439,8 +1444,7 @@ def test_same_client_retry_drains_past_leftover_result():
       with mock.patch.dict("sys.modules", _sdk_modules()), \
            mock.patch("nemo.claude_turn.QUIESCENCE_TIMEOUT", 0.05), \
            mock.patch("nemo.claude_turn.RETRY_DRAIN_TIMEOUT", 3.0):
-        return await run_turn(client, "q1", events.append,
-                              retry_same_client=True)
+        return await run_turn(client, "q1", events.append, ledger=ledger)
     finally:
       feeder.cancel()
 
@@ -1449,21 +1453,25 @@ def test_same_client_retry_drains_past_leftover_result():
   # produced); the point is that the real answer is NOT stranded.
   assert _answers(events) == ["leftover", "real-answer"]
   assert client.q.empty(), "retry stranded its own answer in the buffer"
+  assert ledger.settled, "the retry left the stream unsettled"
 
 
-def test_same_client_retry_control_strands_without_the_flag():
-  """Control: without retry_same_client the turn ends on the leftover Result
-  and the real answer is left stranded — the exact +1 turn lag this fix
-  prevents. Keeps the regression above from passing vacuously."""
+def test_same_client_retry_control_strands_with_a_fresh_ledger():
+  """Control: the same stream, but with a FRESH ledger — what an ordinary turn
+  has, because nothing was owed when it started. It ends on the first Result
+  and the real answer is left stranded: the exact +1 turn lag this fix
+  prevents, reproduced. Keeps the regression above from passing vacuously by
+  proving the ledger's carried-over obligation is what makes the difference."""
   client = _NoSteerQueueClient()
   events: list = []
+  ledger = ResultLedger()  # nothing owed: an ordinary turn, not a retry
 
   async def _run():
     feeder = _feed_turn1_leftover_and_late_answer(client, gap_s=0.3)
     try:
       with mock.patch.dict("sys.modules", _sdk_modules()), \
            mock.patch("nemo.claude_turn.QUIESCENCE_TIMEOUT", 0.05):
-        await run_turn(client, "q1", events.append)  # no retry_same_client
+        await run_turn(client, "q1", events.append, ledger=ledger)
         await asyncio.sleep(0.4)                     # let the late answer land
     finally:
       feeder.cancel()
@@ -1478,6 +1486,8 @@ def test_same_client_retry_leaves_no_lag_for_next_turn():
   """End-to-end over ONE shared stream: after a same-client retry, the NEXT
   turn answers its OWN prompt — no permanent +1 turn lag."""
   client = _NoSteerQueueClient()
+  ledger = ResultLedger()
+  ledger.owe()  # the retry inherits attempt 1's unconsumed Result
 
   async def _run():
     feeder = _feed_turn1_leftover_and_late_answer(client, gap_s=0.3)
@@ -1486,10 +1496,11 @@ def test_same_client_retry_leaves_no_lag_for_next_turn():
       with mock.patch.dict("sys.modules", _sdk_modules()), \
            mock.patch("nemo.claude_turn.QUIESCENCE_TIMEOUT", 0.05), \
            mock.patch("nemo.claude_turn.RETRY_DRAIN_TIMEOUT", 3.0):
-        await run_turn(client, "q1", ev1.append, retry_same_client=True)
+        await run_turn(client, "q1", ev1.append, ledger=ledger)
     finally:
       feeder.cancel()
     assert client.q.empty(), "retry stranded a Result into turn 2's stream"
+    assert ledger.settled, "retry left the stream unsettled for turn 2"
 
     client.feed(
       FakeAssistantMessage(content=[FakeTextBlock(text="t2-answer")]),
@@ -1801,4 +1812,236 @@ def test_steer_probe_failure_falls_back_to_quiescence():
 
   asyncio.run(asyncio.wait_for(_run(), timeout=5))
   assert _answers(events) == ["only"]
+  assert client.q.empty()
+
+
+# ---------------------------------------------------------------------------
+# drain_outstanding: the turn-boundary primitive. When a stream still owes
+# Results from a previous turn, they are read off FIRST (surfacing the late
+# answer) so this turn's query starts on a clean stream. Leaving them there is
+# the +1 lag: the CLI's next Result lands beside them and the turn consumes
+# the OLD answer.
+# ---------------------------------------------------------------------------
+
+def test_drain_outstanding_consumes_stranded_result_and_emits_late_answer():
+  """The stranded output is delivered (not silently dropped) and the ledger
+  settles — so the following turn starts clean."""
+  from nemo.claude_turn import drain_outstanding
+
+  client = _NoSteerQueueClient()
+  client.feed(
+    FakeAssistantMessage(content=[FakeTextBlock(text="stale answer")]),
+    FakeResultMessage(total_cost_usd=0.05),
+  )
+  ledger = ResultLedger()
+  ledger.owe()
+  events: list = []
+
+  async def _run():
+    with mock.patch.dict("sys.modules", _sdk_modules()):
+      return await drain_outstanding(client, ledger, events.append)
+
+  consumed = asyncio.run(asyncio.wait_for(_run(), timeout=10))
+  assert consumed == 1
+  assert ledger.settled
+  assert ledger.outstanding == 0
+  assert _answers(events) == ["stale answer"]
+  assert client.q.empty()
+
+
+def test_drain_outstanding_returns_zero_when_nothing_is_buffered():
+  """An abandoned stream with an EMPTY buffer must not block the turn
+  boundary: the quiet window expires and the caller reconnects instead."""
+  from nemo.claude_turn import drain_outstanding
+
+  client = _NoSteerQueueClient()
+  ledger = ResultLedger()
+  ledger.owe()
+  events: list = []
+
+  async def _run():
+    with mock.patch.dict("sys.modules", _sdk_modules()), \
+         mock.patch("nemo.claude_turn.OUTSTANDING_DRAIN_QUIET", 0.05):
+      return await drain_outstanding(client, ledger, events.append)
+
+  consumed = asyncio.run(asyncio.wait_for(_run(), timeout=10))
+  assert consumed == 0
+  # Still owed: the caller's job is to reconnect, never to query over it.
+  assert not ledger.settled
+  assert _answers(events) == []
+
+
+def test_drain_outstanding_stops_quiet_and_leaves_remainder_owed():
+  """One of two owed Results arrives; the drain returns as soon as the stream
+  goes quiet rather than waiting out the whole bound."""
+  from nemo.claude_turn import drain_outstanding
+
+  client = _NoSteerQueueClient()
+  ledger = ResultLedger()
+  ledger.owe()
+  ledger.owe()
+  client.feed(FakeResultMessage(total_cost_usd=0.01))
+  events: list = []
+
+  async def _run():
+    with mock.patch.dict("sys.modules", _sdk_modules()), \
+         mock.patch("nemo.claude_turn.OUTSTANDING_DRAIN_QUIET", 0.05):
+      return await drain_outstanding(client, ledger, events.append)
+
+  consumed = asyncio.run(asyncio.wait_for(_run(), timeout=10))
+  assert consumed == 1
+  assert ledger.outstanding == 1
+
+
+def test_drain_outstanding_ignores_empty_placeholder_text():
+  """The CLI's "No response requested." filler is not an answer — the drain
+  must not push it to the card as if it were late output."""
+  from nemo.claude_turn import drain_outstanding
+
+  client = _NoSteerQueueClient()
+  client.feed(
+    FakeAssistantMessage(content=[FakeTextBlock(text="No response requested.")]),
+    FakeResultMessage(total_cost_usd=0.01),
+  )
+  ledger = ResultLedger()
+  ledger.owe()
+  events: list = []
+
+  async def _run():
+    with mock.patch.dict("sys.modules", _sdk_modules()):
+      return await drain_outstanding(client, ledger, events.append)
+
+  consumed = asyncio.run(asyncio.wait_for(_run(), timeout=10))
+  assert consumed == 1
+  assert ledger.settled
+  assert _answers(events) == []
+
+
+# ---------------------------------------------------------------------------
+# ResultLedger bookkeeping: it is ONE ledger per client, shared by every turn
+# on that client's stream, so every count it keeps must be either per-attempt
+# (derived from a snapshot) or corrected against authoritative evidence.
+# ---------------------------------------------------------------------------
+
+def test_shared_ledger_does_not_accumulate_across_turns():
+  """SDKThread hands the SAME ledger to every turn on a client — that is how a
+  cross-turn obligation survives. So a turn's expectation must be built from a
+  PER-ATTEMPT snapshot: the ledger's raw ``owed`` is cumulative for the client's
+  whole lifetime, and using it directly makes turn N wait for N Results, fall
+  past the quiescence window, and hang on the progress timeout instead of
+  ending. Four sequential turns here: each must answer its own prompt, settle
+  the books, and finish inside the wrapper timeout.
+
+  QueueClient sets the steer flag on query(), like SDKThread.steer does for a
+  follow-up — that is the path that consults the expectation at all (an
+  unsteered turn ends on its own Result and never counts)."""
+  led = [False]
+  client = QueueClient(led)
+  ledger = ResultLedger()
+  answers: list = []
+
+  async def _run():
+    with mock.patch.dict("sys.modules", _sdk_modules()), \
+         mock.patch("nemo.claude_turn.QUIESCENCE_TIMEOUT", 0.05):
+      for i in range(4):
+        client.feed(
+          FakeAssistantMessage(content=[FakeTextBlock(text=f"a{i}")]),
+          FakeResultMessage(total_cost_usd=0.01),
+        )
+        events: list = []
+        await run_turn(
+          client, f"q{i}", events.append, steered=led, ledger=ledger)
+        answers.append(_answers(events))
+        assert ledger.settled, f"turn {i} left the books open: {ledger!r}"
+        assert client.q.empty(), f"turn {i} stranded output into turn {i+1}"
+    return ledger
+
+  ledger = asyncio.run(asyncio.wait_for(_run(), timeout=10))
+  assert answers == [["a0"], ["a1"], ["a2"], ["a3"]]
+  assert ledger.owed == 4 and ledger.consumed == 4, repr(ledger)
+
+
+def test_folded_steer_leaves_no_phantom_obligation():
+  """The CLI folds an early steer into the running turn: ONE Result for TWO
+  accepted queries. The ledger counts each accepted steer, so without
+  reconciling against the transcript probe the folded steer stays owed
+  forever — and the next turn's boundary would drain for a straggler that
+  does not exist and then reconnect for it."""
+  client = _NoSteerQueueClient()
+  ledger = ResultLedger()
+  steered = [False]
+
+  def probe(session_id: str) -> int:
+    return 0  # transcript: the steer was folded, no continuation Result
+
+  async def _run():
+    with mock.patch.dict("sys.modules", _sdk_modules()), \
+         mock.patch("nemo.claude_turn.QUIESCENCE_TIMEOUT", 0.05):
+      async def _steer():
+        # Mid-turn injection accepted by the CLI (SDKThread.steer owes it),
+        # folded into the running turn: the CLI emits ONE Result for it.
+        await asyncio.sleep(0.01)
+        steered[0] = True
+        ledger.owe()
+        client.feed(
+          FakeAssistantMessage(content=[FakeTextBlock(text="folded")]),
+          FakeResultMessage(total_cost_usd=0.01),
+        )
+      steerer = asyncio.ensure_future(_steer())
+      try:
+        await run_turn(
+          client, "prompt", lambda e: None, steered=steered,
+          steer_probe=probe, ledger=ledger)
+      finally:
+        await steerer
+
+  asyncio.run(asyncio.wait_for(_run(), timeout=5))
+  assert ledger.settled, f"folded steer left a phantom: {ledger!r}"
+
+
+def test_live_steer_continuation_is_not_written_off():
+  """The other direction: when the transcript says a continuation IS running,
+  the ledger must keep owing it. Writing it off here would let the turn end
+  early and strand the continuation's Result — the 2026-07-16 +1 lag."""
+  client = _NoSteerQueueClient()
+  ledger = ResultLedger()
+  steered = [False]
+
+  def probe(session_id: str) -> int:
+    return 1  # one continuation batch is live
+
+  async def _run():
+    with mock.patch.dict("sys.modules", _sdk_modules()), \
+         mock.patch("nemo.claude_turn.QUIESCENCE_TIMEOUT", 0.05):
+      async def _steer():
+        await asyncio.sleep(0.01)
+        steered[0] = True
+        ledger.owe()
+        client.feed(
+          FakeAssistantMessage(content=[FakeTextBlock(text="first")]),
+          FakeResultMessage(total_cost_usd=0.02),
+        )
+
+      async def _late_continuation():
+        await asyncio.sleep(0.2)  # 4x the quiescence window
+        client.feed(
+          FakeAssistantMessage(content=[FakeTextBlock(text="steer-answer")]),
+          FakeResultMessage(total_cost_usd=0.03),
+        )
+
+      steerer = asyncio.ensure_future(_steer())
+      feeder = asyncio.ensure_future(_late_continuation())
+      try:
+        events: list = []
+        await run_turn(
+          client, "prompt", events.append, steered=steered,
+          steer_probe=probe, ledger=ledger)
+        return events
+      finally:
+        await steerer
+        await feeder
+
+  events = asyncio.run(asyncio.wait_for(_run(), timeout=5))
+  assert _answers(events) == ["first", "steer-answer"]
+  assert ledger.settled, repr(ledger)
   assert client.q.empty()

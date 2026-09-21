@@ -361,17 +361,194 @@ RESUME_DRAIN_TIMEOUT = 90  # seconds
 # wait only delays the retry, it does not risk a good turn.
 INCOMPLETE_DRAIN_TIMEOUT = 30  # seconds
 
-# A retry that reuses the SAME SDK client (see run_turn_with_reconnect's
-# Empty/Incomplete branch) re-enters _single_turn while the previous attempt's
-# query may still be streaming. The first ResultMessage this attempt sees can
-# therefore be that attempt's leftover, not ours — so a retry attempt never
-# ends on its first Result: it owes 1 + 1 Results and drains until quiescence
-# after the second, bounded by RETRY_DRAIN_TIMEOUT. Without this the leftover
-# is consumed as this attempt's answer and this attempt's REAL answer is
-# stranded → permanent +1 turn lag (incident 2026-09-20 22:47). The bound must
-# exceed the observed continuation gap (17s); retries are rare, so the extra
-# wait on the one-Result case is an acceptable price for not desyncing.
+# How long a turn that ALREADY has an unresolved obligation on the stream (a
+# retry over a previous attempt's in-flight query — see ResultLedger) waits for
+# the extra Result before giving up. The ledger is what says a second Result is
+# owed; this bound only caps how long we wait for it. It must exceed the
+# observed continuation gap (17s, incident 2026-09-20 22:47); retries are rare,
+# so waiting when the second Result never comes is an acceptable price.
 RETRY_DRAIN_TIMEOUT = 30  # seconds
+
+
+class ResultLedger:
+  """How many ResultMessages the SDK stream still owes this client.
+
+  ``receive_messages()`` is a single-consumer, stateful stream that outlives
+  any one turn. A turn that stops reading while the CLI still owes it a Result
+  strands that Result in the buffer, where the next reader claims it as its own
+  answer: the permanent +1 turn lag, three incidents running (2026-07-16 steer
+  continuation, 2026-08-20 resumed turn, 2026-09-20 same-client retry).
+
+  Each of those fixes added another flag encoding one more way to be owed a
+  Result (``steered`` / ``resumed`` / ``retry_same_client``). This replaces all
+  of them with the count itself: every event that creates an obligation calls
+  ``owe()``, every ResultMessage read off the stream calls ``consume()``, and
+  the stream is SETTLED when the two are equal. Correctness no longer depends
+  on guessing whether more output is coming — only the *bound* on how long we
+  wait for it does.
+
+  ``owe()`` may over-count: the CLI FOLDS a steer that lands early into the
+  running turn, emitting one Result for two queries. That direction is safe —
+  over-counting only makes a turn wait longer, and the wait is bounded.
+  Under-counting is what strands output.
+  """
+
+  def __init__(self) -> None:
+    self.owed = 0
+    self.consumed = 0
+
+  def owe(self, n: int = 1) -> None:
+    """Record that n more Results are owed: a query was accepted by the CLI."""
+    self.owed += n
+
+  def consume(self) -> None:
+    """Record one ResultMessage read off the stream.
+
+    Never counts past ``owed``: a surplus (two Results for one query, as a
+    resumed turn's empty placeholder plus its real continuation produces)
+    would carry forward and silently cancel the NEXT obligation — consumed
+    would equal owed the moment the next turn queried, so that turn would
+    believe it was settled before a single message arrived.
+    """
+    self.consumed = min(self.consumed + 1, self.owed)
+
+  def consume_if_owed(self) -> bool:
+    """Consume one owed Result; no-op when nothing is owed.
+
+    For readers OTHER than the turn runner — currently the between-turn idle
+    drainer, which holds the same stream while no turn is running. An owed
+    Result is still this client's obligation no matter who read it off, so
+    failing to count it would leave the ledger owed forever and make every
+    later turn boundary drain-then-reconnect for an answer that already
+    arrived.
+
+    But a *spontaneous* idle turn's Result is NOT ours, and counting it would
+    do the same damage as the surplus described in ``consume``. Hence the
+    conditional.
+
+    Returns whether it consumed.
+    """
+    if self.outstanding == 0:
+      return False
+    self.consume()
+    return True
+
+  def reconcile_to(self, owed_ceiling: int) -> int:
+    """Write the books down to an authoritative count of what is owed.
+
+    ``owe()`` can only see that the CLI ACCEPTED a query, and the CLI folds an
+    early steer into the running turn — one Result for two queries — so a
+    folded steer leaves an obligation that will never be discharged. The
+    transcript probe is the authority on how many steer continuations are
+    really live (the same evidence the turn uses to decide it may end), so the
+    turn reconciles the ledger against it.
+
+    Never raises the count, and never writes below the caller's ceiling (which
+    always includes the carry-over, so a real obligation can never be erased
+    here). Idempotent: calling it repeatedly with the same ceiling writes
+    nothing more, so a turn that passes quiescence several times cannot erode
+    the books twice.
+
+    Returns how many obligations were written off.
+    """
+    ceiling = min(self.owed, owed_ceiling)
+    written_off = self.owed - ceiling
+    self.owed = ceiling
+    # A Result can land for a steer the probe called folded — the probe reads
+    # the transcript, which lags the stream. Keep consumed within the books.
+    self.consumed = min(self.consumed, self.owed)
+    return written_off
+
+  def reset(self) -> None:
+    """Drop all obligations — the stream itself is gone (fresh subprocess),
+    so whatever the old one owed died with it."""
+    self.owed = 0
+    self.consumed = 0
+
+  @property
+  def outstanding(self) -> int:
+    """Results this stream still owes. >0 means it is not safe to re-query."""
+    return max(0, self.owed - self.consumed)
+
+  @property
+  def settled(self) -> bool:
+    return self.outstanding == 0
+
+  def __repr__(self) -> str:
+    return f"ResultLedger(owed={self.owed}, consumed={self.consumed})"
+
+
+# Turn-boundary drain (see ResultLedger). Before a new query, whatever the
+# stream already holds is by definition the PREVIOUS turn's — the CLI has not
+# been asked anything yet. QUIET is how long we listen for it (nothing there →
+# stop, and let the caller reconnect rather than wait for a straggler); the
+# overall cap only stops a pathological stream from holding the turn hostage.
+OUTSTANDING_DRAIN_QUIET = 2  # seconds of silence = nothing is buffered
+OUTSTANDING_DRAIN_TIMEOUT = 30  # seconds, hard cap
+
+
+async def drain_outstanding(
+  client: TurnClient,
+  ledger: ResultLedger,
+  on_event: Callable[[TurnEvent], None],
+) -> int:
+  """Consume Results a PREVIOUS turn left owed on this client's stream.
+
+  Called at the turn boundary, before the new query. Everything read here is
+  stale by construction: the CLI has not been asked anything yet, so the only
+  thing it can be talking about is the previous turn. Its text is surfaced as
+  late output (dropping a user's answer on the floor would be worse than
+  showing it late), and its Result discharges the obligation, leaving the
+  stream clean for the query that follows.
+
+  Returns the number of Results consumed. Stops after
+  ``OUTSTANDING_DRAIN_QUIET`` seconds of silence, or at
+  ``OUTSTANDING_DRAIN_TIMEOUT`` overall. A caller that still finds the ledger
+  unsettled afterwards must NOT query over it — reconnect, so the obligation
+  dies with the old stream.
+  """
+  from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock
+  import time as _time
+
+  consumed = 0
+  deadline = _time.monotonic() + OUTSTANDING_DRAIN_TIMEOUT
+  response = client.receive_messages()
+  while not ledger.settled:
+    remaining = deadline - _time.monotonic()
+    if remaining <= 0:
+      log.warning("boundary drain: hit the %ds cap with %r",
+                  OUTSTANDING_DRAIN_TIMEOUT, ledger)
+      break
+    next_task = asyncio.ensure_future(response.__anext__())
+    done, _ = await asyncio.wait(
+      {next_task}, timeout=min(OUTSTANDING_DRAIN_QUIET, remaining))
+    if not done:
+      # Silence. Anything still owed is not buffered — it belongs to a query
+      # we have not sent yet, so waiting longer would only delay the turn.
+      next_task.cancel()
+      break
+    try:
+      message = next_task.result()
+    except StopAsyncIteration:
+      break
+    if isinstance(message, ResultMessage):
+      consumed += 1
+      ledger.consume()
+      log.info("boundary drain: consumed a late Result %r", ledger)
+      continue
+    if isinstance(message, AssistantMessage):
+      text = "\n".join(
+        block.text for block in message.content
+        if isinstance(block, TextBlock) and block.text)
+      if text and not _is_empty_response_text(text):
+        log.warning(
+          "boundary drain: delivering %d chars of late output the previous "
+          "turn never claimed", len(text))
+        on_event(AnswerEvent(text=text))
+  if consumed:
+    log.warning("boundary drain: consumed %d late result(s) %r",
+                consumed, ledger)
+  return consumed
 
 # Messages that do NOT count as real progress. Anything outside this set
 # refreshes the progress clock. Checked by class name to avoid importing
@@ -406,7 +583,7 @@ async def _single_turn(
   steer_probe: Callable[[str], int] | None = None,
   resumed: bool = False,
   interrupted: Callable[[], bool] | None = None,
-  retry_same_client: bool = False,
+  ledger: ResultLedger | None = None,
 ) -> _TurnResult:
   """Issue one query() and consume the client's receive_messages() stream.
 
@@ -474,12 +651,14 @@ async def _single_turn(
   model's final text block can land AFTER its Result, and ending on the 8s
   quiescence window instead strands it into the retry.
 
-  ``retry_same_client`` marks a retry that REUSES this client (the
-  Empty/Incomplete branch of ``run_turn_with_reconnect``), as opposed to a
-  retry after a reconnect onto a fresh subprocess. Such a retry must not end
-  on its first ResultMessage: the stream may still owe the previous attempt's
-  Result, so the first one it sees can be a leftover. It keeps draining until
-  quiescence past the second Result, bounded by ``RETRY_DRAIN_TIMEOUT``.
+  ``ledger`` is the shared ``ResultLedger`` for this client's stream (see its
+  docstring). It decides when the turn may end: the turn runs until the stream
+  is SETTLED — every Result the stream owes has been read. A same-client retry
+  therefore cannot end on its first ResultMessage for free: the run_turn that
+  oweds this attempt's query finds the previous attempt's obligation still on
+  the books, so the retry owes two and drains both. No flag says "this is a
+  retry"; the count does. ``RETRY_DRAIN_TIMEOUT`` still bounds how long it
+  waits for the second one.
   """
   from claude_agent_sdk import (
     AssistantMessage, TextBlock, ThinkingBlock, ToolUseBlock, ResultMessage,
@@ -487,12 +666,28 @@ async def _single_turn(
   )
 
   steered_flag: list[bool] = steered if steered is not None else [False]
+  if ledger is None:
+    ledger = ResultLedger()
+
+  # Snapshot BEFORE owing this attempt's own query: anything already on the
+  # books is a carry-over, i.e. a previous attempt on this same stream that
+  # never consumed its Result. That is what "same-client retry" MEANS — the
+  # count says it, so no flag has to.
+  owed_at_attempt_start = ledger.owed
+  carried = ledger.outstanding
+  retry_over_unsettled_stream = carried > 0
+  if retry_over_unsettled_stream:
+    log.warning(
+      "query() on a stream that still owes %d result(s) %r — this attempt "
+      "will drain them before ending", ledger.outstanding, ledger)
 
   import anyio as _anyio
   import time as _time
   log.info("query() prompt=%d chars", len(prompt))
   with _anyio.fail_after(15):
     await client.query(prompt)
+  # The CLI has accepted the query: the stream now owes its Result.
+  ledger.owe()
   log.info("query() sent to CLI")
 
   cost = 0.0
@@ -515,9 +710,11 @@ async def _single_turn(
   # IncompleteTurnError check below fires.
   incomplete_drain_deadline: float | None = None
   # Same-client retry drain (see RETRY_DRAIN_TIMEOUT). Armed for the WHOLE
-  # attempt: the stream may still owe the previous attempt's Result.
+  # attempt when the stream carried an obligation in from a previous attempt:
+  # the ledger says a Result is owed that may never arrive.
   retry_drain_deadline: float | None = (
-    _time.monotonic() + RETRY_DRAIN_TIMEOUT if retry_same_client else None)
+    _time.monotonic() + RETRY_DRAIN_TIMEOUT
+    if retry_over_unsettled_stream else None)
 
   FIRST_MSG_TIMEOUT = 30
   msg_count = 0
@@ -616,17 +813,42 @@ async def _single_turn(
           # IncompleteTurnError path below if the text never comes. Keep
           # saw_result=True so the loop-top bound governs the wait.
           continue
-        expected_results = 1
-        if resume_drain_deadline is not None or retry_drain_deadline is not None:
-          # Resumed turn with an empty first Result, or a same-client retry
-          # whose first Result may be the PREVIOUS attempt's leftover — either
-          # way we still owe the real continuation's Result.
-          expected_results = 2
+        # How many Results THIS attempt owes: the leftovers the stream carried
+        # in (a previous attempt on the same client that never consumed its
+        # Result — which is why a same-client retry legitimately owes two, with
+        # no flag saying so) plus this attempt's own query. Counting is
+        # per-ATTEMPT, from the snapshot taken before this attempt's query():
+        # the ledger's raw ``owed`` is cumulative for the client's lifetime and
+        # would grow with every turn if used directly here.
+        steer_continuations = 0
         if steer_probe is not None and steered_flag[0]:
           try:
-            expected_results += steer_probe(sdk_session_id)
+            steer_continuations = steer_probe(sdk_session_id)
           except Exception as exc:
+            # Probe unavailable → assume nothing extra is coming, which is the
+            # pre-probe behaviour (end at quiescence after the own Result).
             log.warning("steer continuation probe failed: %s", exc)
+        # The ledger counts every steer the CLI ACCEPTED as an obligation, but
+        # the CLI FOLDS an early steer into the running turn — one Result for
+        # two queries. A folded steer therefore leaves an obligation nothing
+        # can ever discharge, which would send the next turn's boundary drain
+        # looking for a straggler that does not exist and then reconnect for
+        # it. Reconciled against the transcript probe (the same evidence that
+        # ends this turn); never writes below the carry-over, and is idempotent
+        # so repeated quiescence passes cannot erode the books twice.
+        written_off = ledger.reconcile_to(
+          owed_at_attempt_start + 1 + steer_continuations)
+        if written_off:
+          log.warning(
+            "steer(s) folded into the running turn: wrote off %d phantom "
+            "result obligation(s) %r", written_off, ledger)
+        expected_results = carried + 1 + steer_continuations
+        if resume_drain_deadline is not None and expected_results < 2:
+          # A resumed turn whose first Result was EMPTY owes the real
+          # continuation's Result, which the ledger cannot see (an empty
+          # placeholder Result does not tell us a continuation exists). This is
+          # the one expectation that stays content-based.
+          expected_results = 2
         if results_seen < expected_results:
           if resume_drain_deadline is not None or retry_drain_deadline is not None:
             # Resumed drain: keep saw_result=True so the loop-top deadline
@@ -883,7 +1105,11 @@ async def _single_turn(
       pending_tasks.clear()
       saw_result = True
       results_seen += 1
-      if (not steered_flag[0] and retry_drain_deadline is None
+      # This Result is now read off the stream, whatever it turns out to be
+      # (this attempt's answer, a leftover the previous attempt owed, or a
+      # steer's follow-on). Consuming it is what keeps the stream settled.
+      ledger.consume()
+      if (not steered_flag[0] and ledger.settled
           and (not resumed or last_emitted != "")):
         # No steer, not a same-client retry, and not a resumed turn owing a
         # continuation past an EMPTY first Result → exactly one Result → done.
@@ -914,7 +1140,8 @@ async def _single_turn(
       # the CLI is silent, after consuming any follow-on Result into THIS
       # run_turn.
       if (resumed and last_emitted == "" and results_seen == 1
-          and resume_drain_deadline is None and retry_drain_deadline is None):
+          and resume_drain_deadline is None
+          and not retry_over_unsettled_stream):
         # Resumed turn whose first Result is empty (e.g. the CLI's "No
         # response requested." placeholder on the replayed session state).
         # The real answer to the re-sent prompt may stream in as a follow-on
@@ -924,6 +1151,16 @@ async def _single_turn(
           "resumed turn: first result empty (result=%r) — draining up to %ds "
           "for the real continuation", result_text[:120], RESUME_DRAIN_TIMEOUT)
       last_progress_at = _time.monotonic()
+
+  # Visibility: a turn that ends while the stream still owes Results has left
+  # output in the buffer. The ledger makes that non-silent — the obligation
+  # stays on the books, so the next turn sees it and drains it as LATE output
+  # instead of claiming it as its own answer (that claim is the +1 turn lag).
+  # Log it loudly anyway: a bound expired and something is genuinely late.
+  if not ledger.settled:
+    log.warning(
+      "turn ended with %d result(s) still owed %r — left on the books for the "
+      "next turn's boundary drain", ledger.outstanding, ledger)
 
   if timed_out:
     on_event(ErrorEvent(message="Turn timed out — SDK stopped responding"))
@@ -976,7 +1213,7 @@ async def run_turn(
   steer_probe: Callable[[str], int] | None = None,
   resumed: bool = False,
   interrupted: Callable[[], bool] | None = None,
-  retry_same_client: bool = False,
+  ledger: ResultLedger | None = None,
 ) -> tuple[float, JsonObject]:
   """Send prompt to SDK client, stream responses, emit events.
 
@@ -997,6 +1234,12 @@ async def run_turn(
   while the user is stopping the RUNNING turn. Passed through so a user stop
   ending the turn mid-generation is not misread as an IncompleteTurnError.
 
+  ``ledger`` is this client's shared ``ResultLedger`` (see its docstring).
+  ``SDKThread`` owns one per client and passes it in; a direct caller may omit
+  it and get a private one, which behaves exactly like today's single-pass
+  turn. It is NOT created fresh per call on the SDK path: the whole point is
+  that an obligation left by one attempt is still visible to the next.
+
   Returns (cost, usage_dict).
   """
   if stale_tasks is None:
@@ -1008,7 +1251,7 @@ async def run_turn(
   # layer owns recovery.
   result = await _single_turn(
     client, prompt, on_event, stale_tasks, stop_task_disabled, is_paused,
-    steered, steer_probe, resumed, interrupted, retry_same_client,
+    steered, steer_probe, resumed, interrupted, ledger,
   )
 
   total_cost = result.cost

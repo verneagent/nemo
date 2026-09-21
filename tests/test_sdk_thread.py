@@ -189,8 +189,7 @@ class TestRunTurnWithReconnect:
     call_count = 0
 
     async def fake_turn(prompt, on_event, stale_tasks=None, is_paused=None,
-                      steer_probe=None, resumed=False,
-                      retry_same_client=False):
+                      steer_probe=None, resumed=False):
       nonlocal call_count
       call_count += 1
       if call_count < 2:
@@ -223,8 +222,7 @@ class TestRunTurnWithReconnect:
     seen_prompts: list[str] = []
 
     async def fake_turn(prompt, on_event, stale_tasks=None, is_paused=None,
-                      steer_probe=None, resumed=False,
-                      retry_same_client=False):
+                      steer_probe=None, resumed=False):
       nonlocal call_count
       call_count += 1
       seen_prompts.append(prompt)
@@ -273,8 +271,7 @@ class TestRunTurnWithReconnect:
     sdk_thread._client = mock.MagicMock()
 
     async def fake_turn(prompt, on_event, stale_tasks=None, is_paused=None,
-                      steer_probe=None, resumed=False,
-                      retry_same_client=False):
+                      steer_probe=None, resumed=False):
       raise TimeoutError("hung")
 
     with mock.patch.object(sdk_thread, "run_turn", side_effect=fake_turn):
@@ -297,8 +294,7 @@ class TestRunTurnWithReconnect:
     reconnect_calls = 0
 
     async def fake_turn(prompt, on_event, stale_tasks=None, is_paused=None,
-                      steer_probe=None, resumed=False,
-                      retry_same_client=False):
+                      steer_probe=None, resumed=False):
       nonlocal turn_calls
       turn_calls += 1
       raise TimeoutError("hung")
@@ -326,8 +322,7 @@ class TestRunTurnWithReconnect:
     expected = (1.0, {"ok": True})
 
     async def fake_turn(prompt, on_event, stale_tasks=None, is_paused=None,
-                      steer_probe=None, resumed=False,
-                      retry_same_client=False):
+                      steer_probe=None, resumed=False):
       nonlocal turn_calls
       turn_calls += 1
       if turn_calls < 3:
@@ -350,8 +345,7 @@ class TestRunTurnWithReconnect:
     call_count = 0
 
     async def fake_turn(prompt, on_event, stale_tasks=None, is_paused=None,
-                      steer_probe=None, resumed=False,
-                      retry_same_client=False):
+                      steer_probe=None, resumed=False):
       nonlocal call_count
       call_count += 1
       if call_count < 2:
@@ -377,8 +371,7 @@ class TestRunTurnWithReconnect:
     call_count = 0
 
     async def fake_turn(prompt, on_event, stale_tasks=None, is_paused=None,
-                      steer_probe=None, resumed=False,
-                      retry_same_client=False):
+                      steer_probe=None, resumed=False):
       nonlocal call_count
       call_count += 1
       raise NonRetryableAPIError("API Error: 402 Insufficient Balance")
@@ -401,8 +394,7 @@ class TestRunTurnWithReconnect:
   def test_not_connected_raises_after_max_attempts(self, sdk_thread: SDKThread):
     """Should raise after exhausting all reconnect attempts for not-connected."""
     async def fake_turn(prompt, on_event, stale_tasks=None, is_paused=None,
-                      steer_probe=None, resumed=False,
-                      retry_same_client=False):
+                      steer_probe=None, resumed=False):
       raise RuntimeError("SDK client not connected")
 
     with mock.patch.object(sdk_thread, "run_turn", side_effect=fake_turn):
@@ -418,8 +410,7 @@ class TestRunTurnWithReconnect:
     call_count = 0
 
     async def fake_turn(prompt, on_event, stale_tasks=None, is_paused=None,
-                      steer_probe=None, resumed=False,
-                      retry_same_client=False):
+                      steer_probe=None, resumed=False):
       nonlocal call_count
       call_count += 1
       raise TimeoutError("hung")
@@ -445,8 +436,7 @@ class TestRunTurnWithReconnect:
     call_count = 0
 
     async def fake_turn(prompt, on_event, stale_tasks=None, is_paused=None,
-                      steer_probe=None, resumed=False,
-                      retry_same_client=False):
+                      steer_probe=None, resumed=False):
       nonlocal call_count
       call_count += 1
       if call_count < 2:
@@ -476,8 +466,7 @@ class TestRunTurnWithReconnect:
     factory_calls = 0
 
     async def fake_turn(prompt, on_event, stale_tasks=None, is_paused=None,
-                      steer_probe=None, resumed=False,
-                      retry_same_client=False):
+                      steer_probe=None, resumed=False):
       nonlocal turn_calls
       turn_calls += 1
       if turn_calls < 2:
@@ -508,8 +497,7 @@ class TestRunTurnWithReconnect:
   def test_factory_returning_none_raises_immediately(self, sdk_thread: SDKThread):
     """If options_factory returns None, treat it like no-options and raise."""
     async def fake_turn(prompt, on_event, stale_tasks=None, is_paused=None,
-                      steer_probe=None, resumed=False,
-                      retry_same_client=False):
+                      steer_probe=None, resumed=False):
       raise TimeoutError("hung")
 
     with mock.patch.object(sdk_thread, "run_turn", side_effect=fake_turn):
@@ -527,8 +515,7 @@ class TestRunTurnWithReconnect:
     call_count = 0
 
     async def fake_turn(prompt, on_event, stale_tasks=None, is_paused=None,
-                      steer_probe=None, resumed=False,
-                      retry_same_client=False):
+                      steer_probe=None, resumed=False):
       nonlocal call_count
       call_count += 1
       raise RuntimeError("some other error")
@@ -557,8 +544,7 @@ class TestRunTurnWithReconnect:
     calls: list[tuple[str, bool]] = []
 
     async def fake_turn(prompt, on_event, stale_tasks=None, is_paused=None,
-                        steer_probe=None, resumed=False,
-                        retry_same_client=False):
+                        steer_probe=None, resumed=False):
       calls.append((prompt, resumed))
       if len(calls) == 1:
         raise EmptyResponseError("Model returned an empty response")
@@ -590,8 +576,7 @@ class TestRunTurnWithReconnect:
     calls: list[tuple[str, bool]] = []
 
     async def fake_turn(prompt, on_event, stale_tasks=None, is_paused=None,
-                        steer_probe=None, resumed=False,
-                        retry_same_client=False):
+                        steer_probe=None, resumed=False):
       calls.append((prompt, resumed))
       raise EmptyResponseError("Model returned an empty response")
 
@@ -622,8 +607,7 @@ class TestRunTurnWithReconnect:
     calls: list[tuple[str, bool]] = []
 
     async def fake_turn(prompt, on_event, stale_tasks=None, is_paused=None,
-                        steer_probe=None, resumed=False,
-                        retry_same_client=False):
+                        steer_probe=None, resumed=False):
       calls.append((prompt, resumed))
       if len(calls) == 1:
         raise IncompleteTurnError("Incomplete turn: only thinking/tool output")
@@ -656,8 +640,7 @@ class TestRunTurnWithReconnect:
     calls: list[tuple[str, bool]] = []
 
     async def fake_turn(prompt, on_event, stale_tasks=None, is_paused=None,
-                        steer_probe=None, resumed=False,
-                        retry_same_client=False):
+                        steer_probe=None, resumed=False):
       calls.append((prompt, resumed))
       raise IncompleteTurnError("Incomplete turn: only thinking/tool output")
 
@@ -1093,3 +1076,152 @@ class _QueueClient:
         yield await self._q.get()
 
     return gen()
+
+
+# ---------------------------------------------------------------------------
+# Turn-boundary drain: a turn must never query over a stream that still owes
+# a previous turn's Results — that is the permanent +1 turn lag.
+# ---------------------------------------------------------------------------
+
+def _result_message(cost: float = 0.01):
+  from claude_agent_sdk import ResultMessage
+  return ResultMessage(
+    subtype="success", duration_ms=1, duration_api_ms=1, is_error=False,
+    num_turns=1, session_id="s1", stop_reason=None, total_cost_usd=cost,
+    usage={}, result=None, structured_output=None)
+
+
+class _StrandedStreamClient:
+  """A client whose stream still holds a previous turn's output.
+
+  ``receive_messages()`` is bound to the loop that created it, exactly like
+  the real SDK client — so ``loops`` records which loop the drain read it on.
+  """
+
+  def __init__(self, messages):
+    self._messages = list(messages)
+    self.loops: list = []
+
+  async def __aenter__(self):
+    return self
+
+  async def __aexit__(self, *exc_info):
+    return None
+
+  def receive_messages(self):
+    async def gen():
+      self.loops.append(asyncio.get_running_loop())
+      for message in self._messages:
+        yield message
+      await asyncio.Event().wait()  # quiet, like an idle CLI stream
+
+    return gen()
+
+
+class TestTurnBoundaryDrain:
+  def test_stranded_answer_is_delivered_before_the_new_turn(self, sdk_thread):
+    """The stream owes a Result when the turn starts: the stale answer is read
+    off and emitted FIRST, so this turn's own query starts clean and the next
+    card answers the next message instead of the previous one."""
+    from claude_agent_sdk import AssistantMessage, TextBlock
+    from nemo.turn import AnswerEvent
+
+    sdk_thread._client = _StrandedStreamClient([
+      AssistantMessage(content=[TextBlock(text="stale answer")],
+                       model="claude-opus-5"),
+      _result_message(),
+    ])
+    sdk_thread._ledger.owe()
+    events: list = []
+    settled_at_turn_start: list[bool] = []
+
+    async def fake_turn(prompt, on_event, stale_tasks=None, is_paused=None,
+                        steer_probe=None, resumed=False):
+      settled_at_turn_start.append(sdk_thread._ledger.settled)
+      return (0.1, {})
+
+    with mock.patch.object(sdk_thread, "run_turn", side_effect=fake_turn):
+      with mock.patch.object(sdk_thread, "reconnect",
+                            new_callable=mock.AsyncMock) as recon:
+        _run(sdk_thread.run_turn_with_reconnect(
+          "new question", on_event=events.append, options=mock.MagicMock()))
+
+    # The turn's query saw a settled stream — nothing was left to strand.
+    assert settled_at_turn_start == [True]
+    # The stale answer was surfaced, not dropped.
+    assert [e.text for e in events if isinstance(e, AnswerEvent)] == \
+      ["stale answer"]
+    # Nothing buffered, so no reconnect was needed.
+    recon.assert_not_awaited()
+    # And it was read on the SDK loop the client lives on, not the caller's.
+    assert sdk_thread._client.loops == [sdk_thread._loop]
+
+  def test_unreadable_stranded_output_forces_a_reconnect(
+      self, sdk_thread, monkeypatch):
+    """Owed Results that are NOT on the stream (already consumed by the idle
+    drainer, or lost) must not be carried into the new turn — reconnect so the
+    obligation dies with the old subprocess."""
+    monkeypatch.setattr("nemo.claude_turn.OUTSTANDING_DRAIN_QUIET", 0.05)
+
+    sdk_thread._client = _StrandedStreamClient([])  # nothing buffered
+    sdk_thread._ledger.owe()
+    fresh = mock.MagicMock(name="fresh_options")
+    reconnect_args: list = []
+
+    async def fake_reconnect(options):
+      reconnect_args.append(options)
+      sdk_thread._ledger.reset()  # the real reconnect does this
+
+    async def fake_turn(prompt, on_event, stale_tasks=None, is_paused=None,
+                        steer_probe=None, resumed=False):
+      return (0.1, {})
+
+    with mock.patch.object(sdk_thread, "run_turn", side_effect=fake_turn):
+      with mock.patch.object(sdk_thread, "reconnect", side_effect=fake_reconnect):
+        _run(sdk_thread.run_turn_with_reconnect(
+          "new question", on_event=lambda e: None, options=fresh))
+
+    # It drained first (found nothing) and only then reconnected.
+    assert sdk_thread._client.loops == [sdk_thread._loop]
+    assert reconnect_args == [fresh]
+    assert sdk_thread._ledger.settled
+
+  def test_no_drain_when_the_stream_owes_nothing(self, sdk_thread):
+    """The common case must stay free: a settled ledger never opens the
+    stream at the boundary."""
+    sdk_thread._client = _StrandedStreamClient([])
+    calls = 0
+
+    async def fake_turn(prompt, on_event, stale_tasks=None, is_paused=None,
+                        steer_probe=None, resumed=False):
+      nonlocal calls
+      calls += 1
+      return (0.1, {})
+
+    with mock.patch.object(sdk_thread, "run_turn", side_effect=fake_turn):
+      _run(sdk_thread.run_turn_with_reconnect(
+        "hello", on_event=lambda e: None, options=mock.MagicMock()))
+
+    assert calls == 1
+    assert sdk_thread._client.loops == []
+
+
+class TestIdleDrainerLedger:
+  """The idle drainer holds the SAME stream between turns, so it can claim a
+  Result the ledger still owes. It must count what it takes."""
+
+  def test_idle_drainer_counts_a_straggler_it_claimed(self, sdk_thread):
+    """Without this, every later turn boundary would drain for a straggler
+    that is already gone, find nothing, and reconnect for nothing."""
+    sdk_thread._ledger.owe()
+    sdk_thread._handle_idle_message(_result_message())
+    assert sdk_thread._ledger.settled
+
+  def test_idle_drainer_does_not_pre_consume_a_spontaneous_turn(
+      self, sdk_thread):
+    """A spontaneous idle turn's Result was never owed by anyone. Counting it
+    would make the NEXT real turn look settled the instant it queried — it
+    would stop reading before its own answer arrived."""
+    sdk_thread._handle_idle_message(_result_message())
+    sdk_thread._ledger.owe()  # the next real turn queries
+    assert sdk_thread._ledger.outstanding == 1

@@ -41,7 +41,7 @@ from typing import Callable
 
 from claude_agent_sdk import CLIConnectionError as _CLIConnectionError
 
-from .claude_turn import run_turn
+from .claude_turn import ResultLedger, drain_outstanding, run_turn
 from .turn import (
   BackgroundTaskDoneEvent, BackgroundTurnDoneEvent, TurnEvent,
 )
@@ -77,6 +77,13 @@ class SDKThread:
     # steer_probe so the turn runner can ask the transcript how many steer
     # continuations (extra Results) the stream still owes before it may end.
     self._steer_texts: list[str] = []
+    # How many ResultMessages this client's stream still owes (see
+    # claude_turn.ResultLedger). One per client, deliberately NOT per turn: an
+    # obligation left by one attempt must still be visible to the next, because
+    # that is exactly what "same-client retry" means and what the +1 turn lag
+    # was made of. Created here so it outlives every turn; reset when the
+    # client (and therefore the stream) is recreated or closed.
+    self._ledger = ResultLedger()
     # One-element mutable flag: set True by interrupt() when the user stops
     # the RUNNING turn, read by turn._single_turn so a user stop that ends the
     # turn mid-generation (thinking-only tail) is NOT misread as an
@@ -253,9 +260,12 @@ class SDKThread:
 
   async def close_client(self) -> None:
     """Close the SDK client on the lifecycle owner task."""
-    if self._client is None:
-      return
-    await self._submit_lifecycle(_CMD_CLOSE)
+    if self._client is not None:
+      await self._submit_lifecycle(_CMD_CLOSE)
+    # The stream died with the subprocess (or never existed), so whatever it
+    # still owed died too. Keeping the obligation would make the next turn
+    # drain — or reconnect for — Results that can no longer arrive.
+    self._ledger.reset()
 
   async def reconnect(self, options: object) -> None:
     """Close and recreate the client (both on the owner task)."""
@@ -270,7 +280,6 @@ class SDKThread:
     is_paused: Callable[[], bool] | None = None,
     steer_probe: Callable[[str, list[str]], int] | None = None,
     resumed: bool = False,
-    retry_same_client: bool = False,
   ) -> tuple[float, JsonObject]:
     """Run a single SDK turn on the SDK thread.
 
@@ -290,10 +299,10 @@ class SDKThread:
     attempt > 0): passed to the turn runner so it drains past an empty first
     Result instead of stranding the real continuation answer.
 
-    ``retry_same_client`` marks a retry that reuses THIS client (the
-    Empty/Incomplete branch of run_turn_with_reconnect) rather than a fresh
-    subprocess: the turn runner then refuses to end on its first Result, which
-    may be the previous attempt's leftover (see RETRY_DRAIN_TIMEOUT).
+    This client's shared ``ResultLedger`` goes with it: whatever the stream
+    still owed when this attempt ended is still owed when the next one starts,
+    which is how a same-client retry knows to drain two Results without anyone
+    passing a "this is a retry" flag.
     """
     if self._client is None:
       raise RuntimeError("SDK client not connected")
@@ -327,7 +336,7 @@ class SDKThread:
           steered=self._steer_holder,
           steer_probe=_bound_probe, resumed=resumed,
           interrupted=lambda: self._interrupt_holder[0],
-          retry_same_client=retry_same_client)
+          ledger=self._ledger)
       finally:
         # Turn complete — resume draining. Any background-task completions /
         # Monitor fires that landed during the turn (or arrive right after)
@@ -335,6 +344,28 @@ class SDKThread:
         self._drain_enabled = True
 
     return await self.run_on_sdk_loop(_turn())
+
+  async def _boundary_drain(
+    self, on_event: Callable[[TurnEvent], None]) -> int:
+    """Read off the Results a previous turn left owed, on the SDK loop.
+
+    Must run on the SDK loop for two reasons: ``client.receive_messages()`` is
+    bound to the loop the client was created on, and the idle drainer shares
+    this stream, so it has to be barred for the whole read. Same barrier as
+    ``run_turn``: two synchronous statements, no await between them, so the
+    drainer either sees the flag cleared before starting a receive or has its
+    in-flight receive cancelled here.
+    """
+    client = self._client
+    if client is None:
+      return 0
+    self._drain_enabled = False
+    if self._drain_pending is not None:
+      self._drain_pending.cancel()
+    try:
+      return await drain_outstanding(client, self._ledger, on_event)
+    finally:
+      self._drain_enabled = True
 
   def start_idle_drain(self, on_idle_event: Callable[[TurnEvent], None]) -> None:
     """Start (or refresh the notifier of) the between-turn idle drainer.
@@ -473,6 +504,10 @@ class SDKThread:
         self._idle_turn_texts.append(text)
       return
     elif isinstance(message, ResultMessage):
+      # This reader can claim a Result the ledger still owes (a previous
+      # turn's straggler). Count it, or the next turn boundary will drain
+      # for it, find nothing, and reconnect for an answer already delivered.
+      self._ledger.consume_if_owed()
       if self._idle_turn_texts:
         ev = BackgroundTurnDoneEvent(
           text="\n".join(self._idle_turn_texts),
@@ -539,20 +574,44 @@ class SDKThread:
     # give up so the host surfaces an explicit error card instead of a
     # misleading empty/fragment "Done ✓".
     incomplete_retries = 1
-    # True while the NEXT attempt reuses the CURRENT client (the
-    # Empty/Incomplete branch below) instead of a reconnected subprocess. Such
-    # an attempt can still see the previous attempt's in-flight output, so the
-    # turn runner must not end it on a first Result that may be that leftover
-    # (see claude_turn.RETRY_DRAIN_TIMEOUT).
-    retry_same_client = False
+    # ---- Turn-boundary invariant (see claude_turn.ResultLedger) ----
+    # A turn must never query over a stream that still owes Results from a
+    # previous one. Those Results are the previous turn's output arriving too
+    # late to be claimed; leave them on the stream and the CLI's next Result
+    # lands beside them, so THIS turn consumes the OLD answer and its own is
+    # stranded — every card one message behind, permanently (+1 turn lag).
+    # So: read them off first (they are surfaced as late output), and if they
+    # are not there to be read, reconnect — the obligation dies with the old
+    # subprocess instead of leaking forward.
+    if not self._ledger.settled:
+      log.warning(
+        "turn boundary: stream still owes %d result(s) %r — draining before "
+        "this turn's query", self._ledger.outstanding, self._ledger)
+      drained = await self.run_on_sdk_loop(self._boundary_drain(on_event))
+      if not self._ledger.settled:
+        fresh = options_factory() if options_factory is not None else options
+        if fresh is None or self._cancelled.is_set():
+          # Cannot reconnect — carry the obligation into the turn instead.
+          # The ledger makes the turn owe both Results, so the late answer is
+          # still delivered here rather than stranded (just attributed to this
+          # turn). Noisy, but never a desync.
+          log.warning(
+            "turn boundary: %d result(s) still owed after draining %s and no "
+            "options to reconnect with — carrying them into this turn",
+            self._ledger.outstanding, drained)
+        else:
+          log.warning(
+            "turn boundary: %d result(s) still owed after draining %s — "
+            "reconnecting so they die with the old stream",
+            self._ledger.outstanding, drained)
+          await self.reconnect(fresh)  # resets the ledger
     for attempt in range(max_attempts):
       if self._cancelled.is_set():
         raise asyncio.CancelledError("SDK turn cancelled")
       try:
         return await self.run_turn(
           prompt, on_event, stale_tasks=stale_tasks, is_paused=is_paused,
-          steer_probe=steer_probe, resumed=(attempt > 0),
-          retry_same_client=retry_same_client)
+          steer_probe=steer_probe, resumed=(attempt > 0))
       except (EmptyResponseError, IncompleteTurnError) as exc:
         if incomplete_retries <= 0:
           log.warning("SDK turn %s (no retries left) — giving up",
@@ -563,7 +622,8 @@ class SDKThread:
           "SDK turn %s — retrying same prompt on same client "
           "(%d retry left): %s", type(exc).__name__, incomplete_retries,
           str(exc)[:200])
-        retry_same_client = True
+        # No flag: the ledger still owes whatever this attempt never consumed,
+        # so the next attempt owes two and drains both (see ResultLedger).
         continue
       except NonRetryableAPIError:
         log.warning("SDK turn non-retryable API error — closing client")
@@ -598,10 +658,9 @@ class SDKThread:
           if self._cancelled.is_set():
             raise asyncio.CancelledError("SDK turn cancelled")
           log.info("Reconnecting...")
+          # Fresh subprocess with resume= — a clean stream, and reconnect()
+          # resets the ledger with it, so the next attempt owes exactly one.
           await self.reconnect(fresh_options)
-          # Fresh subprocess with resume= — its stream is clean, so the next
-          # attempt is a normal resumed turn, not a same-client retry.
-          retry_same_client = False
         else:
           raise  # Other RuntimeErrors should not be retried
     raise RuntimeError(f"SDK turn failed after {max_attempts} attempts")
@@ -649,6 +708,12 @@ class SDKThread:
         # Result rather than stranding it (both fold and late-steer cases).
         self._steer_holder[0] = True
         self._steer_texts.append(text)
+        # The CLI accepted the steer: it now owes a Result for it as well. If
+        # it FOLDS the steer into the running turn instead (one Result for two
+        # queries) the ledger over-counts by one — the turn reconciles that
+        # against the transcript probe, which is the same evidence it uses to
+        # decide it may end (see claude_turn.ResultLedger.reconcile_to).
+        self._ledger.owe()
         return True
       except Exception as e:
         log.warning("steer query() error: %s", e)
