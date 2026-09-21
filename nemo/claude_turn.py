@@ -346,6 +346,33 @@ QUIESCENCE_TIMEOUT = 8  # seconds of CLI silence after a Result = turn complete
 # raises EmptyResponseError and the prompt is retried.
 RESUME_DRAIN_TIMEOUT = 90  # seconds
 
+# A ResultMessage whose only output is thinking/tool text does NOT prove the
+# model was cut off: its final TEXT block can land seconds AFTER the Result.
+# Observed 2026-09-20: Result at 22:47:05, quiescence fired at 22:47:13 (8s),
+# the final text arrived at 22:47:14 — 1.6s too late. Declaring the turn
+# incomplete there raises IncompleteTurnError, and the same-client retry that
+# follows re-queries while that late text is still streaming: the retry then
+# consumes the late text as ITS OWN result and strands its own answer in the
+# receive buffer → permanent +1 turn lag (every later turn replies to the
+# PREVIOUS message). So a thinking-only tail gets INCOMPLETE_DRAIN_TIMEOUT of
+# extra silence to produce its final text before the turn is declared
+# incomplete. Chosen well above the observed 9.6s lag and the 15s steer
+# continuation lag; the turn is already broken at this point, so the extra
+# wait only delays the retry, it does not risk a good turn.
+INCOMPLETE_DRAIN_TIMEOUT = 30  # seconds
+
+# A retry that reuses the SAME SDK client (see run_turn_with_reconnect's
+# Empty/Incomplete branch) re-enters _single_turn while the previous attempt's
+# query may still be streaming. The first ResultMessage this attempt sees can
+# therefore be that attempt's leftover, not ours — so a retry attempt never
+# ends on its first Result: it owes 1 + 1 Results and drains until quiescence
+# after the second, bounded by RETRY_DRAIN_TIMEOUT. Without this the leftover
+# is consumed as this attempt's answer and this attempt's REAL answer is
+# stranded → permanent +1 turn lag (incident 2026-09-20 22:47). The bound must
+# exceed the observed continuation gap (17s); retries are rare, so the extra
+# wait on the one-Result case is an acceptable price for not desyncing.
+RETRY_DRAIN_TIMEOUT = 30  # seconds
+
 # Messages that do NOT count as real progress. Anything outside this set
 # refreshes the progress clock. Checked by class name to avoid importing
 # optional SDK types (RateLimitEvent may not exist on older SDKs).
@@ -379,6 +406,7 @@ async def _single_turn(
   steer_probe: Callable[[str], int] | None = None,
   resumed: bool = False,
   interrupted: Callable[[], bool] | None = None,
+  retry_same_client: bool = False,
 ) -> _TurnResult:
   """Issue one query() and consume the client's receive_messages() stream.
 
@@ -440,6 +468,18 @@ async def _single_turn(
   NOT treat that as an ``IncompleteTurnError`` / ``EmptyResponseError`` (a
   retry would continue the job the user just told us to stop). Only a NATURAL
   completion with a progress-only tail is incomplete.
+
+  A thinking-only tail is additionally given ``INCOMPLETE_DRAIN_TIMEOUT`` of
+  silence before the turn is declared incomplete (see that constant): the
+  model's final text block can land AFTER its Result, and ending on the 8s
+  quiescence window instead strands it into the retry.
+
+  ``retry_same_client`` marks a retry that REUSES this client (the
+  Empty/Incomplete branch of ``run_turn_with_reconnect``), as opposed to a
+  retry after a reconnect onto a fresh subprocess. Such a retry must not end
+  on its first ResultMessage: the stream may still owe the previous attempt's
+  Result, so the first one it sees can be a leftover. It keeps draining until
+  quiescence past the second Result, bounded by ``RETRY_DRAIN_TIMEOUT``.
   """
   from claude_agent_sdk import (
     AssistantMessage, TextBlock, ThinkingBlock, ToolUseBlock, ResultMessage,
@@ -470,6 +510,14 @@ async def _single_turn(
   # continuation message arrives; its expiry ends the turn so the
   # empty-response check below fires instead of spinning the progress budget.
   resume_drain_deadline: float | None = None
+  # Thinking-only-tail drain (see INCOMPLETE_DRAIN_TIMEOUT). Armed when a
+  # Result arrives with no final text yet; its expiry ends the turn so the
+  # IncompleteTurnError check below fires.
+  incomplete_drain_deadline: float | None = None
+  # Same-client retry drain (see RETRY_DRAIN_TIMEOUT). Armed for the WHOLE
+  # attempt: the stream may still owe the previous attempt's Result.
+  retry_drain_deadline: float | None = (
+    _time.monotonic() + RETRY_DRAIN_TIMEOUT if retry_same_client else None)
 
   FIRST_MSG_TIMEOUT = 30
   msg_count = 0
@@ -500,20 +548,37 @@ async def _single_turn(
       # tick means the CLI has gone silent → the turn (including any follow-on)
       # is genuinely complete. Never force a reconnect here — silence after a
       # Result is the normal end of a turn.
-      if resume_drain_deadline is not None:
-        remaining = resume_drain_deadline - _time.monotonic()
+      drain_deadlines = [
+        d for d in (resume_drain_deadline, incomplete_drain_deadline,
+                    retry_drain_deadline) if d is not None]
+      if drain_deadlines:
+        drain_deadline = max(drain_deadlines)
+        remaining = drain_deadline - _time.monotonic()
         if remaining <= 0:
-          # The resumed turn produced only an empty first Result and no
-          # continuation arrived within RESUME_DRAIN_TIMEOUT — genuinely
-          # empty. End the turn so the empty-response check below raises
-          # EmptyResponseError (bounded same-client retry) instead of
-          # spinning to PROGRESS_TIMEOUT.
+          # A drain window expired with no continuation. Which one tells us
+          # what the silence means:
+          #   - resume:  the replayed session's empty first Result had no
+          #              follow-on → genuinely empty → end so the
+          #              empty-response check raises EmptyResponseError.
+          #   - retry-same-client / incomplete: end so the checks below fire
+          #              (EmptyResponseError, or IncompleteTurnError for a
+          #              cut-off tail) instead of spinning to PROGRESS_TIMEOUT.
           if next_task is not None:
             next_task.cancel()
             next_task = None
-          log.warning(
-            "resumed turn: empty first result with no continuation in %ds — "
-            "ending turn for empty-response handling", RESUME_DRAIN_TIMEOUT)
+          if resume_drain_deadline is not None and drain_deadline == resume_drain_deadline:
+            log.warning(
+              "resumed turn: empty first result with no continuation in %ds — "
+              "ending turn for empty-response handling", RESUME_DRAIN_TIMEOUT)
+          elif retry_drain_deadline is not None and drain_deadline == retry_drain_deadline:
+            log.warning(
+              "same-client retry: no second result within %ds — ending turn "
+              "with results_seen=%d (last_emitted=%r)",
+              RETRY_DRAIN_TIMEOUT, results_seen, last_emitted)
+          else:
+            log.warning(
+              "thinking-only tail: no final text within %ds — ending turn as "
+              "incomplete", INCOMPLETE_DRAIN_TIMEOUT)
           break
         iter_timeout = min(QUIESCENCE_TIMEOUT, remaining)
       else:
@@ -544,10 +609,18 @@ async def _single_turn(
         # QUIESCENCE_TIMEOUT (observed 15s). Ending here would strand that
         # continuation in the receive buffer → every later turn answers the
         # PREVIOUS message (+1 turn lag).
+        if incomplete_drain_deadline is not None and last_emitted == "progress":
+          # A thinking-only tail armed this drain at its Result (see
+          # INCOMPLETE_DRAIN_TIMEOUT) and the late final text has not landed
+          # yet. Keep waiting; the loop-top bound expires it into the
+          # IncompleteTurnError path below if the text never comes. Keep
+          # saw_result=True so the loop-top bound governs the wait.
+          continue
         expected_results = 1
-        if resume_drain_deadline is not None:
-          # Resumed turn with an empty first Result — expect the real
-          # continuation's Result too.
+        if resume_drain_deadline is not None or retry_drain_deadline is not None:
+          # Resumed turn with an empty first Result, or a same-client retry
+          # whose first Result may be the PREVIOUS attempt's leftover — either
+          # way we still owe the real continuation's Result.
           expected_results = 2
         if steer_probe is not None and steered_flag[0]:
           try:
@@ -555,7 +628,7 @@ async def _single_turn(
           except Exception as exc:
             log.warning("steer continuation probe failed: %s", exc)
         if results_seen < expected_results:
-          if resume_drain_deadline is not None:
+          if resume_drain_deadline is not None or retry_drain_deadline is not None:
             # Resumed drain: keep saw_result=True so the loop-top deadline
             # bound governs the wait (and ends it cleanly on expiry). Do NOT
             # drop back to the heartbeat/progress budgets — that would
@@ -810,11 +883,29 @@ async def _single_turn(
       pending_tasks.clear()
       saw_result = True
       results_seen += 1
-      if not steered_flag[0] and (not resumed or last_emitted != ""):
-        # No steer, and this is not a resumed turn owing a continuation past
-        # an EMPTY first Result → exactly one Result → done. (For a non-empty
-        # first Result there is nothing after it, so this also covers a
-        # normal answer on a resumed turn with zero added latency.)
+      if (not steered_flag[0] and retry_drain_deadline is None
+          and (not resumed or last_emitted != "")):
+        # No steer, not a same-client retry, and not a resumed turn owing a
+        # continuation past an EMPTY first Result → exactly one Result → done.
+        # (For a non-empty first Result there is nothing after it, so this
+        # also covers a normal answer on a resumed turn with zero added
+        # latency.) A same-client retry never breaks here — its first Result
+        # may be the previous attempt's leftover (see RETRY_DRAIN_TIMEOUT).
+        #
+        # EXCEPT a thinking-only tail: a Result carrying no final TEXT is not
+        # proof the model was cut off — its final text block can land AFTER
+        # the Result (see INCOMPLETE_DRAIN_TIMEOUT). Give it a bounded chance
+        # to arrive; only the drain's expiry lets the IncompleteTurnError
+        # below fire and trigger a retry.
+        if (last_emitted == "progress" and incomplete_drain_deadline is None
+            and not (interrupted is not None and interrupted())):
+          incomplete_drain_deadline = (
+            _time.monotonic() + INCOMPLETE_DRAIN_TIMEOUT)
+          log.info(
+            "thinking-only tail — draining up to %ds for a late final text "
+            "block before declaring the turn incomplete",
+            INCOMPLETE_DRAIN_TIMEOUT)
+          continue
         break
       # A steer was injected this turn, OR this is a resumed turn whose first
       # Result was empty and may owe a real continuation: do NOT break here or
@@ -823,7 +914,7 @@ async def _single_turn(
       # the CLI is silent, after consuming any follow-on Result into THIS
       # run_turn.
       if (resumed and last_emitted == "" and results_seen == 1
-          and resume_drain_deadline is None):
+          and resume_drain_deadline is None and retry_drain_deadline is None):
         # Resumed turn whose first Result is empty (e.g. the CLI's "No
         # response requested." placeholder on the replayed session state).
         # The real answer to the re-sent prompt may stream in as a follow-on
@@ -885,6 +976,7 @@ async def run_turn(
   steer_probe: Callable[[str], int] | None = None,
   resumed: bool = False,
   interrupted: Callable[[], bool] | None = None,
+  retry_same_client: bool = False,
 ) -> tuple[float, JsonObject]:
   """Send prompt to SDK client, stream responses, emit events.
 
@@ -916,7 +1008,7 @@ async def run_turn(
   # layer owns recovery.
   result = await _single_turn(
     client, prompt, on_event, stale_tasks, stop_task_disabled, is_paused,
-    steered, steer_probe, resumed, interrupted,
+    steered, steer_probe, resumed, interrupted, retry_same_client,
   )
 
   total_cost = result.cost

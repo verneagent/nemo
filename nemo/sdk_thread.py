@@ -270,6 +270,7 @@ class SDKThread:
     is_paused: Callable[[], bool] | None = None,
     steer_probe: Callable[[str, list[str]], int] | None = None,
     resumed: bool = False,
+    retry_same_client: bool = False,
   ) -> tuple[float, JsonObject]:
     """Run a single SDK turn on the SDK thread.
 
@@ -288,6 +289,11 @@ class SDKThread:
     ``resumed`` marks a reconnect-retry pass (run_turn_with_reconnect
     attempt > 0): passed to the turn runner so it drains past an empty first
     Result instead of stranding the real continuation answer.
+
+    ``retry_same_client`` marks a retry that reuses THIS client (the
+    Empty/Incomplete branch of run_turn_with_reconnect) rather than a fresh
+    subprocess: the turn runner then refuses to end on its first Result, which
+    may be the previous attempt's leftover (see RETRY_DRAIN_TIMEOUT).
     """
     if self._client is None:
       raise RuntimeError("SDK client not connected")
@@ -320,7 +326,8 @@ class SDKThread:
           stale_tasks=stale_tasks, is_paused=is_paused,
           steered=self._steer_holder,
           steer_probe=_bound_probe, resumed=resumed,
-          interrupted=lambda: self._interrupt_holder[0])
+          interrupted=lambda: self._interrupt_holder[0],
+          retry_same_client=retry_same_client)
       finally:
         # Turn complete — resume draining. Any background-task completions /
         # Monitor fires that landed during the turn (or arrive right after)
@@ -532,13 +539,20 @@ class SDKThread:
     # give up so the host surfaces an explicit error card instead of a
     # misleading empty/fragment "Done ✓".
     incomplete_retries = 1
+    # True while the NEXT attempt reuses the CURRENT client (the
+    # Empty/Incomplete branch below) instead of a reconnected subprocess. Such
+    # an attempt can still see the previous attempt's in-flight output, so the
+    # turn runner must not end it on a first Result that may be that leftover
+    # (see claude_turn.RETRY_DRAIN_TIMEOUT).
+    retry_same_client = False
     for attempt in range(max_attempts):
       if self._cancelled.is_set():
         raise asyncio.CancelledError("SDK turn cancelled")
       try:
         return await self.run_turn(
           prompt, on_event, stale_tasks=stale_tasks, is_paused=is_paused,
-          steer_probe=steer_probe, resumed=(attempt > 0))
+          steer_probe=steer_probe, resumed=(attempt > 0),
+          retry_same_client=retry_same_client)
       except (EmptyResponseError, IncompleteTurnError) as exc:
         if incomplete_retries <= 0:
           log.warning("SDK turn %s (no retries left) — giving up",
@@ -549,6 +563,7 @@ class SDKThread:
           "SDK turn %s — retrying same prompt on same client "
           "(%d retry left): %s", type(exc).__name__, incomplete_retries,
           str(exc)[:200])
+        retry_same_client = True
         continue
       except NonRetryableAPIError:
         log.warning("SDK turn non-retryable API error — closing client")
@@ -584,6 +599,9 @@ class SDKThread:
             raise asyncio.CancelledError("SDK turn cancelled")
           log.info("Reconnecting...")
           await self.reconnect(fresh_options)
+          # Fresh subprocess with resume= — its stream is clean, so the next
+          # attempt is a normal resumed turn, not a same-client retry.
+          retry_same_client = False
         else:
           raise  # Other RuntimeErrors should not be retried
     raise RuntimeError(f"SDK turn failed after {max_attempts} attempts")

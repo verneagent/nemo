@@ -12,7 +12,8 @@ from nemo.turn import (
   RateLimitNoticeEvent, CompactNoticeEvent, TurnEvent,
   canonical_usage,
 )
-from nemo.claude_turn import run_turn, normalize_claude_usage
+from nemo.claude_turn import (
+  run_turn, normalize_claude_usage, IncompleteTurnError)
 
 
 def test_canonical_usage_sums_total():
@@ -1363,6 +1364,223 @@ def test_no_lag_next_turn_gets_its_own_answer():
   assert a1 == ["t1-answer", "t1-steer-answer"]
   # The crux: turn 2 answers q2, NOT the stranded t1-steer-answer.
   assert a2 == ["t2-answer"]
+
+
+# ---------------------------------------------------------------------------
+# Same-client retry drain regression (permanent +1 turn lag, incident
+# 2026-09-20 22:47)
+#
+# run_turn_with_reconnect retries an Empty/Incomplete turn on the SAME client
+# (no reconnect). That retry re-enters _single_turn while the PREVIOUS
+# attempt's query may still be streaming, so the first ResultMessage it sees
+# can be that attempt's leftover rather than its own answer. Ending the turn
+# there reported the leftover as this turn's reply and stranded this turn's
+# real answer in the receive buffer — where the NEXT turn drained it, and the
+# one after that drained the next, forever: every card answered the PREVIOUS
+# user message (observed live for ~11h on oc_2325279d9c989). Fix: a retry
+# that reuses the client never ends on its first Result; it owes 1+1 Results
+# and drains, bounded by RETRY_DRAIN_TIMEOUT.
+# ---------------------------------------------------------------------------
+
+class _NoSteerQueueClient:
+  """Like QueueClient but query() does NOT touch the steer flag.
+
+  QueueClient.query() sets the steer flag (it models SDKThread.steer); a
+  same-client retry must be exercised WITHOUT a steer, or the steer drain
+  would mask the very behaviour under test.
+  """
+
+  def __init__(self):
+    self.q: asyncio.Queue = asyncio.Queue()
+
+  def feed(self, *messages):
+    for m in messages:
+      self.q.put_nowait(m)
+
+  async def query(self, prompt):
+    pass
+
+  async def receive_messages(self):
+    while True:
+      yield await self.q.get()
+
+  async def stop_task(self, task_id):
+    pass
+
+
+def _feed_turn1_leftover_and_late_answer(client, gap_s):
+  """Feed the previous attempt's leftover now, and this attempt's real answer
+  after ``gap_s`` — i.e. past the quiescence window the turn used to end on
+  (the real 17s gap, scaled down)."""
+  client.feed(
+    FakeAssistantMessage(content=[FakeTextBlock(text="leftover")]),
+    FakeResultMessage(total_cost_usd=0.01),
+  )
+
+  async def _late():
+    await asyncio.sleep(gap_s)
+    client.feed(
+      FakeAssistantMessage(content=[FakeTextBlock(text="real-answer")]),
+      FakeResultMessage(total_cost_usd=0.02),
+    )
+
+  return asyncio.ensure_future(_late())
+
+
+def test_same_client_retry_drains_past_leftover_result():
+  """A same-client retry must not end on the leftover Result: the real answer
+  surfaces in THIS turn and nothing is stranded in the shared stream."""
+  client = _NoSteerQueueClient()
+  events: list = []
+
+  async def _run():
+    feeder = _feed_turn1_leftover_and_late_answer(client, gap_s=0.3)
+    try:
+      with mock.patch.dict("sys.modules", _sdk_modules()), \
+           mock.patch("nemo.claude_turn.QUIESCENCE_TIMEOUT", 0.05), \
+           mock.patch("nemo.claude_turn.RETRY_DRAIN_TIMEOUT", 3.0):
+        return await run_turn(client, "q1", events.append,
+                              retry_same_client=True)
+    finally:
+      feeder.cancel()
+
+  asyncio.run(asyncio.wait_for(_run(), timeout=10))
+  # Both were emitted (the leftover's text is what the previous attempt
+  # produced); the point is that the real answer is NOT stranded.
+  assert _answers(events) == ["leftover", "real-answer"]
+  assert client.q.empty(), "retry stranded its own answer in the buffer"
+
+
+def test_same_client_retry_control_strands_without_the_flag():
+  """Control: without retry_same_client the turn ends on the leftover Result
+  and the real answer is left stranded — the exact +1 turn lag this fix
+  prevents. Keeps the regression above from passing vacuously."""
+  client = _NoSteerQueueClient()
+  events: list = []
+
+  async def _run():
+    feeder = _feed_turn1_leftover_and_late_answer(client, gap_s=0.3)
+    try:
+      with mock.patch.dict("sys.modules", _sdk_modules()), \
+           mock.patch("nemo.claude_turn.QUIESCENCE_TIMEOUT", 0.05):
+        await run_turn(client, "q1", events.append)  # no retry_same_client
+        await asyncio.sleep(0.4)                     # let the late answer land
+    finally:
+      feeder.cancel()
+
+  asyncio.run(asyncio.wait_for(_run(), timeout=10))
+  assert _answers(events) == ["leftover"]
+  # The real answer + its Result are stranded on the shared stream.
+  assert client.q.qsize() == 2
+
+
+def test_same_client_retry_leaves_no_lag_for_next_turn():
+  """End-to-end over ONE shared stream: after a same-client retry, the NEXT
+  turn answers its OWN prompt — no permanent +1 turn lag."""
+  client = _NoSteerQueueClient()
+
+  async def _run():
+    feeder = _feed_turn1_leftover_and_late_answer(client, gap_s=0.3)
+    ev1: list = []
+    try:
+      with mock.patch.dict("sys.modules", _sdk_modules()), \
+           mock.patch("nemo.claude_turn.QUIESCENCE_TIMEOUT", 0.05), \
+           mock.patch("nemo.claude_turn.RETRY_DRAIN_TIMEOUT", 3.0):
+        await run_turn(client, "q1", ev1.append, retry_same_client=True)
+    finally:
+      feeder.cancel()
+    assert client.q.empty(), "retry stranded a Result into turn 2's stream"
+
+    client.feed(
+      FakeAssistantMessage(content=[FakeTextBlock(text="t2-answer")]),
+      FakeResultMessage(total_cost_usd=0.01),
+    )
+    ev2: list = []
+    with mock.patch.dict("sys.modules", _sdk_modules()), \
+         mock.patch("nemo.claude_turn.QUIESCENCE_TIMEOUT", 0.05):
+      await run_turn(client, "q2", ev2.append)
+    return _answers(ev1), _answers(ev2)
+
+  a1, a2 = asyncio.run(asyncio.wait_for(_run(), timeout=10))
+  assert a1 == ["leftover", "real-answer"]
+  # The crux: turn 2 answers q2, NOT the stranded turn-1 answer.
+  assert a2 == ["t2-answer"]
+
+
+# ---------------------------------------------------------------------------
+# Premature-Result drain regression (the cause of the incident above)
+#
+# A ResultMessage whose only output is thinking/tool text does NOT prove the
+# model was cut off: its final TEXT block can land AFTER the Result (observed
+# 2026-09-20: Result at 22:47:05, quiescence fired at 22:47:13, final text at
+# 22:47:14 — 1.6s too late). Declaring the turn incomplete there raises
+# IncompleteTurnError and retries the prompt while that late text is still
+# streaming — which is exactly what collided and started the desync. The turn
+# now gives the late text a bounded chance instead.
+# ---------------------------------------------------------------------------
+
+def test_thinking_only_tail_waits_for_late_final_text():
+  """A thinking-only Result followed by a late final text is a COMPLETE turn,
+  not an IncompleteTurnError."""
+  client = _NoSteerQueueClient()
+  events: list = []
+
+  async def _run():
+    client.feed(
+      FakeAssistantMessage(content=[FakeThinkingBlock(thinking="working...")]),
+      FakeResultMessage(total_cost_usd=0.01),
+    )
+
+    async def _late_text():
+      await asyncio.sleep(0.3)
+      client.feed(FakeAssistantMessage(
+        content=[FakeTextBlock(text="final answer")]))
+
+    feeder = asyncio.ensure_future(_late_text())
+    try:
+      with mock.patch.dict("sys.modules", _sdk_modules()), \
+           mock.patch("nemo.claude_turn.QUIESCENCE_TIMEOUT", 0.05), \
+           mock.patch("nemo.claude_turn.INCOMPLETE_DRAIN_TIMEOUT", 3.0):
+        return await run_turn(client, "q", events.append)
+    finally:
+      feeder.cancel()
+
+  asyncio.run(asyncio.wait_for(_run(), timeout=10))
+  assert _answers(events) == ["final answer"]
+  assert any(isinstance(e, DoneEvent) for e in events)
+
+
+def test_thinking_only_tail_still_incomplete_after_the_drain_bound():
+  """Control for the drain above: the wait is BOUNDED. A final text that never
+  lands inside INCOMPLETE_DRAIN_TIMEOUT must still surface as an
+  IncompleteTurnError, which is what triggers the same-client retry — an
+  unbounded wait would hang the turn forever instead."""
+  client = _NoSteerQueueClient()
+  events: list = []
+
+  async def _run():
+    client.feed(
+      FakeAssistantMessage(content=[FakeThinkingBlock(thinking="working...")]),
+      FakeResultMessage(total_cost_usd=0.01),
+    )
+
+    async def _too_late_text():
+      await asyncio.sleep(1.0)
+      client.feed(FakeAssistantMessage(
+        content=[FakeTextBlock(text="way too late")]))
+
+    feeder = asyncio.ensure_future(_too_late_text())
+    try:
+      with mock.patch.dict("sys.modules", _sdk_modules()), \
+           mock.patch("nemo.claude_turn.QUIESCENCE_TIMEOUT", 0.05), \
+           mock.patch("nemo.claude_turn.INCOMPLETE_DRAIN_TIMEOUT", 0.3):
+        return await run_turn(client, "q", events.append)
+    finally:
+      feeder.cancel()
+
+  with pytest.raises(IncompleteTurnError):
+    asyncio.run(asyncio.wait_for(_run(), timeout=10))
+  assert _answers(events) == []
 
 
 # ---------------------------------------------------------------------------
