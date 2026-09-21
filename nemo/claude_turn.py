@@ -370,6 +370,35 @@ INCOMPLETE_DRAIN_TIMEOUT = 30  # seconds
 RETRY_DRAIN_TIMEOUT = 30  # seconds
 
 
+@dataclass(frozen=True)
+class AttemptBooks:
+  """The ledger as ONE attempt must read it: a snapshot taken before its query.
+
+  The ledger's counters are cumulative for the client's LIFETIME; a turn needs
+  them for one OPERATION. Conflating the two is a real bug that was written
+  once already: turn N computed ``max(ledger.owed, 1)`` and waited for N
+  Results — the ones consumed turns ago — so it hung past quiescence on the
+  progress timeout. Taking a snapshot makes the moment explicit and hands back
+  only per-attempt numbers, so there is no cumulative count left to misread.
+  """
+
+  owed_at_start: int
+  carried: int
+
+  def expected_results(self, steer_continuations: int) -> int:
+    """How many Results THIS attempt must read off the stream before it ends.
+
+    Its carry-over (a previous attempt on this same stream that never consumed
+    its Result), its own Result, and one per steer the CLI ran as its own turn.
+    """
+    return self.carried + 1 + steer_continuations
+
+  def owed_ceiling(self, steer_continuations: int) -> int:
+    """``reconcile_to``'s argument: never write the books below what this
+    attempt itself created, so a real obligation can never be erased."""
+    return self.owed_at_start + 1 + steer_continuations
+
+
 class ResultLedger:
   """How many ResultMessages the SDK stream still owes this client.
 
@@ -391,15 +420,31 @@ class ResultLedger:
   running turn, emitting one Result for two queries. That direction is safe —
   over-counting only makes a turn wait longer, and the wait is bounded.
   Under-counting is what strands output.
+
+  The counters are PRIVATE and cumulative for the client's whole lifetime, so
+  a turn must never read them directly: turn N reading ``owed`` computes an
+  expectation of N and waits for Results that were consumed turns ago. Ask for
+  an ``AttemptBooks`` snapshot (``begin_attempt``) instead — that is what
+  fixes the moment and turns the cumulative count into per-attempt numbers.
   """
 
   def __init__(self) -> None:
-    self.owed = 0
-    self.consumed = 0
+    self._owed = 0
+    self._consumed = 0
+
+  def begin_attempt(self) -> AttemptBooks:
+    """Snapshot the books for a query about to be issued.
+
+    Take it BEFORE owing that query: anything already on the books is then by
+    definition a carry-over, i.e. a previous attempt on this same stream that
+    never consumed its Result. That is what "same-client retry" MEANS — the
+    count says it, so no flag has to.
+    """
+    return AttemptBooks(owed_at_start=self._owed, carried=self.outstanding)
 
   def owe(self, n: int = 1) -> None:
     """Record that n more Results are owed: a query was accepted by the CLI."""
-    self.owed += n
+    self._owed += n
 
   def consume(self) -> None:
     """Record one ResultMessage read off the stream.
@@ -410,7 +455,7 @@ class ResultLedger:
     would equal owed the moment the next turn queried, so that turn would
     believe it was settled before a single message arrived.
     """
-    self.consumed = min(self.consumed + 1, self.owed)
+    self._consumed = min(self._consumed + 1, self._owed)
 
   def consume_if_owed(self) -> bool:
     """Consume one owed Result; no-op when nothing is owed.
@@ -451,31 +496,31 @@ class ResultLedger:
 
     Returns how many obligations were written off.
     """
-    ceiling = min(self.owed, owed_ceiling)
-    written_off = self.owed - ceiling
-    self.owed = ceiling
+    ceiling = min(self._owed, owed_ceiling)
+    written_off = self._owed - ceiling
+    self._owed = ceiling
     # A Result can land for a steer the probe called folded — the probe reads
     # the transcript, which lags the stream. Keep consumed within the books.
-    self.consumed = min(self.consumed, self.owed)
+    self._consumed = min(self._consumed, self._owed)
     return written_off
 
   def reset(self) -> None:
     """Drop all obligations — the stream itself is gone (fresh subprocess),
     so whatever the old one owed died with it."""
-    self.owed = 0
-    self.consumed = 0
+    self._owed = 0
+    self._consumed = 0
 
   @property
   def outstanding(self) -> int:
     """Results this stream still owes. >0 means it is not safe to re-query."""
-    return max(0, self.owed - self.consumed)
+    return max(0, self._owed - self._consumed)
 
   @property
   def settled(self) -> bool:
     return self.outstanding == 0
 
   def __repr__(self) -> str:
-    return f"ResultLedger(owed={self.owed}, consumed={self.consumed})"
+    return f"ResultLedger(owed={self._owed}, consumed={self._consumed})"
 
 
 # Turn-boundary drain (see ResultLedger). Before a new query, whatever the
@@ -673,9 +718,8 @@ async def _single_turn(
   # books is a carry-over, i.e. a previous attempt on this same stream that
   # never consumed its Result. That is what "same-client retry" MEANS — the
   # count says it, so no flag has to.
-  owed_at_attempt_start = ledger.owed
-  carried = ledger.outstanding
-  retry_over_unsettled_stream = carried > 0
+  books = ledger.begin_attempt()
+  retry_over_unsettled_stream = books.carried > 0
   if retry_over_unsettled_stream:
     log.warning(
       "query() on a stream that still owes %d result(s) %r — this attempt "
@@ -837,12 +881,12 @@ async def _single_turn(
         # ends this turn); never writes below the carry-over, and is idempotent
         # so repeated quiescence passes cannot erode the books twice.
         written_off = ledger.reconcile_to(
-          owed_at_attempt_start + 1 + steer_continuations)
+          books.owed_ceiling(steer_continuations))
         if written_off:
           log.warning(
             "steer(s) folded into the running turn: wrote off %d phantom "
             "result obligation(s) %r", written_off, ledger)
-        expected_results = carried + 1 + steer_continuations
+        expected_results = books.expected_results(steer_continuations)
         if resume_drain_deadline is not None and expected_results < 2:
           # A resumed turn whose first Result was EMPTY owes the real
           # continuation's Result, which the ledger cannot see (an empty

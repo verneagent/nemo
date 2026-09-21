@@ -1,9 +1,11 @@
 """Tests for nemo.sdk_thread — dedicated SDK thread with its own event loop."""
 
+import ast
 import asyncio
 import contextlib
 import sys
 import time
+from pathlib import Path
 from unittest import mock
 
 import pytest
@@ -1225,3 +1227,131 @@ class TestIdleDrainerLedger:
     sdk_thread._handle_idle_message(_result_message())
     sdk_thread._ledger.owe()  # the next real turn queries
     assert sdk_thread._ledger.outstanding == 1
+
+
+# ---------------------------------------------------------------------------
+# Loop affinity: the client's stream belongs to the SDK loop
+# ---------------------------------------------------------------------------
+
+SDK_THREAD_PATH = Path(__file__).resolve().parent.parent / "nemo" / "sdk_thread.py"
+
+# Methods that may use the client's async surface and are NOT reached through a
+# `run_on_sdk_loop(...)` call in the source. Every other method is derived
+# structurally: passing a coroutine to run_on_sdk_loop (or nesting inside one)
+# is what puts it on the SDK loop.
+_CLIENT_USERS_OFF_THE_CALL_GRAPH = {
+  # `SDKThread.start()` creates it as a task on the SDK loop.
+  "_idle_drain_loop",
+}
+
+
+def _off_loop_client_touches(source: str) -> list[str]:
+  """Report where ``source`` uses ``self._client`` off the SDK loop.
+
+  Reading ``self._client`` is fine (None checks, assignments). What must never
+  happen off the SDK loop is *using* it: ``await self._client.interrupt()``,
+  ``self._client.receive_messages()``, or handing it to a helper
+  (``await drain_outstanding(self._client, …)``). The stream is bound to the
+  loop the client was created on, so such a call does not raise — the await
+  simply never completes, which reads as a hung turn.
+
+  A method is on the SDK loop if its coroutine is handed to
+  ``run_on_sdk_loop(...)`` somewhere in the file, or it is nested inside such a
+  method, or it is listed in ``_CLIENT_USERS_OFF_THE_CALL_GRAPH``.
+  """
+  tree = ast.parse(source)
+  scheduled = set(_CLIENT_USERS_OFF_THE_CALL_GRAPH)
+  for node in ast.walk(tree):
+    if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "run_on_sdk_loop"):
+      for arg in node.args:
+        for inner in ast.walk(arg):
+          if isinstance(inner, ast.Name):
+            scheduled.add(inner.id)
+          elif isinstance(inner, ast.Attribute):
+            scheduled.add(inner.attr)
+
+  offenders: list[str] = []
+
+  def _uses_client(node: ast.AST) -> bool:
+    return any(
+      isinstance(inner, ast.Attribute) and inner.attr == "_client"
+      and isinstance(inner.value, ast.Name) and inner.value.id == "self"
+      for inner in ast.walk(node))
+
+  def visit(node: ast.AST, on_sdk_loop: bool) -> None:
+    for child in ast.iter_child_nodes(node):
+      if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        visit(child, on_sdk_loop or child.name in scheduled)
+        continue
+      if (not on_sdk_loop and isinstance(child, (ast.Await, ast.Call))
+          and _uses_client(child)):
+        where = f"line {child.lineno}"
+        if where not in offenders:
+          offenders.append(where)
+      visit(child, on_sdk_loop)
+
+  visit(tree, False)
+  return offenders
+
+
+def test_client_stream_is_only_touched_on_its_own_loop():
+  """Every use of the SDK client in nemo/sdk_thread.py runs on the SDK loop.
+
+  ``client.receive_messages()`` is bound to the loop that created the client,
+  and so is the rest of its async surface. Awaiting it from the host loop hangs
+  silently — the turn-boundary drain was written that way once and looked
+  exactly like a dead CLI. The runtime half of this rule is
+  ``SDKThread._client_on_sdk_loop`` (see the test below); this is the half that
+  catches the violation before it ever runs.
+  """
+  offenders = _off_loop_client_touches(SDK_THREAD_PATH.read_text())
+  assert offenders == [], (
+    "self._client used off the SDK loop at "
+    f"{', '.join(offenders)} in {SDK_THREAD_PATH.name} — route it through "
+    "SDKThread._client_on_sdk_loop() inside run_on_sdk_loop(), or add the "
+    "method to _CLIENT_USERS_OFF_THE_CALL_GRAPH with the reason it is already "
+    "on that loop")
+
+
+def test_off_loop_guard_catches_the_bug_it_was_written_for():
+  """Control for the guard above: it must flag the pre-fix shape.
+
+  This is the actual code that shipped: the boundary drain awaited on the host
+  loop, handing it ``self._client``. If this stops being flagged the guard has
+  gone blind and the hang it exists for is unguarded again.
+  """
+  buggy = (
+    "class SDKThread:\n"
+    "  async def run_turn_with_reconnect(self, on_event):\n"
+    "    drained = await drain_outstanding(self._client, self._ledger, on_event)\n"
+    "  async def run_on_sdk_loop(self, coro):\n"
+    "    return coro\n")
+  assert _off_loop_client_touches(buggy) == ["line 3"]
+
+  # …and it must stay quiet on the fix, which reaches the same code by
+  # scheduling it onto the SDK loop.
+  fixed = (
+    "class SDKThread:\n"
+    "  async def run_turn_with_reconnect(self, on_event):\n"
+    "    drained = await self.run_on_sdk_loop(self._boundary_drain(on_event))\n"
+    "  async def _boundary_drain(self, on_event):\n"
+    "    return await drain_outstanding(self._client, self._ledger, on_event)\n"
+    "  async def run_on_sdk_loop(self, coro):\n"
+    "    return coro\n")
+  assert _off_loop_client_touches(fixed) == []
+
+
+class TestClientLoopAffinity:
+  def test_client_access_off_the_sdk_loop_raises(self, sdk_thread):
+    """The runtime half: the accessor refuses a host-loop read, so a violation
+    fails loudly instead of hanging (a host loop here stands in for any loop
+    that is not the one the client was created on)."""
+    sdk_thread._client = _StrandedStreamClient([])
+    with pytest.raises(RuntimeError, match="lives on"):
+      _run(sdk_thread._boundary_drain(lambda _event: None))
+
+  def test_client_access_on_the_sdk_loop_is_allowed(self, sdk_thread):
+    sdk_thread._client = _StrandedStreamClient([])
+    assert _run(sdk_thread.run_on_sdk_loop(sdk_thread._boundary_drain(
+      lambda _event: None))) == 0

@@ -13,7 +13,7 @@ from nemo.turn import (
   canonical_usage,
 )
 from nemo.claude_turn import (
-  run_turn, normalize_claude_usage, IncompleteTurnError, ResultLedger)
+  AttemptBooks, ResultLedger, IncompleteTurnError, normalize_claude_usage, run_turn)
 
 
 def test_canonical_usage_sums_total():
@@ -1958,7 +1958,42 @@ def test_shared_ledger_does_not_accumulate_across_turns():
 
   ledger = asyncio.run(asyncio.wait_for(_run(), timeout=10))
   assert answers == [["a0"], ["a1"], ["a2"], ["a3"]]
-  assert ledger.owed == 4 and ledger.consumed == 4, repr(ledger)
+  # The counters are cumulative for the client's lifetime (four queries, four
+  # Results) and are read only through repr — see AttemptBooks.
+  assert repr(ledger) == "ResultLedger(owed=4, consumed=4)"
+
+
+def test_control_cumulative_expectation_hangs_the_turn():
+  """Control for test_shared_ledger_does_not_accumulate_across_turns.
+
+  That test only means something if the expectation it exercises can actually
+  be wrong. It can: computing it from the ledger's raw cumulative count — the
+  bug that was written once — makes the SECOND turn expect two Results, so it
+  waits past quiescence for one that was consumed turn one ago. Same scenario,
+  same client, one patched method: the turn must hang, and the wrapper timeout
+  is how we see it.
+
+  If this ever passes, the test above has stopped testing anything.
+  """
+  led = [False]
+  client = QueueClient(led)
+  ledger = ResultLedger()
+
+  async def _run():
+    with mock.patch.dict("sys.modules", _sdk_modules()), \
+         mock.patch("nemo.claude_turn.QUIESCENCE_TIMEOUT", 0.05), \
+         mock.patch.object(AttemptBooks, "expected_results",
+                           lambda self, steers: self.owed_at_start + 1 + steers):
+      for i in range(2):
+        client.feed(
+          FakeAssistantMessage(content=[FakeTextBlock(text=f"a{i}")]),
+          FakeResultMessage(total_cost_usd=0.01),
+        )
+        await run_turn(
+          client, f"q{i}", [].append, steered=led, ledger=ledger)
+
+  with pytest.raises(asyncio.TimeoutError):
+    asyncio.run(asyncio.wait_for(_run(), timeout=5))
 
 
 def test_folded_steer_leaves_no_phantom_obligation():

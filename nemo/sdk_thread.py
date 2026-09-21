@@ -330,8 +330,12 @@ class SDKThread:
       if self._drain_pending is not None:
         self._drain_pending.cancel()
       try:
+        client = self._client_on_sdk_loop()
+        if client is None:
+          # Closed between run_turn's guard and here.
+          raise RuntimeError("SDK client not connected")
         return await run_turn(
-          self._client, prompt, on_event,
+          client, prompt, on_event,
           stale_tasks=stale_tasks, is_paused=is_paused,
           steered=self._steer_holder,
           steer_probe=_bound_probe, resumed=resumed,
@@ -345,6 +349,24 @@ class SDKThread:
 
     return await self.run_on_sdk_loop(_turn())
 
+  def _client_on_sdk_loop(self) -> ClaudeSDKClientLike | None:
+    """The live client — legal ONLY from the SDK loop (see ``_loop``).
+
+    ``client.receive_messages()`` and the client's other async surface are
+    bound to the loop the client was created on. Touching them from the host
+    loop does not raise — the await simply never completes, which is
+    indistinguishable from a hung turn (this really happened: the turn-boundary
+    drain was awaited on the host loop). Fail loudly instead, and keep every
+    such read behind this one accessor so the AST guard in
+    ``tests/test_sdk_thread.py`` can pin the rule instead of a convention.
+    """
+    running = asyncio.get_running_loop()
+    if self._loop is not None and running is not self._loop:
+      raise RuntimeError(
+        f"SDK client touched on {running!r}, but its stream lives on "
+        f"{self._loop!r} — schedule through run_on_sdk_loop()")
+    return self._client
+
   async def _boundary_drain(
     self, on_event: Callable[[TurnEvent], None]) -> int:
     """Read off the Results a previous turn left owed, on the SDK loop.
@@ -356,7 +378,7 @@ class SDKThread:
     drainer either sees the flag cleared before starting a receive or has its
     in-flight receive cancelled here.
     """
-    client = self._client
+    client = self._client_on_sdk_loop()
     if client is None:
       return 0
     self._drain_enabled = False
@@ -425,13 +447,14 @@ class SDKThread:
     """
     gen: object | None = None
     while not self._cancelled.is_set():
-      if self._client is None or not self._drain_enabled:
+      client = self._client_on_sdk_loop()
+      if client is None or not self._drain_enabled:
         gen = None
         await asyncio.sleep(0.2)
         continue
       if gen is None:
         try:
-          gen = self._client.receive_messages()
+          gen = client.receive_messages()
         except Exception as exc:
           log.warning("idle drain: cannot open message stream: %s", exc)
           gen = None
@@ -678,7 +701,10 @@ class SDKThread:
 
     async def _interrupt():
       try:
-        await self._client.interrupt()
+        client = self._client_on_sdk_loop()
+        if client is None:
+          return
+        await client.interrupt()
       except Exception as e:
         log.warning("interrupt() error: %s", e)
 
@@ -703,7 +729,10 @@ class SDKThread:
 
     async def _steer():
       try:
-        await self._client.query(text)
+        client = self._client_on_sdk_loop()
+        if client is None:
+          return False
+        await client.query(text)
         # Mark this turn as steered so _single_turn drains any follow-on
         # Result rather than stranding it (both fold and late-steer cases).
         self._steer_holder[0] = True
