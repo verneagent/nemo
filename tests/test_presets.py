@@ -7,7 +7,8 @@ import os
 from unittest import mock
 
 from nemo.presets import (
-  Preset, _flatten_providers, _parse_api_key,
+  Preset, _flatten_providers, _parse_api_key, _parse_sync,
+  _fetch_openai_models, _synthesize_synced_presets,
   load_presets, preset_name_for_endpoint, resolve_preset,
 )
 
@@ -526,3 +527,178 @@ def test_kimi_anthropic_only_visible_in_codex_picker(tmp_path):
   assert p is not None
   assert p.supports("claude") is True
   assert p.supports("codex") is False
+
+
+# ---------------------------------------------------------------------------
+# Dynamic `sync` presets — a provider opts into fetching its OpenAI /models
+# ---------------------------------------------------------------------------
+
+def test_parse_sync_forms():
+  assert _parse_sync(None) is None
+  assert _parse_sync(False) is None
+  assert _parse_sync(True) == ""           # name = model id verbatim
+  assert _parse_sync("oc-") == "oc-"       # string shorthand
+  assert _parse_sync({"prefix": "oc-"}) == "oc-"
+  assert _parse_sync({"prefix": 3}) is None  # non-string prefix → disabled
+
+
+def test_fetch_openai_models_parses_data_ids():
+  from nemo import presets as presets_mod
+  captured: dict[str, object] = {}
+
+  class _FakeResp:
+    def __init__(self, body: bytes):
+      self._body = body
+
+    def read(self) -> bytes:
+      return self._body
+
+    def __enter__(self) -> "_FakeResp":
+      return self
+
+    def __exit__(self, *args: object) -> None:
+      return None
+
+  def fake_request(url: str, headers: dict) -> str:
+    captured["url"] = url
+    captured["headers"] = headers
+    return "req"
+
+  body = json.dumps({"data": [
+    {"id": "deepseek-v4.1-flash"},
+    {"id": "deepseek-flash"},
+    {"object": "model"},  # no id → skipped
+  ]}).encode()
+  with mock.patch.object(presets_mod.urllib.request, "Request", fake_request), \
+       mock.patch.object(presets_mod.urllib.request, "urlopen",
+                         lambda req, timeout: _FakeResp(body)):
+    ids = _fetch_openai_models("https://gw/v1/models", "sk-x", 5.0)
+  assert ids == ["deepseek-v4.1-flash", "deepseek-flash"]
+  assert captured["url"] == "https://gw/v1/models"
+  assert captured["headers"]["Authorization"] == "Bearer sk-x"
+  # An explicit User-Agent is required — the gateway 403s Python-urllib's default.
+  assert captured["headers"]["User-Agent"] == "nemo"
+
+
+def test_synthesize_synced_presets_builds_prefixed_inherited_presets():
+  providers = {
+    "opencode-go": {
+      "anthropic": {
+        "baseURL": "https://opencode.ai/zen/go",
+        "apiKey": "{env:OPENCODE_GO_API_KEY}",
+        "auth": "api_key",
+      },
+      "openai": {
+        "baseURL": "https://opencode.ai/zen/go/v1",
+        "apiKey": "{env:OPENCODE_GO_API_KEY}",
+      },
+      "agents": ["opencode", "codex", "claude"],
+      "sync": {"prefix": "oc-"},
+    },
+  }
+
+  def fake_fetch(base_url: str, api_key: str, timeout_s: float) -> list[str]:
+    assert base_url == "https://opencode.ai/zen/go/v1/models"
+    assert api_key == "sk-go"
+    return ["deepseek-v4.1-flash", "deepseek-flash"]
+
+  with mock.patch.dict(os.environ, {"OPENCODE_GO_API_KEY": "sk-go"}):
+    out = _synthesize_synced_presets(providers, fake_fetch, 5.0)
+
+  assert set(out) == {"oc-deepseek-v4.1-flash", "oc-deepseek-flash"}
+  p = out["oc-deepseek-v4.1-flash"]
+  # Inherited endpoint + key + auth + agents; both remotes = the bare id.
+  assert p.openai_url == "https://opencode.ai/zen/go/v1"
+  assert p.openai_remote == "deepseek-v4.1-flash"
+  assert p.anthropic_url == "https://opencode.ai/zen/go"
+  assert p.anthropic_remote == "deepseek-v4.1-flash"
+  assert p.anthropic_auth == "api_key"
+  assert p.api_key_env == "OPENCODE_GO_API_KEY"
+  assert p.agents == ("opencode", "codex", "claude")
+  assert p.supports("opencode") is True
+  assert p.supports("codex") is True
+
+
+def test_synthesize_skips_anthropic_only_provider(caplog):
+  import logging
+  providers = {
+    "kimi": {
+      "anthropic": {"baseURL": "https://api.kimi.com/coding", "apiKey": "k"},
+      "sync": True,  # no openai block → /models is not reachable
+    },
+  }
+  def never_called(base_url: str, api_key: str, timeout_s: float) -> list[str]:
+    raise AssertionError("sync must not fetch without an openai block")
+
+  with caplog.at_level(logging.WARNING, logger="nemo.presets"):
+    out = _synthesize_synced_presets(providers, never_called, 5.0)
+  assert out == {}
+  assert any("needs an openai block" in r.getMessage() for r in caplog.records)
+
+
+def test_synthesize_skips_provider_without_key(caplog):
+  import logging
+  providers = {
+    "opencode-go": {
+      "openai": {"baseURL": "https://opencode.ai/zen/go/v1",
+                 "apiKey": "{env:UNSET_SYNC_KEY_XYZ}"},
+      "sync": "oc-",
+    },
+  }
+  os.environ.pop("UNSET_SYNC_KEY_XYZ", None)
+  with caplog.at_level(logging.WARNING, logger="nemo.presets"):
+    out = _synthesize_synced_presets(
+      providers, lambda *a: ["x"], 5.0)
+  assert out == {}
+  assert any("not in the environment" in r.getMessage() for r in caplog.records)
+
+
+def test_synthesize_fetch_failure_degrades_to_empty(caplog):
+  import logging
+  providers = {
+    "opencode-go": {
+      "openai": {"baseURL": "https://opencode.ai/zen/go/v1", "apiKey": "k"},
+      "sync": "oc-",
+    },
+  }
+  def boom(base_url: str, api_key: str, timeout_s: float) -> list[str]:
+    raise OSError("connection refused")
+
+  with caplog.at_level(logging.WARNING, logger="nemo.presets"):
+    out = _synthesize_synced_presets(providers, boom, 5.0)
+  assert out == {}
+  assert any("sync failed" in r.getMessage() for r in caplog.records)
+
+
+def test_load_presets_merges_synced_presets_static_wins(tmp_path):
+  from nemo import presets as presets_mod
+  user = tmp_path / "models.json"
+  user.write_text(json.dumps({
+    "providers": {
+      "opencode-go": {
+        "openai": {"baseURL": "https://opencode.ai/zen/go/v1", "apiKey": "sk-lit"},
+        "anthropic": {"baseURL": "https://opencode.ai/zen/go", "apiKey": "sk-lit"},
+        "sync": {"prefix": "oc-"},
+        "models": {
+          # Hand-written entry with an explicit [1m] remote that a synced
+          # preset would NOT set (sync sets the remote to the bare id).
+          "oc-deepseek-v4-pro": {"anthropic": {"remote": "deepseek-v4-pro[1m]"}},
+        },
+      },
+    },
+  }))
+
+  def fake_fetch(base_url: str, api_key: str, timeout_s: float) -> list[str]:
+    return ["deepseek-v4-pro", "deepseek-v4.1-flash"]
+
+  with mock.patch.object(presets_mod, "_fetch_openai_models", fake_fetch):
+    presets_mod._SYNC_CACHE.clear()
+    out = load_presets(builtin_path="/nonexistent", user_path=str(user))
+
+  # The synced new model appears…
+  assert "oc-deepseek-v4.1-flash" in out
+  synced = out["oc-deepseek-v4.1-flash"]
+  assert synced.openai_remote == "deepseek-v4.1-flash"
+  assert synced.openai_url == "https://opencode.ai/zen/go/v1"
+  # …and the hand-written same-name entry survives the sync (static wins).
+  assert out["oc-deepseek-v4-pro"].anthropic_remote == "deepseek-v4-pro[1m]"

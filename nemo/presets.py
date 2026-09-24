@@ -58,6 +58,33 @@ May sit at the provider level (a default for its models) and/or per-model
           "models": { "oc-kimi-k3": {} }
         }
 
+An optional ``sync`` block turns a provider into a *dynamic* preset source.
+Instead of hand-maintaining one ``models`` entry per upstream model id,
+nemo fetches the provider's OpenAI-format ``/models`` listing and
+synthesises one preset per returned id, named ``<prefix><id>``. This is how
+``oc-deepseek-v4.1-flash`` can appear the moment the zen/go gateway starts
+serving it, without editing this file::
+
+        "opencode-go": {
+          "openai": { "baseURL": "https://opencode.ai/zen/go/v1", "apiKey": "{env:OPENCODE_GO_API_KEY}" },
+          "sync": { "prefix": "oc-" },
+          "models": { … }           # hand-written entries still win on name clash
+        }
+
+``sync`` accepts ``true`` (empty prefix — the preset name IS the model id),
+a ``"prefix"`` string shorthand, or an object ``{"prefix": "…"}``. The
+listing comes from the ``openai`` protocol block (the ``/models`` endpoint
+is OpenAI-format); a provider with only an ``anthropic`` block can't be
+synced. The synthesized preset inherits the provider's URLs, API key, auth
+style and ``agents`` allowlist, with both remotes set to the bare model id —
+exactly the shape of a hand-written ``oc-*`` entry, so routing at turn time
+is identical. Synced presets are fetched lazily (first ``load_presets``),
+cached for a few minutes, and never fail startup — a network error degrades
+to just the hand-written presets. A caveat: ``/models`` lists the *catalog*,
+not the *enabled* set, so a model the account has disabled (403 "Model
+access is disabled" at request time) still appears — enablement is only
+observable by actually calling the model.
+
 An optional ``vision`` block declares the native media input the model
 accepts — ``{ "image": bool, "video": bool }`` — so incoming media that the
 model can't see gets routed to the ``nemo-vision`` shell tool instead. It may
@@ -95,6 +122,10 @@ import json
 import logging
 import os
 import re
+import time
+import urllib.error
+import urllib.request
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -388,6 +419,145 @@ def _flatten_providers(providers: dict) -> dict[str, Preset]:
   return out
 
 
+def _parse_sync(raw: object) -> str | None:
+  """Parse an optional provider ``sync`` block into a preset-name prefix.
+
+  ``true`` → "" (preset name = model id verbatim); a string → that prefix;
+  ``{"prefix": "…"}`` → the prefix field; absent / false / null → None (no
+  sync). A malformed value logs a warning and disables sync.
+  """
+  if raw is None or raw is False:
+    return None
+  if raw is True:
+    return ""
+  if isinstance(raw, str):
+    return raw
+  if isinstance(raw, dict):
+    prefix = raw.get("prefix", "")
+    if isinstance(prefix, str):
+      return prefix
+    log.warning("sync.prefix must be a string, got %s — disabling sync",
+                type(prefix).__name__)
+    return None
+  log.warning("sync must be true, a string, or an object, got %s — disabling sync",
+              type(raw).__name__)
+  return None
+
+
+def _fetch_openai_models(
+  base_url: str, api_key: str, timeout_s: float,
+) -> list[str]:
+  """GET an OpenAI-format ``/models`` listing and return its model ids.
+
+  Raises on any transport / parse failure — callers treat a failed sync as
+  "no dynamic presets" and log, never letting it break startup.
+  """
+  req = urllib.request.Request(
+    base_url,
+    headers={
+      "Authorization": f"Bearer {api_key}",
+      # opencode.ai's gateway (and its fronting proxy) 403s the default
+      # `Python-urllib/…` User-Agent; an explicit one passes bot detection.
+      "User-Agent": "nemo",
+    },
+  )
+  with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+    body = json.loads(resp.read().decode("utf-8"))
+  if not isinstance(body, dict):
+    return []
+  data = body.get("data")
+  if not isinstance(data, list):
+    return []
+  ids: list[str] = []
+  for item in data:
+    if isinstance(item, dict):
+      mid = item.get("id")
+      if isinstance(mid, str) and mid:
+        ids.append(mid)
+  return ids
+
+
+def _synthesize_synced_presets(
+  providers: dict,
+  fetch: Callable[[str, str, float], list[str]],
+  timeout_s: float,
+) -> dict[str, Preset]:
+  """Build dynamic presets for every provider that opts into ``sync``.
+
+  ``fetch(base_url, api_key, timeout_s) -> [model_id, …]`` is injectable for
+  tests. Each returned id becomes a preset ``<prefix><id>`` inheriting the
+  provider's endpoints / key / auth / agents, with both remotes set to the
+  id — the same shape as a hand-written ``oc-*`` entry, so turn-time routing
+  is identical. A provider with no key or no ``openai`` block is skipped
+  with a warning; a fetch failure skips that provider (never raises).
+  """
+  out: dict[str, Preset] = {}
+  for provider_name, pdata in providers.items():
+    if not isinstance(pdata, dict):
+      continue
+    prefix = _parse_sync(pdata.get("sync"))
+    if prefix is None:
+      continue
+    openai_url, key_env, key_lit, _ = _protocol_block(pdata, "openai")
+    if not openai_url:
+      log.warning(
+        "provider %r: sync needs an openai block with a baseURL — skipping",
+        provider_name)
+      continue
+    api_key = key_lit or (os.environ.get(key_env, "") if key_env else "")
+    if not api_key:
+      log.warning(
+        "provider %r: sync skipped — ${%s} not in the environment",
+        provider_name, key_env)
+      continue
+    try:
+      ids = fetch(openai_url.rstrip("/") + "/models", api_key, timeout_s)
+    except Exception as exc:  # noqa: BLE001 — sync must never break startup
+      log.warning("provider %r: model sync failed: %s", provider_name, exc)
+      continue
+    anthropic_url, ant_key_env, ant_key_lit, ant_auth = _protocol_block(
+      pdata, "anthropic")
+    prov_agents = _parse_agents(pdata.get("agents"), ())
+    for mid in ids:
+      out.setdefault(prefix + mid, Preset(
+        name=prefix + mid,
+        api_key_env=key_env or ant_key_env,
+        api_key_literal=key_lit or ant_key_lit,
+        anthropic_url=anthropic_url,
+        anthropic_remote=mid,
+        anthropic_auth=ant_auth or "bearer",
+        openai_url=openai_url,
+        openai_remote=mid,
+        agents=prov_agents,
+      ))
+  return out
+
+
+_SYNC_TTL_S = 300.0
+_SYNC_TIMEOUT_S = 5.0
+_SYNC_CACHE: dict[tuple[str, str], tuple[float, dict[str, Preset]]] = {}
+
+
+def _cached_synced_presets(
+  providers: dict,
+  cache_key: tuple[str, str],
+) -> dict[str, Preset]:
+  """Dynamic presets for ``providers``, cached for ``_SYNC_TTL_S`` seconds.
+
+  Keyed by (builtin_path, user_path) so tests passing distinct temp files
+  don't bleed into each other, and so a long-lived daemon re-syncs every few
+  minutes to pick up newly-added upstream models.
+  """
+  now = time.monotonic()
+  entry = _SYNC_CACHE.get(cache_key)
+  if entry is not None and now - entry[0] < _SYNC_TTL_S:
+    return entry[1]
+  synced = _synthesize_synced_presets(
+    providers, _fetch_openai_models, _SYNC_TIMEOUT_S)
+  _SYNC_CACHE[cache_key] = (now, synced)
+  return synced
+
+
 def _read_json(path: str | os.PathLike) -> dict:
   try:
     with open(path, encoding="utf-8") as f:
@@ -438,7 +608,13 @@ def load_presets(
   base_providers = _read_json(builtin_path)
   user_providers = _read_json(user_path)
   merged = _merge_providers(base_providers, user_providers)
-  return _flatten_providers(merged)
+  presets = _flatten_providers(merged)
+  # Dynamic ``sync`` providers contribute synthesized presets; hand-written
+  # entries win on a name clash (setdefault keeps the static one).
+  dynamic = _cached_synced_presets(merged, (str(builtin_path), user_path))
+  for name, preset in dynamic.items():
+    presets.setdefault(name, preset)
+  return presets
 
 
 def resolve_preset(
