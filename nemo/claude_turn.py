@@ -617,6 +617,60 @@ class _TurnResult:
   last_thinking: str
 
 
+def _promote_pending_to_stale(
+  pending_tasks: set[str], stale_tasks: set[str],
+) -> list[str]:
+  """Remember a turn's still-pending background task ids as stale (SDK #788).
+
+  A task that outlives the turn that armed it WILL report back later, so its
+  id has to be known: a ``TaskNotificationMessage`` for a known id that
+  arrives mid-turn is a leak — the CLI injects it into the model's context
+  of a turn that never asked for it and the model answers the notification
+  instead of the prompt (observed: a task that finished 23 minutes later
+  contaminated the following turn — commit 7f6a8a7). ``_single_turn``
+  raises ``StaleLeakError`` on a known id so the reconnect layer recovers.
+
+  Known-stale is NOT the same as dead, and must never be treated as one.
+  The task is left RUNNING so the between-turn idle drainer
+  (``SDKThread._idle_drain_loop``) can still deliver its completion as a
+  ``BackgroundTaskDoneEvent`` — that is the only path by which a model that
+  promised "跑完我会主动汇报" can actually be woken to say so.
+
+  Returns the promoted ids.
+  """
+  ids = sorted(pending_tasks)
+  stale_tasks.update(ids)
+  pending_tasks.clear()
+  return ids
+
+
+async def _stop_tasks(
+  client: TurnClient, task_ids: list[str], stop_task_disabled: list[bool],
+) -> None:
+  """Best-effort stop of tasks whose result can no longer reach the user.
+
+  Only for tasks orphaned by an ABANDONED turn (a transient or non-retryable
+  API error), where the attempt that armed them is gone and nothing will
+  ever be waiting for the notification.
+
+  Stopping a task armed by a COMPLETED turn is what silently killed the
+  whole notification path: the CLI reports the reaping itself back as
+  ``status=stopped``, and that was the only notification the idle drainer
+  could ever surface. Regression pinned by
+  ``test_completed_turn_leaves_background_tasks_running``.
+  """
+  for tid in task_ids:
+    if stop_task_disabled[0]:
+      return
+    try:
+      await client.stop_task(tid)
+    except Exception as e:
+      log.warning("Failed to stop stale task %s: %s", tid, e)
+      if "control request timeout" in str(e).lower():
+        stop_task_disabled[0] = True
+        log.warning("stop_task control channel wedged — skipping further stops")
+
+
 async def _single_turn(
   client: TurnClient,
   prompt: str,
@@ -1116,9 +1170,9 @@ async def _single_turn(
             result_text, is_error_flag=is_error_flag)):
         err_sample = (non_retryable_error_text or result_text)[:500]
         log.warning("Non-retryable API error in turn result: %r", err_sample[:200])
-        for tid in list(pending_tasks):
-          stale_tasks.add(tid)
-        pending_tasks.clear()
+        await _stop_tasks(
+          client, _promote_pending_to_stale(pending_tasks, stale_tasks),
+          stop_task_disabled)
         on_event(ErrorEvent(message=err_sample))
         raise NonRetryableAPIError(err_sample)
       if (transient_error_text
@@ -1128,25 +1182,28 @@ async def _single_turn(
         log.warning("Transient API error in turn result — will reconnect: %r",
                     err_sample)
         # Clean up pending tasks before raising so stale bookkeeping stays
-        # consistent.
-        for tid in list(pending_tasks):
-          stale_tasks.add(tid)
-        pending_tasks.clear()
+        # consistent. The attempt is abandoned, so these are genuine orphans:
+        # mark them stale AND stop them (nothing will wait for a result now).
+        await _stop_tasks(
+          client, _promote_pending_to_stale(pending_tasks, stale_tasks),
+          stop_task_disabled)
         raise TransientAPIError(err_sample)
 
-      # Mark remaining pending tasks as stale for future turns.
-      for tid in list(pending_tasks):
-        stale_tasks.add(tid)
-        if stop_task_disabled[0]:
-          continue
-        try:
-          await client.stop_task(tid)
-        except Exception as e:
-          log.warning("Failed to stop stale task %s: %s", tid, e)
-          if "control request timeout" in str(e).lower():
-            stop_task_disabled[0] = True
-            log.warning("stop_task control channel wedged — skipping further stops")
-      pending_tasks.clear()
+      # The turn COMPLETED, so the tasks it left pending were armed on
+      # purpose — the model started a Monitor / background command precisely
+      # so it would be told when the work finished. Record their ids as
+      # stale (a late notification must not contaminate a later turn's
+      # context — SDK #788), but do NOT stop them: the between-turn idle
+      # drainer needs them alive to surface their completion as a
+      # BackgroundTaskDoneEvent, which the host turns into a real follow-up
+      # turn. Stopping them here made every completion arrive as
+      # ``status=stopped`` — a notification about the reaping itself.
+      promoted = _promote_pending_to_stale(pending_tasks, stale_tasks)
+      if promoted:
+        log.info(
+          "turn completed with %d background task(s) still running %s — "
+          "left alive for the idle drainer to report",
+          len(promoted), promoted)
       saw_result = True
       results_seen += 1
       # This Result is now read off the stream, whatever it turns out to be

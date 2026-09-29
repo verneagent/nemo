@@ -3172,11 +3172,14 @@ def run_idle_notification_tests(pid: int, chat_id: str,
 
   # Wait for the drainer to surface
   # it; `queued as turn` is the fix's signature (the bug logged `sent` only).
-  # NB: the CLI STOPS a turn's background tasks when the turn ends, and a
-  # stopped task notifies immediately — so the notification lands ~1s after the
-  # turn, not after the command's own 25s. That is why the follow-up card is
-  # found by COUNTING Done cards rather than by a timestamp: a timestamp taken
-  # after the turn cannot separate the two turns' cards when they are a second
+  # NB: a `sleep 25` task that SURVIVES the turn notifies only when that
+  # sleep is over, so the notification lands ~25s after the turn, not after
+  # it. (Before the 2026-09-28 fix, claude_turn STOPPED every pending task at
+  # turn end, which made the CLI report the reaping itself as
+  # `status=stopped` ~1s after the turn — a notification about the reaping,
+  # never about the work.) Either way the follow-up card is found by
+  # COUNTING Done cards rather than by a timestamp: a timestamp taken after
+  # the turn cannot separate the two turns' cards when they are a second
   # apart.
   queued = log.wait_for_since(
     r"Idle notification queued as turn", mark, timeout=150, poll=2)

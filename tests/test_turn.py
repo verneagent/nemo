@@ -1,10 +1,14 @@
 """Tests for nemo.turn — SDK turn execution and event emission."""
 
+import ast
 import asyncio
 from dataclasses import dataclass
+from pathlib import Path
 from unittest import mock
 
 import pytest
+
+CLAUDE_TURN_PATH = Path(__file__).resolve().parents[1] / "nemo" / "claude_turn.py"
 
 from nemo.turn import (
   ProgressEvent, AnswerEvent,
@@ -378,16 +382,18 @@ def test_stop_task_circuit_breaker_on_control_timeout():
   every pending id. After the first occurrence we should short-circuit all
   further stop_task invocations within the same run_turn orchestration.
   """
-  # Turn yields two pending tasks, a real output, then ResultMessage. No
-  # stale is marked, so the turn is "clean" — the pending tasks are both
-  # promoted to stale. (The output keeps the turn non-empty; this test is
-  # about the stop_task breaker, not empty responses.)
+  # The turn must be ABANDONED for the task reaper to run at all: a turn
+  # that completes leaves its background tasks running on purpose (see
+  # test_completed_turn_leaves_background_tasks_running). So this fixture
+  # ends on a transient API error, which reaps the three pending tasks.
+  from nemo.claude_turn import TransientAPIError
   messages = [
     FakeAssistantMessage(content=[FakeToolUseBlock(name="Agent", input={"description": "x"})]),
     FakeTaskStartedMessage(task_id="t1"),
     FakeTaskStartedMessage(task_id="t2"),
     FakeTaskStartedMessage(task_id="t3"),
-    FakeAssistantMessage(content=[FakeTextBlock(text="done")]),
+    FakeAssistantMessage(content=[FakeTextBlock(
+      text="API Error: Unable to connect to API (ECONNRESET)")]),
     FakeResultMessage(total_cost_usd=0.01),
   ]
   stop_calls: list[str] = []
@@ -408,7 +414,8 @@ def test_stop_task_circuit_breaker_on_control_timeout():
 
   async def _run():
     with mock.patch.dict("sys.modules", _sdk_modules()):
-      await run_turn(TimingOutClient(), "real", events.append)
+      with pytest.raises(TransientAPIError):
+        await run_turn(TimingOutClient(), "real", events.append)
 
   asyncio.run(_run())
   # First stop_task failure trips the breaker — further ids are skipped.
@@ -417,6 +424,168 @@ def test_stop_task_circuit_breaker_on_control_timeout():
   assert len(stop_calls) == 1, \
     f"expected only first stop_task to be attempted, got {stop_calls}"
   assert stop_calls[0] in {"t1", "t2", "t3"}
+
+
+def test_completed_turn_leaves_background_tasks_running():
+  """A background task armed by a turn that COMPLETES must survive it.
+
+  Regression (2026-09-28): the turn-end reap called ``stop_task`` on every
+  still-pending task. The CLI reports the reaping itself back as
+  ``status=stopped`` — and that was the ONLY notification the between-turn
+  idle drainer could ever surface. So a Monitor the model armed to report
+  back on a long job was killed seconds after it started, and "跑完我会主动
+  汇报" had nothing that could fire.
+
+  Surviving is what makes the notification path work: the drainer
+  (``SDKThread._idle_drain_loop``) reads the completion while idle and the
+  host turns it into a real follow-up turn.
+
+  Note the ids ARE still promoted to stale — that half is the SDK #788
+  guard (a late notification must not contaminate a later turn's context,
+  see test_clean_real_turn_preserves_freshly_promoted_stales) and is
+  independent of killing the task. Known-stale must not be read as dead:
+  only a FAILED turn's orphans are stopped.
+  """
+  messages = [
+    FakeAssistantMessage(content=[FakeToolUseBlock(
+      name="Monitor", input={"description": "watch the batch"})]),
+    FakeTaskStartedMessage(task_id="mon_1"),
+    FakeAssistantMessage(content=[FakeTextBlock(text="Monitor 已挂上")]),
+    FakeResultMessage(total_cost_usd=0.01),
+  ]
+  stop_calls: list[str] = []
+
+  class RecordingClient:
+    async def query(self, prompt):
+      pass
+
+    async def receive_messages(self):
+      for msg in messages:
+        yield msg
+
+    async def stop_task(self, task_id):
+      stop_calls.append(task_id)
+
+  events: list = []
+  stale: set[str] = set()
+
+  async def _run():
+    with mock.patch.dict("sys.modules", _sdk_modules()):
+      await run_turn(RecordingClient(), "real", events.append,
+                     stale_tasks=stale)
+
+  asyncio.run(_run())
+  assert any(isinstance(e, DoneEvent) for e in events), \
+    f"fixture must produce a completed turn, got {events}"
+  assert stop_calls == [], (
+    "a completed turn must NOT stop the background tasks it armed — the "
+    f"idle drainer needs them alive to report their completion; got "
+    f"{stop_calls}")
+  assert stale == {"mon_1"}, (
+    "a completed turn's tasks must still be promoted to stale so a late "
+    f"notification cannot contaminate a later turn; got {stale}")
+
+
+def test_control_abandoned_turn_still_reaps_tasks():
+  """Control for test_completed_turn_leaves_background_tasks_running.
+
+  Same client, same ids, same fixture — one difference: the turn is
+  ABANDONED (transient API error) rather than completed. The reaper must
+  still run there, so ``stop_task`` IS called and the ids DO land in
+  ``stale_tasks``.
+
+  That is exactly what the test above asserts the absence of, which is what
+  makes its assertions discriminating rather than a description of an empty
+  fixture. If reaping were ever restored to the completion path, the test
+  above fails — this control is how we know it would notice.
+  """
+  from nemo.claude_turn import TransientAPIError
+  messages = [
+    FakeTaskStartedMessage(task_id="mon_1"),
+    FakeAssistantMessage(content=[FakeTextBlock(
+      text="API Error: Unable to connect to API (ECONNRESET)")]),
+    FakeResultMessage(total_cost_usd=0.01),
+  ]
+  stop_calls: list[str] = []
+
+  class RecordingClient:
+    async def query(self, prompt):
+      pass
+
+    async def receive_messages(self):
+      for msg in messages:
+        yield msg
+
+    async def stop_task(self, task_id):
+      stop_calls.append(task_id)
+
+  stale: set[str] = set()
+
+  async def _run():
+    with mock.patch.dict("sys.modules", _sdk_modules()):
+      with pytest.raises(TransientAPIError):
+        await run_turn(RecordingClient(), "real", [].append,
+                       stale_tasks=stale)
+
+  asyncio.run(_run())
+  assert stop_calls == ["mon_1"], (
+    "an abandoned turn's tasks are orphans and must be stopped, got "
+    f"{stop_calls}")
+  assert stale == {"mon_1"}, (
+    f"an abandoned turn's tasks must be marked stale, got {stale}")
+
+
+def _stop_task_call_sites(src: str) -> list[str]:
+  """``"<enclosing function>:<lineno>"`` for every ``.stop_task(...)`` call."""
+  sites: list[str] = []
+
+  def walk(node: ast.AST, fn: str) -> None:
+    for child in ast.iter_child_nodes(node):
+      name = child.name if isinstance(
+        child, (ast.FunctionDef, ast.AsyncFunctionDef)) else fn
+      if (isinstance(child, ast.Call)
+          and isinstance(child.func, ast.Attribute)
+          and child.func.attr == "stop_task"):
+        sites.append(f"{name}:{child.lineno}")
+      walk(child, name)
+
+  walk(ast.parse(src), "<module>")
+  return sites
+
+
+def test_stop_task_has_exactly_one_call_site():
+  """Stopping a background task is ONE policy point: ``_stop_tasks``.
+
+  That function is called only from the abandoned-turn paths, and this guard
+  is what keeps it that way. The 2026-09-28 regression was an inline
+  ``client.stop_task(tid)`` on the *completion* path: the turn succeeds, the
+  task dies, and the CLI reports the reaping itself as ``status=stopped`` ~1s
+  later. The idle drainer then has nothing to surface, so a model that said
+  "跑完我会主动汇报" can never be woken. The behaviour tests above pin the
+  outcome; this pins the shape, so the reap cannot be reintroduced somewhere
+  the outcome tests do not look.
+  """
+  sites = _stop_task_call_sites(CLAUDE_TURN_PATH.read_text())
+  assert [s.split(":")[0] for s in sites] == ["_stop_tasks"], (
+    f"client.stop_task reachable from {sites} in {CLAUDE_TURN_PATH.name} — "
+    "route every stop through _stop_tasks(), which must stay callable ONLY "
+    "from the abandoned-turn paths; an inline stop on the COMPLETED path "
+    "kills the very task the idle drainer needs alive to report")
+
+
+def test_control_stop_task_guard_flags_an_inline_reap():
+  """Control for test_stop_task_has_exactly_one_call_site.
+
+  Feeds the extractor a source with the old inline reap. A guard that cannot
+  see the exact shape it forbids reports "clean" forever.
+  """
+  src = (
+    "async def _single_turn(client):\n"
+    "  for tid in list(pending):\n"
+    "    await client.stop_task(tid)\n"
+  )
+  assert _stop_task_call_sites(src) == ["_single_turn:3"], (
+    "the guard must flag an inline stop_task on a turn path")
 
 
 def test_transient_api_error_in_assistant_message_raises_and_suppresses():
