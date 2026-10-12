@@ -12,7 +12,7 @@ Config lives in ``~/.nemo/vision.json`` (same home as ``models.json``)::
     {
       "baseURL": "https://dashscope.aliyuncs.com/compatible-mode/v1",
       "apiKey":  "{env:BAILIAN_API_KEY}",
-      "model":   "qwen3-vl-flash"
+      "model":   "qwen3-vl-plus"
     }
 
 All fields are optional — missing ``baseURL`` / ``model`` fall back to the
@@ -37,7 +37,7 @@ from .types import JsonObject, JsonValue
 
 _CONFIG_PATH = "~/.nemo/vision.json"
 _DEFAULT_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
-_DEFAULT_MODEL = "qwen3-vl-flash"
+_DEFAULT_MODEL = "qwen3-vl-plus"
 _DEFAULT_QUESTION = "详细描述这个媒体文件的内容。"
 _TIMEOUT_S = 300
 
