@@ -207,9 +207,22 @@ _FORK_ALLOWED_TOOLS = [
   "Bash", "BashOutput", "KillShell",
   "Read", "Grep", "Glob", "WebSearch", "WebFetch", "TodoWrite",
 ]
+# Claude Code's cron tools are REPL-only ("jobs fire while the REPL is idle").
+# This daemon runs the CLI headless under the Agent SDK, so a job registers
+# successfully and then never ticks (2026-10-27: a group was promised a
+# 15-minute progress report; the job id appears exactly once in the
+# transcript, and no query was ever driven at any scheduled minute). Every
+# session here runs the same way, so deny them everywhere — otherwise the
+# model makes a promise nothing in this process can keep. Recurring work has
+# exactly one working shape: a background task (Monitor / background Bash)
+# whose completion the idle drainer surfaces as a real follow-up turn.
+_CRON_DISALLOWED_TOOLS = [
+  "CronCreate", "CronList", "CronDelete", "ScheduleWakeup",
+]
 _FORK_DISALLOWED_TOOLS = [
   "Write", "Edit", "NotebookEdit", "Agent", "Skill", "AskUserQuestion",
   "mcp__*",
+  *_CRON_DISALLOWED_TOOLS,
 ]
 
 # Hard ceiling so a wedged side query can't hang the chat indefinitely.
@@ -872,6 +885,7 @@ class ClaudeCodingAgent(CodingAgent):
         "Bash", "BashOutput", "KillShell",
         "Glob", "Grep", "WebSearch", "WebFetch", "TodoWrite",
         "AskUserQuestion", "mcp__*",
+        *_CRON_DISALLOWED_TOOLS,
       ],
       max_turns=_BTW_MAX_TURNS,
       permission_mode="bypassPermissions",
@@ -1041,6 +1055,7 @@ class ClaudeCodingAgent(CodingAgent):
         "Write", "Edit", "NotebookEdit", "Bash", "BashOutput", "KillShell",
         "Agent", "Skill", "AskUserQuestion", "WebSearch", "WebFetch",
         "TodoWrite", "mcp__*",
+        *_CRON_DISALLOWED_TOOLS,
       ],
       max_turns=_DIGEST_MAX_TURNS,
       permission_mode="bypassPermissions",
@@ -1192,7 +1207,14 @@ class ClaudeCodingAgent(CodingAgent):
       "  sqlite3 \"$NEMO_DB\" \"SELECT direction, text, datetime(sent_at, 'unixepoch', 'localtime') FROM messages ORDER BY id DESC LIMIT 20;\"\n\n"
       "To send an image or file to the user:\n"
       "  nemo-send image /path/to/screenshot.png\n"
-      "  nemo-send file /path/to/document.pdf"
+      "  nemo-send file /path/to/document.pdf\n\n"
+      "Scheduling: never use CronCreate / CronList / CronDelete / "
+      "ScheduleWakeup. This daemon runs the CLI headless under the Agent SDK, "
+      "where the cron scheduler never ticks — the job registers successfully "
+      "and then never fires. For a recurring progress report, arm a background "
+      "task instead (Monitor polling the log, or a background Bash loop that "
+      "sleeps and echoes); Nemo wakes a real turn when it completes. If no "
+      "background task can do the job, say plainly that you cannot schedule it."
     )
     # Standing nemo-vision note for text-only models (deepseek/kimi). Computed
     # from the live model so it refreshes on each reconnect / /model switch;
@@ -1392,6 +1414,7 @@ class ClaudeCodingAgent(CodingAgent):
         "AskUserQuestion",
         "mcp__*",
       ],
+      disallowed_tools=list(_CRON_DISALLOWED_TOOLS),
       setting_sources=["user", "project"],
       permission_mode=cast(PermissionMode, self._permission_mode),
       system_prompt={

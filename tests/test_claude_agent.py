@@ -1177,6 +1177,64 @@ def test_build_agent_prompt_no_vision_note_for_vision_model():
   assert "nemo-vision" not in prompt
 
 
+def test_build_agent_prompt_forbids_repl_only_cron_tools():
+  """The model must not promise a schedule: CronCreate registers and never
+  ticks here (2026-10-27). The prompt points at the one thing that works."""
+  from unittest import mock
+  from nemo.agent_factory import MediaVision
+  from nemo.claude_agent import ClaudeCodingAgent
+  agent = ClaudeCodingAgent.__new__(ClaudeCodingAgent)
+  agent._model = "claude-opus-4-7"
+  agent._system_prompt = ""
+  with mock.patch("nemo.agent_factory.model_media_vision",
+                  return_value=MediaVision(image=True, video=False)), \
+       mock.patch("nemo.vision_cli.helper_available", return_value=True):
+    prompt = agent._build_agent_prompt()
+  assert "CronCreate" in prompt
+  assert "never ticks" in prompt
+  assert "Monitor" in prompt
+
+
+def _options_agent(tmp_path):
+  from unittest import mock
+  from nemo.claude_agent import ClaudeCodingAgent
+  agent = ClaudeCodingAgent(
+    {"app_id": "a", "app_secret": "b"}, "oc",
+    mock.MagicMock(), mock.MagicMock())
+  agent._project_dir = str(tmp_path)
+  agent._model = "claude-opus-4-7"
+  return agent
+
+
+def _build_options_for_test(agent, tmp_path):
+  # _build_options touches asyncio.get_event_loop() via the askq handler.
+  async def go():
+    return agent._build_options(str(tmp_path), "claude-opus-4-7")
+  return asyncio.run(go())
+
+
+def test_main_turn_options_deny_repl_only_cron_tools(tmp_path):
+  """The main session must not expose the cron tools at all — the CLI accepts
+  them and silently never fires. Names are literal on purpose: asserting
+  against the constant would pass vacuously once the constant is emptied
+  (which is exactly what the control below does)."""
+  opts = _build_options_for_test(_options_agent(tmp_path), tmp_path)
+  denied = set(opts.disallowed_tools or [])
+  assert {"CronCreate", "CronList", "CronDelete", "ScheduleWakeup"} <= denied
+
+
+def test_control_cron_deny_depends_on_the_shared_constant(
+  tmp_path, monkeypatch,
+):
+  """Control: emptying the constant removes the deny, so the test above is
+  actually reading the fix and not passing vacuously."""
+  import nemo.claude_agent as ca
+  monkeypatch.setattr(ca, "_CRON_DISALLOWED_TOOLS", [])
+  opts = _build_options_for_test(_options_agent(tmp_path), tmp_path)
+  denied = set(opts.disallowed_tools or [])
+  assert not {"CronCreate", "CronList", "CronDelete", "ScheduleWakeup"} <= denied
+
+
 # ---------------------------------------------------------------------------
 # digest_transcript / shared one-shot query helper (mocked SDK)
 # ---------------------------------------------------------------------------
