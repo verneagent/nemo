@@ -389,13 +389,26 @@ class SDKThread:
     finally:
       self._drain_enabled = True
 
-  def start_idle_drain(self, on_idle_event: Callable[[TurnEvent], None]) -> None:
+  def start_idle_drain(
+    self, on_idle_event: Callable[[TurnEvent], None],
+    restart: bool = False,
+  ) -> None:
     """Start (or refresh the notifier of) the between-turn idle drainer.
 
     Thread-safe; safe to call any number of times (e.g. after an /agent
     switch rebuilds the adapter). The drain task is created lazily on the
     SDK loop the first time and re-armed on every call so a fresh notifier
     takes effect immediately.
+
+    ``restart=True`` cancels and replaces the running drain task. Pass it
+    after every reconnect: the old task may be parked on a receive future
+    belonging to the client that was just closed, and a task that is merely
+    stuck (not ``done()``) is never replaced by the lazy path — the drainer
+    then stays silent for the rest of the daemon's life while looking
+    healthy (2026-10-28: a group's Monitor fired every 15 minutes for hours,
+    every event queued unread in the SDK stream, and not one card reached
+    Lark; the stale notifications that piled up then forced reconnects that
+    killed the Monitor subprocess).
     """
     self._on_idle_event = on_idle_event
     if self._loop is None:
@@ -403,6 +416,14 @@ class SDKThread:
 
     def _arm() -> None:
       self._drain_enabled = True
+      if restart and self._drain_task is not None:
+        # Cancelling is the only way out of a receive future that will
+        # never complete (the client it read from is gone).
+        self._drain_task.cancel()
+        self._drain_task = None
+        if self._drain_pending is not None:
+          self._drain_pending.cancel()
+          self._drain_pending = None
       if self._drain_task is None or self._drain_task.done():
         # create_task (NOT ensure_future): only create_task accepts `name=`.
         # ensure_future(coro, name=...) raises TypeError on py3.14 — which
@@ -447,52 +468,68 @@ class SDKThread:
     """
     gen: object | None = None
     while not self._cancelled.is_set():
-      client = self._client_on_sdk_loop()
-      if client is None or not self._drain_enabled:
-        gen = None
-        await asyncio.sleep(0.2)
-        continue
-      if gen is None:
+      try:
+        client = self._client_on_sdk_loop()
+        if client is None or not self._drain_enabled:
+          gen = None
+          await asyncio.sleep(0.2)
+          continue
+        if gen is None:
+          try:
+            gen = client.receive_messages()
+          except Exception as exc:
+            log.warning("idle drain: cannot open message stream: %s", exc)
+            gen = None
+            await asyncio.sleep(0.5)
+            continue
+        fut = asyncio.ensure_future(gen.__anext__())
+        self._drain_pending = fut
         try:
-          gen = client.receive_messages()
+          try:
+            await asyncio.wait({fut})
+          except asyncio.CancelledError:
+            # Drain task itself cancelled (shutdown) — cancel the in-flight
+            # receive (transactional: any queued message stays for the next
+            # consumer) and let the cancellation propagate.
+            fut.cancel()
+            raise
+          if fut.cancelled():
+            # The turn-start barrier cancelled our in-flight receive. Stop
+            # draining; the turn runner will consume the stream from here.
+            gen = None
+            continue
+          message = fut.result()
+        except StopAsyncIteration:
+          gen = None
+          continue
         except Exception as exc:
-          log.warning("idle drain: cannot open message stream: %s", exc)
+          log.warning("idle drain receive failed: %s", exc)
           gen = None
-          await asyncio.sleep(0.5)
           continue
-      fut = asyncio.ensure_future(gen.__anext__())
-      self._drain_pending = fut
-      try:
+        finally:
+          self._drain_pending = None
         try:
-          await asyncio.wait({fut})
-        except asyncio.CancelledError:
-          # Drain task itself cancelled (shutdown) — cancel the in-flight
-          # receive (transactional: any queued message stays for the next
-          # consumer) and let the cancellation propagate.
-          fut.cancel()
-          raise
-        if fut.cancelled():
-          # The turn-start barrier cancelled our in-flight receive. Stop
-          # draining; the turn runner will consume the stream from here.
+          self._handle_idle_message(message)
+        except Exception as exc:
+          log.warning("idle drain handler failed: %s", exc)
+        if not self._drain_enabled:
+          # A turn started while we processed the message — stop consuming.
           gen = None
-          continue
-        message = fut.result()
-      except StopAsyncIteration:
-        gen = None
-        continue
+      except asyncio.CancelledError:
+        raise
       except Exception as exc:
-        log.warning("idle drain receive failed: %s", exc)
+        # Anything escaping the branches above (the loop-affinity guard in
+        # ``_client_on_sdk_loop``, an ensure_future TypeError on a new Python,
+        # …) used to kill this task SILENTLY: we keep a strong reference to
+        # it, so "Task exception was never retrieved" never fires and the
+        # daemon looks perfectly healthy while nothing between turns is ever
+        # consumed or surfaced. Log it and reopen the stream instead of dying
+        # — a dead drainer is invisible from the outside, so it must be
+        # impossible.
+        log.error("idle drain crashed: %r — reopening the stream", exc)
         gen = None
-        continue
-      finally:
         self._drain_pending = None
-      try:
-        self._handle_idle_message(message)
-      except Exception as exc:
-        log.warning("idle drain handler failed: %s", exc)
-      if not self._drain_enabled:
-        # A turn started while we processed the message — stop consuming.
-        gen = None
+        await asyncio.sleep(0.5)
 
   def _handle_idle_message(self, message: object) -> None:
     """Classify a spontaneous (idle) SDK message; surface it if visible.

@@ -825,8 +825,12 @@ class ClaudeCodingAgent(CodingAgent):
       self._latest_session_id = ""
       self._options = self._build_options(project_dir, model, resume="")
       await self._sdk.reconnect(self._options)
-    # Re-arm the idle drainer against the freshly connected client.
-    self._sdk.start_idle_drain(self._on_idle_event)
+    # Re-arm the idle drainer against the freshly connected client. restart=
+    # True is required: the old drain task may be parked on a receive future
+    # from the client that was just closed, and the lazy path would leave it
+    # in place (not done → never replaced), silently ending idle delivery for
+    # the rest of this daemon's life.
+    self._sdk.start_idle_drain(self._on_idle_event, restart=True)
 
   async def side_question(self, question: str, sdk_session_id: str) -> str:
     """Read-only ephemeral side question — see CodingAgent.side_question.

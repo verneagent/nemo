@@ -1044,6 +1044,97 @@ class TestIdleDrain:
     finally:
       thread.stop()
 
+  def test_reconnect_replaces_a_wedged_drainer(self):
+    """restart=True must replace a drain task parked on the closed client.
+
+    A drain task waiting on a receive future that will never complete is
+    ``not done()``, so the lazy arm path leaves it exactly where it is: from
+    then on the stream is never read between turns, background events queue
+    up unread, and the daemon looks healthy (2026-10-28 incident). Every
+    reconnect therefore has to cancel + recreate it.
+    """
+    _ensure_real_sdk()
+    thread = SDKThread()
+    thread.start()
+    events: list = []
+    try:
+      thread._client = _HangingClient([])  # sits in a receive forever
+      thread.start_idle_drain(events.append)
+
+      deadline = time.time() + 5
+      while thread._drain_pending is None and time.time() < deadline:
+        time.sleep(0.02)
+      assert thread._drain_pending is not None, "drainer never armed"
+
+      # "Reconnect": a new client with a pending completion, then re-arm the
+      # way ClaudeCodingAgent.reset() does.
+      thread._client = _HangingClient([self._task_notification()])
+      thread.start_idle_drain(events.append, restart=True)
+
+      deadline = time.time() + 5
+      while not events and time.time() < deadline:
+        time.sleep(0.02)
+      assert events, (
+        "restart=True did not replace the wedged drain task — the new "
+        "client's stream was never read")
+      assert isinstance(events[0], BackgroundTaskDoneEvent)
+      assert events[0].task_id == "task_x"
+    finally:
+      thread.stop()
+
+  def test_control_wedged_drainer_stays_wedged_without_restart(self):
+    """Permanent control for the test above: arming WITHOUT restart=True (the
+    pre-fix behaviour) leaves the wedged task in place and surfaces nothing.
+
+    This is what makes the regression test meaningful — it must fail with the
+    fix reverted, and this control must keep passing either way.
+    """
+    _ensure_real_sdk()
+    thread = SDKThread()
+    thread.start()
+    events: list = []
+    try:
+      thread._client = _HangingClient([])
+      thread.start_idle_drain(events.append)
+
+      deadline = time.time() + 5
+      while thread._drain_pending is None and time.time() < deadline:
+        time.sleep(0.02)
+      assert thread._drain_pending is not None, "drainer never armed"
+
+      thread._client = _HangingClient([self._task_notification()])
+      thread.start_idle_drain(events.append)  # no restart
+
+      time.sleep(1.0)
+      assert events == [], "control expected the wedged task to stay parked"
+    finally:
+      thread.stop()
+
+  def test_unexpected_error_does_not_kill_the_drainer(self):
+    """An exception escaping the receive branches must be logged and retried,
+    not kill the task. We hold a strong ref to the task, so a dead drainer
+    raises no 'Task exception was never retrieved' warning — it is simply
+    silent forever, which is the worst possible failure mode."""
+    thread = SDKThread()
+    good = _HangingClient([self._task_notification()])
+    calls = {"n": 0}
+
+    def flaky_client():
+      calls["n"] += 1
+      if calls["n"] == 1:
+        raise RuntimeError("boom")
+      return good
+
+    thread._client_on_sdk_loop = flaky_client  # type: ignore[method-assign]
+    thread._drain_enabled = True
+    events: list = []
+    thread._on_idle_event = events.append
+
+    self._run_loop_until(thread, events, lambda evs: bool(evs))
+
+    assert calls["n"] >= 2, "drainer never retried after the error"
+    assert events and events[0].task_id == "task_x"
+
 
 class _HangingClient:
   """receive_messages yields the given messages, then hangs forever — like a
