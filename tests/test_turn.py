@@ -144,6 +144,7 @@ class FakeTaskStartedMessage:
   task_id: str
   description: str = ""
   task_type: str = ""
+  tool_use_id: str | None = None
 
 
 @dataclass
@@ -286,6 +287,35 @@ def test_task_lifecycle():
   asyncio.run(_run())
   assert any(isinstance(e, TaskStartedEvent) and e.task_id == "task_1" for e in events)
   assert any(isinstance(e, TaskDoneEvent) and e.task_id == "task_1" for e in events)
+
+
+def test_task_started_carries_the_spawning_tool_name():
+  """task_type is "local_bash" for a Monitor AND for a promoted Bash call.
+
+  Only ``tool_use_id`` tells them apart, so the event has to resolve it back
+  to the tool that spawned the task — the marker card keys off exactly that
+  (2026-10-29: a plain git merge turn posted "后台监控已挂上").
+  """
+  messages = [
+    FakeAssistantMessage(content=[FakeToolUseBlock(
+      id="tu_mon", name="Monitor", input={"command": "tail -f train.log"})]),
+    FakeTaskStartedMessage(
+      task_id="task_mon", task_type="local_bash",
+      description="training progress", tool_use_id="tu_mon"),
+    FakeAssistantMessage(content=[FakeTextBlock(text="盯着了")]),
+    FakeResultMessage(),
+  ]
+  events = []
+  async def _run():
+    with mock.patch.dict("sys.modules", _sdk_modules()):
+      client = FakeClient(messages)
+      await run_turn(client, "watch it", events.append)
+  asyncio.run(_run())
+  started = [e for e in events if isinstance(e, TaskStartedEvent)]
+  assert len(started) == 1
+  assert started[0].task_id == "task_mon"
+  assert started[0].task_type == "local_bash"
+  assert started[0].tool_name == "Monitor"
 
 
 def test_stale_leak_raises_for_reconnect_resume():

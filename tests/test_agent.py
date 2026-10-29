@@ -4655,14 +4655,25 @@ def test_task_started_posts_one_marker_card_and_skips_subagents(tmp_path):
         on_event(ProgressEvent(kind="tool", summary="Monitor", first=True))
         on_event(TaskStartedEvent(
           task_id="bmon1", description="light LoRA training progress",
-          task_type="local_bash"))
+          task_type="local_bash", tool_name="Monitor"))
         # Same task announced twice (replayed system message) → one card.
         on_event(TaskStartedEvent(
           task_id="bmon1", description="light LoRA training progress",
-          task_type="local_bash"))
+          task_type="local_bash", tool_name="Monitor"))
         on_event(TaskStartedEvent(
           task_id="a_sub", description="explore the repo",
-          task_type="local_agent"))
+          task_type="local_agent", tool_name="Task"))
+        # A plain Bash call the CLI promoted to a task is ALSO local_bash —
+        # it must not be announced as a monitor (2026-10-29: two "监控已挂上"
+        # cards landed on a git merge / go build turn).
+        on_event(TaskStartedEvent(
+          task_id="bcmd1", description="Merge main into branch",
+          task_type="local_bash", tool_name="Bash"))
+        # Unknown spawning tool (older CLI, no tool_use_id) — stay silent
+        # rather than claim a watch that may not exist.
+        on_event(TaskStartedEvent(
+          task_id="bunk1", description="something long-running",
+          task_type="local_bash"))
         on_event(AnswerEvent("盯着了"))
         on_event(DoneEvent(cost=0.0, usage={"input_tokens": 1}))
 
@@ -4712,6 +4723,10 @@ def test_task_started_posts_one_marker_card_and_skips_subagents(tmp_path):
   blob = json.dumps(markers[0], ensure_ascii=False)
   assert "light LoRA training progress" in blob
   assert "bmon1" in blob
-  # The subagent must not get a card, and neither must its id leak into one.
-  assert all("explore the repo" not in json.dumps(c, ensure_ascii=False)
-             for c in sent_cards)
+  # Nothing but the Monitor may get a card: not the subagent, not the
+  # Bash-spawned task, not an unidentified local_bash task.
+  blob = json.dumps(sent_cards, ensure_ascii=False)
+  assert "explore the repo" not in blob
+  assert "Merge main into branch" not in blob
+  assert "something long-running" not in blob
+  assert "bcmd1" not in blob and "bunk1" not in blob

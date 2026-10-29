@@ -3203,20 +3203,26 @@ async def main_loop(
         had been armed at all. Announcing the arming itself makes that
         observable at the moment it happens.
 
-        Subagents (``local_agent`` / ``remote_agent``) are turn-internal
-        parallel work, not a background watch — a turn that fans out three of
-        them must not produce three cards.
+        ONLY the Monitor tool is announced. ``task_type`` is not enough to
+        tell a watch from ordinary work: the CLI reports a Monitor AND any
+        Bash call it promotes to a task as ``local_bash``, so keying off it
+        put "后台监控已挂上" on plain ``git merge`` / ``go build`` commands
+        (2026-10-29: a group was told a monitor was armed when the model was
+        just running a foreground command). The spawning tool name comes from
+        the tool_use block via ``tool_use_id``; when it is unknown we stay
+        silent rather than claim a watch that may not exist.
         """
-        if event.task_type in ("local_agent", "remote_agent"):
+        log.info("Background task started: task=%s type=%s tool=%s desc=%r",
+                 event.task_id, event.task_type or "?",
+                 event.tool_name or "?", event.description[:120])
+        if event.tool_name != "Monitor":
           return
         if event.task_id and event.task_id in _announced_tasks:
           return
         if event.task_id:
           _announced_tasks.add(event.task_id)
-        title = ("👀 后台监控已挂上" if event.task_type == "local_bash"
-                 else "👀 后台任务已启动")
-        desc = event.description.strip()
-        body = desc or "后台任务已启动"
+        title = "👀 后台监控已挂上"
+        body = event.description.strip() or "监控任务已启动"
         note = "运行中，有结果会自动汇报"
         if event.task_id:
           note = f"task {event.task_id} · {note}"
@@ -3225,8 +3231,8 @@ async def main_loop(
           msg_id = _await_channel(channel.send_card(chat_id, card))
           _register_msg(msg_id, chat_id)
           db.record_sent(msg_id, text=title, chat_id=chat_id)
-          log.info("Background-task marker card sent: %s (task=%s type=%s)",
-                   msg_id, event.task_id, event.task_type or "?")
+          log.info("Background-task marker card sent: %s (task=%s)",
+                   msg_id, event.task_id)
         except Exception as e:
           # Never fail the turn over a cosmetic card.
           log.warning("Background-task marker card failed (task=%s): %s",

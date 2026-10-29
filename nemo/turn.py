@@ -87,6 +87,11 @@ class TaskStartedEvent:
   # it. Both are optional because not every adapter can supply them.
   description: str = ""
   task_type: str = ""
+  # Name of the tool that spawned the task ("Monitor", "Bash", "Task", …).
+  # task_type alone cannot tell a Monitor from an ordinary shell command:
+  # the CLI reports BOTH as "local_bash", and it emits task_started for any
+  # Bash call it promotes to a task, not only for real background work.
+  tool_name: str = ""
 
 
 @dataclass

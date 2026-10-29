@@ -792,6 +792,11 @@ async def _single_turn(
   usage: JsonObject = {}
   sdk_session_id = ""
   pending_tasks: set[str] = set()
+  # tool_use_id → tool name, filled from the assistant's tool_use blocks.
+  # A TaskStartedMessage only carries tool_use_id + task_type, and task_type
+  # cannot distinguish the Monitor tool from a plain Bash command (both are
+  # "local_bash"), so the spawning tool has to be recovered from the call.
+  tool_names: dict[str, str] = {}
   progress_started = False
   timed_out = False
   last_emitted: str = ""
@@ -1078,6 +1083,7 @@ async def _single_turn(
           text_parts.append(block.text)
         elif isinstance(block, ToolUseBlock):
           tool_summary = tool_use_summary(block.name, block.input)
+          tool_names[block.id] = block.name
 
       if thinking_parts:
         thinking_text = "\n".join(thinking_parts)
@@ -1138,6 +1144,7 @@ async def _single_turn(
         task_id=message.task_id,
         description=message.description or "",
         task_type=message.task_type or "",
+        tool_name=tool_names.get(message.tool_use_id or "", ""),
       ))
 
     elif isinstance(message, TaskProgressMessage):
