@@ -4586,7 +4586,7 @@ class _IdleCaptureChannel(_FakeChannel):
     return message_id
 
 
-def _run_idle_notifier(events):
+def _run_idle_notifier(events, then=None):
   """Drive ``_idle_notifier_for`` over ``events`` on a real loop."""
   async def _main():
     channel = _IdleCaptureChannel("oc_test")
@@ -4596,7 +4596,7 @@ def _run_idle_notifier(events):
     notify = _idle_notifier_for(
       channel, "oc_test", budget, pending, asyncio.get_running_loop(),
       monitors)
-    for event in events:
+    for event in [*events, *(then or [])]:
       notify(event)
       # Let the call_soon_threadsafe'd handler run on this loop.
       for _ in range(3):
@@ -4728,6 +4728,21 @@ def test_a_card_in_between_does_not_break_a_monitors_card():
   msg_id, card = channel.updated_cards[0]
   assert msg_id == "om_idle1"
   assert _card_blocks(card) == ["first", "second"]
+
+
+def test_a_fire_without_a_task_id_lands_on_the_only_live_watch():
+  # A Monitor fire reaches Nemo as a plain spontaneous turn with NO task id
+  # (the SDK stream carries none — verified from a live run 2026-10-29). With
+  # exactly one watch live the report can only be its, so it still appends to
+  # that card instead of posting a card per report.
+  channel, _budget = _run_idle_notifier(
+    [BackgroundTurnDoneEvent(text="REPORT_1", task_id="bmon1")],
+    then=[BackgroundTurnDoneEvent(text="REPORT_2", task_id="")],
+  )
+
+  assert len(channel.sent_cards) == 1
+  _msg_id, card = channel.updated_cards[0]
+  assert _card_blocks(card) == ["REPORT_1", "REPORT_2"]
 
 
 def test_control_same_monitor_fires_post_separate_cards():

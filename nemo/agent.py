@@ -449,6 +449,20 @@ class MonitorCards:
   def get(self, task_id: str) -> MonitorCard | None:
     return self._by_task.get(task_id) if task_id else None
 
+  def sole_live_task_id(self) -> str:
+    """The only live watch's id, or "" when there is none or several.
+
+    A Monitor fire reaches Nemo as a plain spontaneous turn — the CLI injects
+    the event into the model's context but the SDK stream carries no task id
+    (no TaskNotificationMessage, and the injected user message is not echoed
+    back; verified from a live run 2026-10-29). With exactly one watch live
+    the report can only belong to it, which is what keeps a single Monitor on
+    one card. Ambiguous with several armed, so don't guess there.
+    """
+    if len(self._by_task) == 1:
+      return next(iter(self._by_task))
+    return ""
+
   def forget(self, task_id: str) -> None:
     self._by_task.pop(task_id, None)
 
@@ -537,6 +551,10 @@ async def _deliver_idle_card(
   Best-effort throughout: a failed PATCH falls back to posting a fresh card
   carrying only the new text, so a transient Lark error can never lose it.
   """
+  if not task_id:
+    # No task identity on the event: attribute it to the only live watch, if
+    # there is exactly one (see MonitorCards.sole_live_task_id).
+    task_id = monitors.sole_live_task_id()
   entry = monitors.get(task_id)
   if entry is not None:
     # Mutate only after the PATCH succeeds, so a failed edit never desyncs
@@ -593,7 +611,9 @@ async def _deliver_idle_card(
   # per fire.
   monitors.register(
     task_id, msg_id, _IDLE_CARD_TITLE, "", [text], updates=1)
-  log.info("Idle notification sent chat=%s msg=%s", chat_id, msg_id)
+  log.info(
+    "Background response card sent chat=%s msg=%s task=%s",
+    chat_id, msg_id, task_id[:12] or "-")
 
 
 def _idle_notifier_for(

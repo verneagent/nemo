@@ -970,6 +970,65 @@ class TestIdleDrain:
     assert "DONE_MARKER" in ev.text
     assert ev.cost == 0.02
 
+  def _notification_user_message(self, task_id, event, summary="Monitor event"):
+    """The CLI's own form of a Monitor fire: an injected user message."""
+    from claude_agent_sdk import TextBlock, UserMessage
+    return UserMessage(content=[TextBlock(text=(
+      "<task-notification>\n"
+      f"<task-id>{task_id}</task-id>\n"
+      f"<summary>{summary}</summary>\n"
+      f"<event>{event}</event>\n"
+      "</task-notification>"
+    ))])
+
+  def test_monitor_fire_carries_its_task_id_on_the_emitted_event(self):
+    """A Monitor fire never arrives as TaskNotificationMessage.
+
+    The CLI injects the event into the model's context as a USER message and
+    lets the model answer it; the spontaneous turn is what we surface. Without
+    reading the ``<task-id>`` out of that message every fire looked like an
+    unrelated background turn, so a watch posted a new card per report instead
+    of appending to its own (2026-10-29).
+    """
+    thread = SDKThread()
+    thread._client = _HangingClient([
+      self._notification_user_message("bmon1", "REPORT_1"),
+      self._assistant("REPORT_1"),
+      self._result(),
+      self._notification_user_message("bmon1", "REPORT_2"),
+      self._assistant("REPORT_2"),
+      self._result(),
+    ])
+    thread._drain_enabled = True
+    events: list = []
+    thread._on_idle_event = events.append
+
+    self._run_loop_until(thread, events, lambda evs: len(evs) >= 2)
+
+    assert [type(e) for e in events] == [BackgroundTurnDoneEvent] * 2
+    assert [e.task_id for e in events] == ["bmon1", "bmon1"]
+    assert [e.text for e in events] == ["REPORT_1", "REPORT_2"]
+
+  def test_control_notification_task_id_is_needed_to_tag_the_event(self):
+    """The extraction is what tags the event: strip the tag, ids go empty."""
+    from claude_agent_sdk import TextBlock, UserMessage
+    thread = SDKThread()
+    thread._client = _HangingClient([
+      UserMessage(content=[TextBlock(text=(
+        "<task-notification>\n<summary>Monitor event</summary>\n"
+        "<event>REPORT_1</event>\n</task-notification>"))]),
+      self._assistant("REPORT_1"),
+      self._result(),
+    ])
+    thread._drain_enabled = True
+    events: list = []
+    thread._on_idle_event = events.append
+
+    self._run_loop_until(thread, events, lambda evs: bool(evs))
+
+    assert isinstance(events[0], BackgroundTurnDoneEvent)
+    assert events[0].task_id == ""
+
   def test_task_notification_does_not_double_surface_across_turns(self):
     """A TaskNotification always resets any in-flight spontaneous text, so a
     subsequent spontaneous turn's text gets its own event, not a merged blob."""

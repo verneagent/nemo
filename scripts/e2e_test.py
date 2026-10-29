@@ -3159,6 +3159,122 @@ def run_steer_lag_test(pid: int, chat_id: str, result: "E2EResult") -> None:
   print()
 
 
+def run_monitor_card_tests(pid: int, chat_id: str,
+                           result: "E2EResult") -> None:
+  """Phase MM — one Monitor owns ONE card; reports append, never replace.
+
+  A watch that fires every few minutes used to post a fresh 🔔 card each
+  time, so a long run buried the conversation. The 👀 marker posted at arm
+  time is now the watch's card: each report the idle drainer delivers is
+  APPENDED to it (same message id, earlier bodies kept) and the footer counts
+  them. This phase arms a Monitor that reports several times and proves the
+  chat still holds exactly ONE card for it.
+
+  MM01 the 👀 marker appears at arm time (it IS the card).
+  MM02 the daemon appends at least two reports to that SAME message id.
+  MM03 the card in Lark still carries ≥2 reports and a "已汇报 N 次" footer.
+  MM04 no second 👀 card was created — the failure this feature prevents.
+  MM05 the earlier report is still there (accumulation, not overwrite).
+  """
+  print(f"{Colors.BOLD}Phase MM: one card per Monitor{Colors.RESET}")
+  log = LogAnalyzer(pid)
+  marker = f"MM_E2E_{int(time.time())}"
+  wait_for_idle(pid, chat_id, timeout=30)
+  mark = log.mark()
+  ts = str(int(time.time() * 1000))
+
+  title = f"MM 进度轮询 {marker}"
+  print("  [MM01] Arming a Monitor that reports several times...")
+  send_msg(
+    "用 Monitor 工具挂一个后台监控，参数如下：\n"
+    f"- description: `{title}`（原样，不要改动）\n"
+    f"- command: `for i in 1 2 3 4 5; do echo {marker}_REPORT_$i; sleep 12; done`\n"
+    "- persistent: true\n"
+    "挂上之后立刻结束本轮，不要自己 sleep 等待、不要轮询、不要做别的事。"
+    "只回一句「已挂上」。",
+    chat_id)
+
+  marker_card = None
+  started = time.time()
+  while time.time() - started < 180:
+    for card in get_bot_msgs(chat_id, after=ts, limit=15):
+      if interactive_card_title(card) == f"👀 {title}":
+        marker_card = card
+        break
+    if marker_card:
+      break
+    time.sleep(3)
+  if not marker_card:
+    result.fail("MM01 monitor marker card", "no 👀 card after arming")
+    log.dump_tail(30, "MM01")
+    return
+  msg_id = marker_card["message_id"]
+  result.ok("MM01 monitor marker card", f"msg={msg_id}")
+
+  # MM02 — the daemon must append to THAT message id, at least twice.
+  appended: list[str] = []
+  rolls = 0
+  started = time.time()
+  while time.time() - started < 240:
+    chunk = log.read_since(mark)
+    appended = [
+      line for line in chunk.splitlines()
+      if "Monitor card appended" in line and msg_id in line
+    ]
+    rolls = chunk.count("Monitor card rolled over")
+    if len(appended) >= 2:
+      break
+    time.sleep(3)
+  if len(appended) >= 2:
+    result.ok("MM02 reports append to the same card",
+              f"{len(appended)} appends to {msg_id}")
+  else:
+    result.fail(
+      "MM02 reports append to the same card",
+      f"only {len(appended)} append(s) to {msg_id} "
+      f"(rollovers={rolls}) — check the idle drainer path")
+    log.dump_tail(40, "MM02")
+    return
+
+  # MM03 — the CARD's own content. Lark cannot be asked: get_message drops
+  # interactive card bodies (it returns a title + placeholder image), so the
+  # daemon's append log is the only machine-readable witness of what the card
+  # holds. Assert on the report count it prints.
+  counts = [
+    int(match.group(1))
+    for match in (re.search(r"\((\d+) reports", line) for line in appended)
+    if match
+  ]
+  if counts and counts[-1] >= 2:
+    result.ok("MM03 card holds several reports",
+              f"{counts[-1]} reports in {msg_id}")
+  else:
+    result.fail("MM03 card holds several reports",
+                f"append lines carried no report count: {appended!r}")
+
+  marker_cards = [
+    card for card in get_bot_msgs(chat_id, after=ts, limit=20)
+    if interactive_card_title(card) == f"👀 {title}"
+  ]
+  if len(marker_cards) == 1:
+    result.ok("MM04 exactly one card for the watch", "1 👀 card")
+  else:
+    result.fail("MM04 exactly one card for the watch",
+                f"{len(marker_cards)} 👀 cards — reports split across cards")
+
+  # MM05 — accumulation, not overwrite: the report count only ever grows and
+  # the card was never rebuilt from scratch (no "part 2" unless it rolled
+  # over, and MM02 already pinned every append to the SAME message id). The
+  # per-section content itself is asserted by the unit tests, since Lark will
+  # not hand the body back.
+  if counts == sorted(counts) and len(set(counts)) == len(counts):
+    result.ok("MM05 earlier reports are kept",
+              f"monotonic report counts {counts}")
+  else:
+    result.fail("MM05 earlier reports are kept",
+                f"report counts went backwards: {counts}")
+
+
 def run_idle_notification_tests(pid: int, chat_id: str,
                                 result: "E2EResult") -> None:
   """Phase ID — a background task finishing during idle starts a REAL turn.
@@ -3452,6 +3568,8 @@ def main():
   parser.add_argument("--idle", action="store_true",
                       help="Run only the idle background-task notification test "
                            "(Phase ID)")
+  parser.add_argument("--monitor", action="store_true",
+                      help="Run only the one-card-per-Monitor test (Phase MM)")
   parser.add_argument("--verbose", "-v", action="store_true",
                       help="Verbose nemo logging")
   args = parser.parse_args()
@@ -3468,11 +3586,15 @@ def main():
                   or args.askq or args.picker or args.recall_picker
                   or args.dual or args.media or args.topic
                   or args.shell or args.switch or args.rollover or args.fork
-                  or args.workflow or args.steer or args.idle)
+                  or args.workflow or args.steer or args.idle
+                  or args.monitor)
   run_all = not single_phase
   created_temp_chat = False
 
   def _cleanup_temp_chat() -> None:
+    if os.environ.get("NEMO_E2E_KEEP_CHAT"):
+      print(f"  Keeping temp chat for inspection: {chat_id}")
+      return
     if created_temp_chat and chat_id:
       dissolve_temp_group(chat_id)
 
@@ -3557,6 +3679,8 @@ def main():
     print(f"  Mode: mid-turn steer +1-lag guard only")
   elif args.idle:
     print(f"  Mode: idle background-task notification only")
+  elif args.monitor:
+    print(f"  Mode: one card per Monitor only")
   print()
 
   # Dual-instance manages its own processes
@@ -3951,6 +4075,14 @@ def main():
     elif args.steer:
       try:
         run_steer_lag_test(pid, chat_id, result)
+      finally:
+        send_msg("/exit", chat_id)
+        if not wait_for_exit(pid, timeout=35):
+          kill_nemo(pid)
+
+    elif args.monitor:
+      try:
+        run_monitor_card_tests(pid, chat_id, result)
       finally:
         send_msg("/exit", chat_id)
         if not wait_for_exit(pid, timeout=35):

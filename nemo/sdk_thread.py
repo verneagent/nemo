@@ -33,6 +33,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import signal as _signal
 import threading
 from collections.abc import Coroutine
@@ -55,6 +56,28 @@ MAX_CONNECT_ATTEMPTS = 5
 _CMD_OPEN = "open"
 _CMD_CLOSE = "close"
 _CMD_STOP = "stop"
+
+
+_TASK_ID_RE = re.compile(r"<task-id>\s*([^<\s]+)\s*</task-id>")
+
+
+def _notification_task_id(text: str) -> str:
+  """Task id carried by an injected ``<task-notification>`` user message."""
+  match = _TASK_ID_RE.search(text)
+  return match.group(1) if match else ""
+
+
+def _user_message_text(message: object) -> str:
+  """Flatten a UserMessage's content (str or text blocks) to plain text."""
+  content = getattr(message, "content", "")
+  if isinstance(content, str):
+    return content
+  parts: list[str] = []
+  for block in content if isinstance(content, list) else []:
+    text = getattr(block, "text", None)
+    if isinstance(text, str):
+      parts.append(text)
+  return "\n".join(parts)
 
 
 class SDKThread:
@@ -548,10 +571,26 @@ class SDKThread:
     internally.
     """
     from claude_agent_sdk import (
-      AssistantMessage, ResultMessage, TaskNotificationMessage,
+      AssistantMessage, ResultMessage, TaskNotificationMessage, UserMessage,
     )
 
+    log.debug(
+      "idle message: %s subtype=%s",
+      type(message).__name__, getattr(message, "subtype", ""))
     ev: TurnEvent | None = None
+    if isinstance(message, UserMessage):
+      # A Monitor firing does NOT arrive as a TaskNotificationMessage: the
+      # CLI injects the event into the model's own context as a user message
+      # (`<task-notification><task-id>b7iwbj9nu</task-id>…`) and lets the
+      # model answer it, which is the spontaneous turn we surface. Without
+      # this the report has no task identity and every fire posts a new card
+      # instead of appending to the Monitor's own (2026-10-29).
+      task_id = _notification_task_id(_user_message_text(message))
+      if task_id:
+        self._idle_task_id = task_id
+        # One event, one answer: don't let a previous partial answer leak in.
+        self._idle_turn_texts.clear()
+      return
     if isinstance(message, TaskNotificationMessage):
       # A background task completed while idle — surface a "task done"
       # notification. Clear any in-flight spontaneous-turn text so this
