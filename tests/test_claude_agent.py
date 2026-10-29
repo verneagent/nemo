@@ -666,6 +666,71 @@ def test_start_does_not_retry_when_no_resume():
   assert attempts["n"] == 1
 
 
+def test_start_arms_the_idle_drainer():
+  """The between-turn drainer is only useful if ``start()`` arms it.
+
+  At daemon boot the host calls ``set_idle_notifier()`` BEFORE ``start()``
+  (there is no SDK thread yet, so that call cannot arm anything by itself).
+  ``start()`` is therefore the only place the drainer gets created — if it
+  forgets, every background completion / Monitor fire is consumed (or, if
+  the drainer also never starts, buffered) and never reaches the user for
+  the daemon's whole life.
+  """
+  from unittest import mock
+
+  agent = _bare_claude_agent()
+  handler = lambda _ev: None  # noqa: E731
+  agent._on_idle_event = handler
+  agent._sdk = mock.MagicMock()
+  agent._sdk.start = lambda: None
+  agent._sdk.create_client = mock.AsyncMock()
+  agent._build_options = lambda *_a, **_k: "OPTIONS"  # type: ignore[assignment]
+
+  asyncio.run(agent.start("/tmp/project", "claude-opus-4-7"))
+
+  agent._sdk.start_idle_drain.assert_called_once_with(handler)
+
+
+def test_reset_restarts_the_idle_drainer():
+  """A reconnect must REPLACE the drain task, not merely re-arm it.
+
+  The old task is parked on a receive future belonging to the client that was
+  just closed. It is not ``done()``, so the lazy arm path leaves it exactly
+  where it is and idle delivery dies silently for the rest of the daemon's
+  life (2026-10-28: a Monitor fired every 15 minutes for hours, every event
+  queued unread, not one card reached Lark). ``reset()`` must therefore pass
+  ``restart=True``; nothing else in the adapter can recover a parked task.
+  """
+  from unittest import mock
+
+  agent = _bare_claude_agent()
+  handler = lambda _ev: None  # noqa: E731
+  agent._on_idle_event = handler
+  agent._sdk = mock.MagicMock()
+  agent._sdk.reconnect = mock.AsyncMock()
+  agent._build_options = lambda *_a, **_k: "OPTIONS"  # type: ignore[assignment]
+
+  asyncio.run(agent.reset("/tmp/project", "claude-opus-4-7", resume="sid"))
+
+  agent._sdk.start_idle_drain.assert_called_once_with(handler, restart=True)
+
+
+def test_set_idle_notifier_stores_and_arms_with_the_handler():
+  """Before ``start()`` the SDK thread does not exist, so set_idle_notifier
+  can only record the handler; ``start()`` reads that attribute. After a
+  start it must arm immediately with the same handler."""
+  from unittest import mock
+
+  agent = _bare_claude_agent()
+  agent._sdk = mock.MagicMock()
+  handler = lambda _ev: None  # noqa: E731
+
+  agent.set_idle_notifier(handler)
+
+  assert agent._on_idle_event is handler
+  agent._sdk.start_idle_drain.assert_called_once_with(handler)
+
+
 def _make_process_error_exc():
   """Helper: ProcessError(exit_code=1) chained under a RuntimeError."""
   class _ProcessError(Exception):

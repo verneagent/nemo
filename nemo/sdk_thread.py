@@ -418,7 +418,11 @@ class SDKThread:
       self._drain_enabled = True
       if restart and self._drain_task is not None:
         # Cancelling is the only way out of a receive future that will
-        # never complete (the client it read from is gone).
+        # never complete (the client it read from is gone). Logged because a
+        # drained-but-silent daemon is indistinguishable from a healthy one:
+        # without this line a forensic read of the log cannot tell whether
+        # the reconnect re-armed the drainer or left the old task parked.
+        log.info("idle drain: replacing the task after reconnect")
         self._drain_task.cancel()
         self._drain_task = None
         if self._drain_pending is not None:

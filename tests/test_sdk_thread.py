@@ -876,6 +876,23 @@ class TestIdleDrain:
 
   These tests drive ``_idle_drain_loop`` directly on a fake client — they do
   NOT need a real CLI subprocess or the anyio transport.
+
+  Invariants pinned here (each one is a regression we have actually shipped):
+
+  - surfaces a TaskNotification as BackgroundTaskDoneEvent;
+  - surfaces a spontaneous turn's text only when its Result arrives, and
+    clears buffered text when a notification interrupts it;
+  - counts a straggler Result it claims (``consume_if_owed``), so the turn
+    boundary does not reconnect for an answer already delivered;
+  - never pre-consumes the NEXT turn's messages (the turn-start barrier);
+  - is started through the real arm path (``create_task``, not
+    ``ensure_future(name=…)``, which silently killed it on py3.14);
+  - **is restartable**: ``restart=True`` replaces a task parked on a closed
+    client's receive future (a parked task is not ``done()``, so the lazy
+    arm path would leave it there forever — 2026-10-28 incident);
+  - **cannot die silently**: an exception anywhere in the loop is logged and
+    the stream reopened; a dead task raises no "Task exception was never
+    retrieved" because SDKThread holds a strong reference.
   """
 
   def _task_notification(self, task_id="task_x", summary="All tests passed"):
@@ -1066,6 +1083,8 @@ class TestIdleDrain:
         time.sleep(0.02)
       assert thread._drain_pending is not None, "drainer never armed"
 
+      wedged_task = thread._drain_task
+
       # "Reconnect": a new client with a pending completion, then re-arm the
       # way ClaudeCodingAgent.reset() does.
       thread._client = _HangingClient([self._task_notification()])
@@ -1079,6 +1098,9 @@ class TestIdleDrain:
         "client's stream was never read")
       assert isinstance(events[0], BackgroundTaskDoneEvent)
       assert events[0].task_id == "task_x"
+      # It really is a NEW task; the wedged one was cancelled, not reused.
+      assert thread._drain_task is not wedged_task
+      assert wedged_task.cancelled()
     finally:
       thread.stop()
 
@@ -1110,11 +1132,15 @@ class TestIdleDrain:
     finally:
       thread.stop()
 
-  def test_unexpected_error_does_not_kill_the_drainer(self):
-    """An exception escaping the receive branches must be logged and retried,
+  def test_unexpected_error_does_not_kill_the_drainer(self, caplog):
+    """An exception escaping the receive branches must be LOGGED and retried,
     not kill the task. We hold a strong ref to the task, so a dead drainer
     raises no 'Task exception was never retrieved' warning — it is simply
-    silent forever, which is the worst possible failure mode."""
+    silent forever, which is the worst possible failure mode. The log line is
+    part of the contract: silence is exactly what made the 2026-10-28
+    incident take hours to find."""
+    import logging
+
     thread = SDKThread()
     good = _HangingClient([self._task_notification()])
     calls = {"n": 0}
@@ -1130,10 +1156,45 @@ class TestIdleDrain:
     events: list = []
     thread._on_idle_event = events.append
 
-    self._run_loop_until(thread, events, lambda evs: bool(evs))
+    with caplog.at_level(logging.ERROR, logger="nemo.sdk_thread"):
+      self._run_loop_until(thread, events, lambda evs: bool(evs))
 
     assert calls["n"] >= 2, "drainer never retried after the error"
     assert events and events[0].task_id == "task_x"
+    assert "idle drain crashed" in caplog.text
+    assert "boom" in caplog.text
+
+  def test_stop_then_start_leaves_a_live_drainer(self):
+    """A daemon that stops (or replaces) the drainer must be able to start a
+    fresh one; a stale task reference must not suppress the new task."""
+    _ensure_real_sdk()
+    thread = SDKThread()
+    thread.start()
+    events: list = []
+    try:
+      thread._client = _HangingClient([])
+      thread.start_idle_drain(events.append)
+      deadline = time.time() + 5
+      while thread._drain_pending is None and time.time() < deadline:
+        time.sleep(0.02)
+      assert thread._drain_pending is not None, "drainer never armed"
+
+      thread.stop_idle_drain()
+      deadline = time.time() + 5
+      while thread._drain_task is not None and time.time() < deadline:
+        time.sleep(0.02)
+      assert thread._drain_task is None
+      assert thread._on_idle_event is None
+
+      thread._client = _HangingClient([self._task_notification()])
+      thread.start_idle_drain(events.append)
+      deadline = time.time() + 5
+      while not events and time.time() < deadline:
+        time.sleep(0.02)
+      assert events, "a fresh drain task was never started after stop()"
+      assert isinstance(events[0], BackgroundTaskDoneEvent)
+    finally:
+      thread.stop()
 
 
 class _HangingClient:

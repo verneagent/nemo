@@ -101,6 +101,14 @@ Lark-connected coding agent daemon. Repo focus:
   relay; never stop to refresh it. Run with `-u` (stdout is block-buffered when
   piped — without it the run looks frozen until exit; don't kill it, SDK phases
   take minutes). See the `scripts/e2e_test.py` header for full details.
+- **The e2e picks its own model.** The daemon's compiled-in default
+  (`claude-opus-5`) is only routable against Anthropic; on a host whose
+  `ANTHROPIC_BASE_URL` points at a gateway (this machine: opencode zen/go) every
+  SDK turn dies with `400 Model is unavailable` before any nemo code runs.
+  `scripts/e2e_test.py` therefore defaults to `oc-deepseek-v4.1-flash` for
+  claude/codex/opencode (skipped for claude-cli, whose preset allowlist does not
+  include it). Override per run with `--model`, or globally with
+  `NEMO_E2E_MODEL`. Do not "fix" a failing case by dropping `--model`.
 - Interactive card features (forms / dropdowns / buttons) must be tested at all three layers, not just the daemon. A daemon test that hand-builds `action_value={"action": …}` stubs away the wire format and will miss bugs in how Lark/the relay actually deliver the action (this is exactly how a `/model` picker form submit shipped broken — the relay dropped it because `value.chat_id` was empty). Cover:
   - `relay/test_relay.py` — POST a realistic webhook (try with AND without `action.value`, since Lark V2 form submits are flaky about preserving it).
   - `tests/test_relay_events.py` — round-trip the relay reply dict through `_relay_msg_to_event`.

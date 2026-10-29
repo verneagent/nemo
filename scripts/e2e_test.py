@@ -64,6 +64,29 @@ PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_CHAT_ID = "oc_8183e1682019ddc0857a29074b3e2858"
 LOG_DIR = os.path.join(HOME, ".nemo/logs")
 BOT_ID = "cli_a9583021bef89ed4"
+
+# Models the harness runs on when --model is not given.
+#
+# The daemon has its own compiled-in default (claude-opus-5 for claude), and on
+# a host whose ANTHROPIC_BASE_URL points at a non-Anthropic gateway (this
+# machine: opencode zen/go) that default is simply unavailable — the run dies
+# with `400 Model is unavailable` on the very first turn and every SDK case
+# reports a failure that says nothing about nemo. The harness therefore picks a
+# preset that is known to be routable for every agent kind it drives.
+#
+# Hardcoded rather than documented-only on purpose: a bare `--idle` run must
+# not silently test nothing. Override per run with `--model`, or globally with
+# NEMO_E2E_MODEL.
+DEFAULT_SDK_MODEL = os.environ.get("NEMO_E2E_MODEL",
+                                   "oc-deepseek-v4.1-flash")
+# claude-cli accepts the same slugs as claude but the preset allowlists above
+# do not include it, so leave it on the daemon default rather than fail the
+# compatibility check.
+DEFAULT_MODEL_BY_AGENT = {
+  "claude": DEFAULT_SDK_MODEL,
+  "codex": DEFAULT_SDK_MODEL,
+  "opencode": DEFAULT_SDK_MODEL,
+}
 # Operator open_id — used when injecting messages via relay
 OPERATOR_OPEN_ID = "ou_1f03ce275afdf3486d658740a39d0d8a"
 
@@ -3140,6 +3163,19 @@ def run_idle_notification_tests(pid: int, chat_id: str,
           follow-up and reported it. This is the user-visible half: the old
           behaviour produced no card here at all.
     ID04  the first notification is never the budget-exhaustion fallback.
+    ID05  idle delivery SURVIVES a reconnect. Every reconnect (/clear,
+          /effort, /model, stale-leak recovery) closes the SDK client, and a
+          drain task parked on a receive future of that closed client is
+          ``not done()`` — so the lazy arm path never replaced it and idle
+          delivery died for the rest of the daemon's life (2026-10-28: a
+          group's Monitor fired every 15 minutes for hours and not one card
+          reached Lark). ``reset()`` must cancel + replace it — asserted both
+          by the deterministic re-arm log line and by arming a new task after
+          a real ``/clear`` reconnect and requiring its follow-up turn.
+    ID06  the drain loop never crashed during the phase — an escaping
+          exception used to kill the task silently (we hold a strong
+          reference, so asyncio never prints "Task exception was never
+          retrieved").
   """
   print(f"{Colors.BOLD}Phase ID: Idle background-task notification{Colors.RESET}")
   log = LogAnalyzer(pid)
@@ -3231,6 +3267,94 @@ def run_idle_notification_tests(pid: int, chat_id: str,
                 "budget spent on the FIRST notification")
   else:
     result.ok("ID04 first notification not budget-capped", "within budget")
+
+  # ---- ID05: idle delivery survives a reconnect ---------------------------
+  # `/clear` is the cheapest externally-triggerable reconnect: the daemon
+  # awaits `coding_agent.reset(...)` BEFORE it reads the next event, so once
+  # the follow-up message is picked up the reset (and its drainer re-arm) has
+  # completed. Two assertions, because the failure is silent:
+  #   (a) the deterministic half — `reset()` must log that it REPLACED the
+  #       drain task. The lazy arm path only creates a task when the old one
+  #       is `done()`; a task parked on a receive future of the closed client
+  #       is not, so it is never replaced and the daemon keeps looking healthy
+  #       while nothing is drained. (The wedge itself is reproduced
+  #       deterministically by tests/test_sdk_thread.py
+  #       `test_control_wedged_drainer_stays_wedged_without_restart`; in a
+  #       real subprocess the parked future sometimes does resolve, which is
+  #       why this log check exists on top of the behavioural one.)
+  #   (b) the behavioural half — a NEW background task armed after the
+  #       reconnect must still come back as a real turn.
+  phase_mark = log.mark()
+  print("  [ID05] Forcing a reconnect via /clear, then arming a new task...")
+  send_msg("/clear", chat_id)
+  clear_seen = False
+  started = time.time()
+  while time.time() - started < 60:
+    if any("Session Cleared" in interactive_card_title(card)
+           for card in get_bot_msgs(chat_id, after=ts, limit=10)):
+      clear_seen = True
+      break
+    time.sleep(2)
+  if not clear_seen:
+    result.fail("ID05 idle delivery survives reconnect",
+                "no Session Cleared card")
+    log.dump_tail(25, "ID05")
+    print()
+    return
+  rearmed = log.wait_for_since(
+    r"idle drain: replacing the task after reconnect",
+    phase_mark, timeout=30, poll=1)
+  if rearmed:
+    result.ok("ID05 reconnect replaces the drain task", "reset() re-armed it")
+  else:
+    result.fail(
+      "ID05 reconnect replaces the drain task",
+      "reset() did not replace the drain task — the old one is still parked "
+      "on the closed client's stream (idle delivery is dead from here on)")
+    log.dump_tail(25, "ID05")
+  wait_for_idle(pid, chat_id, timeout=60)
+  clear_mark = log.mark()
+  ts2 = str(int(time.time() * 1000))
+  send_msg(
+    "Start ONE background task using the Monitor tool, with the command "
+    f"`sleep 15; echo {marker}_RESTART` and a short description. "
+    "Then END YOUR TURN IMMEDIATELY. Do not wait for it, do not poll it. "
+    "Reply with one short sentence confirming you started it.",
+    chat_id)
+  requeued = log.wait_for_since(
+    r"Idle notification queued as turn", clear_mark, timeout=150, poll=2)
+  if not requeued:
+    result.fail(
+      "ID05 idle delivery survives reconnect",
+      "no 'queued as turn' after /clear — the drain task did not survive "
+      "reset() (parked on the closed client's stream)")
+    log.dump_tail(30, "ID05")
+    print()
+    return
+  # And the model must act on it: the start turn's card is #1, the follow-up
+  # #2. Counting Done cards is structural — both turns can land in the same
+  # second, so a timestamp cannot tell them apart.
+  follow2 = None
+  started = time.time()
+  while time.time() - started < 180:
+    if len(done_cards(chat_id, after=ts2)) >= 2:
+      follow2 = done_cards(chat_id, after=ts2)[0]
+      break
+    time.sleep(3)
+  if follow2:
+    result.ok("ID05 idle delivery survives reconnect",
+              "/clear → task → follow-up turn")
+  else:
+    result.fail("ID05 idle delivery survives reconnect",
+                "notification queued but no follow-up Done card")
+    log.dump_tail(30, "ID05")
+
+  # ---- ID06: the drain loop never dies silently ---------------------------
+  if "idle drain crashed" in log.read_since(phase_mark):
+    result.fail("ID06 idle drain never crashes",
+                "daemon logged 'idle drain crashed' during the phase")
+  else:
+    result.ok("ID06 idle drain never crashes", "loop stayed alive")
   print()
 
 
@@ -3243,7 +3367,9 @@ def main():
                       choices=["claude", "codex", "opencode", "claude-cli"],
                       help="Coding agent agent (default: claude)")
   parser.add_argument("--model", default="",
-                      help="Model to use (agent default if omitted)")
+                      help="Model to use (default: $NEMO_E2E_MODEL or "
+                           "oc-deepseek-v4.1-flash — the daemon's built-in "
+                           "default is not routable on every host)")
   parser.add_argument("--skip-sdk", action="store_true",
                       help="Skip all SDK turn tests (commands only)")
   parser.add_argument("--stress", action="store_true",
@@ -3283,6 +3409,12 @@ def main():
   parser.add_argument("--verbose", "-v", action="store_true",
                       help="Verbose nemo logging")
   args = parser.parse_args()
+
+  # Fall back to a model that actually routes on this host — see
+  # DEFAULT_MODEL_BY_AGENT. An explicit --model always wins, and an unknown
+  # agent kind keeps "" so the daemon's own default applies.
+  if not args.model:
+    args.model = DEFAULT_MODEL_BY_AGENT.get(args.agent, "")
 
   chat_id = args.chat_id.strip()
   result = E2EResult()
@@ -3500,7 +3632,7 @@ def main():
       if not args.skip_sdk:
         run_idle_notification_tests(pid, chat_id, result)
       else:
-        for n in ["ID01", "ID02", "ID03", "ID04"]:
+        for n in ["ID01", "ID02", "ID03", "ID04", "ID05", "ID06"]:
           result.skip(f"{n} idle notification", "skipped by --skip-sdk")
 
       # ---- Phase 3: Signals ----
