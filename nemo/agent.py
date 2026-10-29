@@ -649,6 +649,30 @@ def _idle_budget_card(
   return cards.build_markdown_card("\n".join(lines), title=title, color=color)
 
 
+_IDLE_ERROR_TITLE = "❌ 后台报告无法归属"
+
+
+async def _send_idle_error_card(
+  channel: LarkChannel, chat_id: str, headline: str, detail: str,
+) -> None:
+  """Surface an undeliverable idle report as a RED card.
+
+  A ``log.error`` alone is invisible to the chat, and the chat is where
+  someone actually sees the problem. This card reports a FAULT — it is not a
+  home for the report and it never registers as a Monitor: the report itself
+  is still dropped.
+  """
+  card = cards.build_card(
+    _IDLE_ERROR_TITLE, body=f"**{headline}**\n\n{detail}", color="red")
+  try:
+    msg_id = await channel.send_card(chat_id, card)
+  except Exception as exc:
+    log.error("Idle error card send FAILED too: %s", exc)
+    return
+  _register_msg(msg_id, chat_id)
+  log.info("Idle error card sent chat=%s msg=%s", chat_id, msg_id)
+
+
 async def _deliver_idle_card(
   channel: LarkChannel, chat_id: str, monitors: MonitorCards,
   task_id: str, text: str,
@@ -660,8 +684,8 @@ async def _deliver_idle_card(
   that over with a "🔔 后台自动响应" card is what let the disagreement go
   unnoticed all afternoon — the card looked like a feature while the watch it
   came from was mis-attributed to a dead task (2026-10-29, oc_956058b1…).
-  Such a report is an ERROR, logged loudly and dropped; it is never invented
-  into a card of its own.
+  Such a report is dropped and surfaced as a RED error card, because a fault
+  has to be visible in the chat, not only in the log.
   """
   if not task_id:
     # No task identity on the event: attribute it to the only live watch, if
@@ -677,11 +701,18 @@ async def _deliver_idle_card(
         "Idle report for an already ended task, no card to append chat=%s "
         "task=%s", chat_id, task_id[:12])
     else:
+      label = task_id[:12] or "未归属"
       log.error(
         "Idle report has no Monitor card to land on — dropped. chat=%s "
         "task=%s. The SDK reported a task the card registry does not know; "
         "either attribution failed (several watches live) or a card was "
-        "never registered.", chat_id, task_id[:12] or "<unattributed>")
+        "never registered.", chat_id, label)
+      await _send_idle_error_card(
+        channel, chat_id,
+        f"任务 `{label}` 的报告找不到对应的监控卡片，已丢弃。",
+        "这通常意味着监控卡片的归属判断失效（同时挂了多个监控）、"
+        "或卡片从未注册。\n\n报告内容：\n\n"
+        f"{_truncate_for_preview(text, 600)}")
     return
 
   # Mutate only after the PATCH succeeds, so a failed edit never desyncs
@@ -695,6 +726,11 @@ async def _deliver_idle_card(
       log.error(
         "Monitor card append FAILED, report dropped (msg=%s task=%s): %s",
         entry.message_id, task_id[:12], exc)
+      await _send_idle_error_card(
+        channel, chat_id,
+        f"监控 `{task_id[:12]}` 的报告写入卡片失败，已丢弃。",
+        f"卡片 `{entry.message_id}` 更新失败：{exc}\n\n报告内容：\n\n"
+        f"{_truncate_for_preview(text, 600)}")
       return
     entry.adopt(staged)
     log.info(
@@ -710,12 +746,20 @@ async def _deliver_idle_card(
   except Exception as exc:
     log.error("Monitor card rollover edit FAILED (msg=%s): %s",
               entry.message_id, exc)
+    await _send_idle_error_card(
+      channel, chat_id,
+      f"监控 `{task_id[:12]}` 的卡片封存失败。",
+      f"卡片 `{entry.message_id}` 更新失败：{exc}")
   staged = entry.continued(text)
   try:
     msg_id = await channel.send_card(chat_id, _monitor_card(staged))
   except Exception as exc:
     log.error("Monitor card rollover send FAILED (task=%s): %s",
               task_id[:12], exc)
+    await _send_idle_error_card(
+      channel, chat_id,
+      f"监控 `{task_id[:12]}` 的续卡发送失败，报告已丢弃。",
+      f"{exc}\n\n报告内容：\n\n{_truncate_for_preview(text, 600)}")
     return
   _register_msg(msg_id, chat_id)
   staged.message_id = msg_id

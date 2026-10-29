@@ -4737,21 +4737,32 @@ def test_idle_spontaneous_turn_lands_on_its_monitors_card():
   assert budget.consecutive == 0
 
 
-def test_an_unattributable_report_is_an_error_not_a_card(caplog):
+def test_an_unattributable_report_posts_a_red_error_card(caplog):
   # There is no generic "🔔 后台自动响应" fallback any more: a report that
   # cannot find its watch's card is a real disagreement between the SDK and
-  # the card registry, and covering it with a card is what hid the bug.
+  # the card registry, and covering it with a card is what hid the bug. The
+  # report is still dropped, but the FAULT is shown in the chat — a log line
+  # alone is invisible to the person reading the conversation.
   from nemo.agent import log as agent_log
   caplog.set_level("ERROR", logger=agent_log.name)
   channel, _budget = _run_idle_notifier([
     BackgroundTurnDoneEvent(text="nobody owns me", task_id="bunknown"),
   ])
 
-  assert channel.sent_cards == []
+  # The report did NOT land on any Monitor card…
   assert channel.updated_cards == []
   assert any(
     rec.levelname == "ERROR" and "no Monitor card to land on" in rec.getMessage()
     for rec in caplog.records)
+
+  # …and what the chat gets is a RED error card, not a bell.
+  (chat_id, card), = channel.sent_cards
+  assert chat_id == "oc_test"
+  assert _idle_title(card) == "❌ 后台报告无法归属"
+  assert card["header"]["template"] == "red"
+  body = " ".join(_card_blocks(card))
+  assert "bunknown" in body
+  assert "nobody owns me" in body
 
 
 def _card_blocks(card):
@@ -4831,8 +4842,12 @@ def test_a_fire_without_a_task_id_lands_on_the_only_live_watch():
   assert _card_blocks(card)[-2:] == ["REPORT_1", "REPORT_2"]
 
 
-def test_control_without_the_registry_no_report_reaches_a_card():
-  """The registry is what routes a report: disable it and nothing is posted."""
+def test_control_without_the_registry_no_report_reaches_its_card():
+  """The registry is what routes a report: disable it and the watch is silent.
+
+  The reports do not disappear quietly either — each is a fault the chat is
+  told about on a red card.
+  """
   monitors = MonitorCards()
   _armed_monitor(monitors, "bmon1")
   with mock.patch.object(MonitorCards, "get", return_value=None):
@@ -4841,8 +4856,10 @@ def test_control_without_the_registry_no_report_reaches_a_card():
       BackgroundTurnDoneEvent(text="second", task_id="bmon1"),
     ], monitors=monitors)
 
-  assert channel.sent_cards == []
   assert channel.updated_cards == []
+  assert [_idle_title(card) for _chat, card in channel.sent_cards] == [
+    "❌ 后台报告无法归属", "❌ 后台报告无法归属",
+  ]
 
 
 def test_background_cards_from_different_tasks_do_not_merge():
