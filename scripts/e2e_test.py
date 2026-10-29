@@ -3175,6 +3175,8 @@ def run_monitor_card_tests(pid: int, chat_id: str,
   MM03 the card in Lark still carries ≥2 reports and a "已汇报 N 次" footer.
   MM04 no second 👀 card was created — the failure this feature prevents.
   MM05 the earlier report is still there (accumulation, not overwrite).
+  MM06 when the watch's command exits, its card is marked ended — a dead
+       card must not look live next to a re-armed watch with the same name.
   """
   print(f"{Colors.BOLD}Phase MM: one card per Monitor{Colors.RESET}")
   log = LogAnalyzer(pid)
@@ -3273,6 +3275,30 @@ def run_monitor_card_tests(pid: int, chat_id: str,
   else:
     result.fail("MM05 earlier reports are kept",
                 f"report counts went backwards: {counts}")
+
+  # MM06 — when the watch's command finally exits, its card must SAY it is
+  # over. A card that just stops changing reads as still-live, and a model
+  # that stops a broken watch and re-arms it under the same description then
+  # leaves two identical 👀 cards with no way to tell which one is running
+  # (2026-10-29, oc_956058b1…). Asserts the daemon's close line for THIS card:
+  # Lark will not hand the patched body back.
+  started = time.time()
+  closed = ""
+  while time.time() - started < 180:
+    for line in log.read_since(mark).splitlines():
+      if "Monitor card closed" in line and msg_id in line:
+        closed = line
+    if closed:
+      break
+    time.sleep(3)
+  if "status=completed" in closed:
+    result.ok("MM06 a finished watch's card is marked ended", closed.strip())
+  else:
+    result.fail(
+      "MM06 a finished watch's card is marked ended",
+      f"no 'Monitor card closed … status=completed' line for {msg_id} "
+      f"(last: {closed.strip() or 'none'})")
+    log.dump_tail(40, "MM06")
 
 
 def run_idle_notification_tests(pid: int, chat_id: str,

@@ -31,6 +31,7 @@ from nemo.agent import (
   _should_send_plain_text,
   _update_done_card_with_fallback,
   IdleTurnBudget,
+  MonitorCard,
   MonitorCards,
   MAX_IDLE_AUTO_TURNS,
   main_loop,
@@ -39,7 +40,7 @@ from nemo.channel import IncomingMessage
 from nemo.turn import (
   AnswerEvent, BackgroundTaskDoneEvent, BackgroundTurnDoneEvent,
   CompactNoticeEvent, CompactStartedEvent, DoneEvent,
-  ProgressEvent, RateLimitNoticeEvent, TaskStartedEvent,
+  ProgressEvent, RateLimitNoticeEvent, TaskDoneEvent, TaskStartedEvent,
 )
 
 
@@ -4586,16 +4587,17 @@ class _IdleCaptureChannel(_FakeChannel):
     return message_id
 
 
-def _run_idle_notifier(events, then=None):
+def _run_idle_notifier(events, then=None, monitors=None, cleared=None):
   """Drive ``_idle_notifier_for`` over ``events`` on a real loop."""
   async def _main():
     channel = _IdleCaptureChannel("oc_test")
     budget = IdleTurnBudget()
-    monitors = MonitorCards()
+    registry = monitors if monitors is not None else MonitorCards()
+    cleared_tasks: list[str] = []
     pending: set[asyncio.Task[None]] = set()
     notify = _idle_notifier_for(
       channel, "oc_test", budget, pending, asyncio.get_running_loop(),
-      monitors)
+      registry, cleared_tasks.append)
     for event in [*events, *(then or [])]:
       notify(event)
       # Let the call_soon_threadsafe'd handler run on this loop.
@@ -4603,6 +4605,8 @@ def _run_idle_notifier(events, then=None):
         await asyncio.sleep(0)
     if pending:
       await asyncio.gather(*list(pending))
+    if cleared is not None:
+      cleared.extend(cleared_tasks)
     return channel, budget
 
   return asyncio.run(_main())
@@ -4774,15 +4778,53 @@ def test_a_finished_monitor_stops_owning_its_card():
   # A task completion ends the watch; a later event reusing the id (the id is
   # reusable once the CLI has reaped the task) must not append to the dead
   # card. Covered through the idle handler, which forgets it.
+  cleared: list[str] = []
   channel, _budget = _run_idle_notifier([
     BackgroundTurnDoneEvent(text="first", task_id="bmon1"),
     BackgroundTaskDoneEvent(task_id="bmon1", status="completed"),
     BackgroundTurnDoneEvent(text="after", task_id="bmon1"),
-  ])
+  ], cleared=cleared)
+  # The persisted record is cleared too, so a restart does not announce a
+  # watch that already ended. This used to raise NameError (``db`` is a
+  # main_loop local, the notifier is module-level) and silently skip it.
+  assert cleared == ["bmon1"]
 
-  # "after" starts its own card instead of appending to the finished one.
+  # The dead card is closed out (a stopped watch must not look live)…
+  (closed_id, closed), = channel.updated_cards
+  assert closed_id == "om_idle1"
+  assert "✅ 已结束" in _card_footer(closed)
+  assert closed["header"]["template"] == "grey"
+  # …and "after" starts its own card instead of appending to the dead one.
   assert len(channel.sent_cards) == 2
+
+
+def test_control_a_dead_watch_card_keeps_looking_live():
+  """Permanent control for the idle-path close.
+
+  With ``_close_monitor_card`` reduced to the pre-fix behaviour (forget the
+  entry, never PATCH), a watch that ends BETWEEN turns is retired silently —
+  its card still says "已挂上，有结果会自动汇报" and reads exactly like the
+  live watch the model re-armed right after it (2026-10-29, oc_956058b1…:
+  e2e MM06 caught precisely this).
+  """
+  async def _forget_only(channel, monitors, task_id, status):
+    del channel, status
+    monitors.forget(task_id)
+
+  # An armed watch (its 👀 card registered in an earlier turn) ends between
+  # turns — the exact path e2e MM06 exercises.
+  monitors = MonitorCards()
+  monitors.register(
+    "bmon1", "om_marker", "👀 v7 collect LoRA 训练进度",
+    "每 5 分钟检查一次", ["task bmon1"])
+  with mock.patch("nemo.agent._close_monitor_card", _forget_only):
+    channel, _budget = _run_idle_notifier(
+      [BackgroundTaskDoneEvent(task_id="bmon1", status="completed")],
+      monitors=monitors)
+
+  # The card is never told: it keeps reading as an armed watch.
   assert channel.updated_cards == []
+  assert monitors.get("bmon1") is None
 
 
 def test_a_full_monitor_card_continues_on_a_new_one():
@@ -4930,10 +4972,12 @@ def test_idle_notifications_drive_real_turns_and_reset_on_user_message(
   agent.channel = channel
   real_notifier_for = _idle_notifier_for
 
-  def _spy_notifier_for(channel_, chat_id, budget, pending, loop, monitors):
+  def _spy_notifier_for(
+    channel_, chat_id, budget, pending, loop, monitors, clear_monitor,
+  ):
     captured["budget"] = budget
     return real_notifier_for(
-      channel_, chat_id, budget, pending, loop, monitors)
+      channel_, chat_id, budget, pending, loop, monitors, clear_monitor)
 
   with mock.patch("nemo.agent.load_credentials", return_value={
     "app_id": "app_id", "app_secret": "app_secret",
@@ -5073,6 +5117,207 @@ def test_monitor_reports_append_to_the_marker_card(tmp_path):
   footer = _card_footer(card)
   assert "每 20 秒检查一次" in footer
   assert "已汇报 1 次" in footer
+
+
+def test_a_finished_monitor_marks_its_card_ended(tmp_path):
+  """A dead watch's card must SAY it is dead.
+
+  The model routinely stops a watch whose command turned out to be wrong and
+  re-arms a corrected one with the same description — 2026-10-29 in
+  oc_956058b1…, where the first Monitor's `grep 'Iter N:'` never matched
+  mlx's rich UI, so it was stopped 37s later and re-armed. The chat was left
+  with two identical 👀 cards and nothing to say which was live: a card that
+  simply stops changing looks exactly like one that is still working.
+  """
+  sent_cards: list[object] = []
+
+  class _CapturingChannel(_FakeChannel):
+    def __init__(self, _chat_id):
+      super().__init__(_chat_id)
+      self.updated_cards: list[tuple[str, object]] = []
+
+    async def send_card(self, _chat_id, card):
+      sent_cards.append(card)
+      return f"om_card_{len(sent_cards)}"
+
+    async def update_card(self, card_id, card):
+      self.updated_cards.append((card_id, card))
+      return card_id
+
+  class _ArmingAgent(_FakeAgent):
+    def supports_steering(self):
+      return False
+
+    async def run_turn(self, _prompt, on_event):
+      def _emit():
+        on_event(ProgressEvent(kind="tool", summary="Monitor", first=True))
+        on_event(TaskStartedEvent(
+          task_id="bmon1", description="v7 collect LoRA 训练进度",
+          task_type="local_bash", tool_name="Monitor",
+          command="while true; do echo tick; sleep 300; done",
+          timeout_ms=3600000))
+        # The watch turned out to be broken; the model stops it and arms a
+        # corrected one with the SAME description. The second card is
+        # legitimate — the first must not look live.
+        on_event(TaskDoneEvent(task_id="bmon1", status="stopped"))
+        on_event(TaskStartedEvent(
+          task_id="bmon2", description="v7 collect LoRA 训练进度",
+          task_type="local_bash", tool_name="Monitor",
+          command="while true; do echo tick; sleep 300; done",
+          timeout_ms=3600000))
+        on_event(AnswerEvent("盯着了"))
+        on_event(DoneEvent(cost=0.0, usage={"input_tokens": 1}))
+
+      await asyncio.to_thread(_emit)
+      return 0.0, {"input_tokens": 1}
+
+  registries: list[MonitorCards] = []
+
+  class _CapturingCards(MonitorCards):
+    def __init__(self):
+      super().__init__()
+      registries.append(self)
+
+  channel = _CapturingChannel("oc_test")
+  channel._messages = [
+    IncomingMessage(
+      event_type="im.message.receive_v1", chat_id="oc_test",
+      sender_id="ou_user", message_id="om_1", msg_type="text",
+      text="挂个监控", create_time="1"),
+    IncomingMessage(
+      event_type="im.message.receive_v1", chat_id="oc_test",
+      sender_id="ou_user", message_id="om_exit", msg_type="text",
+      text="/exit", create_time="2"),
+  ]
+
+  async def _recv(timeout=300):
+    del timeout
+    if channel._messages:
+      return channel._messages.pop(0)
+    return None
+  channel.receive = _recv
+
+  with mock.patch("nemo.agent.load_credentials", return_value={
+    "app_id": "app_id", "app_secret": "app_secret", "email": "u@e.com",
+  }), \
+       mock.patch("nemo.agent.Database", _FakeDB), \
+       mock.patch("nemo.agent.LarkChannel", return_value=channel), \
+       mock.patch("nemo.agent.build_coding_agent", return_value=_ArmingAgent()), \
+       mock.patch("nemo.agent.MonitorCards", _CapturingCards), \
+       mock.patch("nemo.agent._send_response", new=mock.AsyncMock()), \
+       mock.patch("nemo.group_config.load_config", return_value={}), \
+       mock.patch("nemo.config.load_relay_config", return_value=("", "")), \
+       mock.patch("signal.signal"):
+    rc = asyncio.run(main_loop("oc_test", str(tmp_path), "claude-opus-4-6"))
+
+  assert rc == 0
+  registry = registries[0]
+  markers = [
+    c for c in sent_cards
+    if c.get("header", {}).get("title", {}).get("content")
+    == "👀 v7 collect LoRA 训练进度"]
+  assert len(markers) == 2, "both arms keep their own 👀 card"
+  # The stopped watch's card was closed and greyed out…
+  first_id = "om_card_%d" % (sent_cards.index(markers[0]) + 1)
+  closed = [c for mid, c in channel.updated_cards if mid == first_id]
+  assert closed, "the stopped watch's card must be patched, not left running"
+  assert "⏹ 已停止" in _card_footer(closed[-1])
+  assert closed[-1]["header"]["template"] == "grey"
+  # …and it is no longer a candidate for attribution or appends.
+  assert registry.get("bmon1") is None
+  # The re-armed watch is untouched and still owns its card.
+  entry = registry.get("bmon2")
+  assert entry is not None
+  assert entry.ended == ""
+
+
+def test_control_a_closed_monitor_card_keeps_looking_live(tmp_path):
+  """The end mark is what distinguishes a dead watch's card from a live one.
+
+  Permanent control for ``test_a_finished_monitor_marks_its_card_ended``:
+  with the closing PATCH disabled (its trigger is the only thing that sets
+  ``ended``), the card is retired silently and still reads as armed — which
+  is exactly the confusion this feature removes.
+  """
+  sent_cards: list[object] = []
+
+  class _CapturingChannel(_FakeChannel):
+    def __init__(self, _chat_id):
+      super().__init__(_chat_id)
+      self.updated_cards: list[tuple[str, object]] = []
+
+    async def send_card(self, _chat_id, card):
+      sent_cards.append(card)
+      return f"om_card_{len(sent_cards)}"
+
+    async def update_card(self, card_id, card):
+      self.updated_cards.append((card_id, card))
+      return card_id
+
+  class _ArmingAgent(_FakeAgent):
+    async def run_turn(self, _prompt, on_event):
+      def _emit():
+        on_event(ProgressEvent(kind="tool", summary="Monitor", first=True))
+        on_event(TaskStartedEvent(
+          task_id="bmon1", description="v7 collect LoRA 训练进度",
+          task_type="local_bash", tool_name="Monitor",
+          command="while true; do echo tick; sleep 300; done",
+          timeout_ms=3600000))
+        on_event(TaskDoneEvent(task_id="bmon1", status="stopped"))
+        on_event(AnswerEvent("盯着了"))
+        on_event(DoneEvent(cost=0.0, usage={"input_tokens": 1}))
+
+      await asyncio.to_thread(_emit)
+      return 0.0, {"input_tokens": 1}
+
+  channel = _CapturingChannel("oc_test")
+  channel._messages = [
+    IncomingMessage(
+      event_type="im.message.receive_v1", chat_id="oc_test",
+      sender_id="ou_user", message_id="om_1", msg_type="text",
+      text="挂个监控", create_time="1"),
+    IncomingMessage(
+      event_type="im.message.receive_v1", chat_id="oc_test",
+      sender_id="ou_user", message_id="om_exit", msg_type="text",
+      text="/exit", create_time="2"),
+  ]
+
+  async def _recv(timeout=300):
+    del timeout
+    if channel._messages:
+      return channel._messages.pop(0)
+    return None
+  channel.receive = _recv
+
+  # The control: a card that never learns it ended (the pre-fix behaviour).
+  def _no_end(self, status):
+    del status
+    return self.clone()
+
+  with mock.patch("nemo.agent.load_credentials", return_value={
+    "app_id": "app_id", "app_secret": "app_secret", "email": "u@e.com",
+  }), \
+       mock.patch("nemo.agent.Database", _FakeDB), \
+       mock.patch("nemo.agent.LarkChannel", return_value=channel), \
+       mock.patch("nemo.agent.build_coding_agent", return_value=_ArmingAgent()), \
+       mock.patch.object(MonitorCard, "finished", _no_end), \
+       mock.patch("nemo.agent._send_response", new=mock.AsyncMock()), \
+       mock.patch("nemo.group_config.load_config", return_value={}), \
+       mock.patch("nemo.config.load_relay_config", return_value=("", "")), \
+       mock.patch("signal.signal"):
+    rc = asyncio.run(main_loop("oc_test", str(tmp_path), "claude-opus-4-6"))
+
+  assert rc == 0
+  marker_index = next(
+    i for i, c in enumerate(sent_cards)
+    if c.get("header", {}).get("title", {}).get("content")
+    == "👀 v7 collect LoRA 训练进度")
+  marker_id = "om_card_%d" % (marker_index + 1)
+  closed = [c for mid, c in channel.updated_cards if mid == marker_id]
+  assert closed, "the card is still patched (it is the start marker)"
+  assert all("已停止" not in _card_footer(c) for c in closed)
+  footer = _card_footer(closed[-1])
+  assert "已挂上，有结果会自动汇报" in footer
 
 
 def test_task_started_posts_one_marker_card_and_skips_subagents(tmp_path):

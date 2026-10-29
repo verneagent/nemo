@@ -367,7 +367,7 @@ class MonitorCard:
   """
   def __init__(
     self, message_id: str, title: str, meta: str, sections: list[str],
-    part: int = 1, updates: int = 0,
+    part: int = 1, updates: int = 0, ended: str = "",
   ) -> None:
     self.message_id = message_id
     self.title = title
@@ -375,11 +375,23 @@ class MonitorCard:
     self.sections = sections  # one markdown block per entry
     self.part = part
     self.updates = updates
+    # Set once the watch is over ("⏹ 已停止" / "✅ 已结束" / "❌ 失败退出").
+    # A dead watch's card otherwise looks exactly like a live one — and a
+    # model that stops a broken watch and re-arms it with the same
+    # description leaves the chat with two indistinguishable 👀 cards
+    # (2026-10-29, oc_956058b1…).
+    self.ended = ended
 
   def clone(self) -> MonitorCard:
     return MonitorCard(
       self.message_id, self.title, self.meta, list(self.sections),
-      self.part, self.updates)
+      self.part, self.updates, self.ended)
+
+  def finished(self, status: str) -> MonitorCard:
+    """This card's watch ended — a final, frozen version carrying the reason."""
+    clone = self.clone()
+    clone.ended = _MONITOR_END_LABELS.get(status, "已结束")
+    return clone
 
   def with_report(self, text: str) -> MonitorCard:
     clone = self.clone()
@@ -410,18 +422,28 @@ class MonitorCard:
     parts = [self.meta]
     if self.updates:
       parts.append(f"已汇报 {self.updates} 次")
-    else:
+    elif not self.ended:
       parts.append("已挂上，有结果会自动汇报")
+    if self.ended:
+      parts.append(self.ended)
     if continued_away:
       parts.append("续卡见下一张")
     return " · ".join(p for p in parts if p)
+
+
+_MONITOR_END_LABELS = {
+  "stopped": "⏹ 已停止",
+  "failed": "❌ 失败退出",
+  "completed": "✅ 已结束",
+}
 
 
 def _monitor_card(
   entry: MonitorCard, continued_away: bool = False,
 ) -> JsonObject:
   return cards.build_sections_card(
-    entry.sections, title=entry.title_text(), color="blue",
+    entry.sections, title=entry.title_text(),
+    color="grey" if entry.ended else "blue",
     note=entry.footer(continued_away))
 
 
@@ -616,6 +638,36 @@ async def _deliver_idle_card(
     chat_id, msg_id, task_id[:12] or "-")
 
 
+async def _close_monitor_card(
+  channel: LarkChannel, monitors: MonitorCards, task_id: str, status: str,
+) -> None:
+  """Freeze the watch's card with its end label and retire it from the registry.
+
+  A Monitor ends in one of two places, and BOTH need this: a watch stopped or
+  finishing inside a turn comes through ``TaskDoneEvent``, while one that ends
+  between turns only surfaces as ``BackgroundTaskDoneEvent`` from the idle
+  drainer — which used to just forget the card, leaving a dead watch looking
+  exactly like a live one (2026-10-29, oc_956058b1…: the model stopped a
+  broken watch and re-armed it under the same description, so the chat held
+  two identical 👀 cards).
+  """
+  entry = monitors.get(task_id)
+  if entry is None:
+    return
+  try:
+    await channel.update_card(
+      entry.message_id, _monitor_card(entry.finished(status)))
+    log.info("Monitor card closed msg=%s task=%s status=%s",
+             entry.message_id, task_id[:12], status or "?")
+  except Exception as exc:
+    # Never fail a turn over a cosmetic card.
+    log.warning("Monitor card close failed (task=%s): %s", task_id, exc)
+  finally:
+    # Retired either way: nothing may append to a dead watch's card, and it
+    # must not be counted as live by sole_live_task_id().
+    monitors.forget(task_id)
+
+
 def _idle_notifier_for(
   channel: LarkChannel,
   chat_id: str,
@@ -623,6 +675,7 @@ def _idle_notifier_for(
   pending: set[asyncio.Task[None]],
   loop: asyncio.AbstractEventLoop,
   monitors: MonitorCards,
+  clear_monitor: Callable[[str], None],
 ) -> Callable[[object], None]:
   """Build the idle-event notifier handed to ``CodingAgent.set_idle_notifier``.
 
@@ -665,14 +718,19 @@ def _idle_notifier_for(
   def _handle_idle_event(event: object) -> None:
     """Runs on the main loop — the only place ``budget`` is touched."""
     if isinstance(event, BackgroundTaskDoneEvent):
-      # A Monitor that finished between turns is no longer live; forget it
-      # so a restart doesn't announce a watch that already ended.
+      # A Monitor that finished between turns is no longer live; clear the
+      # persisted record so a restart doesn't announce a watch that already
+      # ended. (``db`` is a main_loop local and this function is module-level,
+      # so the write comes in as a callable — reading it off a global raised
+      # NameError on every idle completion, silently losing the cleanup.)
       try:
-        db.clear_monitor(event.task_id)
+        clear_monitor(event.task_id)
       except Exception as e:
         log.warning("Failed to clear monitor %s: %s", event.task_id, e)
-      # Its card is final now: a later event can't belong to this watch.
-      monitors.forget(event.task_id)
+      # Its card is final now: close it out (a dead watch's card that merely
+      # stops changing is indistinguishable from a live one) and retire it.
+      _track(asyncio.ensure_future(_close_monitor_card(
+        channel, monitors, event.task_id, event.status)))
       if budget.consecutive >= budget.max_consecutive:
         log.info(
           "Idle notification: auto-turn budget spent (%d), card instead "
@@ -2151,7 +2209,7 @@ async def main_loop(
   coding_agent.set_idle_notifier(
     _idle_notifier_for(
       channel, chat_id, _idle_budget, _idle_send_tasks, main_loop_ref,
-      _monitor_cards))
+      _monitor_cards, db.clear_monitor))
   running = True
   _dissolve_on_exit = False
   # In-flight `/btw` side questions spawned during a running turn. Kept
@@ -2809,7 +2867,7 @@ async def main_loop(
           coding_agent.set_idle_notifier(
             _idle_notifier_for(
               channel, chat_id, _idle_budget, _idle_send_tasks, main_loop_ref,
-              _monitor_cards))
+              _monitor_cards, db.clear_monitor))
           log.info("Agent switch to %s (model=%s, resume=%s)",
                    agent, model,
                    _sdk_session_id[:8] if _sdk_session_id else "none")
@@ -3531,6 +3589,15 @@ async def main_loop(
           log.warning("Background-task marker card failed (task=%s): %s",
                       event.task_id, e)
 
+      def _finish_monitor_card(task_id: str, status: str) -> None:
+        """Close the watch's card from inside a turn (see _close_monitor_card).
+
+        In-turn TaskDone is only one of the two places a watch ends; one that
+        ends between turns surfaces through the idle drainer instead.
+        """
+        _await_channel(
+          _close_monitor_card(channel, _monitor_cards, task_id, status))
+
       def _on_event(event):
         # Thread safety: this runs on the SDK thread. It mutates _turn_card_id,
         # _turn_steps. The main loop only reads these AFTER
@@ -3566,8 +3633,9 @@ async def main_loop(
             db.clear_monitor(event.task_id)
           except Exception as e:
             log.warning("Failed to clear monitor %s: %s", event.task_id, e)
-          # Its card is final; nothing may append to it afterwards.
-          _monitor_cards.forget(event.task_id)
+          # Its card is final; nothing may append to it afterwards — but it
+          # must SAY it is final, or a stopped watch reads as a live one.
+          _finish_monitor_card(event.task_id, event.status)
 
         elif isinstance(event, AnswerEvent):
           _turn_steps.append(cards.ThinkingStep("answer", event.text))
