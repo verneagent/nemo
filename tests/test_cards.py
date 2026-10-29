@@ -8,7 +8,8 @@ from nemo.cards import (
   build_model_picker_card, build_model_switched_card, build_shell_card,
   build_agent_picker_card, build_agent_switched_card,
   build_session_picker_card, build_session_recalled_card,
-  tool_use_summary, _elapsed_title, _elapsed_text, _usage_text,
+  tool_use_summary, monitor_cadence, _elapsed_title, _elapsed_text,
+  _usage_text,
   _collapsible_thinking,
   LARK_CARD_BYTE_LIMIT, TIMELINE_CHAR_BUDGET,
   card_content_bytes, is_card_oversized, timeline_overflows,
@@ -1438,3 +1439,22 @@ def test_session_recalled_card_has_no_form():
   assert "form_action_type" not in blob
   assert "01fe69c7" in blob
   assert "claude-opus-4-7" in blob
+
+
+def test_monitor_cadence_reads_the_poll_interval_from_the_command():
+  """The Monitor tool has no interval field — it is a `sleep` in the command.
+
+  The LAST sleep is the loop's poll wait; an earlier one is a one-off delay
+  before the loop even starts. The timeout is the tool's own cap.
+  """
+  assert monitor_cadence(
+    "until [ -f /tmp/x.exit ]; do sleep 20; done; echo done", 3600000
+  ) == "每 20 秒检查一次 · 最长 1 小时"
+  assert monitor_cadence(
+    "sleep 5; while true; do grep ERR log; sleep 2m; done", 0
+  ) == "每 2 分钟检查一次"
+  assert monitor_cadence("sleep 0.5; echo hi", 0) == "每 500 毫秒检查一次"
+  # Nothing to report: no sleep, no timeout.
+  assert monitor_cadence("tail -f train.log", 0) == ""
+  # Timeout alone is still useful.
+  assert monitor_cadence("", 900000) == "最长 15 分钟"

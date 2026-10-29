@@ -4853,7 +4853,9 @@ def test_task_started_posts_one_marker_card_and_skips_subagents(tmp_path):
         on_event(ProgressEvent(kind="tool", summary="Monitor", first=True))
         on_event(TaskStartedEvent(
           task_id="bmon1", description="light LoRA training progress",
-          task_type="local_bash", tool_name="Monitor"))
+          task_type="local_bash", tool_name="Monitor",
+          command="until [ -f /tmp/x.exit ]; do sleep 20; done",
+          timeout_ms=3600000))
         # Same task announced twice (replayed system message) → one card.
         on_event(TaskStartedEvent(
           task_id="bmon1", description="light LoRA training progress",
@@ -4921,6 +4923,10 @@ def test_task_started_posts_one_marker_card_and_skips_subagents(tmp_path):
   blob = json.dumps(markers[0], ensure_ascii=False)
   assert "light LoRA training progress" in blob
   assert "bmon1" in blob
+  # The card says how often it actually looks ("已挂上" alone left the user
+  # guessing when a result might appear).
+  assert "每 20 秒检查一次" in blob
+  assert "最长 1 小时" in blob
   # Nothing but the Monitor may get a card: not the subagent, not the
   # Bash-spawned task, not an unidentified local_bash task.
   blob = json.dumps(sent_cards, ensure_ascii=False)

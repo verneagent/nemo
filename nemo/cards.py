@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
@@ -114,6 +115,47 @@ def _usage_text(usage: JsonObject) -> str:
   if cw:
     parts.append(f"cw {cw:,}")
   parts.append(f"o {_n('output_tokens'):,}")
+  return " · ".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# Monitor cadence
+# ---------------------------------------------------------------------------
+
+# `sleep 20`, `sleep 0.5`, `sleep 5s`, `sleep 2m` … — the Monitor tool has no
+# interval parameter, the wait lives in the shell command it runs.
+_SLEEP_RE = re.compile(r"\bsleep\s+([0-9]+(?:\.[0-9]+)?)(ms|[smh])?\b")
+_SLEEP_UNIT_SECONDS = {"ms": 0.001, "": 1.0, "s": 1.0, "m": 60.0, "h": 3600.0}
+
+
+def _duration_text(seconds: float) -> str:
+  """Human duration: 5 秒 / 20 秒 / 15 分钟 / 2 小时 (no trailing .0)."""
+  if seconds < 1:
+    return f"{seconds * 1000:.0f} 毫秒"
+  if seconds < 60:
+    return f"{seconds:g} 秒"
+  if seconds < 3600:
+    return f"{seconds / 60:g} 分钟"
+  return f"{seconds / 3600:g} 小时"
+
+
+def monitor_cadence(command: str, timeout_ms: int = 0) -> str:
+  """One-line description of a Monitor's rhythm, '' when nothing is known.
+
+  Uses the LAST `sleep` in the command: inside a poll loop (`while true; do …
+  sleep 20; done`, `until …; do sleep 5; done`) that is the interval, whereas
+  an earlier sleep is usually a one-off wait before the loop starts. The
+  timeout is the tool's own cap on how long the watch may run.
+  """
+  parts: list[str] = []
+  matches = _SLEEP_RE.findall(command or "")
+  if matches:
+    value, unit = matches[-1]
+    seconds = float(value) * _SLEEP_UNIT_SECONDS[unit]
+    if seconds > 0:
+      parts.append(f"每 {_duration_text(seconds)}检查一次")
+  if timeout_ms and timeout_ms > 0:
+    parts.append(f"最长 {_duration_text(timeout_ms / 1000)}")
   return " · ".join(parts)
 
 

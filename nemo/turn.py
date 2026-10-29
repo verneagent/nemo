@@ -92,6 +92,11 @@ class TaskStartedEvent:
   # the CLI reports BOTH as "local_bash", and it emits task_started for any
   # Bash call it promotes to a task, not only for real background work.
   tool_name: str = ""
+  # The Monitor tool's raw command and its timeout. The tool has no interval
+  # field — the polling cadence is whatever the shell command does (usually
+  # ``sleep N`` inside a loop) — so the card derives it from ``command``.
+  command: str = ""
+  timeout_ms: int = 0
 
 
 @dataclass

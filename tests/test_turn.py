@@ -298,7 +298,9 @@ def test_task_started_carries_the_spawning_tool_name():
   """
   messages = [
     FakeAssistantMessage(content=[FakeToolUseBlock(
-      id="tu_mon", name="Monitor", input={"command": "tail -f train.log"})]),
+      id="tu_mon", name="Monitor",
+      input={"command": "until [ -f done ]; do sleep 20; done",
+             "timeout_ms": 900000})]),
     FakeTaskStartedMessage(
       task_id="task_mon", task_type="local_bash",
       description="training progress", tool_use_id="tu_mon"),
@@ -316,6 +318,9 @@ def test_task_started_carries_the_spawning_tool_name():
   assert started[0].task_id == "task_mon"
   assert started[0].task_type == "local_bash"
   assert started[0].tool_name == "Monitor"
+  # The marker card states the cadence, so the raw command + cap ride along.
+  assert started[0].command == "until [ -f done ]; do sleep 20; done"
+  assert started[0].timeout_ms == 900000
 
 
 def test_stale_leak_raises_for_reconnect_resume():

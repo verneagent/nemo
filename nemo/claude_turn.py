@@ -797,6 +797,10 @@ async def _single_turn(
   # cannot distinguish the Monitor tool from a plain Bash command (both are
   # "local_bash"), so the spawning tool has to be recovered from the call.
   tool_names: dict[str, str] = {}
+  # tool_use_id → the Monitor call's input, kept only for Monitor so the
+  # marker card can state the polling cadence and the timeout cap. Holding
+  # every tool's input would keep whole file bodies alive for the turn.
+  monitor_inputs: dict[str, JsonObject] = {}
   progress_started = False
   timed_out = False
   last_emitted: str = ""
@@ -1084,6 +1088,8 @@ async def _single_turn(
         elif isinstance(block, ToolUseBlock):
           tool_summary = tool_use_summary(block.name, block.input)
           tool_names[block.id] = block.name
+          if block.name == "Monitor":
+            monitor_inputs[block.id] = block.input
 
       if thinking_parts:
         thinking_text = "\n".join(thinking_parts)
@@ -1140,11 +1146,16 @@ async def _single_turn(
 
     elif isinstance(message, TaskStartedMessage):
       pending_tasks.add(message.task_id)
+      monitor = monitor_inputs.get(message.tool_use_id or "", {})
+      command = monitor.get("command", "")
+      timeout_ms = monitor.get("timeout_ms", 0)
       on_event(TaskStartedEvent(
         task_id=message.task_id,
         description=message.description or "",
         task_type=message.task_type or "",
         tool_name=tool_names.get(message.tool_use_id or "", ""),
+        command=command if isinstance(command, str) else "",
+        timeout_ms=timeout_ms if isinstance(timeout_ms, int) else 0,
       ))
 
     elif isinstance(message, TaskProgressMessage):

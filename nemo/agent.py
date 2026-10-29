@@ -3303,9 +3303,14 @@ async def main_loop(
           _announced_tasks.add(event.task_id)
         title = "👀 后台监控已挂上"
         body = event.description.strip() or "监控任务已启动"
-        note = "运行中，有结果会自动汇报"
+        # Say how often it actually looks. The Monitor tool has no interval
+        # field, so the cadence comes from the command's own sleep; without
+        # it "已挂上" still left the user guessing when a result might appear.
+        note_parts = [cards.monitor_cadence(event.command, event.timeout_ms)]
         if event.task_id:
-          note = f"task {event.task_id} · {note}"
+          note_parts.append(f"task {event.task_id}")
+        note_parts.append("有结果会自动汇报")
+        note = " · ".join(p for p in note_parts if p)
         try:
           card = cards.build_card(title, body=body, color="blue", note=note)
           msg_id = _await_channel(channel.send_card(chat_id, card))
