@@ -14,6 +14,7 @@ from nemo.agent import (
   _IDLE_PROMPT_PREFIX,
   _RECALL_PROMPT_PREFIX,
   _SESSION_PICKER_LIMIT,
+  _deliver_idle_card,
   _idle_budget_card,
   _idle_notifier_for,
   _session_picker_options,
@@ -30,6 +31,7 @@ from nemo.agent import (
   _should_send_plain_text,
   _update_done_card_with_fallback,
   IdleTurnBudget,
+  MonitorCards,
   MAX_IDLE_AUTO_TURNS,
   main_loop,
 )
@@ -4564,19 +4566,24 @@ def _card_json(card):
 
 
 class _IdleCaptureChannel(_FakeChannel):
-  """Records push_back'd messages and sent cards."""
+  """Records push_back'd messages, sent cards and card edits."""
 
   def __init__(self, _chat_id):
     super().__init__(_chat_id)
     self.pushed: list[IncomingMessage] = []
     self.sent_cards: list[tuple[str, object]] = []
+    self.updated_cards: list[tuple[str, object]] = []
 
   def push_back(self, message):
     self.pushed.append(message)
 
   async def send_card(self, chat_id, card):
     self.sent_cards.append((chat_id, card))
-    return "om_idle"
+    return f"om_idle{len(self.sent_cards)}"
+
+  async def update_card(self, message_id, card):
+    self.updated_cards.append((message_id, card))
+    return message_id
 
 
 def _run_idle_notifier(events):
@@ -4584,9 +4591,11 @@ def _run_idle_notifier(events):
   async def _main():
     channel = _IdleCaptureChannel("oc_test")
     budget = IdleTurnBudget()
+    monitors = MonitorCards()
     pending: set[asyncio.Task[None]] = set()
     notify = _idle_notifier_for(
-      channel, "oc_test", budget, pending, asyncio.get_running_loop())
+      channel, "oc_test", budget, pending, asyncio.get_running_loop(),
+      monitors)
     for event in events:
       notify(event)
       # Let the call_soon_threadsafe'd handler run on this loop.
@@ -4665,6 +4674,124 @@ def test_idle_spontaneous_turn_still_sends_its_own_card():
   assert len(channel.sent_cards) == 1
   assert _idle_title(channel.sent_cards[0][1]) == "🔔 后台自动响应"
   assert budget.consecutive == 0
+
+
+def _card_blocks(card):
+  """Markdown body sections, excluding the grey footer (``text_size``)."""
+  return [
+    e["content"] for e in card["body"]["elements"]
+    if e["tag"] == "markdown" and "text_size" not in e
+  ]
+
+
+def _card_footer(card):
+  for element in card["body"]["elements"]:
+    if element.get("text_size"):
+      return element["content"]
+  return ""
+
+
+def test_consecutive_fires_of_one_monitor_append_to_the_same_card():
+  # A watch that fires every few minutes used to post a fresh 🔔 card each
+  # time, burying the conversation. Fires of the SAME task now accumulate into
+  # one card — and earlier bodies are KEPT, because each answers a different
+  # moment.
+  channel, _budget = _run_idle_notifier([
+    BackgroundTurnDoneEvent(text="first check: all green", task_id="bmon1"),
+    BackgroundTurnDoneEvent(text="second check: one failure", task_id="bmon1"),
+  ])
+
+  assert len(channel.sent_cards) == 1
+  assert len(channel.updated_cards) == 1
+  msg_id, card = channel.updated_cards[0]
+  # The edit targets the card the first fire posted.
+  assert msg_id == "om_idle1"
+  assert _idle_title(card) == "🔔 后台自动响应"
+  assert _card_blocks(card) == [
+    "first check: all green", "second check: one failure",
+  ]
+  # Sections are visually separated so two answers don't run together.
+  assert {"tag": "hr"} in card["body"]["elements"]
+
+
+def test_a_card_in_between_does_not_break_a_monitors_card():
+  # Merging keys off the Monitor's identity, NOT off "is this the previous
+  # message": fires are minutes apart and anything may land in between (here
+  # another watch's card), yet the next report still belongs on its own card.
+  channel, _budget = _run_idle_notifier([
+    BackgroundTurnDoneEvent(text="first", task_id="bmon1"),
+    BackgroundTurnDoneEvent(text="other watch", task_id="bmon2"),
+    BackgroundTurnDoneEvent(text="second", task_id="bmon1"),
+  ])
+
+  assert len(channel.sent_cards) == 2
+  msg_id, card = channel.updated_cards[0]
+  assert msg_id == "om_idle1"
+  assert _card_blocks(card) == ["first", "second"]
+
+
+def test_control_same_monitor_fires_post_separate_cards():
+  """The registry is what makes the test above pass: disable it, they split."""
+  with mock.patch.object(MonitorCards, "get", return_value=None):
+    channel, _budget = _run_idle_notifier([
+      BackgroundTurnDoneEvent(text="first", task_id="bmon1"),
+      BackgroundTurnDoneEvent(text="second", task_id="bmon1"),
+    ])
+
+  assert len(channel.sent_cards) == 2
+  assert channel.updated_cards == []
+
+
+def test_background_cards_from_different_tasks_do_not_merge():
+  channel, _budget = _run_idle_notifier([
+    BackgroundTurnDoneEvent(text="from monitor", task_id="bmon1"),
+    BackgroundTurnDoneEvent(text="from another", task_id="bmon2"),
+  ])
+
+  assert len(channel.sent_cards) == 2
+  assert channel.updated_cards == []
+  assert [_card_blocks(c)[0] for _mid, c in channel.sent_cards] == [
+    "from monitor", "from another",
+  ]
+
+
+def test_a_finished_monitor_stops_owning_its_card():
+  # A task completion ends the watch; a later event reusing the id (the id is
+  # reusable once the CLI has reaped the task) must not append to the dead
+  # card. Covered through the idle handler, which forgets it.
+  channel, _budget = _run_idle_notifier([
+    BackgroundTurnDoneEvent(text="first", task_id="bmon1"),
+    BackgroundTaskDoneEvent(task_id="bmon1", status="completed"),
+    BackgroundTurnDoneEvent(text="after", task_id="bmon1"),
+  ])
+
+  # "after" starts its own card instead of appending to the finished one.
+  assert len(channel.sent_cards) == 2
+  assert channel.updated_cards == []
+
+
+def test_a_full_monitor_card_continues_on_a_new_one():
+  # A full card is never truncated: it is frozen ("续卡见下一张") and the next
+  # report opens part 2, exactly like a rolled-over Working card. Nothing the
+  # user was shown disappears.
+  with mock.patch(
+      "nemo.agent.TURN_CARD_ROLLOVER_BYTE_LIMIT", 200):
+    channel, _budget = _run_idle_notifier([
+      BackgroundTurnDoneEvent(text="a" * 120, task_id="bmon1"),
+      BackgroundTurnDoneEvent(text="b" * 120, task_id="bmon1"),
+    ])
+
+  assert len(channel.sent_cards) == 2
+  (frozen_id, frozen), = channel.updated_cards
+  assert frozen_id == "om_idle1"
+  assert _card_blocks(frozen)[0] == "a" * 120
+  assert "续卡见下一张" in _card_footer(frozen)
+
+  _chat, continuation = channel.sent_cards[1]
+  assert _idle_title(continuation) == "🔔 后台自动响应 · 续 2"
+  assert _card_blocks(continuation) == ["b" * 120]
+  # The report count carries across the rollover.
+  assert "已汇报 2 次" in _card_footer(continuation)
 
 
 class _IdleSpyAgent(_FakeAgent):
@@ -4788,9 +4915,10 @@ def test_idle_notifications_drive_real_turns_and_reset_on_user_message(
   agent.channel = channel
   real_notifier_for = _idle_notifier_for
 
-  def _spy_notifier_for(channel_, chat_id, budget, pending, loop):
+  def _spy_notifier_for(channel_, chat_id, budget, pending, loop, monitors):
     captured["budget"] = budget
-    return real_notifier_for(channel_, chat_id, budget, pending, loop)
+    return real_notifier_for(
+      channel_, chat_id, budget, pending, loop, monitors)
 
   with mock.patch("nemo.agent.load_credentials", return_value={
     "app_id": "app_id", "app_secret": "app_secret",
@@ -4825,6 +4953,111 @@ def test_idle_notifications_drive_real_turns_and_reset_on_user_message(
     c for _, c in channel.sent_cards
     if c.get("header", {}).get("title", {}).get("content") == "✅ 后台任务完成"]
   assert len(fallback) == 1
+
+
+def test_monitor_reports_append_to_the_marker_card(tmp_path):
+  """Arming a Monitor and reporting on it share ONE card.
+
+  The 👀 marker is not a separate notice: it is the watch's card, and every
+  report appends to it, so the chat has one legible card per Monitor.
+  """
+  sent_cards: list[object] = []
+
+  class _CapturingChannel(_FakeChannel):
+    def __init__(self, _chat_id):
+      super().__init__(_chat_id)
+      self.updated_cards: list[tuple[str, object]] = []
+
+    async def send_card(self, _chat_id, card):
+      sent_cards.append(card)
+      return f"om_card_{len(sent_cards)}"
+
+    async def update_card(self, card_id, card):
+      self.updated_cards.append((card_id, card))
+      return card_id
+
+  class _ArmingAgent(_FakeAgent):
+    async def run_turn(self, _prompt, on_event):
+      def _emit():
+        on_event(ProgressEvent(kind="tool", summary="Monitor", first=True))
+        on_event(TaskStartedEvent(
+          task_id="bmon1", description="light LoRA training progress",
+          task_type="local_bash", tool_name="Monitor",
+          command="until [ -f /tmp/x.exit ]; do sleep 20; done",
+          timeout_ms=3600000))
+        on_event(AnswerEvent("盯着了"))
+        on_event(DoneEvent(cost=0.0, usage={"input_tokens": 1}))
+
+      await asyncio.to_thread(_emit)
+      return 0.0, {"input_tokens": 1}
+
+  registries: list[MonitorCards] = []
+
+  class _CapturingCards(MonitorCards):
+    def __init__(self):
+      super().__init__()
+      registries.append(self)
+
+  channel = _CapturingChannel("oc_test")
+  channel._messages = [
+    IncomingMessage(
+      event_type="im.message.receive_v1",
+      chat_id="oc_test", sender_id="ou_user",
+      message_id="om_msg", msg_type="text",
+      text="你给我盯一下", create_time="1",
+    ),
+    IncomingMessage(
+      event_type="im.message.receive_v1",
+      chat_id="oc_test", sender_id="ou_user",
+      message_id="om_exit", msg_type="text",
+      text="/exit", create_time="2",
+    ),
+  ]
+
+  async def _recv(timeout=300):
+    del timeout
+    if channel._messages:
+      return channel._messages.pop(0)
+    return None
+  channel.receive = _recv
+
+  with mock.patch("nemo.agent.load_credentials", return_value={
+    "app_id": "app_id", "app_secret": "app_secret", "email": "u@e.com",
+  }), \
+       mock.patch("nemo.agent.Database", _FakeDB), \
+       mock.patch("nemo.agent.LarkChannel", return_value=channel), \
+       mock.patch("nemo.agent.build_coding_agent", return_value=_ArmingAgent()), \
+       mock.patch("nemo.agent.MonitorCards", _CapturingCards), \
+       mock.patch("nemo.agent._send_response", new=mock.AsyncMock()), \
+       mock.patch("nemo.group_config.load_config", return_value={}), \
+       mock.patch("nemo.config.load_relay_config", return_value=("", "")), \
+       mock.patch("signal.signal"):
+    rc = asyncio.run(main_loop("oc_test", str(tmp_path), "claude-opus-4-6"))
+
+  assert rc == 0
+  registry = registries[0]
+  entry = registry.get("bmon1")
+  assert entry is not None
+  marker_index = next(
+    i for i, c in enumerate(sent_cards)
+    if c["header"]["title"]["content"] == "👀 light LoRA training progress")
+  assert entry.message_id == f"om_card_{marker_index + 1}"
+
+  asyncio.run(_deliver_idle_card(
+    channel, "oc_test", registry, "bmon1", "第一轮：loss 0.82"))
+
+  (msg_id, card), = [
+    u for u in channel.updated_cards if u[0] == entry.message_id]
+  assert msg_id == entry.message_id
+  # The title is the Monitor's own name and does not change.
+  assert _idle_title(card) == "👀 light LoRA training progress"
+  blocks = _card_blocks(card)
+  assert "第一轮：loss 0.82" in blocks
+  assert any("task bmon1" in b for b in blocks)
+  # Footer keeps the cadence and says how many reports are in the card.
+  footer = _card_footer(card)
+  assert "每 20 秒检查一次" in footer
+  assert "已汇报 1 次" in footer
 
 
 def test_task_started_posts_one_marker_card_and_skips_subagents(tmp_path):
@@ -4917,11 +5150,13 @@ def test_task_started_posts_one_marker_card_and_skips_subagents(tmp_path):
 
   assert rc == 0
   titles = [c["header"]["title"]["content"] for c in sent_cards]
+  # The title is the Monitor's own description — the model names the watch,
+  # and that name stays fixed while its card is updated.
   markers = [c for c in sent_cards
-             if c["header"]["title"]["content"] == "👀 后台监控已挂上"]
+             if c["header"]["title"]["content"]
+             == "👀 light LoRA training progress"]
   assert len(markers) == 1, titles
   blob = json.dumps(markers[0], ensure_ascii=False)
-  assert "light LoRA training progress" in blob
   assert "bmon1" in blob
   # The card says how often it actually looks ("已挂上" alone left the user
   # guessing when a result might appear).

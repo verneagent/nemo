@@ -222,6 +222,10 @@ class BackgroundTurnDoneEvent:
   """
   text: str
   cost: float = 0.0
+  # The task whose completion triggered the turn (empty for a self-directed
+  # follow-up). Consecutive fires of the SAME Monitor accumulate into one card
+  # instead of posting a new one each time.
+  task_id: str = ""
 
 
 TurnEvent = (

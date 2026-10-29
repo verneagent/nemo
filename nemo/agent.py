@@ -352,6 +352,110 @@ class IdleTurnBudget:
   max_consecutive: int = MAX_IDLE_AUTO_TURNS
 
 
+class MonitorCard:
+  """The card a live Monitor owns — one card, rolled over when full.
+
+  The "👀" marker that announced the watch IS the card its reports append to,
+  so a 15-minute watch leaves one legible card instead of a trail of them. The
+  title is fixed at arming time (the model's own ``description``, which is
+  what makes it meaningful) and the footer carries the meta — cadence, task,
+  how many reports are in there.
+
+  When a report no longer fits, nothing is thrown away: the current card is
+  frozen with "续卡见下一张" exactly like a rolled-over Working card, and the
+  report opens the next part.
+  """
+  def __init__(
+    self, message_id: str, title: str, meta: str, sections: list[str],
+    part: int = 1, updates: int = 0,
+  ) -> None:
+    self.message_id = message_id
+    self.title = title
+    self.meta = meta          # cadence / timeout, fixed at arming time
+    self.sections = sections  # one markdown block per entry
+    self.part = part
+    self.updates = updates
+
+  def clone(self) -> MonitorCard:
+    return MonitorCard(
+      self.message_id, self.title, self.meta, list(self.sections),
+      self.part, self.updates)
+
+  def with_report(self, text: str) -> MonitorCard:
+    clone = self.clone()
+    clone.sections.append(text)
+    clone.updates += 1
+    return clone
+
+  def continued(self, text: str) -> MonitorCard:
+    """The next part: a fresh card opened by ``text``."""
+    return MonitorCard(
+      "", self.title, self.meta, [text], self.part + 1, self.updates + 1)
+
+  def adopt(self, other: MonitorCard) -> None:
+    """Take over ``other``'s state once its card is actually on the wire."""
+    self.message_id = other.message_id
+    self.title = other.title
+    self.meta = other.meta
+    self.sections = other.sections
+    self.part = other.part
+    self.updates = other.updates
+
+  def title_text(self) -> str:
+    if self.part == 1:
+      return self.title
+    return f"{self.title} · 续 {self.part}"
+
+  def footer(self, continued_away: bool = False) -> str:
+    parts = [self.meta]
+    if self.updates:
+      parts.append(f"已汇报 {self.updates} 次")
+    else:
+      parts.append("已挂上，有结果会自动汇报")
+    if continued_away:
+      parts.append("续卡见下一张")
+    return " · ".join(p for p in parts if p)
+
+
+def _monitor_card(
+  entry: MonitorCard, continued_away: bool = False,
+) -> JsonObject:
+  return cards.build_sections_card(
+    entry.sections, title=entry.title_text(), color="blue",
+    note=entry.footer(continued_away))
+
+
+class MonitorCards:
+  """task_id → the card that Monitor owns. Daemon-scoped, main-loop owned.
+
+  Keyed by task identity, NOT by "is this the previous message": a monitor
+  fires minutes apart and anything may land in between (a real turn, another
+  watch, a command reply), yet its next report still belongs on its own card.
+  Entries are dropped when the task ends and on reconnect (monitors die with
+  the CLI subprocess, so the registry must not outlive it).
+  """
+  def __init__(self) -> None:
+    self._by_task: dict[str, MonitorCard] = {}
+
+  def register(
+    self, task_id: str, message_id: str, title: str, meta: str,
+    sections: list[str], updates: int = 0,
+  ) -> None:
+    if not task_id or not message_id:
+      return
+    self._by_task[task_id] = MonitorCard(
+      message_id, title, meta, sections, updates=updates)
+
+  def get(self, task_id: str) -> MonitorCard | None:
+    return self._by_task.get(task_id) if task_id else None
+
+  def forget(self, task_id: str) -> None:
+    self._by_task.pop(task_id, None)
+
+  def clear(self) -> None:
+    self._by_task.clear()
+
+
 def _idle_status_style(status: str) -> tuple[str, str]:
   """Map an SDK task status to a (title, header colour) pair."""
   return _IDLE_STATUS_STYLES.get(status, _IDLE_STATUS_FALLBACK)
@@ -421,17 +525,75 @@ def _idle_budget_card(
   return cards.build_markdown_card("\n".join(lines), title=title, color=color)
 
 
-async def _send_idle_card(
-  channel: LarkChannel, chat_id: str, card: JsonObject,
+_IDLE_CARD_TITLE = "🔔 后台自动响应"
+
+
+async def _deliver_idle_card(
+  channel: LarkChannel, chat_id: str, monitors: MonitorCards,
+  task_id: str, text: str,
 ) -> None:
-  """Send one standalone idle-notification card. Best-effort."""
+  """Append ``text`` to the card its Monitor owns, else post a new one.
+
+  Best-effort throughout: a failed PATCH falls back to posting a fresh card
+  carrying only the new text, so a transient Lark error can never lose it.
+  """
+  entry = monitors.get(task_id)
+  if entry is not None:
+    # Mutate only after the PATCH succeeds, so a failed edit never desyncs
+    # the card from what Lark actually shows.
+    staged = entry.with_report(text)
+    if not cards.card_exceeds_rollover(
+        _monitor_card(staged), TURN_CARD_ROLLOVER_BYTE_LIMIT):
+      try:
+        await channel.update_card(entry.message_id, _monitor_card(staged))
+      except Exception as exc:
+        log.warning(
+          "Monitor card append failed, posting a new card: %s", exc)
+      else:
+        entry.adopt(staged)
+        log.info(
+          "Monitor card appended chat=%s task=%s msg=%s (%d reports, "
+          "part %d)", chat_id, task_id[:12], entry.message_id,
+          entry.updates, entry.part)
+        return
+    else:
+      # Full: freeze this card exactly like a rolled-over Working card and
+      # open the next part with the new report. Nothing is ever discarded.
+      try:
+        await channel.update_card(
+          entry.message_id, _monitor_card(entry, continued_away=True))
+      except Exception as exc:
+        log.warning("Monitor card rollover edit failed: %s", exc)
+      staged = entry.continued(text)
+      try:
+        msg_id = await channel.send_card(
+          chat_id, _monitor_card(staged))
+      except Exception as exc:
+        log.warning("Monitor card rollover send failed: %s", exc)
+        return
+      _register_msg(msg_id, chat_id)
+      staged.message_id = msg_id
+      entry.adopt(staged)
+      log.info(
+        "Monitor card rolled over chat=%s task=%s msg=%s (part %d)",
+        chat_id, task_id[:12], msg_id, entry.part)
+      return
+
+  # No card owned by this task (a self-directed background turn, or the very
+  # first report after a reconnect). It gets its own card.
+  card = cards.build_markdown_card(text, title=_IDLE_CARD_TITLE, color="blue")
   try:
     msg_id = await channel.send_card(chat_id, card)
   except Exception as exc:
     log.warning("Idle notification send failed: %s", exc)
     return
-  log.info("Idle notification sent chat=%s msg=%s", chat_id, msg_id)
   _register_msg(msg_id, chat_id)
+  # Own it too, so a watch that never got a marker card (it was armed before
+  # a reconnect) still consolidates its reports instead of posting a new card
+  # per fire.
+  monitors.register(
+    task_id, msg_id, _IDLE_CARD_TITLE, "", [text], updates=1)
+  log.info("Idle notification sent chat=%s msg=%s", chat_id, msg_id)
 
 
 def _idle_notifier_for(
@@ -440,6 +602,7 @@ def _idle_notifier_for(
   budget: IdleTurnBudget,
   pending: set[asyncio.Task[None]],
   loop: asyncio.AbstractEventLoop,
+  monitors: MonitorCards,
 ) -> Callable[[object], None]:
   """Build the idle-event notifier handed to ``CodingAgent.set_idle_notifier``.
 
@@ -463,11 +626,21 @@ def _idle_notifier_for(
       # Main loop already closed (shutdown) — the drainer outlives it briefly.
       log.warning("Idle notification dropped, main loop gone: %s", exc)
 
-  def _send(card: JsonObject) -> None:
-    """Schedule a card send, holding a strong ref so it isn't GC'd mid-send."""
-    task = asyncio.ensure_future(_send_idle_card(channel, chat_id, card))
+  def _track(task: asyncio.Task[None]) -> None:
+    """Hold a strong ref so a scheduled send isn't GC'd mid-flight."""
     pending.add(task)
     task.add_done_callback(pending.discard)
+
+  def _send(card: JsonObject) -> None:
+    async def _post() -> None:
+      try:
+        msg_id = await channel.send_card(chat_id, card)
+      except Exception as exc:
+        log.warning("Idle notification send failed: %s", exc)
+        return
+      log.info("Idle notification sent chat=%s msg=%s", chat_id, msg_id)
+      _register_msg(msg_id, chat_id)
+    _track(asyncio.ensure_future(_post()))
 
   def _handle_idle_event(event: object) -> None:
     """Runs on the main loop — the only place ``budget`` is touched."""
@@ -478,6 +651,8 @@ def _idle_notifier_for(
         db.clear_monitor(event.task_id)
       except Exception as e:
         log.warning("Failed to clear monitor %s: %s", event.task_id, e)
+      # Its card is final now: a later event can't belong to this watch.
+      monitors.forget(event.task_id)
       if budget.consecutive >= budget.max_consecutive:
         log.info(
           "Idle notification: auto-turn budget spent (%d), card instead "
@@ -492,9 +667,9 @@ def _idle_notifier_for(
         chat_id, event.task_id[:12], event.status,
         budget.consecutive, budget.max_consecutive)
       return
-    _send(cards.build_markdown_card(
-      _truncate_for_preview(event.text), title="🔔 后台自动响应",
-      color="blue"))
+    _track(asyncio.ensure_future(_deliver_idle_card(
+      channel, chat_id, monitors, event.task_id,
+      _truncate_for_preview(event.text))))
 
   return _notify
 
@@ -1951,10 +2126,12 @@ async def main_loop(
   # on /agent: the auto-turn budget (reset by any real user message) and the
   # strong refs to in-flight notification-card sends.
   _idle_budget = IdleTurnBudget()
+  _monitor_cards = MonitorCards()
   _idle_send_tasks: set[asyncio.Task[None]] = set()
   coding_agent.set_idle_notifier(
     _idle_notifier_for(
-      channel, chat_id, _idle_budget, _idle_send_tasks, main_loop_ref))
+      channel, chat_id, _idle_budget, _idle_send_tasks, main_loop_ref,
+      _monitor_cards))
   running = True
   _dissolve_on_exit = False
   # In-flight `/btw` side questions spawned during a running turn. Kept
@@ -2074,6 +2251,9 @@ async def main_loop(
       db.clear_monitors(chat_id)
     except Exception as e:
       log.warning("Failed to clear recorded monitors: %s", e)
+    # The reconnect kills every Monitor child process, so their cards stop
+    # being live too — a later fire can no longer belong to them.
+    _monitor_cards.clear()
     await coding_agent.reset(project_dir, model, resume=resume)
 
   def _is_own_message(mid: str) -> bool:
@@ -2608,7 +2788,8 @@ async def main_loop(
           # adapter's SDKThread starts its own drainer on start()).
           coding_agent.set_idle_notifier(
             _idle_notifier_for(
-              channel, chat_id, _idle_budget, _idle_send_tasks, main_loop_ref))
+              channel, chat_id, _idle_budget, _idle_send_tasks, main_loop_ref,
+              _monitor_cards))
           log.info("Agent switch to %s (model=%s, resume=%s)",
                    agent, model,
                    _sdk_session_id[:8] if _sdk_session_id else "none")
@@ -3192,7 +3373,7 @@ async def main_loop(
         )
         try:
           if (
-            cards.card_content_bytes(card) > TURN_CARD_ROLLOVER_BYTE_LIMIT
+            cards.card_exceeds_rollover(card, TURN_CARD_ROLLOVER_BYTE_LIMIT)
             and len(active_steps) > 1
           ):
             new_start = len(_turn_steps) - 1
@@ -3301,21 +3482,28 @@ async def main_loop(
           return
         if event.task_id:
           _announced_tasks.add(event.task_id)
-        title = "👀 后台监控已挂上"
-        body = event.description.strip() or "监控任务已启动"
+        body = event.description.strip() or "后台监控"
         # Say how often it actually looks. The Monitor tool has no interval
         # field, so the cadence comes from the command's own sleep; without
         # it "已挂上" still left the user guessing when a result might appear.
-        note_parts = [cards.monitor_cadence(event.command, event.timeout_ms)]
-        if event.task_id:
-          note_parts.append(f"task {event.task_id}")
-        note_parts.append("有结果会自动汇报")
-        note = " · ".join(p for p in note_parts if p)
+        note = cards.monitor_cadence(event.command, event.timeout_ms)
         try:
-          card = cards.build_card(title, body=body, color="blue", note=note)
+          # The description is the model's own words for this watch, so it
+          # makes a meaningful title — and it stays fixed for the card's life,
+          # which is what makes one scrolling card legible.
+          card_title = f"👀 {body}"
+          card = cards.build_sections_card(
+            [f"<font color='grey'>task {event.task_id}</font>"],
+            title=card_title, color="blue", note=note)
           msg_id = _await_channel(channel.send_card(chat_id, card))
           _register_msg(msg_id, chat_id)
-          db.record_sent(msg_id, text=title, chat_id=chat_id)
+          db.record_sent(msg_id, text=card_title, chat_id=chat_id)
+          # This marker IS the watch's card: every report appends to it, so
+          # the chat keeps one live card per Monitor instead of a marker plus
+          # a stream of 🔔 cards.
+          _monitor_cards.register(
+            event.task_id, msg_id, card_title, note,
+            [f"<font color='grey'>task {event.task_id}</font>"])
           log.info("Background-task marker card sent: %s (task=%s)",
                    msg_id, event.task_id)
         except Exception as e:
@@ -3358,6 +3546,8 @@ async def main_loop(
             db.clear_monitor(event.task_id)
           except Exception as e:
             log.warning("Failed to clear monitor %s: %s", event.task_id, e)
+          # Its card is final; nothing may append to it afterwards.
+          _monitor_cards.forget(event.task_id)
 
         elif isinstance(event, AnswerEvent):
           _turn_steps.append(cards.ThinkingStep("answer", event.text))

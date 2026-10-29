@@ -128,6 +128,10 @@ class SDKThread:
     # Assistant text of the spontaneous turn currently being drained, flushed
     # to a BackgroundTurnDoneEvent when its ResultMessage arrives.
     self._idle_turn_texts: list[str] = []
+    # Task id whose notification triggered the spontaneous turn being drained
+    # (a Monitor firing). Rides on the BackgroundTurnDoneEvent so the host can
+    # tell consecutive fires of the SAME watch apart from unrelated ones.
+    self._idle_task_id: str = ""
 
   def start(self) -> None:
     """Start the SDK thread. Blocks until the event loop is ready."""
@@ -554,6 +558,7 @@ class SDKThread:
       # notification is a clean breadcrumb (the CLI may then run a follow-up
       # spontaneous turn whose own text gets its own card).
       self._idle_turn_texts.clear()
+      self._idle_task_id = message.task_id
       ev = BackgroundTaskDoneEvent(
         task_id=message.task_id,
         status=getattr(message, "status", "") or "",
@@ -576,8 +581,10 @@ class SDKThread:
         ev = BackgroundTurnDoneEvent(
           text="\n".join(self._idle_turn_texts),
           cost=getattr(message, "total_cost_usd", 0) or 0.0,
+          task_id=self._idle_task_id,
         )
         self._idle_turn_texts.clear()
+        self._idle_task_id = ""
     else:
       # SystemMessage (thinking / compact / progress), TaskStarted /
       # TaskProgress, stream events — nothing worth surfacing idle.

@@ -3238,7 +3238,7 @@ def run_idle_notification_tests(pid: int, chat_id: str,
   started = time.time()
   while time.time() - started < 30:
     for card in get_bot_msgs(chat_id, after=ts, limit=10):
-      if interactive_card_title(card).startswith("👀 后台监控已挂上"):
+      if interactive_card_title(card).startswith("👀 "):
         marker_card = card
         break
     if marker_card:

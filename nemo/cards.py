@@ -462,6 +462,15 @@ def _collapsible_thinking(steps: list[ThinkingStep]) -> JsonObject:
   }
 
 
+def card_exceeds_rollover(card: JsonObject, limit: int) -> bool:
+  """True when ``card`` is too big to keep PATCHing and must roll over.
+
+  Shared by the Working card and a live Monitor's card so both roll at the
+  same size: freeze the current card, continue on a new one.
+  """
+  return card_content_bytes(card) > limit
+
+
 def card_content_bytes(card: JsonObject) -> int:
   """Serialized size of a card's `content`, as Lark measures it (utf-8)."""
   return len(json.dumps(card, ensure_ascii=False).encode("utf-8"))
@@ -1525,13 +1534,37 @@ def build_ask_user_question_card(
 
 def build_markdown_card(content: str, title: str = "", color: str = "") -> JsonObject:
   """Build a Card V2 with markdown content."""
+  return _markdown_card([content], title=title, color=color)
+
+
+def build_sections_card(
+  sections: list[str], title: str = "", color: str = "", note: str = "",
+) -> JsonObject:
+  """Build a Card V2 whose body is several markdown blocks split by rules.
+
+  Used for a live Monitor's card: each section is one report and stays
+  readable on its own instead of being merged into one wall of text. ``note``
+  is a single-line grey footer (cadence, report count).
+  """
+  return _markdown_card(
+    sections, title=title, color=color, separated=True, note=note)
+
+
+def _markdown_card(
+  sections: list[str], *, title: str = "", color: str = "",
+  separated: bool = False, note: str = "",
+) -> JsonObject:
+  elements: list[JsonObject] = []
+  for idx, section in enumerate(sections):
+    if separated and idx:
+      elements.append({"tag": "hr"})
+    elements.append({"tag": "markdown", "content": section})
+  if note:
+    elements.append(_note_element(note))
   card: JsonObject = {
     "schema": "2.0",
     "config": {"update_multi": True},
-    "body": {
-      "direction": "vertical",
-      "elements": [{"tag": "markdown", "content": content}],
-    },
+    "body": {"direction": "vertical", "elements": elements},
   }
   if title:
     header: JsonObject = {"title": {"tag": "plain_text", "content": title}}
