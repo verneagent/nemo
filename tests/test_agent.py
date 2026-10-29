@@ -24,6 +24,7 @@ from nemo.agent import (
   _in_turn_filtered_out,
   _interrupt_and_drain,
   _is_user_message_event,
+  _merge_group,
   _merge_pending,
   _requeue_pending,
   _restart_model_arg,
@@ -3201,6 +3202,50 @@ def test_merge_pending_with_non_text():
   assert others[0].event_type == "card.action.trigger"
 
 
+def _internal_msg(text: str) -> _IM:
+  return _IM(event_type="im.message.receive_v1", chat_id="oc_test",
+             sender_id="", msg_type="text", text=text,
+             message_id="idle_x", is_internal=True)
+
+
+def test_merge_pending_never_mixes_internal_with_user_text():
+  # A merged batch keeps ONE sender. Folding a Nemo-synthesised internal
+  # message (sender "") in front of the user's text made the whole batch look
+  # like an unknown sender, so the authorization check dropped it — user
+  # message included (2026-10-29, oc_956058b1…: "继续给我盯一下" vanished
+  # behind a stranded background-task notification).
+  internal = _internal_msg("[后台任务通知] 任务 `be4bsak2p` 状态：stopped")
+  user = _msg("继续给我盯一下", message_id="om_9")
+
+  merged, others = _merge_pending([internal, user])
+
+  assert merged.text == "继续给我盯一下"
+  assert merged.sender_id == "ou_user"
+  assert merged.is_internal is False
+  # The injection rides as its own queue entry, still marked internal so it
+  # keeps bypassing the human-sender check.
+  assert [m.text for m in others] == [internal.text]
+  assert others[0].is_internal is True
+
+
+def test_control_merging_internal_text_takes_the_internal_sender():
+  """Permanent control for the same-origin merge rule.
+
+  With every text message in one bucket (the pre-fix behaviour) the batch is
+  owned by the internal message's EMPTY sender — the exact value the main loop
+  rejects with "Skipping: unauthorized sender", taking the user's real message
+  down with it.
+  """
+  internal = _internal_msg("[后台任务通知] …")
+  user = _msg("继续给我盯一下", message_id="om_9")
+
+  with mock.patch("nemo.agent._merge_group", lambda msg: "user"):
+    merged = _merge_pending([internal, user])
+
+  assert merged.sender_id == ""
+  assert "继续给我盯一下" in merged.text
+
+
 def test_requeue_pending_merges():
   """_requeue_pending pushes a single merged message back."""
   pushed: list[_IM] = []
@@ -4668,16 +4713,45 @@ def test_idle_budget_card_title_reflects_task_status():
     assert _idle_title(card) == title, status
 
 
-def test_idle_spontaneous_turn_still_sends_its_own_card():
+def _armed_monitor(monitors, task_id, title="👀 watch"):
+  """Register the marker card the Monitor's own turn would have created."""
+  msg_id = f"om_marker_{task_id}"
+  monitors.register(
+    task_id, msg_id, title, "每 5 分钟检查一次", [f"task {task_id}"])
+  return msg_id
+
+
+def test_idle_spontaneous_turn_lands_on_its_monitors_card():
   # BackgroundTurnDoneEvent already carries the CLI's finished answer —
   # re-prompting would only duplicate it, and it must not eat the budget.
-  channel, budget = _run_idle_notifier([
-    BackgroundTurnDoneEvent(text="done!", cost=0.02)])
+  monitors = MonitorCards()
+  marker = _armed_monitor(monitors, "bmon1")
+  channel, budget = _run_idle_notifier(
+    [BackgroundTurnDoneEvent(text="done!", cost=0.02)], monitors=monitors)
 
   assert channel.pushed == []
-  assert len(channel.sent_cards) == 1
-  assert _idle_title(channel.sent_cards[0][1]) == "🔔 后台自动响应"
+  assert channel.sent_cards == []
+  msg_id, card = channel.updated_cards[-1]
+  assert msg_id == marker
+  assert _card_blocks(card)[-1] == "done!"
   assert budget.consecutive == 0
+
+
+def test_an_unattributable_report_is_an_error_not_a_card(caplog):
+  # There is no generic "🔔 后台自动响应" fallback any more: a report that
+  # cannot find its watch's card is a real disagreement between the SDK and
+  # the card registry, and covering it with a card is what hid the bug.
+  from nemo.agent import log as agent_log
+  caplog.set_level("ERROR", logger=agent_log.name)
+  channel, _budget = _run_idle_notifier([
+    BackgroundTurnDoneEvent(text="nobody owns me", task_id="bunknown"),
+  ])
+
+  assert channel.sent_cards == []
+  assert channel.updated_cards == []
+  assert any(
+    rec.levelname == "ERROR" and "no Monitor card to land on" in rec.getMessage()
+    for rec in caplog.records)
 
 
 def _card_blocks(card):
@@ -4700,18 +4774,19 @@ def test_consecutive_fires_of_one_monitor_append_to_the_same_card():
   # time, burying the conversation. Fires of the SAME task now accumulate into
   # one card — and earlier bodies are KEPT, because each answers a different
   # moment.
+  monitors = MonitorCards()
+  marker = _armed_monitor(monitors, "bmon1")
   channel, _budget = _run_idle_notifier([
     BackgroundTurnDoneEvent(text="first check: all green", task_id="bmon1"),
     BackgroundTurnDoneEvent(text="second check: one failure", task_id="bmon1"),
-  ])
+  ], monitors=monitors)
 
-  assert len(channel.sent_cards) == 1
-  assert len(channel.updated_cards) == 1
-  msg_id, card = channel.updated_cards[0]
-  # The edit targets the card the first fire posted.
-  assert msg_id == "om_idle1"
-  assert _idle_title(card) == "🔔 后台自动响应"
-  assert _card_blocks(card) == [
+  assert channel.sent_cards == []
+  assert len(channel.updated_cards) == 2
+  msg_id, card = channel.updated_cards[-1]
+  # Every edit targets the card the watch's own turn created.
+  assert msg_id == marker
+  assert _card_blocks(card)[-2:] == [
     "first check: all green", "second check: one failure",
   ]
   # Sections are visually separated so two answers don't run together.
@@ -4722,16 +4797,19 @@ def test_a_card_in_between_does_not_break_a_monitors_card():
   # Merging keys off the Monitor's identity, NOT off "is this the previous
   # message": fires are minutes apart and anything may land in between (here
   # another watch's card), yet the next report still belongs on its own card.
+  monitors = MonitorCards()
+  marker = _armed_monitor(monitors, "bmon1")
+  _armed_monitor(monitors, "bmon2")
   channel, _budget = _run_idle_notifier([
     BackgroundTurnDoneEvent(text="first", task_id="bmon1"),
     BackgroundTurnDoneEvent(text="other watch", task_id="bmon2"),
     BackgroundTurnDoneEvent(text="second", task_id="bmon1"),
-  ])
+  ], monitors=monitors)
 
-  assert len(channel.sent_cards) == 2
-  msg_id, card = channel.updated_cards[0]
-  assert msg_id == "om_idle1"
-  assert _card_blocks(card) == ["first", "second"]
+  assert channel.sent_cards == []
+  msg_id, card = channel.updated_cards[-1]
+  assert msg_id == marker
+  assert _card_blocks(card)[-2:] == ["first", "second"]
 
 
 def test_a_fire_without_a_task_id_lands_on_the_only_live_watch():
@@ -4739,37 +4817,46 @@ def test_a_fire_without_a_task_id_lands_on_the_only_live_watch():
   # (the SDK stream carries none — verified from a live run 2026-10-29). With
   # exactly one watch live the report can only be its, so it still appends to
   # that card instead of posting a card per report.
+  monitors = MonitorCards()
+  marker = _armed_monitor(monitors, "bmon1")
   channel, _budget = _run_idle_notifier(
     [BackgroundTurnDoneEvent(text="REPORT_1", task_id="bmon1")],
     then=[BackgroundTurnDoneEvent(text="REPORT_2", task_id="")],
+    monitors=monitors,
   )
 
-  assert len(channel.sent_cards) == 1
-  _msg_id, card = channel.updated_cards[0]
-  assert _card_blocks(card) == ["REPORT_1", "REPORT_2"]
+  assert channel.sent_cards == []
+  msg_id, card = channel.updated_cards[-1]
+  assert msg_id == marker
+  assert _card_blocks(card)[-2:] == ["REPORT_1", "REPORT_2"]
 
 
-def test_control_same_monitor_fires_post_separate_cards():
-  """The registry is what makes the test above pass: disable it, they split."""
+def test_control_without_the_registry_no_report_reaches_a_card():
+  """The registry is what routes a report: disable it and nothing is posted."""
+  monitors = MonitorCards()
+  _armed_monitor(monitors, "bmon1")
   with mock.patch.object(MonitorCards, "get", return_value=None):
     channel, _budget = _run_idle_notifier([
       BackgroundTurnDoneEvent(text="first", task_id="bmon1"),
       BackgroundTurnDoneEvent(text="second", task_id="bmon1"),
-    ])
+    ], monitors=monitors)
 
-  assert len(channel.sent_cards) == 2
+  assert channel.sent_cards == []
   assert channel.updated_cards == []
 
 
 def test_background_cards_from_different_tasks_do_not_merge():
+  monitors = MonitorCards()
+  first = _armed_monitor(monitors, "bmon1")
+  second = _armed_monitor(monitors, "bmon2")
   channel, _budget = _run_idle_notifier([
     BackgroundTurnDoneEvent(text="from monitor", task_id="bmon1"),
     BackgroundTurnDoneEvent(text="from another", task_id="bmon2"),
-  ])
+  ], monitors=monitors)
 
-  assert len(channel.sent_cards) == 2
-  assert channel.updated_cards == []
-  assert [_card_blocks(c)[0] for _mid, c in channel.sent_cards] == [
+  assert channel.sent_cards == []
+  assert [mid for mid, _card in channel.updated_cards] == [first, second]
+  assert [_card_blocks(c)[-1] for _mid, c in channel.updated_cards] == [
     "from monitor", "from another",
   ]
 
@@ -4780,26 +4867,28 @@ def test_a_finished_monitor_keeps_its_wrap_up_on_the_same_card():
   # entry sent it down the fallback path — a stray 🔔 card — and re-registered
   # a dead watch, which then blocked attribution of the NEXT real fire too
   # (2026-10-29, oc_956058b1…: 4 good appends, a stop, then bell cards).
+  monitors = MonitorCards()
+  marker = _armed_monitor(monitors, "bmon1")
   cleared: list[str] = []
   channel, _budget = _run_idle_notifier([
     BackgroundTurnDoneEvent(text="first", task_id="bmon1"),
     BackgroundTaskDoneEvent(task_id="bmon1", status="completed"),
     BackgroundTurnDoneEvent(text="after", task_id="bmon1"),
-  ], cleared=cleared)
+  ], monitors=monitors, cleared=cleared)
   # The persisted record is cleared, so a restart does not announce a watch
   # that already ended. This used to raise NameError (``db`` is a main_loop
   # local, the notifier is module-level) and silently skip the cleanup.
   assert cleared == ["bmon1"]
 
   # The dead card is closed out (a stopped watch must not look live)…
-  closed_id, closed = channel.updated_cards[0]
-  assert closed_id == "om_idle1"
+  closed_id, closed = channel.updated_cards[1]
+  assert closed_id == marker
   assert "✅ 已结束" in _card_footer(closed)
   assert closed["header"]["template"] == "grey"
   # …and the wrap-up still lands on THAT card, not a second one.
-  assert len(channel.sent_cards) == 1
+  assert channel.sent_cards == []
   last_id, last = channel.updated_cards[-1]
-  assert last_id == "om_idle1"
+  assert last_id == marker
   assert _card_blocks(last)[-1] == "after"
   assert "✅ 已结束" in _card_footer(last)
 
@@ -4825,6 +4914,26 @@ def test_ended_monitor_cards_are_pruned_oldest_first():
 
   assert monitors.get("b0") is None
   assert monitors.get(f"b{MAX_ENDED_MONITOR_CARDS + 2}") is not None
+
+
+def test_a_wrap_up_for_a_watch_armed_before_a_restart_is_dropped(caplog):
+  # A watch armed by a PREVIOUS daemon has no card in this process, so its
+  # wrap-up cannot land anywhere — and it must not be invented into a card.
+  # That is the *explained* case, so it is not an error: nothing here is a
+  # mistake, the watch simply predates this process.
+  from nemo.agent import log as agent_log
+  caplog.set_level("ERROR", logger=agent_log.name)
+  monitors = MonitorCards()
+  channel, _budget = _run_idle_notifier([
+    BackgroundTaskDoneEvent(task_id="bold1", status="stopped"),
+    BackgroundTurnDoneEvent(text="watch over", task_id="bold1"),
+  ], monitors=monitors)
+
+  assert channel.sent_cards == []
+  assert caplog.records == []
+  # Nor does the dead task come back as a live watch worth attributing to.
+  assert monitors.get("bold1") is None
+  assert monitors.sole_live_task_id() == ""
 
 
 def test_control_a_dead_watch_card_keeps_looking_live():
@@ -4860,21 +4969,28 @@ def test_a_full_monitor_card_continues_on_a_new_one():
   # A full card is never truncated: it is frozen ("续卡见下一张") and the next
   # report opens part 2, exactly like a rolled-over Working card. Nothing the
   # user was shown disappears.
+  monitors = MonitorCards()
+  _armed_monitor(monitors, "bmon1", title="👀 v8 训练 + ckpt150 评估")
+  # The marker card is already ~400 bytes; 650 fits one 120-char report and
+  # forces the second one over.
   with mock.patch(
-      "nemo.agent.TURN_CARD_ROLLOVER_BYTE_LIMIT", 200):
+      "nemo.agent.TURN_CARD_ROLLOVER_BYTE_LIMIT", 650):
     channel, _budget = _run_idle_notifier([
       BackgroundTurnDoneEvent(text="a" * 120, task_id="bmon1"),
       BackgroundTurnDoneEvent(text="b" * 120, task_id="bmon1"),
-    ])
+    ], monitors=monitors)
 
-  assert len(channel.sent_cards) == 2
-  (frozen_id, frozen), = channel.updated_cards
-  assert frozen_id == "om_idle1"
-  assert _card_blocks(frozen)[0] == "a" * 120
+  # Only the continuation is a NEW card; the first report (and the freeze of
+  # the marker) are edits of the card the watch's own turn created.
+  assert len(channel.sent_cards) == 1
+  frozen_id, frozen = channel.updated_cards[-1]
+  assert frozen_id == "om_marker_bmon1"
+  assert [mid for mid, _c in channel.updated_cards] == ["om_marker_bmon1"] * 2
+  assert _card_blocks(frozen)[-1] == "a" * 120
   assert "续卡见下一张" in _card_footer(frozen)
 
-  _chat, continuation = channel.sent_cards[1]
-  assert _idle_title(continuation) == "🔔 后台自动响应 · 续 2"
+  _chat, continuation = channel.sent_cards[0]
+  assert _idle_title(continuation) == "👀 v8 训练 + ckpt150 评估 · 续 2"
   assert _card_blocks(continuation) == ["b" * 120]
   # The report count carries across the rollover.
   assert "已汇报 2 次" in _card_footer(continuation)

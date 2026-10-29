@@ -3308,16 +3308,16 @@ def run_monitor_card_tests(pid: int, chat_id: str,
     log.dump_tail(40, "MM06")
 
   # MM07 — ending a watch makes the CLI run one last wrap-up turn, and that
-  # answer arrives tagged with the now dead task id. Dropping the entry for it
-  # sent the answer down the fallback path (a stray 🔔 card) AND re-registered
-  # the dead watch, which then blocked attribution of the next real fire
-  # (2026-10-29, oc_956058b1…: bell cards everywhere). The wrap-up must land on
-  # the watch's own card.
+  # answer arrives tagged with the now dead task id. It must land on the
+  # watch's own card; the generic "🔔 后台自动响应" fallback is DELETED, so a
+  # report that cannot find its card now logs an ERROR instead of inventing
+  # one. Either way no card of its own may appear for a dead watch.
   time.sleep(20)
   chunk = log.read_since(mark)
   stray = [
     line for line in chunk.splitlines()
-    if "Background response card sent" in line
+    if ("Background response card sent" in line
+        or "no Monitor card to land on" in line)
     and task_prefix in line
   ]
   if stray:

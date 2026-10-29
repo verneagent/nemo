@@ -198,6 +198,48 @@ def _is_user_message_event(msg: IncomingMessage) -> bool:
   return msg.event_type in _USER_MESSAGE_EVENT_TYPES
 
 
+_MERGE_GROUP_USER = "user"
+_MERGE_GROUP_INTERNAL = "internal"
+
+
+def _merge_group(msg: IncomingMessage) -> str:
+  """The merge bucket a text message belongs to.
+
+  Only messages of the SAME origin merge, because a merged message keeps a
+  single ``sender_id``. Folding an internal message (sender "") together with
+  a user's text produced a batch the authorization check then rejected as an
+  unknown sender — silently dropping the user's real message with it
+  (2026-10-29, oc_956058b1…: "继续给我盯一下" vanished because it was merged
+  behind a stranded background-task notification).
+  """
+  return _MERGE_GROUP_INTERNAL if msg.is_internal else _MERGE_GROUP_USER
+
+
+def _merge_text_group(msgs: list[IncomingMessage]) -> IncomingMessage | None:
+  """Merge one same-origin group of text messages, or None for an empty one."""
+  if not msgs:
+    return None
+  if len(msgs) == 1:
+    return msgs[0]
+  lines = [f"[用户在上一轮工作期间发送了 {len(msgs)} 条消息]"]
+  for m in msgs:
+    lines.append(m.text.strip())
+  base = msgs[0]
+  return IncomingMessage(
+    event_type=base.event_type,
+    chat_id=base.chat_id,
+    chat_type=base.chat_type,
+    sender_id=base.sender_id,
+    message_id=msgs[-1].message_id,
+    msg_type="text",
+    text="\n".join(lines),
+    mentions=base.mentions,
+    create_time=msgs[-1].create_time,
+    raw=base.raw,
+    is_internal=base.is_internal,
+  )
+
+
 def _merge_pending(pending: list[IncomingMessage]) -> IncomingMessage | None:
   """Merge multiple pending messages into a single IncomingMessage.
 
@@ -221,29 +263,18 @@ def _merge_pending(pending: list[IncomingMessage]) -> IncomingMessage | None:
     else:
       other_msgs.append(msg)
 
-  merged: IncomingMessage | None = None
-  if text_msgs:
-    if len(text_msgs) == 1:
-      merged = text_msgs[0]
-    else:
-      lines = [f"[用户在上一轮工作期间发送了 {len(text_msgs)} 条消息]"]
-      for m in text_msgs:
-        lines.append(m.text.strip())
-      base = text_msgs[0]
-      merged = IncomingMessage(
-        event_type=base.event_type,
-        chat_id=base.chat_id,
-        chat_type=base.chat_type,
-        sender_id=base.sender_id,
-        message_id=text_msgs[-1].message_id,
-        msg_type="text",
-        text="\n".join(lines),
-        mentions=base.mentions,
-        create_time=text_msgs[-1].create_time,
-        raw=base.raw,
-      )
+  groups: dict[str, list[IncomingMessage]] = {}
+  for msg in text_msgs:
+    groups.setdefault(_merge_group(msg), []).append(msg)
+  merged = _merge_text_group(groups.pop(_MERGE_GROUP_USER, []))
+  # Internal injections ride as their own queue entries so each keeps the
+  # is_internal flag that lets it past the human-sender check.
+  for internal in groups.values():
+    extra = _merge_text_group(internal)
+    if extra is not None:
+      other_msgs.insert(0, extra)
 
-  # Return merged text + any non-text messages that need separate handling
+  # Return merged text + any messages that need separate handling
   if other_msgs:
     # Non-text messages (card actions, commands) stay individual
     return merged, other_msgs  # type: ignore[return-value]
@@ -474,10 +505,21 @@ class MonitorCards:
   def __init__(self) -> None:
     self._by_task: dict[str, MonitorCard] = {}
     self._ended_order: list[str] = []
+    # Every task id seen ending in this process, card or not. A watch armed by
+    # a PREVIOUS daemon has no entry here, but its notification is fully
+    # delivered and its CLI-side wrap-up turn still arrives afterwards — the
+    # registry has to remember the ending anyway, or that answer posts a 🔔
+    # card and re-registers a dead watch as live (2026-10-29, oc_956058b1…).
+    self._ended_seen: list[str] = []
 
   def mark_ended(self, task_id: str, status: str) -> MonitorCard | None:
     """Freeze the entry in place; None when this task owns no card."""
-    entry = self._by_task.get(task_id) if task_id else None
+    if not task_id:
+      return None
+    if task_id not in self._ended_seen:
+      self._ended_seen.append(task_id)
+      del self._ended_seen[:-MAX_ENDED_MONITOR_CARDS]
+    entry = self._by_task.get(task_id)
     if entry is None:
       return None
     ended = entry.finished(status)
@@ -497,8 +539,17 @@ class MonitorCards:
   ) -> None:
     if not task_id or not message_id:
       return
+    # A dead task must never come back as a live watch: registering it would
+    # win the sole-live attribution it does not deserve and swallow the next
+    # real fire's task id.
+    if self.is_ended(task_id):
+      return
     self._by_task[task_id] = MonitorCard(
       message_id, title, meta, sections, updates=updates)
+
+  def is_ended(self, task_id: str) -> bool:
+    """True when this task has reported its ending in this process."""
+    return bool(task_id) and task_id in self._ended_seen
 
   def get(self, task_id: str) -> MonitorCard | None:
     return self._by_task.get(task_id) if task_id else None
@@ -525,6 +576,8 @@ class MonitorCards:
 
   def clear(self) -> None:
     self._by_task.clear()
+    self._ended_order.clear()
+    self._ended_seen.clear()
 
 
 def _idle_status_style(status: str) -> tuple[str, str]:
@@ -596,81 +649,80 @@ def _idle_budget_card(
   return cards.build_markdown_card("\n".join(lines), title=title, color=color)
 
 
-_IDLE_CARD_TITLE = "🔔 后台自动响应"
-
-
 async def _deliver_idle_card(
   channel: LarkChannel, chat_id: str, monitors: MonitorCards,
   task_id: str, text: str,
 ) -> None:
-  """Append ``text`` to the card its Monitor owns, else post a new one.
+  """Append ``text`` to the card its Monitor owns.
 
-  Best-effort throughout: a failed PATCH falls back to posting a fresh card
-  carrying only the new text, so a transient Lark error can never lose it.
+  There is deliberately NO generic fallback card. A report that cannot find
+  its watch's card means the card registry and the SDK disagree, and papering
+  that over with a "🔔 后台自动响应" card is what let the disagreement go
+  unnoticed all afternoon — the card looked like a feature while the watch it
+  came from was mis-attributed to a dead task (2026-10-29, oc_956058b1…).
+  Such a report is an ERROR, logged loudly and dropped; it is never invented
+  into a card of its own.
   """
   if not task_id:
     # No task identity on the event: attribute it to the only live watch, if
     # there is exactly one (see MonitorCards.sole_live_task_id).
     task_id = monitors.sole_live_task_id()
   entry = monitors.get(task_id)
-  if entry is not None:
-    # Mutate only after the PATCH succeeds, so a failed edit never desyncs
-    # the card from what Lark actually shows.
-    staged = entry.with_report(text)
-    if not cards.card_exceeds_rollover(
-        _monitor_card(staged), TURN_CARD_ROLLOVER_BYTE_LIMIT):
-      try:
-        await channel.update_card(entry.message_id, _monitor_card(staged))
-      except Exception as exc:
-        log.warning(
-          "Monitor card append failed, posting a new card: %s", exc)
-      else:
-        entry.adopt(staged)
-        log.info(
-          "Monitor card appended chat=%s task=%s msg=%s (%d reports, "
-          "part %d)", chat_id, task_id[:12], entry.message_id,
-          entry.updates, entry.part)
-        return
-    else:
-      # Full: freeze this card exactly like a rolled-over Working card and
-      # open the next part with the new report. Nothing is ever discarded.
-      try:
-        await channel.update_card(
-          entry.message_id, _monitor_card(entry, continued_away=True))
-      except Exception as exc:
-        log.warning("Monitor card rollover edit failed: %s", exc)
-      staged = entry.continued(text)
-      try:
-        msg_id = await channel.send_card(
-          chat_id, _monitor_card(staged))
-      except Exception as exc:
-        log.warning("Monitor card rollover send failed: %s", exc)
-        return
-      _register_msg(msg_id, chat_id)
-      staged.message_id = msg_id
-      entry.adopt(staged)
+  if entry is None:
+    if monitors.is_ended(task_id):
+      # The watch already reported its ending and owns no card here (it was
+      # armed by a previous daemon, or the ending was delivered as a turn).
+      # Its wrap-up adds nothing the chat does not already know.
       log.info(
-        "Monitor card rolled over chat=%s task=%s msg=%s (part %d)",
-        chat_id, task_id[:12], msg_id, entry.part)
-      return
+        "Idle report for an already ended task, no card to append chat=%s "
+        "task=%s", chat_id, task_id[:12])
+    else:
+      log.error(
+        "Idle report has no Monitor card to land on — dropped. chat=%s "
+        "task=%s. The SDK reported a task the card registry does not know; "
+        "either attribution failed (several watches live) or a card was "
+        "never registered.", chat_id, task_id[:12] or "<unattributed>")
+    return
 
-  # No card owned by this task (a self-directed background turn, or the very
-  # first report after a reconnect). It gets its own card.
-  card = cards.build_markdown_card(text, title=_IDLE_CARD_TITLE, color="blue")
+  # Mutate only after the PATCH succeeds, so a failed edit never desyncs
+  # the card from what Lark actually shows.
+  staged = entry.with_report(text)
+  if not cards.card_exceeds_rollover(
+      _monitor_card(staged), TURN_CARD_ROLLOVER_BYTE_LIMIT):
+    try:
+      await channel.update_card(entry.message_id, _monitor_card(staged))
+    except Exception as exc:
+      log.error(
+        "Monitor card append FAILED, report dropped (msg=%s task=%s): %s",
+        entry.message_id, task_id[:12], exc)
+      return
+    entry.adopt(staged)
+    log.info(
+      "Monitor card appended chat=%s task=%s msg=%s (%d reports, part %d)",
+      chat_id, task_id[:12], entry.message_id, entry.updates, entry.part)
+    return
+
+  # Full: freeze this card exactly like a rolled-over Working card and open
+  # the next part with the new report. Nothing is ever discarded.
   try:
-    msg_id = await channel.send_card(chat_id, card)
+    await channel.update_card(
+      entry.message_id, _monitor_card(entry, continued_away=True))
   except Exception as exc:
-    log.warning("Idle notification send failed: %s", exc)
+    log.error("Monitor card rollover edit FAILED (msg=%s): %s",
+              entry.message_id, exc)
+  staged = entry.continued(text)
+  try:
+    msg_id = await channel.send_card(chat_id, _monitor_card(staged))
+  except Exception as exc:
+    log.error("Monitor card rollover send FAILED (task=%s): %s",
+              task_id[:12], exc)
     return
   _register_msg(msg_id, chat_id)
-  # Own it too, so a watch that never got a marker card (it was armed before
-  # a reconnect) still consolidates its reports instead of posting a new card
-  # per fire.
-  monitors.register(
-    task_id, msg_id, _IDLE_CARD_TITLE, "", [text], updates=1)
+  staged.message_id = msg_id
+  entry.adopt(staged)
   log.info(
-    "Background response card sent chat=%s msg=%s task=%s",
-    chat_id, msg_id, task_id[:12] or "-")
+    "Monitor card rolled over chat=%s task=%s msg=%s (part %d)",
+    chat_id, task_id[:12], msg_id, entry.part)
 
 
 async def _close_monitor_card(
