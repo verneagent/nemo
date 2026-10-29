@@ -4774,28 +4774,57 @@ def test_background_cards_from_different_tasks_do_not_merge():
   ]
 
 
-def test_a_finished_monitor_stops_owning_its_card():
-  # A task completion ends the watch; a later event reusing the id (the id is
-  # reusable once the CLI has reaped the task) must not append to the dead
-  # card. Covered through the idle handler, which forgets it.
+def test_a_finished_monitor_keeps_its_wrap_up_on_the_same_card():
+  # Ending a watch makes the CLI run one last turn for the model to wrap up,
+  # and that answer comes tagged with the (now dead) task id. Dropping the
+  # entry sent it down the fallback path — a stray 🔔 card — and re-registered
+  # a dead watch, which then blocked attribution of the NEXT real fire too
+  # (2026-10-29, oc_956058b1…: 4 good appends, a stop, then bell cards).
   cleared: list[str] = []
   channel, _budget = _run_idle_notifier([
     BackgroundTurnDoneEvent(text="first", task_id="bmon1"),
     BackgroundTaskDoneEvent(task_id="bmon1", status="completed"),
     BackgroundTurnDoneEvent(text="after", task_id="bmon1"),
   ], cleared=cleared)
-  # The persisted record is cleared too, so a restart does not announce a
-  # watch that already ended. This used to raise NameError (``db`` is a
-  # main_loop local, the notifier is module-level) and silently skip it.
+  # The persisted record is cleared, so a restart does not announce a watch
+  # that already ended. This used to raise NameError (``db`` is a main_loop
+  # local, the notifier is module-level) and silently skip the cleanup.
   assert cleared == ["bmon1"]
 
   # The dead card is closed out (a stopped watch must not look live)…
-  (closed_id, closed), = channel.updated_cards
+  closed_id, closed = channel.updated_cards[0]
   assert closed_id == "om_idle1"
   assert "✅ 已结束" in _card_footer(closed)
   assert closed["header"]["template"] == "grey"
-  # …and "after" starts its own card instead of appending to the dead one.
-  assert len(channel.sent_cards) == 2
+  # …and the wrap-up still lands on THAT card, not a second one.
+  assert len(channel.sent_cards) == 1
+  last_id, last = channel.updated_cards[-1]
+  assert last_id == "om_idle1"
+  assert _card_blocks(last)[-1] == "after"
+  assert "✅ 已结束" in _card_footer(last)
+
+
+def test_an_ended_monitor_is_not_counted_as_live():
+  # Attribution asks "is there exactly ONE live watch?". An ended watch still
+  # holds its card so wrap-up text can land on it, but it must not compete.
+  monitors = MonitorCards()
+  monitors.register("blive", "om_live", "👀 live", "", ["task blive"])
+  monitors.register("bdead", "om_dead", "👀 dead", "", ["task bdead"])
+  monitors.mark_ended("bdead", "stopped")
+
+  assert monitors.sole_live_task_id() == "blive"
+  assert monitors.get("bdead") is not None
+
+
+def test_ended_monitor_cards_are_pruned_oldest_first():
+  from nemo.agent import MAX_ENDED_MONITOR_CARDS
+  monitors = MonitorCards()
+  for i in range(MAX_ENDED_MONITOR_CARDS + 3):
+    monitors.register(f"b{i}", f"om_{i}", f"👀 {i}", "", [f"task b{i}"])
+    monitors.mark_ended(f"b{i}", "completed")
+
+  assert monitors.get("b0") is None
+  assert monitors.get(f"b{MAX_ENDED_MONITOR_CARDS + 2}") is not None
 
 
 def test_control_a_dead_watch_card_keeps_looking_live():
@@ -5223,8 +5252,11 @@ def test_a_finished_monitor_marks_its_card_ended(tmp_path):
   assert closed, "the stopped watch's card must be patched, not left running"
   assert "⏹ 已停止" in _card_footer(closed[-1])
   assert closed[-1]["header"]["template"] == "grey"
-  # …and it is no longer a candidate for attribution or appends.
-  assert registry.get("bmon1") is None
+  # …and it is no longer a candidate for attribution (it is kept only so a
+  # wrap-up tagged with the dead id lands on that card instead of a 🔔 one).
+  ended = registry.get("bmon1")
+  assert ended is not None and ended.ended == "⏹ 已停止"
+  assert registry.sole_live_task_id() == "bmon2"
   # The re-armed watch is untouched and still owns its card.
   entry = registry.get("bmon2")
   assert entry is not None

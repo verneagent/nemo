@@ -3177,6 +3177,8 @@ def run_monitor_card_tests(pid: int, chat_id: str,
   MM05 the earlier report is still there (accumulation, not overwrite).
   MM06 when the watch's command exits, its card is marked ended — a dead
        card must not look live next to a re-armed watch with the same name.
+  MM07 the wrap-up turn the CLI runs when a watch ends lands on that card,
+       not on a stray 🔔 card that also re-registers the dead watch.
   """
   print(f"{Colors.BOLD}Phase MM: one card per Monitor{Colors.RESET}")
   log = LogAnalyzer(pid)
@@ -3212,6 +3214,11 @@ def run_monitor_card_tests(pid: int, chat_id: str,
     return
   msg_id = marker_card["message_id"]
   result.ok("MM01 monitor marker card", f"msg={msg_id}")
+  # The daemon logs task ids truncated to 12 chars.
+  task_prefix = next(
+    (line.split("task=")[1].split()[0] for line in
+     reversed(log.read_since(mark).splitlines())
+     if "Background task started" in line and "tool=Monitor" in line), "")
 
   # MM02 — the daemon must append to THAT message id, at least twice.
   appended: list[str] = []
@@ -3299,6 +3306,26 @@ def run_monitor_card_tests(pid: int, chat_id: str,
       f"no 'Monitor card closed … status=completed' line for {msg_id} "
       f"(last: {closed.strip() or 'none'})")
     log.dump_tail(40, "MM06")
+
+  # MM07 — ending a watch makes the CLI run one last wrap-up turn, and that
+  # answer arrives tagged with the now dead task id. Dropping the entry for it
+  # sent the answer down the fallback path (a stray 🔔 card) AND re-registered
+  # the dead watch, which then blocked attribution of the next real fire
+  # (2026-10-29, oc_956058b1…: bell cards everywhere). The wrap-up must land on
+  # the watch's own card.
+  time.sleep(20)
+  chunk = log.read_since(mark)
+  stray = [
+    line for line in chunk.splitlines()
+    if "Background response card sent" in line
+    and task_prefix in line
+  ]
+  if stray:
+    result.fail("MM07 the wrap-up lands on the watch's card",
+                f"posted a separate card for a dead watch: {stray[-1].strip()}")
+  else:
+    result.ok("MM07 the wrap-up lands on the watch's card",
+              "no stray card for the ended task")
 
 
 def run_idle_notification_tests(pid: int, chat_id: str,

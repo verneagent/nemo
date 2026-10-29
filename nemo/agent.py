@@ -326,6 +326,12 @@ def _register_msg(msg_id: str, chat_id: str) -> None:
 # with no human in the loop. Any real user message resets the count.
 MAX_IDLE_AUTO_TURNS = 3
 
+# Ended Monitors keep their card in the registry so the model's wrap-up answer
+# (which arrives tagged with the dead task id) lands on that card instead of a
+# stray 🔔 one. They are pruned oldest-first past this many, so a long-lived
+# chat that arms watch after watch cannot grow the registry without bound.
+MAX_ENDED_MONITOR_CARDS = 8
+
 # Header title + colour per SDK task status. The old notifier hardcoded
 # "✅ 后台任务完成" for every status, so a `stopped` / `failed` task read as a
 # success. Status is `completed` | `failed` | `stopped` in the SDK.
@@ -412,6 +418,7 @@ class MonitorCard:
     self.sections = other.sections
     self.part = other.part
     self.updates = other.updates
+    self.ended = other.ended
 
   def title_text(self) -> str:
     if self.part == 1:
@@ -453,11 +460,36 @@ class MonitorCards:
   Keyed by task identity, NOT by "is this the previous message": a monitor
   fires minutes apart and anything may land in between (a real turn, another
   watch, a command reply), yet its next report still belongs on its own card.
-  Entries are dropped when the task ends and on reconnect (monitors die with
-  the CLI subprocess, so the registry must not outlive it).
+
+  A finished watch KEEPS its entry, marked ``ended``, instead of being dropped:
+  ending a watch makes the CLI run one last turn for the model to wrap up, and
+  that answer arrives tagged with the (now dead) task id. Dropping the entry
+  sent it down the fallback path — a stray 🔔 card — and worse, re-registered a
+  dead watch, so ``sole_live_task_id()`` saw two entries and could no longer
+  attribute the next real fire either (2026-10-29, oc_956058b1…: 4 good
+  appends, then a stop, then every later report became a bell card).
+  ``sole_live_task_id()`` therefore counts only the un-ended entries, and the
+  ended ones are pruned oldest-first past ``MAX_ENDED_MONITOR_CARDS``.
   """
   def __init__(self) -> None:
     self._by_task: dict[str, MonitorCard] = {}
+    self._ended_order: list[str] = []
+
+  def mark_ended(self, task_id: str, status: str) -> MonitorCard | None:
+    """Freeze the entry in place; None when this task owns no card."""
+    entry = self._by_task.get(task_id) if task_id else None
+    if entry is None:
+      return None
+    ended = entry.finished(status)
+    entry.adopt(ended)
+    if task_id not in self._ended_order:
+      self._ended_order.append(task_id)
+    self._prune_ended()
+    return entry
+
+  def _prune_ended(self) -> None:
+    while len(self._ended_order) > MAX_ENDED_MONITOR_CARDS:
+      self._by_task.pop(self._ended_order.pop(0), None)
 
   def register(
     self, task_id: str, message_id: str, title: str, meta: str,
@@ -481,12 +513,15 @@ class MonitorCards:
     the report can only belong to it, which is what keeps a single Monitor on
     one card. Ambiguous with several armed, so don't guess there.
     """
-    if len(self._by_task) == 1:
-      return next(iter(self._by_task))
+    live = [tid for tid, entry in self._by_task.items() if not entry.ended]
+    if len(live) == 1:
+      return live[0]
     return ""
 
   def forget(self, task_id: str) -> None:
     self._by_task.pop(task_id, None)
+    if task_id in self._ended_order:
+      self._ended_order.remove(task_id)
 
   def clear(self) -> None:
     self._by_task.clear()
@@ -651,21 +686,16 @@ async def _close_monitor_card(
   broken watch and re-armed it under the same description, so the chat held
   two identical 👀 cards).
   """
-  entry = monitors.get(task_id)
+  entry = monitors.mark_ended(task_id, status)
   if entry is None:
     return
   try:
-    await channel.update_card(
-      entry.message_id, _monitor_card(entry.finished(status)))
+    await channel.update_card(entry.message_id, _monitor_card(entry))
     log.info("Monitor card closed msg=%s task=%s status=%s",
              entry.message_id, task_id[:12], status or "?")
   except Exception as exc:
     # Never fail a turn over a cosmetic card.
     log.warning("Monitor card close failed (task=%s): %s", task_id, exc)
-  finally:
-    # Retired either way: nothing may append to a dead watch's card, and it
-    # must not be counted as live by sole_live_task_id().
-    monitors.forget(task_id)
 
 
 def _idle_notifier_for(
