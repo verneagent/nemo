@@ -1219,6 +1219,16 @@ class ClaudeCodingAgent(CodingAgent):
       "task instead (Monitor polling the log, or a background Bash loop that "
       "sleeps and echoes); Nemo wakes a real turn when it completes. If no "
       "background task can do the job, say plainly that you cannot schedule it."
+      "\n\n"
+      "Watching: when the user asks you to watch / monitor / 盯着 something, "
+      "the background task must ALSO emit a short progress line on a fixed "
+      "interval (at most ~10 minutes), not just the terminal event. A monitor "
+      "that only speaks at the very end looks exactly like no monitor at all — "
+      "the user sees silence and concludes nothing is running (2026-10-29: a "
+      "group was told 盯着了 and heard nothing for 31 minutes). Make any "
+      "'stalled' threshold well above the source log's own update cadence "
+      "(a trainer printing every 10 iterations is silent for ~10 minutes even "
+      "when healthy), or it will cry wolf."
     )
     # Standing nemo-vision note for text-only models (deepseek/kimi). Computed
     # from the live model so it refreshes on each reconnect / /model switch;

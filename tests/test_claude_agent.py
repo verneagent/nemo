@@ -1260,6 +1260,29 @@ def test_build_agent_prompt_forbids_repl_only_cron_tools():
   assert "Monitor" in prompt
 
 
+def test_build_agent_prompt_requires_a_heartbeat_when_watching():
+  """'盯着了' must not mean 'silent until the end' (2026-10-29).
+
+  A group was told the work was being watched and then heard nothing for 31
+  minutes: the Monitor only echoed on the terminal sentinel, so no event ever
+  reached the drainer while the training was healthy. The prompt must demand
+  a periodic progress line in addition to the terminal event, and warn that a
+  stall threshold below the log's own cadence cries wolf."""
+  from unittest import mock
+  from nemo.agent_factory import MediaVision
+  from nemo.claude_agent import ClaudeCodingAgent
+  agent = ClaudeCodingAgent.__new__(ClaudeCodingAgent)
+  agent._model = "oc-deepseek-v4.1-flash"
+  agent._system_prompt = ""
+  with mock.patch("nemo.agent_factory.model_media_vision",
+                  return_value=MediaVision(image=True, video=False)), \
+       mock.patch("nemo.vision_cli.helper_available", return_value=True):
+    prompt = agent._build_agent_prompt()
+  assert "progress line" in prompt
+  assert "looks exactly like no monitor at all" in prompt
+  assert "update cadence" in prompt
+
+
 def _options_agent(tmp_path):
   from unittest import mock
   from nemo.claude_agent import ClaudeCodingAgent
