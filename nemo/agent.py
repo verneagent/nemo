@@ -547,6 +547,22 @@ def _attach_timeline_file(
     log.warning("Failed to attach timeline file: %s", e)
 
 
+def _done_body_segments(
+  steer_answers: list[str], final_text: str,
+) -> list[str] | None:
+  """Body segments for a turn a steer split into two queries.
+
+  ``steer_answers`` holds the last answer step at each moment a follow-up was
+  steered in. Those answers are complete, so they belong in the Done body
+  next to the final one; returning None keeps the ordinary single-answer
+  card. Duplicates are dropped: a second steer usually sees the same step.
+  """
+  earlier = [t for t in steer_answers if t and t != final_text]
+  if not earlier or not final_text:
+    return None
+  return [*earlier, final_text]
+
+
 def _upload_body_as_file(
   *,
   channel: LarkChannel,
@@ -589,6 +605,7 @@ def _update_done_card_with_fallback(
   final_text: str,
   thinking,
   elapsed: int,
+  body_segments: list[str] | None = None,
   usage,
   session_id: str,
   await_channel,
@@ -613,9 +630,9 @@ def _update_done_card_with_fallback(
   if cards.timeline_overflows(thinking):
     _attach_timeline_file(channel, chat_id, thinking)
 
-  def _build(body: str) -> JsonObject:
+  def _build(body: str, segments: list[str] | None = None) -> JsonObject:
     return cards.build_turn_card(
-      "done", body=body, steps=thinking,
+      "done", body=body, body_segments=segments, steps=thinking,
       elapsed=elapsed, usage=usage, session_id=session_id,
       compact_notice=compact_notice,
       answered_questions=answered_questions,
@@ -629,7 +646,11 @@ def _update_done_card_with_fallback(
       register_msg(turn_card_id, chat_id)
     return turn_card_id
 
-  full_card = _build(final_text)
+  # The file/preview fallbacks have one body string, so flatten the segments
+  # the same way they read inline.
+  combined = "\n\n---\n\n".join(body_segments) if body_segments else final_text
+
+  full_card = _build(final_text, body_segments)
 
   # Proactive size guard: an oversized card would 200 + render empty, so skip
   # the doomed PATCH and go straight to the body-as-file fallback.
@@ -641,7 +662,7 @@ def _update_done_card_with_fallback(
       return turn_card_id
     return _upload_body_as_file(
       channel=channel, chat_id=chat_id, turn_card_id=turn_card_id,
-      final_text=final_text, build_card=_build, patch=_patch)
+      final_text=combined, build_card=_build, patch=_patch)
 
   try:
     return _patch(full_card)
@@ -656,7 +677,7 @@ def _update_done_card_with_fallback(
   ) or not final_text:
     return turn_card_id
 
-  preview_card = _build(_truncate_for_preview(final_text))
+  preview_card = _build(_truncate_for_preview(combined))
   if not cards.is_card_oversized(preview_card):
     try:
       return _patch(preview_card)
@@ -665,7 +686,7 @@ def _update_done_card_with_fallback(
 
   return _upload_body_as_file(
     channel=channel, chat_id=chat_id, turn_card_id=turn_card_id,
-    final_text=final_text, build_card=_build, patch=_patch)
+    final_text=combined, build_card=_build, patch=_patch)
 
 
 async def _handle_turn_error(
@@ -3431,6 +3452,10 @@ async def main_loop(
           # Final response = last answer step (if any)
           answer_steps = [s for s in _turn_steps if s.kind == "answer"]
           final_text = answer_steps[-1].content if answer_steps else ""
+          # A steer made this turn answer two questions. Keep the interrupted
+          # answer in the body instead of letting the Done card show only the
+          # last one (the other would be buried in the Thinking panel).
+          body_segments = _done_body_segments(_steer_answers, final_text)
           # Ask the active coding agent for any agent-specific note to tack
           # onto the response (e.g. Claude warns when the session jsonl is
           # getting large so the user remembers to /clear).
@@ -3450,6 +3475,7 @@ async def main_loop(
               chat_id=chat_id,
               turn_card_id=_turn_card_id,
               final_text=final_text,
+              body_segments=body_segments,
               thinking=thinking,
               elapsed=elapsed,
               usage=event.usage,
@@ -3535,6 +3561,12 @@ async def main_loop(
       # detect (at turn end) any the turn never actually consumed and
       # re-queue them: (message_id, steer_text, IncomingMessage, get_reaction_id).
       _steered_this_turn: list[tuple[str, str, IncomingMessage, str]] = []
+      # Answers a steer interrupted. The CLI runs the steered message as a
+      # SECOND query, so the turn ends up with two complete answers — but the
+      # Done card's body is only the LAST answer step, which demoted the
+      # first one into the collapsible timeline. Capture it at steer time so
+      # the card can show both (2026-10-29).
+      _steer_answers: list[str] = []
       # Follow-ups that arrived BEFORE this turn reached its first tool-call
       # boundary. We hold them here instead of steering immediately: folding a
       # brand-new question into a still-running text-only answer makes the reply
@@ -3748,6 +3780,20 @@ async def main_loop(
           log.warning("Failed to ack absorbed message: %s", exc)
           return ""
 
+      def _note_steer_answer() -> None:
+        """Snapshot the answer a steer is about to interrupt.
+
+        Only a TEXT step counts: if the model's latest output was a tool call
+        (or thinking), it hadn't finished answering, and promoting a stray
+        narration line would be noise. A repeated steer sees the same last
+        step, so guard against recording it twice.
+        """
+        if not _turn_steps or _turn_steps[-1].kind != "answer":
+          return
+        text = _turn_steps[-1].content
+        if text and (not _steer_answers or _steer_answers[-1] != text):
+          _steer_answers.append(text)
+
       async def _flush_deferred_steers() -> None:
         """Fold boundary-deferred follow-ups into the running turn.
 
@@ -3760,6 +3806,7 @@ async def main_loop(
           mid, text, m, _rid = _deferred_steers.pop(0)
           if await coding_agent.steer(text):
             log.info("Steered deferred follow-up at tool boundary: %s", text[:60])
+            _note_steer_answer()
             get_rid = ""
             if mid:
               get_rid = await _mark_absorbed(mid)
@@ -3995,6 +4042,7 @@ async def main_loop(
               continue
             if steer_text and await coding_agent.steer(steer_text):
               log.info("Steered message into running turn: %s", steer_text[:60])
+              _note_steer_answer()
               # Optimistically swap its OneSecond ack for Get (absorbed).
               # Recorded so the DoneEvent handler can verify the turn really
               # folded it in; if not, the Get is reverted and it's re-queued.

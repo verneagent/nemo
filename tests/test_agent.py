@@ -1001,6 +1001,192 @@ def test_message_during_turn_steers_instead_of_queuing(tmp_path):
   assert ("om_steer", "CheckMark") not in calls
 
 
+def test_steered_turn_shows_both_answers_in_the_done_body(tmp_path):
+  """A steer makes the CLI answer a SECOND question in the same turn.
+
+  Only the last answer step became the Done card's body, so the reply to the
+  first question was demoted into the collapsible Thinking panel — the user
+  saw their first answer "buried" (2026-10-29, oc_956058b1…). Both answers
+  must stay in the body, separated by a rule.
+  """
+  steer_seen = asyncio.Event()
+  turn_done = asyncio.Event()
+  cards_sent: list[dict] = []
+
+  class _SteeringAgent(_FakeAgent):
+    def supports_steering(self):
+      return True
+
+    async def steer(self, _text):
+      steer_seen.set()
+      return True
+
+    async def run_turn(self, _prompt, on_event):
+      def _first():
+        on_event(ProgressEvent(kind="tool", summary="Bash", first=True))
+        on_event(AnswerEvent("answering the first question"))
+      await asyncio.to_thread(_first)
+      await steer_seen.wait()
+
+      def _second():
+        on_event(AnswerEvent("answering the second question"))
+        on_event(DoneEvent(cost=0.0, usage={"input_tokens": 1}))
+      await asyncio.to_thread(_second)
+      turn_done.set()
+      return 0.0, {"input_tokens": 1}
+
+  class _SteerChannel(_QueuedChannel):
+    def __init__(self):
+      super().__init__("oc_test", [
+        IncomingMessage(event_type="im.message.receive_v1", chat_id="oc_test",
+                        sender_id="ou_user", message_id="om_q1",
+                        msg_type="text", text="first question", create_time="1"),
+        IncomingMessage(event_type="im.message.receive_v1", chat_id="oc_test",
+                        sender_id="ou_user", message_id="om_q2",
+                        msg_type="text", text="second question", create_time="2"),
+        IncomingMessage(event_type="im.message.receive_v1", chat_id="oc_test",
+                        sender_id="ou_user", message_id="om_exit",
+                        msg_type="text", text="/exit", create_time="3"),
+      ])
+      self._n = 0
+
+    def push_back(self, message):
+      self._messages.insert(0, message)
+
+    async def receive(self, timeout=300):
+      self._n += 1
+      if self._n == 2:  # let the turn establish before steering
+        await asyncio.sleep(0.05)
+      if self._n == 3:  # hold /exit until the steered turn has finished
+        await turn_done.wait()
+      return await super().receive(timeout)
+
+    async def send_card(self, _chat_id, card):
+      cards_sent.append(card)
+      return "om_card"
+
+    async def update_card(self, card_id, card):
+      cards_sent.append(card)
+      return card_id
+
+  channel = _SteerChannel()
+
+  with mock.patch("nemo.agent.load_credentials", return_value={
+    "app_id": "app_id", "app_secret": "app_secret",
+    "email": "user@example.com",
+  }), \
+       mock.patch("nemo.agent.Database", _FakeDB), \
+       mock.patch("nemo.agent.LarkChannel", return_value=channel), \
+       mock.patch("nemo.agent.build_coding_agent", return_value=_SteeringAgent()), \
+       mock.patch("nemo.group_config.load_config", return_value={}), \
+       mock.patch("nemo.config.load_relay_config", return_value=("", "")), \
+       mock.patch("signal.signal"):
+    result = asyncio.run(main_loop("oc_test", str(tmp_path), "claude-opus-4-6"))
+
+  assert result == 0
+  done = [c for c in cards_sent
+          if c.get("header", {}).get("title", {}).get("content") == "Done ✓"]
+  assert done, "no Done card"
+  body = done[-1]["body"]["elements"]
+  contents = [e.get("content", "") for e in body if e.get("tag") == "markdown"]
+  # Both answers are in the body; the panel is a separate collapsible element.
+  assert "answering the first question" in contents
+  assert "answering the second question" in contents
+  first_i = contents.index("answering the first question")
+  second_i = contents.index("answering the second question")
+  assert first_i < second_i
+  kinds = [e.get("tag") for e in body]
+  assert "hr" in kinds[first_i:second_i + 1], kinds
+
+
+def test_control_only_the_last_answer_reaches_the_done_body(tmp_path):
+  """Control for the test above: without the steer snapshot the first answer
+  never reaches the body, which is the bug being fixed."""
+  steer_seen = asyncio.Event()
+  turn_done = asyncio.Event()
+  cards_sent: list[dict] = []
+
+  class _SteeringAgent(_FakeAgent):
+    def supports_steering(self):
+      return True
+
+    async def steer(self, _text):
+      steer_seen.set()
+      return True
+
+    async def run_turn(self, _prompt, on_event):
+      def _first():
+        on_event(ProgressEvent(kind="tool", summary="Bash", first=True))
+        on_event(AnswerEvent("answering the first question"))
+      await asyncio.to_thread(_first)
+      await steer_seen.wait()
+
+      def _second():
+        on_event(AnswerEvent("answering the second question"))
+        on_event(DoneEvent(cost=0.0, usage={"input_tokens": 1}))
+      await asyncio.to_thread(_second)
+      turn_done.set()
+      return 0.0, {"input_tokens": 1}
+
+  class _SteerChannel(_QueuedChannel):
+    def __init__(self):
+      super().__init__("oc_test", [
+        IncomingMessage(event_type="im.message.receive_v1", chat_id="oc_test",
+                        sender_id="ou_user", message_id="om_q1",
+                        msg_type="text", text="first question", create_time="1"),
+        IncomingMessage(event_type="im.message.receive_v1", chat_id="oc_test",
+                        sender_id="ou_user", message_id="om_q2",
+                        msg_type="text", text="second question", create_time="2"),
+        IncomingMessage(event_type="im.message.receive_v1", chat_id="oc_test",
+                        sender_id="ou_user", message_id="om_exit",
+                        msg_type="text", text="/exit", create_time="3"),
+      ])
+      self._n = 0
+
+    def push_back(self, message):
+      self._messages.insert(0, message)
+
+    async def receive(self, timeout=300):
+      self._n += 1
+      if self._n == 2:
+        await asyncio.sleep(0.05)
+      if self._n == 3:
+        await turn_done.wait()
+      return await super().receive(timeout)
+
+    async def send_card(self, _chat_id, card):
+      cards_sent.append(card)
+      return "om_card"
+
+    async def update_card(self, card_id, card):
+      cards_sent.append(card)
+      return card_id
+
+  channel = _SteerChannel()
+
+  with mock.patch("nemo.agent.load_credentials", return_value={
+    "app_id": "app_id", "app_secret": "app_secret",
+    "email": "user@example.com",
+  }), \
+       mock.patch("nemo.agent.Database", _FakeDB), \
+       mock.patch("nemo.agent.LarkChannel", return_value=channel), \
+       mock.patch("nemo.agent.build_coding_agent", return_value=_SteeringAgent()), \
+       mock.patch("nemo.agent._done_body_segments", return_value=None), \
+       mock.patch("nemo.group_config.load_config", return_value={}), \
+       mock.patch("nemo.config.load_relay_config", return_value=("", "")), \
+       mock.patch("signal.signal"):
+    result = asyncio.run(main_loop("oc_test", str(tmp_path), "claude-opus-4-6"))
+
+  assert result == 0
+  done = [c for c in cards_sent
+          if c.get("header", {}).get("title", {}).get("content") == "Done ✓"]
+  body = done[-1]["body"]["elements"]
+  contents = [e.get("content", "") for e in body if e.get("tag") == "markdown"]
+  assert "answering the second question" in contents
+  assert "answering the first question" not in contents, \
+    "control: without the snapshot the first answer is missing from the body"
+
+
 def test_queue_command_during_turn_bypasses_steering(tmp_path):
   """`/queue <message>` must wait for the current turn even when the agent can
   steer plain follow-ups into the active turn."""

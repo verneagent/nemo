@@ -685,6 +685,7 @@ def build_turn_card(
   phase: str,
   *,
   body: str = "",
+  body_segments: list[str] | None = None,
   steps: list[ThinkingStep] | None = None,
   current_tool: str = "",
   elapsed: int = 0,
@@ -703,6 +704,9 @@ def build_turn_card(
 
   phase: "working" | "continued" | "stopping" | "stopped" | "done" | "error"
   body:  for done/error — final response or error message
+  body_segments: for a turn that answered MORE than one question (a steer
+    starts a second query), the answers in order, rendered as separate
+    markdown blocks divided by a rule. Overrides ``body``.
   steps: unified thinking timeline (text + tool entries in order)
   status_notice: short blue banner shown above the working state as a
     live "what's happening now" hint (only rendered in working/stopping/
@@ -806,8 +810,15 @@ def build_turn_card(
     # decisions the user made stay visible in the terminal card.
     if answered_questions:
       elements.append(_answered_questions_element(answered_questions))
-    # Final response (inline)
-    if body:
+    # Final response (inline). Multiple segments = the turn answered more
+    # than one question (a steer split it into two queries); each answer
+    # stays visible instead of all but the last sinking into the timeline.
+    if body_segments:
+      for idx, segment in enumerate(body_segments):
+        if idx:
+          elements.append({"tag": "hr"})
+        elements.append({"tag": "markdown", "content": segment})
+    elif body:
       elements.append({"tag": "markdown", "content": body})
     # Thinking timeline
     if steps:
