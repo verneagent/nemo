@@ -640,7 +640,10 @@ def _emit_jsonl_events(
             if name in ("Task", "Agent"):
               tid = str(b.get("id") or "")
               log.info("claude-cli subagent start: tool=%s id=%s", name, tid[:12])
-              on_event(TaskStartedEvent(task_id=tid))
+              # Subagents are turn-internal parallel work, not a background
+              # watch the user asked for — task_type keeps them out of the
+              # "background monitor armed" marker card.
+              on_event(TaskStartedEvent(task_id=tid, task_type="local_agent"))
       _accumulate_usage(state, msg.get("usage"))
     elif rtype == "system":
       sub = row.get("subtype")

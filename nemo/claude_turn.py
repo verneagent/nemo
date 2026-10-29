@@ -1134,7 +1134,11 @@ async def _single_turn(
 
     elif isinstance(message, TaskStartedMessage):
       pending_tasks.add(message.task_id)
-      on_event(TaskStartedEvent(task_id=message.task_id))
+      on_event(TaskStartedEvent(
+        task_id=message.task_id,
+        description=message.description or "",
+        task_type=message.task_type or "",
+      ))
 
     elif isinstance(message, TaskProgressMessage):
       desc = getattr(message, "description", "") or ""

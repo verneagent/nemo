@@ -494,6 +494,23 @@ def get_bot_msgs(chat_id: str, after: str = "0",
   return msgs
 
 
+def newest_completed_msg(chat_id: str, after: str,
+                         limit: int = 10) -> dict | None:
+  """Newest bot message that represents a completed turn.
+
+  Scans the recent messages instead of trusting only the newest one. A turn
+  can post other cards at or after its Done card — the background-task marker
+  lands WHILE the turn is still running, and idle notifications follow it —
+  so a newest-message-only check sits on top of a Done card it can never
+  reach and reports "no Done card" for a turn that plainly completed
+  (2026-10-29: the marker-card change broke ID01 exactly this way).
+  """
+  for msg in get_bot_msgs(chat_id, after=after, limit=limit):
+    if is_done_response(msg):
+      return msg
+  return None
+
+
 def wait_for_response(chat_id: str, after: str,
                       timeout: int = 60, poll: int = 3,
                       require_done: bool = False) -> tuple[dict | None, float]:
@@ -501,11 +518,13 @@ def wait_for_response(chat_id: str, after: str,
   start = time.time()
   deadline = start + timeout
   while time.time() < deadline:
-    msg = get_latest_bot_msg(chat_id, after=after)
-    if msg and msg["time"] > after:
-      if require_done and not is_done_response(msg):
-        time.sleep(poll)
-        continue
+    if require_done:
+      msg = newest_completed_msg(chat_id, after=after)
+    else:
+      msg = get_latest_bot_msg(chat_id, after=after)
+      if msg and msg["time"] <= after:
+        msg = None
+    if msg:
       return msg, time.time() - start
     time.sleep(poll)
   return None, time.time() - start
@@ -3156,6 +3175,8 @@ def run_idle_notification_tests(pid: int, chat_id: str,
 
     ID01  the background task starts and the turn ENDS (the completion has to
           land in the between-turn idle window to be a real idle event).
+    ID01b arming the background task posts a 👀 marker card immediately, so
+          the watch is visible in the chat before anything fires.
     ID02  the daemon logs `Idle notification queued as turn` — the card-only
           path logs `Idle notification sent` and nothing else, which is
           exactly the regression.
@@ -3205,6 +3226,31 @@ def run_idle_notification_tests(pid: int, chat_id: str,
     return
   wait_for_idle(pid, chat_id, timeout=60)
   result.ok("ID01 background task started", f"{elapsed:.1f}s")
+
+  # ID01b: arming a background task posts a marker card AT ARM TIME. Without
+  # it the chat shows nothing until the task finishes, which is exactly how a
+  # user concludes "没有挂上 monitor" (2026-10-29: told 盯着了, silent for 31
+  # minutes). This also proves the SDK's TaskStartedMessage carries
+  # task_type=local_bash for Monitor — the unit test can only feed it
+  # by hand.
+  print("  [ID01b] Looking for the background-task marker card...")
+  marker_card = None
+  started = time.time()
+  while time.time() - started < 30:
+    for card in get_bot_msgs(chat_id, after=ts, limit=10):
+      if interactive_card_title(card).startswith("👀 后台监控已挂上"):
+        marker_card = card
+        break
+    if marker_card:
+      break
+    time.sleep(2)
+  if marker_card:
+    result.ok("ID01b background-task marker card", "posted at arm time")
+  else:
+    result.fail(
+      "ID01b background-task marker card",
+      "no 👀 card after arming — the user cannot tell a monitor is running")
+    log.dump_tail(20, "ID01b")
 
   # Wait for the drainer to surface
   # it; `queued as turn` is the fix's signature (the bug logged `sent` only).
@@ -3632,7 +3678,7 @@ def main():
       if not args.skip_sdk:
         run_idle_notification_tests(pid, chat_id, result)
       else:
-        for n in ["ID01", "ID02", "ID03", "ID04", "ID05", "ID06"]:
+        for n in ["ID01", "ID01b", "ID02", "ID03", "ID04", "ID05", "ID06"]:
           result.skip(f"{n} idle notification", "skipped by --skip-sdk")
 
       # ---- Phase 3: Signals ----

@@ -35,7 +35,7 @@ from .types import JsonObject
 from .turn import (
   AnswerEvent, BackgroundTaskDoneEvent, BackgroundTurnDoneEvent,
   CompactNoticeEvent, CompactStartedEvent, DoneEvent,
-  ProgressEvent, RateLimitNoticeEvent, StaleLeakNoticeEvent,
+  ProgressEvent, RateLimitNoticeEvent, StaleLeakNoticeEvent, TaskStartedEvent,
 )
 
 log = logging.getLogger(__name__)
@@ -3191,6 +3191,47 @@ async def main_loop(
 
       channel.turn_ctx = TurnCardCtx(redraw=_turn_ctx_redraw)
 
+      _announced_tasks: set[str] = set()
+
+      def _announce_task_started(event: TaskStartedEvent) -> None:
+        """Post a marker card the instant a background task is armed.
+
+        A Monitor that only speaks on its terminal sentinel is invisible
+        until it fires: the user asked for a watch, was told 盯着了, and then
+        heard nothing for 31 minutes while the watched job ran normally
+        (2026-10-29). From the chat there was no way to tell whether anything
+        had been armed at all. Announcing the arming itself makes that
+        observable at the moment it happens.
+
+        Subagents (``local_agent`` / ``remote_agent``) are turn-internal
+        parallel work, not a background watch — a turn that fans out three of
+        them must not produce three cards.
+        """
+        if event.task_type in ("local_agent", "remote_agent"):
+          return
+        if event.task_id and event.task_id in _announced_tasks:
+          return
+        if event.task_id:
+          _announced_tasks.add(event.task_id)
+        title = ("👀 后台监控已挂上" if event.task_type == "local_bash"
+                 else "👀 后台任务已启动")
+        desc = event.description.strip()
+        body = desc or "后台任务已启动"
+        note = "运行中，有结果会自动汇报"
+        if event.task_id:
+          note = f"task {event.task_id} · {note}"
+        try:
+          card = cards.build_card(title, body=body, color="blue", note=note)
+          msg_id = _await_channel(channel.send_card(chat_id, card))
+          _register_msg(msg_id, chat_id)
+          db.record_sent(msg_id, text=title, chat_id=chat_id)
+          log.info("Background-task marker card sent: %s (task=%s type=%s)",
+                   msg_id, event.task_id, event.task_type or "?")
+        except Exception as e:
+          # Never fail the turn over a cosmetic card.
+          log.warning("Background-task marker card failed (task=%s): %s",
+                      event.task_id, e)
+
       def _on_event(event):
         # Thread safety: this runs on the SDK thread. It mutates _turn_card_id,
         # _turn_steps. The main loop only reads these AFTER
@@ -3215,6 +3256,9 @@ async def main_loop(
             _turn_status_notice = ""
             _ensure_card()
           _update_working(current_tool=_turn_current_tool if event.kind == "tool" else None)
+
+        elif isinstance(event, TaskStartedEvent):
+          _announce_task_started(event)
 
         elif isinstance(event, AnswerEvent):
           _turn_steps.append(cards.ThinkingStep("answer", event.text))

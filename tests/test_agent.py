@@ -37,7 +37,7 @@ from nemo.channel import IncomingMessage
 from nemo.turn import (
   AnswerEvent, BackgroundTaskDoneEvent, BackgroundTurnDoneEvent,
   CompactNoticeEvent, CompactStartedEvent, DoneEvent,
-  ProgressEvent, RateLimitNoticeEvent,
+  ProgressEvent, RateLimitNoticeEvent, TaskStartedEvent,
 )
 
 
@@ -4627,3 +4627,91 @@ def test_idle_notifications_drive_real_turns_and_reset_on_user_message(
     c for _, c in channel.sent_cards
     if c.get("header", {}).get("title", {}).get("content") == "✅ 后台任务完成"]
   assert len(fallback) == 1
+
+
+def test_task_started_posts_one_marker_card_and_skips_subagents(tmp_path):
+  """Arming a Monitor / background Bash must be visible in the chat at once.
+
+  2026-10-29: a group was told 盯着了 and the Monitor only spoke on its
+  terminal sentinel, so the chat showed nothing for 31 minutes while the
+  watched job ran normally — the user concluded no monitor had been armed.
+  The marker card makes the arming itself observable at the moment it
+  happens. Subagents are turn-internal parallel work and must stay silent
+  (a fan-out of three would otherwise post three cards).
+  """
+  sent_cards: list[object] = []
+
+  class _CapturingChannel(_FakeChannel):
+    async def send_card(self, _chat_id, card):
+      sent_cards.append(card)
+      return f"om_card_{len(sent_cards)}"
+
+    async def update_card(self, card_id, _card):
+      return card_id
+
+  class _ArmingAgent(_FakeAgent):
+    async def run_turn(self, _prompt, on_event):
+      def _emit():
+        on_event(ProgressEvent(kind="tool", summary="Monitor", first=True))
+        on_event(TaskStartedEvent(
+          task_id="bmon1", description="light LoRA training progress",
+          task_type="local_bash"))
+        # Same task announced twice (replayed system message) → one card.
+        on_event(TaskStartedEvent(
+          task_id="bmon1", description="light LoRA training progress",
+          task_type="local_bash"))
+        on_event(TaskStartedEvent(
+          task_id="a_sub", description="explore the repo",
+          task_type="local_agent"))
+        on_event(AnswerEvent("盯着了"))
+        on_event(DoneEvent(cost=0.0, usage={"input_tokens": 1}))
+
+      await asyncio.to_thread(_emit)
+      return 0.0, {"input_tokens": 1}
+
+  channel = _CapturingChannel("oc_test")
+  channel._messages = [
+    IncomingMessage(
+      event_type="im.message.receive_v1",
+      chat_id="oc_test", sender_id="ou_user",
+      message_id="om_msg", msg_type="text",
+      text="你给我盯一下", create_time="1",
+    ),
+    IncomingMessage(
+      event_type="im.message.receive_v1",
+      chat_id="oc_test", sender_id="ou_user",
+      message_id="om_exit", msg_type="text",
+      text="/exit", create_time="2",
+    ),
+  ]
+
+  async def _recv(timeout=300):
+    del timeout
+    if channel._messages:
+      return channel._messages.pop(0)
+    return None
+  channel.receive = _recv
+
+  with mock.patch("nemo.agent.load_credentials", return_value={
+    "app_id": "app_id", "app_secret": "app_secret", "email": "u@e.com",
+  }), \
+       mock.patch("nemo.agent.Database", _FakeDB), \
+       mock.patch("nemo.agent.LarkChannel", return_value=channel), \
+       mock.patch("nemo.agent.build_coding_agent", return_value=_ArmingAgent()), \
+       mock.patch("nemo.agent._send_response", new=mock.AsyncMock()), \
+       mock.patch("nemo.group_config.load_config", return_value={}), \
+       mock.patch("nemo.config.load_relay_config", return_value=("", "")), \
+       mock.patch("signal.signal"):
+    rc = asyncio.run(main_loop("oc_test", str(tmp_path), "claude-opus-4-6"))
+
+  assert rc == 0
+  titles = [c["header"]["title"]["content"] for c in sent_cards]
+  markers = [c for c in sent_cards
+             if c["header"]["title"]["content"] == "👀 后台监控已挂上"]
+  assert len(markers) == 1, titles
+  blob = json.dumps(markers[0], ensure_ascii=False)
+  assert "light LoRA training progress" in blob
+  assert "bmon1" in blob
+  # The subagent must not get a card, and neither must its id leak into one.
+  assert all("explore the repo" not in json.dumps(c, ensure_ascii=False)
+             for c in sent_cards)

@@ -142,6 +142,8 @@ class FakeResultMessage:
 @dataclass
 class FakeTaskStartedMessage:
   task_id: str
+  description: str = ""
+  task_type: str = ""
 
 
 @dataclass

@@ -4,6 +4,7 @@ import ast
 import sys
 from pathlib import Path
 
+from scripts import e2e_test as e2e
 from scripts.e2e_test import (
   LogAnalyzer,
   interactive_card_title,
@@ -47,6 +48,58 @@ def test_is_done_response_distinguishes_working_and_done_cards() -> None:
   assert not is_done_response(working)
   assert is_done_response(done)
   assert is_done_response(text)
+
+
+MARKER_CARD = {
+  "type": "interactive",
+  "body": '{"title":"👀 后台监控已挂上","elements":[]}',
+  "time": "2000",
+  "message_id": "om_marker",
+}
+DONE_CARD = {
+  "type": "interactive",
+  "body": '{"title":"Done ✓","elements":[]}',
+  "time": "1000",
+  "message_id": "om_done",
+}
+
+
+def test_wait_for_response_finds_the_done_card_under_a_newer_marker(
+  monkeypatch,
+) -> None:
+  """A card posted AFTER the Done card must not hide it.
+
+  Arming a background task posts a 👀 marker while the turn is still
+  running, so the marker is often the newest bot message when the turn
+  finishes. A newest-message-only search then never sees the Done card and
+  reports a completed turn as failed (2026-10-29, ID01).
+  """
+  monkeypatch.setattr(
+    e2e, "get_bot_msgs", lambda *a, **k: [MARKER_CARD, DONE_CARD])
+  msg, _ = e2e.wait_for_response(
+    "oc_test", after="0", timeout=1, poll=0, require_done=True)
+  assert msg is not None
+  assert msg["message_id"] == "om_done"
+
+
+def test_control_newest_only_lookup_misses_the_done_card(monkeypatch) -> None:
+  """Control: with the old newest-only lookup the same messages yield nothing.
+
+  Pins the scan as the load-bearing part — if someone "simplifies"
+  ``wait_for_response`` back to ``get_latest_bot_msg`` this assertion is what
+  fails.
+  """
+  monkeypatch.setattr(
+    e2e, "get_bot_msgs", lambda *a, **k: [MARKER_CARD, DONE_CARD])
+
+  def _newest_only(chat_id: str, after: str, limit: int = 10) -> dict | None:
+    msgs = e2e.get_bot_msgs(chat_id, after=after, limit=limit)
+    return msgs[0] if msgs and e2e.is_done_response(msgs[0]) else None
+
+  monkeypatch.setattr(e2e, "newest_completed_msg", _newest_only)
+  msg, _ = e2e.wait_for_response(
+    "oc_test", after="0", timeout=1, poll=0, require_done=True)
+  assert msg is None
 
 
 def test_log_analyzer_read_since_and_wait_for_since(tmp_path: Path) -> None:

@@ -82,6 +82,11 @@ class AnswerEvent:
 @dataclass
 class TaskStartedEvent:
   task_id: str
+  # CLI task type ("local_bash" for Monitor / background Bash, "local_agent"
+  # / "remote_agent" for subagents) and the human description the model gave
+  # it. Both are optional because not every adapter can supply them.
+  description: str = ""
+  task_type: str = ""
 
 
 @dataclass
