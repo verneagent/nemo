@@ -78,6 +78,18 @@ class _FakeDB:
   def set_sdk_session_id(self, _chat_id, _sdk_session_id, _agent, _endpoint_key=""):
     pass
 
+  def record_monitor(self, _chat_id, _task_id, _description=""):
+    pass
+
+  def clear_monitor(self, _task_id):
+    pass
+
+  def clear_monitors(self, _chat_id):
+    pass
+
+  def take_stale_monitors(self, _chat_id):
+    return []
+
 
 class _FakeChannel:
   def __init__(self, _chat_id):
@@ -4730,3 +4742,120 @@ def test_task_started_posts_one_marker_card_and_skips_subagents(tmp_path):
   assert "Merge main into branch" not in blob
   assert "something long-running" not in blob
   assert "bcmd1" not in blob and "bunk1" not in blob
+
+
+def test_leftover_monitors_are_announced_once_after_a_restart(tmp_path):
+  """A restart kills every Monitor; the model must not pretend otherwise.
+
+  Monitors are child processes of the CLI, so the new daemon has none — but
+  the resumed transcript still contains the "盯着了" and the 👀 card. Without
+  this notice the model answers "还在监控" from stale context. The notice is
+  injected into the FIRST turn only, and it tells the model not to re-arm on
+  its own (2026-10-29: 重启或 /clear 就是要清干净，只有用户再说才重挂).
+  """
+  prompts: list[str] = []
+  recorded: list[tuple[str, str]] = []
+
+  class _StaleDB(_FakeDB):
+    def __init__(self, project_dir):
+      super().__init__(project_dir)
+      self._taken = False
+
+    def take_stale_monitors(self, _chat_id):
+      if self._taken:
+        return []
+      self._taken = True
+      return [("btask1", "watch the LoRA training")]
+
+    def record_monitor(self, _chat_id, task_id, description=""):
+      recorded.append((task_id, description))
+
+  class _PromptAgent(_FakeAgent):
+    def __init__(self):
+      self.turns = 0
+
+    def supports_steering(self):
+      return False
+
+    async def run_turn(self, prompt, on_event):
+      prompts.append(prompt)
+      self.turns += 1
+      turn = self.turns
+
+      def _emit():
+        # The real adapter emits from the SDK thread; emitting straight from
+        # the main loop would deadlock on _await_channel (which blocks until
+        # the main loop runs the coroutine it schedules).
+        if turn == 1:
+          # The model re-arms a watch in the first turn; it must be persisted.
+          on_event(TaskStartedEvent(
+            task_id="bmon2", description="new watch",
+            task_type="local_bash", tool_name="Monitor"))
+        on_event(AnswerEvent("ok"))
+        on_event(DoneEvent(cost=0.0, usage={"input_tokens": 1}))
+
+      await asyncio.to_thread(_emit)
+      return 0.0, {"input_tokens": 1}
+
+  channel = _FakeChannel("oc_test")
+  channel.send_card = mock.AsyncMock(return_value="om_card")
+  channel.update_card = mock.AsyncMock(side_effect=lambda cid, _c: cid)
+  channel._messages = [
+    IncomingMessage(
+      event_type="im.message.receive_v1",
+      chat_id="oc_test", sender_id="ou_user",
+      message_id="om_msg1", msg_type="text",
+      text="还在盯着吗", create_time="1",
+    ),
+    IncomingMessage(
+      event_type="im.message.receive_v1",
+      chat_id="oc_test", sender_id="ou_user",
+      message_id="om_msg2", msg_type="text",
+      text="继续", create_time="2",
+    ),
+    IncomingMessage(
+      event_type="im.message.receive_v1",
+      chat_id="oc_test", sender_id="ou_user",
+      message_id="om_exit", msg_type="text",
+      text="/exit", create_time="3",
+    ),
+  ]
+
+  async def _recv(timeout=300):
+    del timeout
+    if not channel._messages:
+      return None
+    nxt = channel._messages[0]
+    if nxt.message_id == "om_exit" and len(prompts) < 2:
+      # Hold /exit back until the follow-up turn exists. Otherwise turn 1's
+      # watcher drains the whole queue, hits /exit, and the loop breaks with
+      # only one prompt — the "injected exactly once" half never runs.
+      await asyncio.sleep(0.02)
+      return None
+    return channel._messages.pop(0)
+  channel.receive = _recv
+  # A message consumed mid-turn is requeued by the daemon; the fake has to
+  # actually put it back or the follow-up turn's input is lost.
+  channel.push_back = lambda m: channel._messages.insert(0, m)
+
+  with mock.patch("nemo.agent.load_credentials", return_value={
+    "app_id": "app_id", "app_secret": "app_secret", "email": "u@e.com",
+  }), \
+       mock.patch("nemo.agent.Database", _StaleDB), \
+       mock.patch("nemo.agent.LarkChannel", return_value=channel), \
+       mock.patch("nemo.agent.build_coding_agent", return_value=_PromptAgent()), \
+       mock.patch("nemo.agent._send_response", new=mock.AsyncMock()), \
+       mock.patch("nemo.group_config.load_config", return_value={}), \
+       mock.patch("nemo.config.load_relay_config", return_value=("", "")), \
+       mock.patch("signal.signal"):
+    rc = asyncio.run(main_loop("oc_test", str(tmp_path), "claude-opus-4-6"))
+
+  assert rc == 0
+  assert len(prompts) == 2, prompts
+  assert "watch the LoRA training" in prompts[0]
+  assert "已经随着进程终止全部停止" in prompts[0]
+  assert "不要重新挂" in prompts[0]
+  # Consumed: the second turn is just the user's message.
+  assert "已经随着进程终止全部停止" not in prompts[1]
+  # Re-arming in turn 1 is persisted for the NEXT restart.
+  assert ("bmon2", "new watch") in recorded

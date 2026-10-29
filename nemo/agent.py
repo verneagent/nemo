@@ -35,7 +35,8 @@ from .types import JsonObject
 from .turn import (
   AnswerEvent, BackgroundTaskDoneEvent, BackgroundTurnDoneEvent,
   CompactNoticeEvent, CompactStartedEvent, DoneEvent,
-  ProgressEvent, RateLimitNoticeEvent, StaleLeakNoticeEvent, TaskStartedEvent,
+  ProgressEvent, RateLimitNoticeEvent, StaleLeakNoticeEvent, TaskDoneEvent,
+  TaskStartedEvent,
 )
 
 log = logging.getLogger(__name__)
@@ -471,6 +472,12 @@ def _idle_notifier_for(
   def _handle_idle_event(event: object) -> None:
     """Runs on the main loop — the only place ``budget`` is touched."""
     if isinstance(event, BackgroundTaskDoneEvent):
+      # A Monitor that finished between turns is no longer live; forget it
+      # so a restart doesn't announce a watch that already ended.
+      try:
+        db.clear_monitor(event.task_id)
+      except Exception as e:
+        log.warning("Failed to clear monitor %s: %s", event.task_id, e)
       if budget.consecutive >= budget.max_consecutive:
         log.info(
           "Idle notification: auto-turn budget spent (%d), card instead "
@@ -1984,6 +1991,41 @@ async def main_loop(
   # One-shot flag: prepend a pacing hint to the next user prompt after an
   # SDK timeout. Cleared after use or on /clear.
   _pending_pacing_hint = False
+  # One-shot notice for the first turn after a restart, built from the
+  # monitors a previous daemon left in the DB. A Monitor is a child process
+  # of the CLI, so restarting the daemon kills it silently — the resumed
+  # session still remembers arming it and would answer "还在盯着" from stale
+  # context. Injected into the next prompt so the model knows the truth
+  # without Nemo starting an unrequested turn.
+  _pending_restart_notice = ""
+
+  def _orphaned_monitors() -> str:
+    """Text listing monitors a previous process left behind, '' if none."""
+    try:
+      stale = db.take_stale_monitors(chat_id)
+    except Exception as e:
+      log.warning("Could not read leftover monitors: %s", e)
+      return ""
+    if not stale:
+      return ""
+    log.info(
+      "Armed %d monitor(s) died with the previous daemon — notifying on the "
+      "next turn", len(stale))
+    lines = [
+      "【系统提示 · 与用户消息无关】上一个 Nemo 进程里挂的后台监控已经随着"
+      "进程终止全部停止，现在没有任何监控在运行。之前挂的是：",
+    ]
+    for task_id, desc in stale:
+      lines.append(f"- {desc or '(无描述)'} (task {task_id[:12]})")
+    lines += [
+      "",
+      "回答用户时不要声称这些监控还在跑。默认不要重新挂；只有用户明确让你"
+      "重新盯的时候才挂。",
+    ]
+    return "\n".join(lines)
+
+
+  _pending_restart_notice = _orphaned_monitors()
   # Message id of the /model picker card awaiting a confirmation PATCH.
   # Set when a picker submit (model_switch:*) is accepted; the __model__
   # handler reads it after the switch lands and rewrites that card into
@@ -2003,6 +2045,14 @@ async def main_loop(
   signal.signal(signal.SIGTERM, handle_sig)
 
   async def _restart_client(resume: str = ""):
+    # The reconnect closes the CLI, and every Monitor it spawned dies with
+    # it. Forget the persisted rows too — otherwise the next daemon start
+    # would announce watches that ended here, and a /clear is supposed to
+    # leave the chat with nothing running.
+    try:
+      db.clear_monitors(chat_id)
+    except Exception as e:
+      log.warning("Failed to clear recorded monitors: %s", e)
     await coding_agent.reset(project_dir, model, resume=resume)
 
   def _is_own_message(mid: str) -> bool:
@@ -3217,6 +3267,15 @@ async def main_loop(
                  event.tool_name or "?", event.description[:120])
         if event.tool_name != "Monitor":
           return
+        if event.task_id:
+          # Persist the live watch: a Monitor dies with the daemon and
+          # nothing in the chat says so, so the next process needs this list
+          # to tell the model the truth on its first turn.
+          try:
+            db.record_monitor(
+              chat_id, event.task_id, event.description.strip())
+          except Exception as e:
+            log.warning("Failed to record monitor %s: %s", event.task_id, e)
         if event.task_id and event.task_id in _announced_tasks:
           return
         if event.task_id:
@@ -3265,6 +3324,14 @@ async def main_loop(
 
         elif isinstance(event, TaskStartedEvent):
           _announce_task_started(event)
+
+        elif isinstance(event, TaskDoneEvent):
+          # The watch ended — it must stop being reported as live on the
+          # next daemon start.
+          try:
+            db.clear_monitor(event.task_id)
+          except Exception as e:
+            log.warning("Failed to clear monitor %s: %s", event.task_id, e)
 
         elif isinstance(event, AnswerEvent):
           _turn_steps.append(cards.ThinkingStep("answer", event.text))
@@ -3452,6 +3519,10 @@ async def main_loop(
         _pending_pacing_hint = False
       else:
         prompt_for_agent = user_message
+      if _pending_restart_notice:
+        log.info("Injecting the restart monitor notice into this turn")
+        prompt_for_agent = _pending_restart_notice + "\n\n" + prompt_for_agent
+        _pending_restart_notice = ""
       sdk_task = asyncio.create_task(
         coding_agent.run_turn(prompt_for_agent, _on_event)
       )

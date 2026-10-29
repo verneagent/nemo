@@ -66,6 +66,12 @@ CREATE TABLE IF NOT EXISTS agent_sessions (
   sdk_session_id TEXT NOT NULL DEFAULT '',
   PRIMARY KEY (chat_id, agent, endpoint_key)
 );
+CREATE TABLE IF NOT EXISTS armed_monitors (
+  task_id TEXT PRIMARY KEY,
+  chat_id TEXT NOT NULL DEFAULT '',
+  description TEXT DEFAULT '',
+  armed_at REAL DEFAULT 0
+);
 """
 
 
@@ -363,3 +369,58 @@ class Database:
       "SELECT message_id FROM working_state WHERE session_id = ?", (session_id,)
     ).fetchone()
     return row["message_id"] if row else None
+
+  # --- Armed background monitors ---
+  #
+  # A Monitor is a child process of the CLI subprocess, so it dies with the
+  # daemon — silently: nothing in the chat says the watch ended, while the
+  # resumed session still remembers having armed it. Persisting the live ones
+  # lets the next daemon tell the model they are gone instead of letting it
+  # answer "还在盯着" from stale context.
+
+  def record_monitor(
+    self, chat_id: str, task_id: str, description: str = "",
+  ) -> None:
+    self._conn.execute(
+      """INSERT OR REPLACE INTO armed_monitors
+           (task_id, chat_id, description, armed_at)
+         VALUES (?, ?, ?, ?)""",
+      (task_id, chat_id, description, time.time()),
+    )
+    self._conn.commit()
+
+  def clear_monitor(self, task_id: str) -> None:
+    self._conn.execute(
+      "DELETE FROM armed_monitors WHERE task_id = ?", (task_id,)
+    )
+    self._conn.commit()
+
+  def clear_monitors(self, chat_id: str) -> None:
+    """Forget every recorded Monitor for ``chat_id``.
+
+    Used on reconnect (/clear, /model, /effort, stale-leak recovery): the
+    CLI that owned those child processes is closed, so none of them is live
+    any more and a later restart must not announce them as lost watches.
+    """
+    self._conn.execute(
+      "DELETE FROM armed_monitors WHERE chat_id = ?", (chat_id,)
+    )
+    self._conn.commit()
+
+  def take_stale_monitors(self, chat_id: str) -> list[tuple[str, str]]:
+    """Return AND delete the monitors a previous daemon left behind.
+
+    Anything still recorded at startup belongs to a process that is gone —
+    its task ids are meaningless to the new CLI session, so keeping them
+    would only make every later startup re-announce the same dead task.
+    """
+    rows = self._conn.execute(
+      "SELECT task_id, description FROM armed_monitors WHERE chat_id = ?",
+      (chat_id,),
+    ).fetchall()
+    if rows:
+      self._conn.execute(
+        "DELETE FROM armed_monitors WHERE chat_id = ?", (chat_id,)
+      )
+      self._conn.commit()
+    return [(row["task_id"], row["description"] or "") for row in rows]

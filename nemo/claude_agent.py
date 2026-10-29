@@ -23,7 +23,13 @@ from .db import Database
 from .permissions import build_ask_user_question_handler, build_permission_handler
 from .sdk_thread import SDKThread
 from .sessions import DIGEST_TASK_INTRO, claude_project_slug
-from .turn import CompactStartedEvent, TurnEvent
+from .turn import (
+  BackgroundTaskDoneEvent,
+  CompactStartedEvent,
+  TaskDoneEvent,
+  TaskStartedEvent,
+  TurnEvent,
+)
 from .types import JsonObject
 
 # Env vars Claude Code / claude-agent-sdk honor for endpoint overrides
@@ -219,6 +225,14 @@ _FORK_ALLOWED_TOOLS = [
 _CRON_DISALLOWED_TOOLS = [
   "CronCreate", "CronList", "CronDelete", "ScheduleWakeup",
 ]
+
+# How many Monitors may be live at once in one conversation. Each one is a
+# real child process that keeps burning resources until it exits (and on the
+# Mac Studio a pile of idle shells has already contributed to port
+# exhaustion), while the marginal watch adds little. Enforced with a
+# PreToolUse hook, not a prompt line: the model can arm several in one
+# response, so a soft instruction loses the race — see ``_on_pre_tool_use``.
+MAX_LIVE_MONITORS = 3
 _FORK_DISALLOWED_TOOLS = [
   "Write", "Edit", "NotebookEdit", "Agent", "Skill", "AskUserQuestion",
   "mcp__*",
@@ -575,6 +589,11 @@ class ClaudeCodingAgent(CodingAgent):
     # adapter. Kept here (not in the abstract CodingAgent interface) because
     # only the Claude SDK exhibits the bug.
     self._stale_tasks: set[str] = set()
+    # Monitor tasks armed and not yet finished, across turns (a Monitor
+    # outlives the turn that started it). Drives MAX_LIVE_MONITORS in the
+    # PreToolUse hook; cleared on reconnect because a closed client takes its
+    # child processes — and therefore every running Monitor — with it.
+    self._live_monitors: set[str] = set()
     # Live per-turn on_event sink for hook callbacks. Hooks are session-
     # scoped (registered once on ClaudeAgentOptions) but events are
     # per-turn, so the PreCompact hook reads this attribute to find the
@@ -604,7 +623,7 @@ class ClaudeCodingAgent(CodingAgent):
     per-turn ``on_event``.
     """
     self._on_idle_event = handler
-    self._sdk.start_idle_drain(handler)
+    self._sdk.start_idle_drain(self._idle_sink)
 
   async def start(
     self, project_dir: str, model: str, resume: str = "",
@@ -662,7 +681,7 @@ class ClaudeCodingAgent(CodingAgent):
       await self._sdk.create_client(self._options)
     # Arm the between-turn idle drainer (if the host registered a notifier
     # before start — otherwise set_idle_notifier arms it on its own).
-    self._sdk.start_idle_drain(self._on_idle_event)
+    self._sdk.start_idle_drain(self._idle_sink)
 
   async def run_turn(
     self,
@@ -674,6 +693,7 @@ class ClaudeCodingAgent(CodingAgent):
     def _wrapped(ev: TurnEvent) -> None:
       if isinstance(ev, DoneEvent) and ev.session_id:
         self._latest_session_id = ev.session_id
+      self._observe_event(ev)
       on_event(ev)
 
     def _options_factory() -> object:
@@ -698,6 +718,67 @@ class ClaudeCodingAgent(CodingAgent):
         steer_probe=self.steer_continuation_batches)
     finally:
       self._current_on_event = None
+
+  def _idle_sink(self, event: TurnEvent) -> None:
+    """Drainer sink: track task state, then hand the event to the host."""
+    self._observe_event(event)
+    if self._on_idle_event is not None:
+      self._on_idle_event(event)
+
+  def _observe_event(self, event: TurnEvent) -> None:
+    """Track which Monitor tasks are live (runs on the SDK thread).
+
+    Both event paths feed this: the per-turn ``on_event`` and the idle
+    notifier. A Monitor outlives the turn that armed it, so the set is
+    deliberately owned by the adapter rather than by a turn.
+    """
+    if isinstance(event, TaskStartedEvent):
+      if event.tool_name == "Monitor" and event.task_id:
+        self._live_monitors.add(event.task_id)
+    elif isinstance(event, TaskDoneEvent):
+      self._live_monitors.discard(event.task_id)
+    elif isinstance(event, BackgroundTaskDoneEvent):
+      self._live_monitors.discard(event.task_id)
+
+  async def _on_pre_tool_use(
+    self,
+    hook_input: object,
+    tool_use_id: object,
+    context: object,
+  ) -> dict[str, object]:
+    """SDK PreToolUse hook — refuse a 4th concurrent Monitor.
+
+    The model can arm several Monitors in a single response, so a prompt
+    line is a race it can lose; denying the call is deterministic and the
+    reason goes back to the model, which will merge or drop the extra watch
+    instead of silently having it killed.
+    """
+    del tool_use_id, context
+    try:
+      if not isinstance(hook_input, dict):
+        return {}
+      if hook_input.get("tool_name") != "Monitor":
+        return {}
+      live = len(self._live_monitors)
+      if live < MAX_LIVE_MONITORS:
+        return {}
+      log.warning(
+        "Denied a Monitor: %d already live (%s)",
+        live, ", ".join(sorted(self._live_monitors))[:80])
+      return {
+        "hookSpecificOutput": {
+          "hookEventName": "PreToolUse",
+          "permissionDecision": "deny",
+          "permissionDecisionReason": (
+            f"同时最多 {MAX_LIVE_MONITORS} 个后台监控，现在已经有 {live} 个在跑。"
+            "先停掉不需要的（KillShell），或者把多个观察合并成一条 Monitor "
+            "命令，再挂新的。"
+          ),
+        },
+      }
+    except Exception as exc:  # never block tool use on a bookkeeping error
+      log.warning("PreToolUse Monitor hook error: %s", exc)
+      return {}
 
   async def _on_pre_compact(
     self,
@@ -809,6 +890,10 @@ class ClaudeCodingAgent(CodingAgent):
     # marked stale belong to the old session and will never be delivered
     # on the new one — keeping them would force a pointless drain turn.
     self._stale_tasks.clear()
+    # The same reconnect kills every Monitor: they are child processes of the
+    # CLI being closed. Forgetting them here is what lets the user arm new
+    # ones afterwards instead of hitting MAX_LIVE_MONITORS forever.
+    self._live_monitors.clear()
     self._project_dir = project_dir
     self._model = model
     self._latest_session_id = resume
@@ -830,7 +915,7 @@ class ClaudeCodingAgent(CodingAgent):
     # from the client that was just closed, and the lazy path would leave it
     # in place (not done → never replaced), silently ending idle delivery for
     # the rest of this daemon's life.
-    self._sdk.start_idle_drain(self._on_idle_event, restart=True)
+    self._sdk.start_idle_drain(self._idle_sink, restart=True)
 
   async def side_question(self, question: str, sdk_session_id: str) -> str:
     """Read-only ephemeral side question — see CodingAgent.side_question.
@@ -1228,7 +1313,14 @@ class ClaudeCodingAgent(CodingAgent):
       "group was told 盯着了 and heard nothing for 31 minutes). Make any "
       "'stalled' threshold well above the source log's own update cadence "
       "(a trainer printing every 10 iterations is silent for ~10 minutes even "
-      "when healthy), or it will cry wolf."
+      "when healthy), or it will cry wolf. At most "
+      f"{MAX_LIVE_MONITORS} Monitors may run at once — a 4th call is denied "
+      "by the harness, so stop an unneeded one (KillShell) or combine the "
+      "watches instead of retrying. Monitors do NOT survive a restart or "
+      "/clear: everything running dies with the process. Nothing will tell "
+      "the user they stopped, so if they ask whether a watch is still live, "
+      "check instead of trusting the old context, and re-arm only when they "
+      "explicitly ask again."
     )
     # Standing nemo-vision note for text-only models (deepseek/kimi). Computed
     # from the live model so it refreshes on each reconnect / /model switch;
@@ -1448,6 +1540,12 @@ class ClaudeCodingAgent(CodingAgent):
       # SystemMessage(subtype="compact_boundary"); see turn.py.
       hooks={
         "PreCompact": [HookMatcher(hooks=[self._on_pre_compact])],
+        # Cap concurrent Monitors at MAX_LIVE_MONITORS. The matcher keeps the
+        # callback off every other tool call, so ordinary Bash/Read traffic
+        # pays nothing.
+        "PreToolUse": [
+          HookMatcher(matcher="Monitor", hooks=[self._on_pre_tool_use]),
+        ],
       },
       can_use_tool=_can_use_tool,
       # Single stream_json messages can exceed the SDK's 1 MB default when

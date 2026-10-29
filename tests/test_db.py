@@ -411,3 +411,36 @@ def test_get_current_session(tmp_path):
     assert s is not None
     assert s["session_id"] == "sess1"
     db.close()
+
+
+def test_armed_monitors_survive_a_process_boundary_and_are_taken_once(tmp_path):
+  """A Monitor dies with the daemon; the next one must learn about it once.
+
+  ``take_stale_monitors`` both returns and deletes, so the same dead watch is
+  announced on exactly one restart instead of on every start forever.
+  """
+  with mock.patch("nemo.db.DB_BASE", str(tmp_path)):
+    db = Database(str(tmp_path / "project"))
+    db.record_monitor("chat1", "btask1", "watch training")
+    db.record_monitor("chat1", "btask2", "watch deploy")
+    # A task that ended must not be announced after a restart.
+    db.clear_monitor("btask2")
+
+    stale = db.take_stale_monitors("chat1")
+    assert stale == [("btask1", "watch training")]
+    assert db.take_stale_monitors("chat1") == []
+    db.close()
+
+
+def test_clear_monitors_forgets_a_chats_watches_but_not_anothers(tmp_path):
+  """A reconnect kills that chat's Monitors; other chats keep theirs."""
+  with mock.patch("nemo.db.DB_BASE", str(tmp_path)):
+    db = Database(str(tmp_path / "project"))
+    db.record_monitor("chat1", "btask1", "watch training")
+    db.record_monitor("chat2", "btask2", "watch deploy")
+
+    db.clear_monitors("chat1")
+
+    assert db.take_stale_monitors("chat1") == []
+    assert db.take_stale_monitors("chat2") == [("btask2", "watch deploy")]
+    db.close()

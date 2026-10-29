@@ -546,6 +546,7 @@ def _bare_claude_agent():
   agent._on_idle_event = None  # start()/reset() re-arm the idle drain with it
   agent._sdk_started = True
   agent._stale_tasks = set()
+  agent._live_monitors = set()
   agent._project_dir = ""
   agent._model = ""
   agent._latest_session_id = ""
@@ -688,7 +689,14 @@ def test_start_arms_the_idle_drainer():
 
   asyncio.run(agent.start("/tmp/project", "claude-opus-4-7"))
 
-  agent._sdk.start_idle_drain.assert_called_once_with(handler)
+  # The drainer is armed with the adapter's observing sink, which must both
+  # track task state and hand every event to the host handler.
+  armed = agent._sdk.start_idle_drain.call_args.args[0]
+  seen: list[object] = []
+  agent._on_idle_event = seen.append
+  ev = object()
+  armed(ev)
+  assert seen == [ev]
 
 
 def test_reset_restarts_the_idle_drainer():
@@ -712,7 +720,13 @@ def test_reset_restarts_the_idle_drainer():
 
   asyncio.run(agent.reset("/tmp/project", "claude-opus-4-7", resume="sid"))
 
-  agent._sdk.start_idle_drain.assert_called_once_with(handler, restart=True)
+  assert agent._sdk.start_idle_drain.call_args.kwargs == {"restart": True}
+  armed = agent._sdk.start_idle_drain.call_args.args[0]
+  seen: list[object] = []
+  agent._on_idle_event = seen.append
+  ev = object()
+  armed(ev)
+  assert seen == [ev]
 
 
 def test_set_idle_notifier_stores_and_arms_with_the_handler():
@@ -728,7 +742,12 @@ def test_set_idle_notifier_stores_and_arms_with_the_handler():
   agent.set_idle_notifier(handler)
 
   assert agent._on_idle_event is handler
-  agent._sdk.start_idle_drain.assert_called_once_with(handler)
+  armed = agent._sdk.start_idle_drain.call_args.args[0]
+  seen: list[object] = []
+  agent._on_idle_event = seen.append
+  ev = object()
+  armed(ev)
+  assert seen == [ev]
 
 
 def _make_process_error_exc():
@@ -749,6 +768,7 @@ def _bare_reset_agent():
   agent = ClaudeCodingAgent.__new__(ClaudeCodingAgent)
   agent._on_idle_event = None  # reset() re-arms the idle drain with it
   agent._stale_tasks = set()
+  agent._live_monitors = set()
   agent._project_dir = ""
   agent._model = ""
   agent._latest_session_id = ""
@@ -1426,3 +1446,120 @@ def test_side_question_still_collects_text_via_shared_helper(tmp_path, monkeypat
   monkeypatch.setitem(sys.modules, "claude_agent_sdk", _fake_sdk(script))
   out = asyncio.run(agent.side_question("what?", ""))
   assert out == "the answer"
+
+
+def _monitor_agent():
+  from nemo.claude_agent import ClaudeCodingAgent
+  agent = ClaudeCodingAgent.__new__(ClaudeCodingAgent)
+  agent._live_monitors = set()
+  return agent
+
+
+def test_pre_tool_use_denies_the_fourth_monitor():
+  """At most 3 live Monitors; the deny reason must be actionable.
+
+  The model can arm several in one response, so the ceiling has to be
+  deterministic — a prompt line loses that race.
+  """
+  from nemo.claude_agent import MAX_LIVE_MONITORS
+
+  assert MAX_LIVE_MONITORS == 3
+  agent = _monitor_agent()
+  for i in range(MAX_LIVE_MONITORS):
+    out = asyncio.run(agent._on_pre_tool_use(
+      {"tool_name": "Monitor", "tool_input": {"command": "tail -f x"}},
+      "tu_1", None))
+    assert out == {}, f"monitor #{i + 1} must be allowed"
+    agent._live_monitors.add(f"task_{i}")
+
+  denied = asyncio.run(agent._on_pre_tool_use(
+    {"tool_name": "Monitor", "tool_input": {"command": "tail -f y"}},
+    "tu_9", None))
+  hook = denied["hookSpecificOutput"]
+  assert hook["permissionDecision"] == "deny"
+  assert "3" in hook["permissionDecisionReason"]
+  # Tell the model HOW to free a slot, not just that it failed.
+  assert "KillShell" in hook["permissionDecisionReason"]
+
+
+def test_pre_tool_use_leaves_other_tools_alone():
+  agent = _monitor_agent()
+  agent._live_monitors = {"a", "b", "c", "d"}  # over the cap on purpose
+  out = asyncio.run(agent._on_pre_tool_use(
+    {"tool_name": "Bash", "tool_input": {"command": "ls"}}, "tu_1", None))
+  assert out == {}
+
+
+def test_finished_monitor_frees_its_slot():
+  """A completed watch must not eat the cap forever."""
+  from nemo.turn import TaskDoneEvent, TaskStartedEvent
+
+  agent = _monitor_agent()
+  agent._on_idle_event = None
+  agent._observe_event(TaskStartedEvent(
+    task_id="m1", task_type="local_bash", tool_name="Monitor"))
+  assert agent._live_monitors == {"m1"}
+  # A plain Bash task is not a monitor and must not count.
+  agent._observe_event(TaskStartedEvent(
+    task_id="b1", task_type="local_bash", tool_name="Bash"))
+  assert agent._live_monitors == {"m1"}
+  agent._observe_event(TaskDoneEvent(task_id="m1", status="completed"))
+  assert agent._live_monitors == set()
+
+
+def test_reset_forgets_monitors_because_the_reconnect_kills_them(tmp_path):
+  """Monitors are children of the closed client — the cap must reset too."""
+  from nemo.claude_agent import ClaudeCodingAgent
+
+  agent = ClaudeCodingAgent.__new__(ClaudeCodingAgent)
+  agent._live_monitors = {"m1", "m2", "m3"}
+  agent._stale_tasks = set()
+  agent._read_only = False
+  agent._fork_parent_id = ""
+  agent._effort = ""
+  agent._sdk = _FakeSDK()
+  agent._build_options = lambda *_a, **_k: object()  # type: ignore[method-assign]
+  asyncio.run(agent.reset("/proj", "model", resume="sess"))
+  assert agent._live_monitors == set()
+
+
+class _FakeSDK:
+  def __init__(self) -> None:
+    self.drained = []
+
+  async def reconnect(self, _options):
+    return None
+
+  def start_idle_drain(self, handler, restart=False):
+    self.drained.append((handler, restart))
+
+
+def test_options_register_the_monitor_hook():
+  """The deny only exists if the hook is wired onto the real options."""
+  from nemo.claude_agent import ClaudeCodingAgent
+
+  agent = ClaudeCodingAgent.__new__(ClaudeCodingAgent)
+  agent._read_only = False
+  agent._credentials = {"app_id": "a", "app_secret": "b"}
+  agent._chat_id = "oc_test"
+  agent._db = None
+  agent._channel = None
+  agent._permission_mode = "bypassPermissions"
+  agent._system_prompt = ""
+  from nemo.coding_agent import EndpointConfig
+  agent._endpoint = EndpointConfig()
+  agent._project_dir = "/proj"
+  agent._model = "m"
+  agent._effort = ""
+  agent._fork_parent_id = ""
+  agent._endpoint_selection = None
+  from unittest import mock
+  with mock.patch(
+      "nemo.claude_agent.build_ask_user_question_handler",
+      return_value=mock.AsyncMock()), \
+     mock.patch(
+      "nemo.claude_agent.build_permission_handler",
+      return_value=mock.AsyncMock()):
+    options = ClaudeCodingAgent._build_options(agent, "/proj", "m")
+  matchers = options.hooks["PreToolUse"]
+  assert any(m.matcher == "Monitor" for m in matchers)
