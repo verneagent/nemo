@@ -673,6 +673,81 @@ async def _send_idle_error_card(
   log.info("Idle error card sent chat=%s msg=%s", chat_id, msg_id)
 
 
+async def _announce_monitor_started(
+  channel: LarkChannel, chat_id: str, monitors: MonitorCards,
+  announced: set[str], record_monitor: Callable[[str, str], None],
+  record_sent: Callable[[str, str], None], event: TaskStartedEvent,
+) -> None:
+  """Post a marker card the instant a background task is armed.
+
+  A Monitor that only speaks on its terminal sentinel is invisible until it
+  fires: the user asked for a watch, was told 盯着了, and then heard nothing
+  for 31 minutes while the watched job ran normally (2026-10-29). From the
+  chat there was no way to tell whether anything had been armed at all.
+  Announcing the arming itself makes that observable at the moment it
+  happens.
+
+  ONLY the Monitor tool is announced. ``task_type`` is not enough to tell a
+  watch from ordinary work: the CLI reports a Monitor AND any Bash call it
+  promotes to a task as ``local_bash``, so keying off it put "后台监控已挂上"
+  on plain ``git merge`` / ``go build`` commands (2026-10-29: a group was
+  told a monitor was armed when the model was just running a foreground
+  command). The spawning tool name comes from the tool_use block via
+  ``tool_use_id``; when it is unknown we stay silent rather than claim a
+  watch that may not exist.
+
+  TWO callers, and they need different threading: a turn's event handler
+  runs on the SDK thread and blocks on the send, while the idle drainer's
+  announce runs on the main loop and must only SCHEDULE this coroutine —
+  awaiting it there deadlocks the loop that has to perform the send
+  (2026-10-30, oc_956058b1…).
+  """
+  log.info("Background task started: task=%s type=%s tool=%s desc=%r",
+           event.task_id, event.task_type or "?",
+           event.tool_name or "?", event.description[:120])
+  if event.tool_name != "Monitor":
+    return
+  if event.task_id:
+    # Persist the live watch: a Monitor dies with the daemon and nothing in
+    # the chat says so, so the next process needs this list to tell the
+    # model the truth on its first turn.
+    try:
+      record_monitor(event.task_id, event.description.strip())
+    except Exception as e:
+      log.warning("Failed to record monitor %s: %s", event.task_id, e)
+  if event.task_id and event.task_id in announced:
+    return
+  if event.task_id:
+    announced.add(event.task_id)
+  body = event.description.strip() or "后台监控"
+  # Say how often it actually looks. The Monitor tool has no interval field,
+  # so the cadence comes from the command's own sleep; without it "已挂上"
+  # still left the user guessing when a result might appear.
+  note = cards.monitor_cadence(event.command, event.timeout_ms)
+  try:
+    # The description is the model's own words for this watch, so it makes a
+    # meaningful title — and it stays fixed for the card's life, which is
+    # what makes one scrolling card legible.
+    card_title = f"👀 {body}"
+    card = cards.build_sections_card(
+      [f"<font color='grey'>task {event.task_id}</font>"],
+      title=card_title, color="blue", note=note)
+    msg_id = await channel.send_card(chat_id, card)
+    _register_msg(msg_id, chat_id)
+    record_sent(msg_id, card_title)
+    # This marker IS the watch's card: every report appends to it, so the
+    # chat keeps one live card per Monitor instead of a stream of cards.
+    monitors.register(
+      event.task_id, msg_id, card_title, note,
+      [f"<font color='grey'>task {event.task_id}</font>"])
+    log.info("Background-task marker card sent: %s (task=%s)",
+             msg_id, event.task_id)
+  except Exception as e:
+    # Never fail a turn over a cosmetic card.
+    log.warning("Background-task marker card failed (task=%s): %s",
+                event.task_id, e)
+
+
 async def _deliver_idle_card(
   channel: LarkChannel, chat_id: str, monitors: MonitorCards,
   task_id: str, text: str,
@@ -794,6 +869,16 @@ async def _close_monitor_card(
     log.warning("Monitor card close failed (task=%s): %s", task_id, exc)
 
 
+# The idle-drainer events the host reacts to. TaskStarted belongs here because
+# the CLI runs some turns ITSELF (the wrap-up after a notification), and a
+# Monitor the model arms in one of those reaches the host only this way —
+# dropping it left the watch with no marker card and made every fire it
+# produced unattributable (2026-10-30, oc_956058b1…). Named so the control
+# test can patch it out and prove the branch is what carries the arming.
+_IDLE_SURFACED_EVENTS = (
+  TaskStartedEvent, BackgroundTaskDoneEvent, BackgroundTurnDoneEvent)
+
+
 def _idle_notifier_for(
   channel: LarkChannel,
   chat_id: str,
@@ -802,6 +887,7 @@ def _idle_notifier_for(
   loop: asyncio.AbstractEventLoop,
   monitors: MonitorCards,
   clear_monitor: Callable[[str], None],
+  announce_started: Callable[[TaskStartedEvent], None],
 ) -> Callable[[object], None]:
   """Build the idle-event notifier handed to ``CodingAgent.set_idle_notifier``.
 
@@ -816,8 +902,7 @@ def _idle_notifier_for(
   on_event threading contract.
   """
   def _notify(event: object) -> None:
-    if not isinstance(
-        event, (BackgroundTaskDoneEvent, BackgroundTurnDoneEvent)):
+    if not isinstance(event, _IDLE_SURFACED_EVENTS):
       return
     try:
       loop.call_soon_threadsafe(_handle_idle_event, event)
@@ -843,6 +928,15 @@ def _idle_notifier_for(
 
   def _handle_idle_event(event: object) -> None:
     """Runs on the main loop — the only place ``budget`` is touched."""
+    if isinstance(event, TaskStartedEvent):
+      # A Monitor armed by a turn the CLI ran on its own (the wrap-up after a
+      # notification, say) reaches us only through the drainer. Its marker
+      # card IS the card its reports append to, so skipping it left the watch
+      # owning nothing: every fire became a red "无法归属" card
+      # (2026-10-30, oc_956058b1…). ``announce_started`` schedules rather
+      # than blocks — we are ON the loop that performs the send.
+      announce_started(event)
+      return
     if isinstance(event, BackgroundTaskDoneEvent):
       # A Monitor that finished between turns is no longer live; clear the
       # persisted record so a restart doesn't announce a watch that already
@@ -2332,10 +2426,30 @@ async def main_loop(
   _idle_budget = IdleTurnBudget()
   _monitor_cards = MonitorCards()
   _idle_send_tasks: set[asyncio.Task[None]] = set()
+  # Task ids whose arming has already been announced this process. Hoisted
+  # here (not next to the turn-path closure that fills it) because the idle
+  # notifier needs the SAME set: a Monitor armed by a turn the CLI ran on its
+  # own must not post a second marker for a watch the turn path announced.
+  _announced_tasks: set[str] = set()
+
+  def _announce_started_on_loop(event: TaskStartedEvent) -> None:
+    """Announce an arming surfaced by the idle drainer.
+
+    Runs on the main loop, which is the very loop that has to perform the
+    send — awaiting here would deadlock it, so this only schedules.
+    """
+    task = asyncio.ensure_future(_announce_monitor_started(
+      channel, chat_id, _monitor_cards, _announced_tasks,
+      lambda tid, desc: db.record_monitor(chat_id, tid, desc),
+      lambda mid, text: db.record_sent(mid, text=text, chat_id=chat_id),
+      event))
+    _idle_send_tasks.add(task)
+    task.add_done_callback(_idle_send_tasks.discard)
+
   coding_agent.set_idle_notifier(
     _idle_notifier_for(
       channel, chat_id, _idle_budget, _idle_send_tasks, main_loop_ref,
-      _monitor_cards, db.clear_monitor))
+      _monitor_cards, db.clear_monitor, _announce_started_on_loop))
   running = True
   _dissolve_on_exit = False
   # In-flight `/btw` side questions spawned during a running turn. Kept
@@ -2993,7 +3107,7 @@ async def main_loop(
           coding_agent.set_idle_notifier(
             _idle_notifier_for(
               channel, chat_id, _idle_budget, _idle_send_tasks, main_loop_ref,
-              _monitor_cards, db.clear_monitor))
+              _monitor_cards, db.clear_monitor, _announce_started_on_loop))
           log.info("Agent switch to %s (model=%s, resume=%s)",
                    agent, model,
                    _sdk_session_id[:8] if _sdk_session_id else "none")
@@ -3647,73 +3761,20 @@ async def main_loop(
 
       channel.turn_ctx = TurnCardCtx(redraw=_turn_ctx_redraw)
 
-      _announced_tasks: set[str] = set()
-
       def _announce_task_started(event: TaskStartedEvent) -> None:
-        """Post a marker card the instant a background task is armed.
+        """Turn-path arming announce: blocks the SDK thread until the card is
+        out, so the marker exists before the turn that armed the watch ends.
 
-        A Monitor that only speaks on its terminal sentinel is invisible
-        until it fires: the user asked for a watch, was told 盯着了, and then
-        heard nothing for 31 minutes while the watched job ran normally
-        (2026-10-29). From the chat there was no way to tell whether anything
-        had been armed at all. Announcing the arming itself makes that
-        observable at the moment it happens.
-
-        ONLY the Monitor tool is announced. ``task_type`` is not enough to
-        tell a watch from ordinary work: the CLI reports a Monitor AND any
-        Bash call it promotes to a task as ``local_bash``, so keying off it
-        put "后台监控已挂上" on plain ``git merge`` / ``go build`` commands
-        (2026-10-29: a group was told a monitor was armed when the model was
-        just running a foreground command). The spawning tool name comes from
-        the tool_use block via ``tool_use_id``; when it is unknown we stay
-        silent rather than claim a watch that may not exist.
+        The body lives in ``_announce_monitor_started`` because the SAME
+        announce has to run for a Monitor armed by a turn the CLI ran on its
+        own (see ``_idle_notifier_for``) — where blocking the main loop would
+        deadlock the daemon instead (2026-10-30, oc_956058b1…).
         """
-        log.info("Background task started: task=%s type=%s tool=%s desc=%r",
-                 event.task_id, event.task_type or "?",
-                 event.tool_name or "?", event.description[:120])
-        if event.tool_name != "Monitor":
-          return
-        if event.task_id:
-          # Persist the live watch: a Monitor dies with the daemon and
-          # nothing in the chat says so, so the next process needs this list
-          # to tell the model the truth on its first turn.
-          try:
-            db.record_monitor(
-              chat_id, event.task_id, event.description.strip())
-          except Exception as e:
-            log.warning("Failed to record monitor %s: %s", event.task_id, e)
-        if event.task_id and event.task_id in _announced_tasks:
-          return
-        if event.task_id:
-          _announced_tasks.add(event.task_id)
-        body = event.description.strip() or "后台监控"
-        # Say how often it actually looks. The Monitor tool has no interval
-        # field, so the cadence comes from the command's own sleep; without
-        # it "已挂上" still left the user guessing when a result might appear.
-        note = cards.monitor_cadence(event.command, event.timeout_ms)
-        try:
-          # The description is the model's own words for this watch, so it
-          # makes a meaningful title — and it stays fixed for the card's life,
-          # which is what makes one scrolling card legible.
-          card_title = f"👀 {body}"
-          card = cards.build_sections_card(
-            [f"<font color='grey'>task {event.task_id}</font>"],
-            title=card_title, color="blue", note=note)
-          msg_id = _await_channel(channel.send_card(chat_id, card))
-          _register_msg(msg_id, chat_id)
-          db.record_sent(msg_id, text=card_title, chat_id=chat_id)
-          # This marker IS the watch's card: every report appends to it, so
-          # the chat keeps one live card per Monitor instead of a marker plus
-          # a stream of 🔔 cards.
-          _monitor_cards.register(
-            event.task_id, msg_id, card_title, note,
-            [f"<font color='grey'>task {event.task_id}</font>"])
-          log.info("Background-task marker card sent: %s (task=%s)",
-                   msg_id, event.task_id)
-        except Exception as e:
-          # Never fail the turn over a cosmetic card.
-          log.warning("Background-task marker card failed (task=%s): %s",
-                      event.task_id, e)
+        _await_channel(_announce_monitor_started(
+          channel, chat_id, _monitor_cards, _announced_tasks,
+          lambda tid, desc: db.record_monitor(chat_id, tid, desc),
+          lambda mid, text: db.record_sent(mid, text=text, chat_id=chat_id),
+          event))
 
       def _finish_monitor_card(task_id: str, status: str) -> None:
         """Close the watch's card from inside a turn (see _close_monitor_card).

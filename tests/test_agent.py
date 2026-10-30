@@ -4632,17 +4632,20 @@ class _IdleCaptureChannel(_FakeChannel):
     return message_id
 
 
-def _run_idle_notifier(events, then=None, monitors=None, cleared=None):
+def _run_idle_notifier(
+  events, then=None, monitors=None, cleared=None, announced=None,
+):
   """Drive ``_idle_notifier_for`` over ``events`` on a real loop."""
   async def _main():
     channel = _IdleCaptureChannel("oc_test")
     budget = IdleTurnBudget()
     registry = monitors if monitors is not None else MonitorCards()
     cleared_tasks: list[str] = []
+    announced_events: list[object] = []
     pending: set[asyncio.Task[None]] = set()
     notify = _idle_notifier_for(
       channel, "oc_test", budget, pending, asyncio.get_running_loop(),
-      registry, cleared_tasks.append)
+      registry, cleared_tasks.append, announced_events.append)
     for event in [*events, *(then or [])]:
       notify(event)
       # Let the call_soon_threadsafe'd handler run on this loop.
@@ -4652,6 +4655,8 @@ def _run_idle_notifier(events, then=None, monitors=None, cleared=None):
       await asyncio.gather(*list(pending))
     if cleared is not None:
       cleared.extend(cleared_tasks)
+    if announced is not None:
+      announced.extend(announced_events)
     return channel, budget
 
   return asyncio.run(_main())
@@ -4735,6 +4740,47 @@ def test_idle_spontaneous_turn_lands_on_its_monitors_card():
   assert msg_id == marker
   assert _card_blocks(card)[-1] == "done!"
   assert budget.consecutive == 0
+
+
+def test_a_watch_armed_by_a_cli_run_turn_is_announced_from_idle():
+  """TaskStarted surfaced between turns must reach the announce path.
+
+    The CLI runs the wrap-up turn after a notification itself, so a Monitor
+    armed THERE is only ever visible to the drainer. If the notifier drops
+    TaskStarted, the watch owns no marker card and every report it produces
+    is unattributable — the red "无法归属" card, once a minute, for the whole
+    run (2026-10-30, oc_956058b1…).
+  """
+  announced: list[object] = []
+  _run_idle_notifier(
+    [TaskStartedEvent(
+      task_id="bs35tlysg", description="classify 延迟 benchmark（server 模式）",
+      task_type="local_bash", tool_name="Monitor", command="sleep 60",
+      timeout_ms=600000)],
+    announced=announced)
+
+  assert len(announced) == 1
+  assert announced[0].task_id == "bs35tlysg"
+  assert announced[0].tool_name == "Monitor"
+
+
+def test_control_without_the_idle_branch_the_arming_never_reaches_the_host():
+  """Permanent control: the TaskStarted branch is what makes it arrive.
+
+    Patching the branch out of ``_handle_idle_event`` must leave the notifier
+    silent for an arming — otherwise the test above would pass even with the
+    bug (a notifier that drops the event) still in place.
+  """
+  announced: list[object] = []
+  with mock.patch("nemo.agent._IDLE_SURFACED_EVENTS",
+                  (BackgroundTaskDoneEvent, BackgroundTurnDoneEvent)):
+    _run_idle_notifier(
+      [TaskStartedEvent(
+        task_id="bs35tlysg", description="classify", task_type="local_bash",
+        tool_name="Monitor", command="sleep 60", timeout_ms=600000)],
+      announced=announced)
+
+  assert announced == []
 
 
 def test_an_unattributable_report_posts_a_red_error_card(caplog):
@@ -5136,10 +5182,13 @@ def test_idle_notifications_drive_real_turns_and_reset_on_user_message(
 
   def _spy_notifier_for(
     channel_, chat_id, budget, pending, loop, monitors, clear_monitor,
+    announce_started,
   ):
     captured["budget"] = budget
+    captured["announce_started"] = announce_started
     return real_notifier_for(
-      channel_, chat_id, budget, pending, loop, monitors, clear_monitor)
+      channel_, chat_id, budget, pending, loop, monitors, clear_monitor,
+      announce_started)
 
   with mock.patch("nemo.agent.load_credentials", return_value={
     "app_id": "app_id", "app_secret": "app_secret",

@@ -12,7 +12,9 @@ import pytest
 
 from claude_agent_sdk import CLIConnectionError
 from nemo.sdk_thread import SDKThread, MAX_CONNECT_ATTEMPTS
-from nemo.turn import BackgroundTaskDoneEvent, BackgroundTurnDoneEvent
+from nemo.turn import (
+  BackgroundTaskDoneEvent, BackgroundTurnDoneEvent, TaskStartedEvent,
+)
 
 
 def _ensure_real_sdk():
@@ -1048,6 +1050,67 @@ class TestIdleDrain:
     assert isinstance(events[0], BackgroundTaskDoneEvent)
     assert isinstance(events[1], BackgroundTurnDoneEvent)
     assert events[1].text == "Acknowledging the completed task."
+
+  def _monitor_use(self, use_id="call_m1", command="while true; do sleep 60; done"):
+    from claude_agent_sdk import AssistantMessage, ToolUseBlock
+    return AssistantMessage(
+      content=[ToolUseBlock(
+        id=use_id, name="Monitor",
+        input={"command": command, "timeout_ms": 600000})],
+      model="kimi-k3")
+
+  def _task_started(self, task_id="bstart1", use_id="call_m1"):
+    from claude_agent_sdk import TaskStartedMessage
+    return TaskStartedMessage(
+      subtype="task_started", data={}, task_id=task_id,
+      description="classify 延迟 benchmark", uuid="u2", session_id="s1",
+      tool_use_id=use_id, task_type="local_bash")
+
+  def test_surfaces_task_started_during_idle_with_its_tool_name(self):
+    """A Monitor armed by a turn the CLI ran itself must still be announced.
+
+    The wrap-up turn after a notification is run by the CLI, not by Nemo, so
+    a Monitor the model arms there reaches the host ONLY through the drainer.
+    Skipping TaskStarted left the watch with no card and no registry entry;
+    every fire it produced then landed on the red "无法归属" card
+    (2026-10-30, oc_956058b1…). tool_name/command have to be recovered from
+    the assistant's tool_use block — task_type alone cannot tell a Monitor
+    from a plain Bash task.
+    """
+    thread = SDKThread()
+    thread._client = _HangingClient([
+      self._monitor_use(), self._task_started(), self._result(),
+    ])
+    thread._drain_enabled = True
+    events: list = []
+    thread._on_idle_event = events.append
+
+    self._run_loop_until(thread, events, lambda evs: bool(evs))
+
+    started = [e for e in events if isinstance(e, TaskStartedEvent)]
+    assert len(started) == 1
+    assert started[0].task_id == "bstart1"
+    assert started[0].tool_name == "Monitor"
+    assert "sleep 60" in started[0].command
+    assert started[0].timeout_ms == 600000
+    assert started[0].description == "classify 延迟 benchmark"
+
+  def test_control_task_started_without_the_tool_use_block_stays_unnamed(self):
+    """The tool name comes from the block, not from the task type: drop the
+    block (as a stream that never showed it would) and the arming must not
+    be claimable as a Monitor."""
+    thread = SDKThread()
+    thread._client = _HangingClient([self._task_started(), self._result()])
+    thread._drain_enabled = True
+    events: list = []
+    thread._on_idle_event = events.append
+
+    self._run_loop_until(thread, events, lambda evs: bool(evs))
+
+    started = [e for e in events if isinstance(e, TaskStartedEvent)]
+    assert len(started) == 1
+    assert started[0].tool_name == ""
+    assert started[0].command == ""
 
   def test_turn_start_barrier_leaves_message_for_next_consumer(self):
     """The run_turn barrier (drain_enabled=False + cancel pending receive)

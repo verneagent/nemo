@@ -44,7 +44,8 @@ from claude_agent_sdk import CLIConnectionError as _CLIConnectionError
 
 from .claude_turn import ResultLedger, drain_outstanding, run_turn
 from .turn import (
-  BackgroundTaskDoneEvent, BackgroundTurnDoneEvent, TurnEvent,
+  BackgroundTaskDoneEvent, BackgroundTurnDoneEvent, TaskStartedEvent,
+  TurnEvent,
 )
 from .types import ClaudeSDKClientLike, JsonObject
 
@@ -155,6 +156,15 @@ class SDKThread:
     # (a Monitor firing). Rides on the BackgroundTurnDoneEvent so the host can
     # tell consecutive fires of the SAME watch apart from unrelated ones.
     self._idle_task_id: str = ""
+    # tool_use_id → tool name / Monitor input, collected from the assistant's
+    # tool_use blocks while draining a spontaneous turn. A TaskStartedMessage
+    # carries ONLY tool_use_id + task_type, and task_type cannot tell the
+    # Monitor tool from a plain Bash call — so a watch armed by a turn the CLI
+    # ran on its own was previously invisible to the host: no marker card, no
+    # registry entry, and every one of its reports then landed on the red
+    # "无法归属" card (2026-10-30, oc_956058b1…).
+    self._idle_tool_names: dict[str, str] = {}
+    self._idle_monitor_inputs: dict[str, JsonObject] = {}
 
   def start(self) -> None:
     """Start the SDK thread. Blocks until the event loop is ready."""
@@ -571,7 +581,8 @@ class SDKThread:
     internally.
     """
     from claude_agent_sdk import (
-      AssistantMessage, ResultMessage, TaskNotificationMessage, UserMessage,
+      AssistantMessage, ResultMessage, TaskNotificationMessage,
+      TaskStartedMessage, UserMessage,
     )
 
     log.debug(
@@ -608,9 +619,39 @@ class SDKThread:
       text = "".join(
         block.text for block in getattr(message, "content", [])
         if getattr(block, "text", None))
+      for block in getattr(message, "content", []) or []:
+        # Remember which tool each tool_use_id spawned; TaskStartedMessage
+        # needs it to say whether the new task is a Monitor (see the field
+        # comment above). Only Monitor inputs are kept — holding every tool's
+        # input keeps whole file bodies alive for the drainer's lifetime.
+        name = getattr(block, "name", None)
+        use_id = getattr(block, "id", None)
+        if not name or not use_id:
+          continue
+        self._idle_tool_names[use_id] = name
+        if name == "Monitor":
+          tool_input = getattr(block, "input", None)
+          if isinstance(tool_input, dict):
+            self._idle_monitor_inputs[use_id] = tool_input
       if text:
         self._idle_turn_texts.append(text)
       return
+    elif isinstance(message, TaskStartedMessage):
+      # A Monitor armed by a turn the CLI ran itself (the wrap-up turn after
+      # a notification, for instance). The marker card IS the watch's card,
+      # so the host has to learn about the arming here too — otherwise the
+      # watch owns no card and every fire it produces is unattributable.
+      monitor = self._idle_monitor_inputs.get(message.tool_use_id or "", {})
+      command = monitor.get("command", "")
+      timeout_ms = monitor.get("timeout_ms", 0)
+      ev = TaskStartedEvent(
+        task_id=message.task_id,
+        description=message.description or "",
+        task_type=message.task_type or "",
+        tool_name=self._idle_tool_names.get(message.tool_use_id or "", ""),
+        command=command if isinstance(command, str) else "",
+        timeout_ms=timeout_ms if isinstance(timeout_ms, int) else 0,
+      )
     elif isinstance(message, ResultMessage):
       # This reader can claim a Result the ledger still owes (a previous
       # turn's straggler). Count it, or the next turn boundary will drain
@@ -624,9 +665,14 @@ class SDKThread:
         )
         self._idle_turn_texts.clear()
         self._idle_task_id = ""
+      # The spontaneous turn is over: its tool_use ids can never be matched
+      # again, and keeping them would leak one entry per tool call for the
+      # life of the daemon.
+      self._idle_tool_names.clear()
+      self._idle_monitor_inputs.clear()
     else:
-      # SystemMessage (thinking / compact / progress), TaskStarted /
-      # TaskProgress, stream events — nothing worth surfacing idle.
+      # SystemMessage (thinking / compact / progress), TaskProgress, stream
+      # events — nothing worth surfacing idle.
       return
 
     if ev is None:
