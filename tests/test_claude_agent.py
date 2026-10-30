@@ -1303,6 +1303,29 @@ def test_build_agent_prompt_requires_a_heartbeat_when_watching():
   assert "update cadence" in prompt
 
 
+def test_build_agent_prompt_ties_the_report_cadence_to_the_echo():
+  """One poll must equal one report (2026-10-30, oc_956058b1…).
+
+  The card's footer is rendered from the LAST `sleep` in the Monitor command
+  (`cards.monitor_cadence`), so a loop that sleeps 60 and only echoes every
+  10th iteration advertises "每 1 分钟检查一次" while the user sees a card
+  update every 10 minutes — and concludes the watch is dead. The prompt must
+  forbid gating the echo behind a counter."""
+  from unittest import mock
+  from nemo.agent_factory import MediaVision
+  from nemo.claude_agent import ClaudeCodingAgent
+  agent = ClaudeCodingAgent.__new__(ClaudeCodingAgent)
+  agent._model = "oc-deepseek-v4.1-flash"
+  agent._system_prompt = ""
+  with mock.patch("nemo.agent_factory.model_media_vision",
+                  return_value=MediaVision(image=True, video=False)), \
+       mock.patch("nemo.vision_cli.helper_available", return_value=True):
+    prompt = agent._build_agent_prompt()
+  assert "ONE POLL = ONE REPORT" in prompt
+  assert "LAST `sleep`" in prompt
+  assert "% 10" in prompt  # names the exact shape it forbids
+
+
 def _options_agent(tmp_path):
   from unittest import mock
   from nemo.claude_agent import ClaudeCodingAgent
