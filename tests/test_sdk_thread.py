@@ -972,6 +972,79 @@ class TestIdleDrain:
     assert "DONE_MARKER" in ev.text
     assert ev.cost == 0.02
 
+  def test_a_fire_the_stream_cannot_name_is_attributed_by_the_host(self):
+    """A fire's task id is not on the stream; the adapter supplies it.
+
+    The CLI never echoes the injected notification row, so with two watches
+    live there was no way to tell which one a report belonged to and every
+    report was dropped onto the red "无法归属" card (2026-10-30, Phase MI).
+    ``task_id_source`` is called once per drained Result.
+    """
+    thread = SDKThread()
+    thread._client = _HangingClient([
+      self._assistant("REPORT_2 for the second watch"),
+      self._result(),
+    ])
+    thread._drain_enabled = True
+    events: list = []
+    thread._on_idle_event = events.append
+    asked: list[str] = []
+
+    def _source(session_id):
+      asked.append(session_id)
+      return "bmon2"
+
+    thread._idle_task_id_source = _source
+
+    self._run_loop_until(thread, events, lambda evs: bool(evs))
+
+    assert [type(e) for e in events] == [BackgroundTurnDoneEvent]
+    assert events[0].task_id == "bmon2"
+    assert asked == ["s1"]
+
+  def test_the_task_id_source_is_polled_even_by_a_turn_with_no_visible_text(self):
+    """The source advances a transcript cursor — one row per turn.
+
+    Skipping it for an invisible turn would leave the cursor one row behind
+    and hang every later report on the PREVIOUS watch's card.
+    """
+    thread = SDKThread()
+    thread._client = _HangingClient([self._result()])
+    thread._drain_enabled = True
+    events: list = []
+    thread._on_idle_event = events.append
+    calls: list[str] = []
+
+    def _source(session_id):
+      calls.append(session_id)
+      return "bmon3"
+
+    thread._idle_task_id_source = _source
+
+    self._run_loop_until(thread, events, lambda _evs: bool(calls))
+
+    assert calls == ["s1"]
+    assert events == []  # no answer text → no card trigger
+
+  def test_control_without_the_task_id_source_the_report_stays_unattributed(
+    self,
+  ):
+    """Control: this is the pre-fix behaviour the red cards came from."""
+    thread = SDKThread()
+    thread._client = _HangingClient([
+      self._assistant("REPORT_1"),
+      self._result(),
+    ])
+    thread._drain_enabled = True
+    events: list = []
+    thread._on_idle_event = events.append
+
+    with mock.patch.object(thread, "_idle_task_id_source", None):
+      self._run_loop_until(thread, events, lambda evs: bool(evs))
+
+    assert [type(e) for e in events] == [BackgroundTurnDoneEvent]
+    assert events[0].task_id == ""
+
   def _notification_user_message(self, task_id, event, summary="Monitor event"):
     """The CLI's own form of a Monitor fire: an injected user message."""
     from claude_agent_sdk import TextBlock, UserMessage

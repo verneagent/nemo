@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import sys
 
@@ -720,7 +721,11 @@ def test_reset_restarts_the_idle_drainer():
 
   asyncio.run(agent.reset("/tmp/project", "claude-opus-4-7", resume="sid"))
 
-  assert agent._sdk.start_idle_drain.call_args.kwargs == {"restart": True}
+  kwargs = agent._sdk.start_idle_drain.call_args.kwargs
+  assert kwargs["restart"] is True
+  # The drainer must be able to name the watch a fire belongs to — a fire
+  # carries no task id on the stream (see _next_idle_fire_task_id).
+  assert kwargs["task_id_source"] == agent._next_idle_fire_task_id
   armed = agent._sdk.start_idle_drain.call_args.args[0]
   seen: list[object] = []
   agent._on_idle_event = seen.append
@@ -1530,6 +1535,145 @@ def test_finished_monitor_frees_its_slot():
   assert agent._live_monitors == set()
 
 
+_FIRE_PROJECT = "/proj/fire"
+
+
+def _fire_agent(tmp_path, monkeypatch, session_id="sess-1"):
+  """A bare adapter whose fire cursor is baselined on a temp transcript."""
+  from nemo.claude_agent import ClaudeCodingAgent
+
+  monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "cfg"))
+  agent = ClaudeCodingAgent.__new__(ClaudeCodingAgent)
+  agent._project_dir = _FIRE_PROJECT
+  agent._latest_session_id = session_id
+  agent._idle_fire_session = ""
+  agent._idle_fire_offset = 0
+  agent._idle_fire_ids = []
+  agent._reset_idle_fire_cursor()
+  return agent
+
+
+def _append_transcript(session_id, rows, raw=""):
+  path = _session_jsonl_path(_FIRE_PROJECT, session_id)
+  os.makedirs(os.path.dirname(path), exist_ok=True)
+  with open(path, "a", encoding="utf-8") as fh:
+    for row in rows:
+      fh.write(json.dumps(row) + "\n")
+    if raw:
+      fh.write(raw)
+
+
+def _notification_row(task_id, event="REPORT_1"):
+  return {
+    "type": "user",
+    "origin": {"kind": "task-notification"},
+    "message": {"role": "user", "content": (
+      "<task-notification>\n"
+      f"<task-id>{task_id}</task-id>\n"
+      "<summary>Monitor event: watch</summary>\n"
+      f"<event>{event}</event>\n"
+      "</task-notification>")},
+  }
+
+
+def _tool_result_row():
+  """A user row that is NOT a notification — must never be consumed."""
+  return {
+    "type": "user",
+    "origin": {"kind": "tool-result"},
+    "message": {"role": "user", "content": [{"type": "tool_result"}]},
+  }
+
+
+def test_fire_cursor_names_the_watch_behind_each_drained_turn(
+    tmp_path, monkeypatch,
+):
+  """Two live watches: the transcript is the only exact attribution source.
+
+  A Monitor fire carries no task id on the SDK stream (the CLI injects the
+  ``<task-notification>`` row into the model's context and never echoes it),
+  so with two watches armed ``MonitorCards.sole_live_task_id()`` returns ""
+  and every report became a red "无法归属" card even though the transcript
+  said exactly which watch fired (2026-10-30, e2e Phase MI05).
+  """
+  agent = _fire_agent(tmp_path, monkeypatch)
+  sid = agent._idle_fire_session
+
+  _append_transcript(sid, [
+    _notification_row("bmon_a", "REPORT_1"), _tool_result_row(),
+    _notification_row("bmon_b", "REPORT_1"),
+  ])
+
+  assert agent._next_idle_fire_task_id(sid) == "bmon_a"
+  assert agent._next_idle_fire_task_id(sid) == "bmon_b"
+  # Nothing left: a turn the transcript has no row for stays unattributed
+  # instead of borrowing its predecessor's watch.
+  assert agent._next_idle_fire_task_id(sid) == ""
+
+
+def test_fire_cursor_ignores_rows_written_before_the_drainer_armed(
+    tmp_path, monkeypatch,
+):
+  """Baseline at EOF — replaying history would mislabel the next report."""
+  agent = _fire_agent(tmp_path, monkeypatch)
+  sid = agent._idle_fire_session
+  _append_transcript(sid, [_notification_row("bmon_old")])
+  agent._reset_idle_fire_cursor()
+
+  assert agent._next_idle_fire_task_id(sid) == ""
+
+  _append_transcript(sid, [_notification_row("bmon_new")])
+  assert agent._next_idle_fire_task_id(sid) == "bmon_new"
+
+
+def test_fire_cursor_waits_for_a_half_written_row(tmp_path, monkeypatch):
+  """Consuming a partial line would lose the notification it belongs to."""
+  agent = _fire_agent(tmp_path, monkeypatch)
+  sid = agent._idle_fire_session
+  line = json.dumps(_notification_row("bmon_half"))
+
+  _append_transcript(sid, [], raw=line[:20])
+  assert agent._next_idle_fire_task_id(sid) == ""
+
+  _append_transcript(sid, [], raw=line[20:] + "\n")
+  assert agent._next_idle_fire_task_id(sid) == "bmon_half"
+
+
+def test_fire_cursor_rebaselines_when_the_session_changes(
+    tmp_path, monkeypatch,
+):
+  """A Result from an unseen session must not replay that session's history."""
+  agent = _fire_agent(tmp_path, monkeypatch)
+  _append_transcript("sess-2", [_notification_row("bmon_old")])
+
+  assert agent._next_idle_fire_task_id("sess-2") == ""
+  assert agent._idle_fire_session == "sess-2"
+
+  _append_transcript("sess-2", [_notification_row("bmon_now")])
+  assert agent._next_idle_fire_task_id("sess-2") == "bmon_now"
+
+
+def test_control_without_the_notification_row_parser_nothing_is_attributed(
+    tmp_path, monkeypatch,
+):
+  """Control for the cursor test: the row parser IS the fix.
+
+  With it patched out the transcript is read but yields no ids, which is the
+  pre-fix behaviour (every fire unattributed).
+  """
+  from unittest import mock
+
+  from nemo import claude_agent
+
+  agent = _fire_agent(tmp_path, monkeypatch)
+  sid = agent._idle_fire_session
+  _append_transcript(sid, [_notification_row("bmon_a")])
+
+  with mock.patch.object(claude_agent, "_task_notification_row_id",
+                         return_value=""):
+    assert agent._next_idle_fire_task_id(sid) == ""
+
+
 def test_reset_forgets_monitors_because_the_reconnect_kills_them(tmp_path):
   """Monitors are children of the closed client — the cap must reset too."""
   from nemo.claude_agent import ClaudeCodingAgent
@@ -1553,7 +1697,7 @@ class _FakeSDK:
   async def reconnect(self, _options):
     return None
 
-  def start_idle_drain(self, handler, restart=False):
+  def start_idle_drain(self, handler, restart=False, task_id_source=None):
     self.drained.append((handler, restart))
 
 

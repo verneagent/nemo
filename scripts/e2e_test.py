@@ -3328,6 +3328,144 @@ def run_monitor_card_tests(pid: int, chat_id: str,
               "no stray card for the ended task")
 
 
+def run_monitor_idle_arm_tests(pid: int, chat_id: str,
+                               result: "E2EResult") -> None:
+  """Phase MI — a Monitor armed while the CLI is running its own turn.
+
+  The CLI answers a Monitor fire itself, so a watch the model arms in one of
+  those answers never passes through ``run_turn``. Its TaskStarted only
+  reaches the daemon through the idle drainer, and dropping it left the watch
+  with no card: every report it produced became a red "后台报告无法归属" card,
+  once a minute, for the whole run (2026-10-30, oc_956058b1…).
+
+  MI01 a first watch's 👀 card appears (the normal, in-turn path).
+  MI02 the SECOND watch is armed from the idle drainer (the daemon logs it
+       separately from the turn-path arming).
+  MI03 that watch gets its own 👀 marker card.
+  MI04 its reports APPEND to that card instead of erroring out.
+  MI05 nothing was reported as unattributable during the phase.
+
+  The trigger is a Monitor fire: the model is told to arm the second watch
+  when it sees a specific report, which happens in the CLI-run answer turn.
+  """
+  print(f"{Colors.BOLD}Phase MI: a Monitor armed from the idle drainer"
+        f"{Colors.RESET}")
+  log = LogAnalyzer(pid)
+  marker = f"MI_E2E_{int(time.time())}"
+  wait_for_idle(pid, chat_id, timeout=30)
+  mark = log.mark()
+  ts = str(int(time.time() * 1000))
+
+  first_title = f"MI 轮询 {marker}"
+  idle_title = f"MI 空闲挂载 {marker}"
+  print("  [MI01] Arming the watch that drives the CLI-side answer turn...")
+  send_msg(
+    "用 Monitor 工具挂一个后台监控：\n"
+    f"- description: `{first_title}`（原样）\n"
+    f"- command: `for i in 1 2 3 4 5 6; do echo {marker}_REPORT_$i; sleep 20; done`\n"
+    "- persistent: true\n\n"
+    "**重要，必须严格遵守**：之后每次这个监控发来报告，你都直接结束本轮，"
+    "只回一句「收到」。**唯独当报告内容是 "
+    f"`{marker}_REPORT_3` 时**，不要只回一句，而是先挂第二个 Monitor：\n"
+    f"- description: `{idle_title}`（原样）\n"
+    "- command: `for i in 1 2 3 4 5; do echo "
+    f"{marker}_IDLE_$i; sleep 20; done`\n"
+    "- persistent: true\n"
+    "然后再回一句「收到，第二个已挂上」。不要自己 sleep、不要轮询。\n\n"
+    "现在先只把第一个 Monitor 挂上，然后立刻结束本轮，回「已挂上」。",
+    chat_id)
+
+  first_card = None
+  started = time.time()
+  while time.time() - started < 180:
+    for card in get_bot_msgs(chat_id, after=ts, limit=20):
+      if interactive_card_title(card) == f"👀 {first_title}":
+        first_card = card
+        break
+    if first_card:
+      break
+    time.sleep(3)
+  if not first_card:
+    result.fail("MI01 first watch armed", "no 👀 card for the first watch")
+    log.dump_tail(30, "MI01")
+    return
+  result.ok("MI01 first watch armed", f"msg={first_card['message_id']}")
+
+  # MI02 — the second arming must come through the drainer. The distinct log
+  # line is the whole point: the card looks identical either way.
+  idle_line = ""
+  started = time.time()
+  while time.time() - started < 300:
+    for line in log.read_since(mark).splitlines():
+      if ("Background task started from the idle drainer" in line
+          and "tool=Monitor" in line):
+        idle_line = line
+    if idle_line:
+      break
+    time.sleep(3)
+  if not idle_line:
+    result.fail(
+      "MI02 armed from the idle drainer",
+      "the model never armed a second Monitor in a CLI-run turn")
+    log.dump_tail(50, "MI02")
+    return
+  idle_task = next(
+    (tok.split("=")[1] for tok in idle_line.split() if tok.startswith("task=")),
+    "")
+  result.ok("MI02 armed from the idle drainer", idle_line.strip())
+
+  # MI03 — the idle arming posts its own marker card, i.e. the host really
+  # learned about the watch rather than merely logging it.
+  idle_card = None
+  started = time.time()
+  while time.time() - started < 120:
+    for card in get_bot_msgs(chat_id, after=ts, limit=30):
+      if interactive_card_title(card) == f"👀 {idle_title}":
+        idle_card = card
+        break
+    if idle_card:
+      break
+    time.sleep(3)
+  if not idle_card:
+    result.fail("MI03 the idle watch gets its own card",
+                "no 👀 card for the drainer-armed watch")
+    log.dump_tail(40, "MI03")
+    return
+  idle_msg = idle_card["message_id"]
+  result.ok("MI03 the idle watch gets its own card", f"msg={idle_msg}")
+
+  # MI04 — its reports land on that card. This is what the bug destroyed.
+  appended: list[str] = []
+  started = time.time()
+  while time.time() - started < 180:
+    appended = [
+      line for line in log.read_since(mark).splitlines()
+      if "Monitor card appended" in line and idle_msg in line
+    ]
+    if appended:
+      break
+    time.sleep(3)
+  if appended:
+    result.ok("MI04 its reports append to that card",
+              f"{len(appended)} append(s) to {idle_msg}")
+  else:
+    result.fail("MI04 its reports append to that card",
+                f"no append to {idle_msg} — reports went elsewhere")
+    log.dump_tail(40, "MI04")
+
+  # MI05 — nothing may have been reported as unattributable.
+  chunk = log.read_since(mark)
+  lost = [
+    line for line in chunk.splitlines()
+    if "no Monitor card to land on" in line
+  ]
+  if lost:
+    result.fail("MI05 no unattributable report",
+                f"{len(lost)} dropped report(s): {lost[-1].strip()}")
+  else:
+    result.ok("MI05 no unattributable report", "every report found its card")
+
+
 def run_idle_notification_tests(pid: int, chat_id: str,
                                 result: "E2EResult") -> None:
   """Phase ID — a background task finishing during idle starts a REAL turn.
@@ -3623,6 +3761,8 @@ def main():
                            "(Phase ID)")
   parser.add_argument("--monitor", action="store_true",
                       help="Run only the one-card-per-Monitor test (Phase MM)")
+  parser.add_argument("--monitor-idle", action="store_true",
+                      help="Run only the drainer-armed Monitor test (Phase MI)")
   parser.add_argument("--verbose", "-v", action="store_true",
                       help="Verbose nemo logging")
   args = parser.parse_args()
@@ -3640,7 +3780,7 @@ def main():
                   or args.dual or args.media or args.topic
                   or args.shell or args.switch or args.rollover or args.fork
                   or args.workflow or args.steer or args.idle
-                  or args.monitor)
+                  or args.monitor or args.monitor_idle)
   run_all = not single_phase
   created_temp_chat = False
 
@@ -3734,6 +3874,8 @@ def main():
     print(f"  Mode: idle background-task notification only")
   elif args.monitor:
     print(f"  Mode: one card per Monitor only")
+  elif args.monitor_idle:
+    print(f"  Mode: Monitor armed from the idle drainer only")
   print()
 
   # Dual-instance manages its own processes
@@ -4128,6 +4270,14 @@ def main():
     elif args.steer:
       try:
         run_steer_lag_test(pid, chat_id, result)
+      finally:
+        send_msg("/exit", chat_id)
+        if not wait_for_exit(pid, timeout=35):
+          kill_nemo(pid)
+
+    elif args.monitor_idle:
+      try:
+        run_monitor_idle_arm_tests(pid, chat_id, result)
       finally:
         send_msg("/exit", chat_id)
         if not wait_for_exit(pid, timeout=35):

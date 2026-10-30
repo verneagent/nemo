@@ -149,6 +149,15 @@ class SDKThread:
     # as run_turn's on_event). None → the drainer consumes + discards (still
     # fixes the #788 leak, just silently).
     self._on_idle_event: Callable[[TurnEvent], None] | None = None
+    # Task id for the spontaneous turn being drained, resolved from OUTSIDE
+    # the stream: the CLI never echoes the injected `<task-notification>` user
+    # row, so a fire carries no identity and two live Monitors made every
+    # report unattributable (2026-10-30). The adapter supplies a resolver that
+    # reads the session transcript, where every notification the CLI injects
+    # is recorded as one user row — exactly one per spontaneous turn. It is
+    # called once per Result (whether or not that turn produced visible text)
+    # so the transcript cursor stays in step with the turns.
+    self._idle_task_id_source: Callable[[str], str] | None = None
     # Assistant text of the spontaneous turn currently being drained, flushed
     # to a BackgroundTurnDoneEvent when its ResultMessage arrives.
     self._idle_turn_texts: list[str] = []
@@ -429,6 +438,7 @@ class SDKThread:
   def start_idle_drain(
     self, on_idle_event: Callable[[TurnEvent], None],
     restart: bool = False,
+    task_id_source: Callable[[str], str] | None = None,
   ) -> None:
     """Start (or refresh the notifier of) the between-turn idle drainer.
 
@@ -448,6 +458,7 @@ class SDKThread:
     killed the Monitor subprocess).
     """
     self._on_idle_event = on_idle_event
+    self._idle_task_id_source = task_id_source
     if self._loop is None:
       return
 
@@ -657,14 +668,24 @@ class SDKThread:
       # turn's straggler). Count it, or the next turn boundary will drain
       # for it, find nothing, and reconnect for an answer already delivered.
       self._ledger.consume_if_owed()
+      # Resolve the notification this turn answers BEFORE deciding whether it
+      # produced text: the resolver advances a transcript cursor, so calling
+      # it only for visible turns would leave it one row behind from then on
+      # and hand every later report its PREDECESSOR's watch.
+      task_id = self._idle_task_id
+      if self._idle_task_id_source is not None:
+        task_id = self._idle_task_id_source(
+          getattr(message, "session_id", "") or "") or task_id
       if self._idle_turn_texts:
         ev = BackgroundTurnDoneEvent(
           text="\n".join(self._idle_turn_texts),
           cost=getattr(message, "total_cost_usd", 0) or 0.0,
-          task_id=self._idle_task_id,
+          task_id=task_id,
         )
         self._idle_turn_texts.clear()
-        self._idle_task_id = ""
+      # The turn is over either way — a leftover id would be worn by the NEXT
+      # turn's report, which belongs to a different watch.
+      self._idle_task_id = ""
       # The spontaneous turn is over: its tool_use ids can never be matched
       # again, and keeping them would leak one entry per tool call for the
       # life of the daemon.

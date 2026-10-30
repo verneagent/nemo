@@ -2438,6 +2438,12 @@ async def main_loop(
     Runs on the main loop, which is the very loop that has to perform the
     send — awaiting here would deadlock it, so this only schedules.
     """
+    # Distinguishable from the turn-path arming on purpose: which path armed
+    # a watch is not visible in the card, and the e2e for this bug has to
+    # prove the arming came through the drainer (2026-10-30).
+    log.info("Background task started from the idle drainer: task=%s "
+             "tool=%s desc=%r", event.task_id, event.tool_name or "?",
+             event.description[:120])
     task = asyncio.ensure_future(_announce_monitor_started(
       channel, chat_id, _monitor_cards, _announced_tasks,
       lambda tid, desc: db.record_monitor(chat_id, tid, desc),

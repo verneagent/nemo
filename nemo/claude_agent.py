@@ -300,6 +300,42 @@ def _session_jsonl_path(project_dir: str, sdk_session_id: str) -> str:
     config_dir, "projects", _project_slug(project_dir), f"{sdk_session_id}.jsonl")
 
 
+_NOTIFICATION_TASK_ID_RE = re.compile(r"<task-id>\s*([^<\s]+)\s*</task-id>")
+
+
+def _task_notification_row_id(line: bytes) -> str:
+  """Task id of one transcript row, if it is an injected notification.
+
+  The CLI records every background notification it injects into the model's
+  context as a ``user`` row with ``origin.kind == "task-notification"`` — one
+  row per spontaneous turn, written before that turn runs. That row is the
+  only exact record of which watch a between-turn answer belongs to (see
+  ``ClaudeCodingAgent._next_idle_fire_task_id``). Anything else — tool
+  results, the model's own rows, malformed lines — yields "".
+  """
+  try:
+    row: object = json.loads(line)
+  except ValueError:
+    return ""
+  if not isinstance(row, dict) or row.get("type") != "user":
+    return ""
+  origin = row.get("origin")
+  if not isinstance(origin, dict) or origin.get("kind") != "task-notification":
+    return ""
+  message = row.get("message")
+  content = message.get("content") if isinstance(message, dict) else None
+  if isinstance(content, str):
+    text = content
+  elif isinstance(content, list):
+    text = "".join(
+      block["text"] for block in content
+      if isinstance(block, dict) and isinstance(block.get("text"), str))
+  else:
+    return ""
+  match = _NOTIFICATION_TASK_ID_RE.search(text)
+  return match.group(1) if match else ""
+
+
 def _short_error(exc: BaseException) -> str:
   """One-line summary suitable for a log breadcrumb."""
   return str(exc).split("\n")[0][:200]
@@ -605,6 +641,12 @@ class ClaudeCodingAgent(CodingAgent):
     # None → the drainer consumes the stream (fixing the #788 stale-leak) but
     # discards the events.
     self._on_idle_event: Callable[[TurnEvent], None] | None = None
+    # Transcript cursor used to tell WHICH watch a background report belongs
+    # to (see _next_idle_fire_task_id). Reset whenever the session changes:
+    # rows already in the file were written before this drainer existed.
+    self._idle_fire_session: str = ""
+    self._idle_fire_offset: int = 0
+    self._idle_fire_ids: list[str] = []
 
   def set_effort(self, effort: str) -> None:
     self._effort = effort if effort in _CLAUDE_EFFORT_LEVELS else ""
@@ -623,7 +665,8 @@ class ClaudeCodingAgent(CodingAgent):
     per-turn ``on_event``.
     """
     self._on_idle_event = handler
-    self._sdk.start_idle_drain(self._idle_sink)
+    self._sdk.start_idle_drain(
+      self._idle_sink, task_id_source=self._next_idle_fire_task_id)
 
   async def start(
     self, project_dir: str, model: str, resume: str = "",
@@ -677,11 +720,16 @@ class ClaudeCodingAgent(CodingAgent):
         resume[:8], _short_error(exc),
       )
       self._latest_session_id = ""
+      # The unusable id owns no transcript we can cursor over; re-baseline on
+      # the fresh session when its first DoneEvent names it.
+      self._reset_idle_fire_cursor()
       self._options = self._build_options(project_dir, model, resume="")
       await self._sdk.create_client(self._options)
+    self._reset_idle_fire_cursor()
     # Arm the between-turn idle drainer (if the host registered a notifier
     # before start — otherwise set_idle_notifier arms it on its own).
-    self._sdk.start_idle_drain(self._idle_sink)
+    self._sdk.start_idle_drain(
+      self._idle_sink, task_id_source=self._next_idle_fire_task_id)
 
   async def run_turn(
     self,
@@ -692,7 +740,11 @@ class ClaudeCodingAgent(CodingAgent):
 
     def _wrapped(ev: TurnEvent) -> None:
       if isinstance(ev, DoneEvent) and ev.session_id:
-        self._latest_session_id = ev.session_id
+        if ev.session_id != self._latest_session_id:
+          # A session id learned mid-life (the first turn of a fresh session)
+          # gives the fire cursor a transcript to baseline against.
+          self._latest_session_id = ev.session_id
+          self._reset_idle_fire_cursor()
       self._observe_event(ev)
       on_event(ev)
 
@@ -870,6 +922,79 @@ class ClaudeCodingAgent(CodingAgent):
       return 0
     return _steer_continuation_batches(rows, texts)
 
+  def _reset_idle_fire_cursor(self, session_id: str | None = None) -> None:
+    """Baseline the fire cursor at the END of the session transcript.
+
+    Everything already in the file was written before the drainer armed, so
+    replaying it would attribute ancient notifications to the next report.
+    """
+    self._idle_fire_ids = []
+    self._idle_fire_session = (
+      self._latest_session_id if session_id is None else session_id)
+    self._idle_fire_offset = 0
+    if not self._idle_fire_session:
+      return
+    path = _session_jsonl_path(self._project_dir, self._idle_fire_session)
+    try:
+      self._idle_fire_offset = os.path.getsize(path)
+    except OSError as exc:
+      # A brand-new session may not have flushed its first row yet: start at
+      # 0 so nothing written from now on is missed.
+      log.debug("fire cursor: no transcript at %s yet (%s)", path,
+                _short_error(exc))
+
+  def _next_idle_fire_task_id(self, session_id: str) -> str:
+    """Task id of the background notification the drained turn just answered.
+
+    The SDK stream never carries a fire's identity: the CLI injects the
+    ``<task-notification>`` row into the model's context and does not echo it
+    back, so ``MonitorCards.sole_live_task_id()`` was the only attribution —
+    and it returns "" as soon as two watches are live, which turned EVERY
+    report into a red "无法归属" card (2026-10-30, oc_956058b1…, e2e Phase MI).
+
+    The transcript has the missing fact: the CLI records each injected
+    notification as a ``user`` row with ``origin.kind == "task-notification"``
+    — exactly one per spontaneous turn, written before that turn runs. So one
+    row is consumed per drained Result, in order. No guessing, no fallback:
+    a Result with no row behind it stays unattributed and the host reports
+    that as the fault it is.
+    """
+    sid = session_id or self._latest_session_id
+    if not sid:
+      return ""
+    if sid != self._idle_fire_session:
+      # Never baselined (the session id arrived with a Result, not a Done).
+      # Baseline at EOF and leave THIS result unattributed rather than
+      # replaying the transcript's history as if it were news.
+      log.info("fire cursor: baseline %s (session changed)", sid[:8])
+      self._reset_idle_fire_cursor(sid)
+      return ""
+    self._scan_idle_fires(sid)
+    if not self._idle_fire_ids:
+      return ""
+    return self._idle_fire_ids.pop(0)
+
+  def _scan_idle_fires(self, session_id: str) -> None:
+    """Append every newly written notification row's task id, in order."""
+    path = _session_jsonl_path(self._project_dir, session_id)
+    try:
+      with open(path, "rb") as fh:
+        fh.seek(self._idle_fire_offset)
+        chunk = fh.read()
+    except OSError as exc:
+      log.warning("fire cursor: cannot read %s: %s", path, _short_error(exc))
+      return
+    # Only complete rows: the CLI may be mid-write, and consuming half a row
+    # would hide the notification it belongs to forever.
+    end = chunk.rfind(b"\n")
+    if end < 0:
+      return
+    self._idle_fire_offset += end + 1
+    for line in chunk[:end + 1].splitlines():
+      task_id = _task_notification_row_id(line)
+      if task_id:
+        self._idle_fire_ids.append(task_id)
+
   def _load_transcript_rows(self, session_id: str) -> list[JsonObject] | None:
     """Parse the session transcript jsonl, or None if unreadable."""
     path = _session_jsonl_path(self._project_dir, session_id)
@@ -908,6 +1033,7 @@ class ClaudeCodingAgent(CodingAgent):
         resume[:8], _short_error(exc),
       )
       self._latest_session_id = ""
+      self._reset_idle_fire_cursor()
       self._options = self._build_options(project_dir, model, resume="")
       await self._sdk.reconnect(self._options)
     # Re-arm the idle drainer against the freshly connected client. restart=
@@ -915,7 +1041,10 @@ class ClaudeCodingAgent(CodingAgent):
     # from the client that was just closed, and the lazy path would leave it
     # in place (not done → never replaced), silently ending idle delivery for
     # the rest of this daemon's life.
-    self._sdk.start_idle_drain(self._idle_sink, restart=True)
+    self._reset_idle_fire_cursor()
+    self._sdk.start_idle_drain(
+      self._idle_sink, restart=True,
+      task_id_source=self._next_idle_fire_task_id)
 
   async def side_question(self, question: str, sdk_session_id: str) -> str:
     """Read-only ephemeral side question — see CodingAgent.side_question.
