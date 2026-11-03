@@ -145,6 +145,12 @@ class SDKThread:
     self._drain_enabled: bool = False      # written on the SDK loop only
     self._drain_pending: asyncio.Future[object] | None = None
     self._drain_task: asyncio.Task[object] | None = None
+    # The client the current drain task was armed against (SDK loop only).
+    # A drain task parked on a receive future of a client that has since been
+    # closed is ``not done()``, so the lazy arm path would leave it there
+    # forever; comparing this against ``_client`` is how an arm call notices
+    # that the stream it is reading no longer exists (see reconnect()).
+    self._drain_client: object | None = None
     # Notifier for surfaced idle events (thread-safe callback, same contract
     # as run_turn's on_event). None → the drainer consumes + discards (still
     # fixes the #788 leak, just silently).
@@ -317,6 +323,31 @@ class SDKThread:
     """Close and recreate the client (both on the owner task)."""
     await self.close_client()
     await self.create_client(options)
+    # Every client replacement goes through here, and the drain task is
+    # reading the client that was just closed. A user-initiated reconnect
+    # (/clear, /model, /effort) re-arms it in ClaudeCodingAgent.reset(), but
+    # the watchdog stall recovery and the stale-leak recovery reconnect from
+    # inside run_turn_with_reconnect — they never pass through reset(), so
+    # the drainer stayed parked on a dead stream for the rest of the
+    # daemon's life: background completions and every Monitor fire queued
+    # unread while the daemon looked healthy (2026-11-03, oc_956058b1…: a
+    # watch fired every minute for three turns and its card never updated;
+    # the log's last "SDK client connected" was hours earlier and not one
+    # idle event followed it). Re-arming HERE means no caller can forget.
+    self._rearm_idle_drain()
+
+  def _rearm_idle_drain(self) -> None:
+    """Cancel and recreate the drain task against the CURRENT client.
+
+    No-op when no drainer was ever armed (nothing to replace). Runs on the
+    SDK loop via reconnect(); ``start_idle_drain`` schedules its arm on that
+    same loop.
+    """
+    if self._drain_task is None:
+      return
+    self.start_idle_drain(
+      self._on_idle_event, restart=True,
+      task_id_source=self._idle_task_id_source)
 
   async def run_turn(
     self,
@@ -436,7 +467,7 @@ class SDKThread:
       self._drain_enabled = True
 
   def start_idle_drain(
-    self, on_idle_event: Callable[[TurnEvent], None],
+    self, on_idle_event: Callable[[TurnEvent], None] | None,
     restart: bool = False,
     task_id_source: Callable[[str], str] | None = None,
   ) -> None:
@@ -464,18 +495,25 @@ class SDKThread:
 
     def _arm() -> None:
       self._drain_enabled = True
-      if restart and self._drain_task is not None:
+      # Treat a client swap as an implicit restart — see
+      # _drain_client_is_stale.
+      replace = restart or self._drain_client_is_stale()
+      if replace and self._drain_task is not None:
         # Cancelling is the only way out of a receive future that will
         # never complete (the client it read from is gone). Logged because a
         # drained-but-silent daemon is indistinguishable from a healthy one:
         # without this line a forensic read of the log cannot tell whether
         # the reconnect re-armed the drainer or left the old task parked.
-        log.info("idle drain: replacing the task after reconnect")
+        log.info(
+          "idle drain: replacing the task (%s)",
+          "reconnect" if restart else "client changed under it")
         self._drain_task.cancel()
         self._drain_task = None
         if self._drain_pending is not None:
           self._drain_pending.cancel()
           self._drain_pending = None
+      # Remember which client this task will read, for the next arm call.
+      self._drain_client = self._client
       if self._drain_task is None or self._drain_task.done():
         # create_task (NOT ensure_future): only create_task accepts `name=`.
         # ensure_future(coro, name=...) raises TypeError on py3.14 — which
@@ -488,6 +526,19 @@ class SDKThread:
       self._loop.call_soon_threadsafe(_arm)
     except RuntimeError:
       pass  # loop already stopped
+
+  def _drain_client_is_stale(self) -> bool:
+    """True when the drain task reads a client that is no longer the current one.
+
+    The drain task reads a client, not "the client": once that client is
+    replaced, its receive future never completes, and a task parked there is
+    ``not done()`` — so the lazy arm path would leave it in place forever.
+    Re-arming is therefore implicitly a restart whenever the client changed
+    under the task. ``_client`` is written on the SDK loop only, and so is
+    this check (called from ``_arm``).
+    """
+    return (self._drain_client is not None
+            and self._drain_client is not self._client)
 
   def stop_idle_drain(self) -> None:
     """Stop the idle drainer (shutdown). Consumes nothing further."""

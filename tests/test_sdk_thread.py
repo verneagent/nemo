@@ -1299,12 +1299,131 @@ class TestIdleDrain:
     finally:
       thread.stop()
 
+  def test_reconnect_re_arms_the_drainer_it_replaced(self):
+    """``SDKThread.reconnect()`` itself must re-arm the idle drainer.
+
+    Every client replacement goes through reconnect(): the watchdog stall
+    recovery and the stale-leak recovery call it from inside
+    ``run_turn_with_reconnect``, and they never pass through
+    ``ClaudeCodingAgent.reset()`` (the only caller that used to pass
+    ``restart=True``). So after the first such reconnect the drain task sat
+    in a receive future of a closed client — ``not done()``, so the lazy arm
+    path never replaced it — and nothing between turns was ever read again
+    (2026-11-03, oc_956058b1…: a Monitor fired every minute for three turns,
+    the CLI answered all three, and not one card reached Lark).
+    """
+    _ensure_real_sdk()
+    thread = SDKThread()
+    thread.start()
+    events: list = []
+    old = _HangingClient([])
+    new = _HangingClient([self._task_notification()])
+    try:
+      thread._client = old
+      thread.start_idle_drain(events.append)
+
+      deadline = time.time() + 5
+      while thread._drain_pending is None and time.time() < deadline:
+        time.sleep(0.02)
+      assert thread._drain_pending is not None, "drainer never armed"
+      wedged_task = thread._drain_task
+
+      with mock.patch("claude_agent_sdk.ClaudeSDKClient", return_value=new):
+        asyncio.run(thread.reconnect(object()))
+
+      assert thread._client is new, "reconnect did not install the new client"
+      assert old.closed, "reconnect did not close the old client"
+
+      deadline = time.time() + 5
+      while not events and time.time() < deadline:
+        time.sleep(0.02)
+      assert events, (
+        "reconnect() left the drainer parked on the closed client — the new "
+        "client's stream is never read, so every background completion and "
+        "Monitor fire between turns is silently dropped")
+      assert isinstance(events[0], BackgroundTaskDoneEvent)
+      assert events[0].task_id == "task_x"
+      deadline = time.time() + 5
+      while not wedged_task.cancelled() and time.time() < deadline:
+        time.sleep(0.02)
+      assert wedged_task.cancelled(), "the wedged drain task was not cancelled"
+    finally:
+      thread.stop()
+
+  def test_control_without_the_rearm_reconnect_leaves_the_drainer_parked(self):
+    """Permanent control for the test above: with the re-arm patched out (the
+    pre-fix behaviour), the same reconnect surfaces nothing.
+
+    A regression test that passes with the bug present is worse than none —
+    this control is what makes the test above meaningful.
+    """
+    _ensure_real_sdk()
+    thread = SDKThread()
+    thread.start()
+    events: list = []
+    old = _HangingClient([])
+    new = _HangingClient([self._task_notification()])
+    try:
+      thread._client = old
+      thread.start_idle_drain(events.append)
+
+      deadline = time.time() + 5
+      while thread._drain_pending is None and time.time() < deadline:
+        time.sleep(0.02)
+      assert thread._drain_pending is not None, "drainer never armed"
+
+      with mock.patch.object(SDKThread, "_rearm_idle_drain", lambda self: None):
+        with mock.patch("claude_agent_sdk.ClaudeSDKClient", return_value=new):
+          asyncio.run(thread.reconnect(object()))
+
+      time.sleep(1.0)
+      assert events == [], (
+        "control expected the drainer to stay parked on the closed client")
+    finally:
+      thread.stop()
+
   def test_control_wedged_drainer_stays_wedged_without_restart(self):
     """Permanent control for the test above: arming WITHOUT restart=True (the
     pre-fix behaviour) leaves the wedged task in place and surfaces nothing.
 
     This is what makes the regression test meaningful — it must fail with the
-    fix reverted, and this control must keep passing either way.
+    fix reverted, and this control must keep passing either way. The stale-
+    client belt (``_drain_client_is_stale``) is patched out too: it is a
+    SECOND guard against exactly this wedge, so the control has to disable
+    both to reproduce the raw "lazy arm path" behaviour it documents. What
+    tears the wedge down on its own is covered by
+    ``test_stale_client_swap_re_arms_even_without_restart``.
+    """
+    _ensure_real_sdk()
+    thread = SDKThread()
+    thread.start()
+    events: list = []
+    try:
+      thread._client = _HangingClient([])
+      thread.start_idle_drain(events.append)
+
+      deadline = time.time() + 5
+      while thread._drain_pending is None and time.time() < deadline:
+        time.sleep(0.02)
+      assert thread._drain_pending is not None, "drainer never armed"
+
+      with mock.patch.object(
+          SDKThread, "_drain_client_is_stale", lambda self: False):
+        thread._client = _HangingClient([self._task_notification()])
+        thread.start_idle_drain(events.append)  # no restart
+
+        time.sleep(1.0)
+      assert events == [], "control expected the wedged task to stay parked"
+    finally:
+      thread.stop()
+
+  def test_stale_client_swap_re_arms_even_without_restart(self):
+    """Belt for the reconnect fix: ANY arm call after the client changed under
+    the drain task restarts it, even when the caller forgot ``restart=True``.
+
+    The drainer cannot heal itself here — it is parked inside a receive future
+    that will never complete, so nothing in ``_idle_drain_loop`` ever runs
+    again. The arm-time check is the only place the wedge is observable.
     """
     _ensure_real_sdk()
     thread = SDKThread()
@@ -1320,10 +1439,16 @@ class TestIdleDrain:
       assert thread._drain_pending is not None, "drainer never armed"
 
       thread._client = _HangingClient([self._task_notification()])
-      thread.start_idle_drain(events.append)  # no restart
+      thread.start_idle_drain(events.append)  # no restart on purpose
 
-      time.sleep(1.0)
-      assert events == [], "control expected the wedged task to stay parked"
+      deadline = time.time() + 5
+      while not events and time.time() < deadline:
+        time.sleep(0.02)
+      assert events, (
+        "a client swap did not restart the drainer — it stays parked on the "
+        "closed client's stream")
+      assert isinstance(events[0], BackgroundTaskDoneEvent)
+      assert events[0].task_id == "task_x"
     finally:
       thread.stop()
 
@@ -1394,10 +1519,21 @@ class TestIdleDrain:
 
 class _HangingClient:
   """receive_messages yields the given messages, then hangs forever — like a
-  real idle CLI stream that pushes a few spontaneous events and goes quiet."""
+  real idle CLI stream that pushes a few spontaneous events and goes quiet.
+
+  ``__aenter__``/``__aexit__`` make it usable as the connect/close half of a
+  ``reconnect()`` (see ``test_reconnect_re_arms_the_drainer_it_replaced``)."""
 
   def __init__(self, messages):
     self._messages = list(messages)
+    self.closed = False
+
+  async def __aenter__(self):
+    return self
+
+  async def __aexit__(self, *_exc):
+    self.closed = True
+    return False
 
   def receive_messages(self):
     async def gen():
