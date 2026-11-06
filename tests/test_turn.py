@@ -413,7 +413,7 @@ def test_a_monitor_is_never_promoted_to_stale():
   pending = {"task_mon", "task_bash"}
   stale: set[str] = set()
 
-  ids = _promote_pending_to_stale(pending, stale, {"task_mon"})
+  ids = _promote_pending_to_stale(pending, stale, watches={"task_mon"})
 
   # Every pending id is still reported (callers log it and STOP orphans on an
   # abandoned turn).

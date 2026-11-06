@@ -618,8 +618,7 @@ class _TurnResult:
 
 
 def _promote_pending_to_stale(
-  pending_tasks: set[str], stale_tasks: set[str],
-  watches: set[str] = set(),
+  pending_tasks: set[str], stale_tasks: set[str], *, watches: set[str],
 ) -> list[str]:
   """Remember a turn's still-pending background task ids as stale (SDK #788).
 
@@ -1212,7 +1211,7 @@ async def _single_turn(
         err_sample = (non_retryable_error_text or result_text)[:500]
         log.warning("Non-retryable API error in turn result: %r", err_sample[:200])
         await _stop_tasks(
-          client, _promote_pending_to_stale(pending_tasks, stale_tasks, watch_tasks),
+          client, _promote_pending_to_stale(pending_tasks, stale_tasks, watches=watch_tasks),
           stop_task_disabled)
         on_event(ErrorEvent(message=err_sample))
         raise NonRetryableAPIError(err_sample)
@@ -1226,7 +1225,7 @@ async def _single_turn(
         # consistent. The attempt is abandoned, so these are genuine orphans:
         # mark them stale AND stop them (nothing will wait for a result now).
         await _stop_tasks(
-          client, _promote_pending_to_stale(pending_tasks, stale_tasks, watch_tasks),
+          client, _promote_pending_to_stale(pending_tasks, stale_tasks, watches=watch_tasks),
           stop_task_disabled)
         raise TransientAPIError(err_sample)
 
@@ -1239,7 +1238,7 @@ async def _single_turn(
       # BackgroundTaskDoneEvent, which the host turns into a real follow-up
       # turn. Stopping them here made every completion arrive as
       # ``status=stopped`` — a notification about the reaping itself.
-      promoted = _promote_pending_to_stale(pending_tasks, stale_tasks, watch_tasks)
+      promoted = _promote_pending_to_stale(pending_tasks, stale_tasks, watches=watch_tasks)
       if promoted:
         log.info(
           "turn completed with %d background task(s) still running %s — "
