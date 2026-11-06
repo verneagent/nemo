@@ -233,6 +233,19 @@ _CRON_DISALLOWED_TOOLS = [
 # PreToolUse hook, not a prompt line: the model can arm several in one
 # response, so a soft instruction loses the race — see ``_on_pre_tool_use``.
 MAX_LIVE_MONITORS = 3
+
+
+def _deny_monitor(reason: str) -> dict[str, object]:
+  """A PreToolUse denial whose reason the model reads verbatim."""
+  return {
+    "hookSpecificOutput": {
+      "hookEventName": "PreToolUse",
+      "permissionDecision": "deny",
+      "permissionDecisionReason": reason,
+    },
+  }
+
+
 _FORK_DISALLOWED_TOOLS = [
   "Write", "Edit", "NotebookEdit", "Agent", "Skill", "AskUserQuestion",
   "mcp__*",
@@ -584,6 +597,13 @@ class _OneShotResult:
 class ClaudeCodingAgent(CodingAgent):
   """CodingAgent adapter for the Claude Agent SDK."""
 
+  # Class-level defaults: the PreToolUse hook reads these, and tests build
+  # instances with ``__new__`` (no __init__), where instance attributes set
+  # in __init__ do not exist.
+  _watch_armer: Callable[
+    [dict[str, object]], Awaitable[tuple[bool, str]]] | None = None
+  _host_loop: asyncio.AbstractEventLoop | None = None
+
   def __init__(
     self,
     credentials: dict[str, str],
@@ -647,6 +667,23 @@ class ClaudeCodingAgent(CodingAgent):
     self._idle_fire_session: str = ""
     self._idle_fire_offset: int = 0
     self._idle_fire_ids: list[str] = []
+    # Daemon-owned watch armer (host-supplied). When set, a ``Monitor`` call
+    # is DENIED and its command handed here instead: the daemon spawns the
+    # process itself, so report identity is the spawn and lifecycle is the
+    # process, instead of being reconstructed from CLI events. Runs on the
+    # host loop (the hook executes on the SDK loop), hence the loop handle.
+    self._watch_armer: Callable[
+      [dict[str, object]], Awaitable[tuple[bool, str]]] | None = None
+    self._host_loop: asyncio.AbstractEventLoop | None = None
+
+  def set_watch_armer(
+    self,
+    armer: Callable[[dict[str, object]], Awaitable[tuple[bool, str]]],
+    host_loop: asyncio.AbstractEventLoop,
+  ) -> None:
+    """Take over ``Monitor`` execution (see nemo/watches.py)."""
+    self._watch_armer = armer
+    self._host_loop = host_loop
 
   def set_effort(self, effort: str) -> None:
     self._effort = effort if effort in _CLAUDE_EFFORT_LEVELS else ""
@@ -824,23 +861,39 @@ class ClaudeCodingAgent(CodingAgent):
         return {}
       if hook_input.get("tool_name") != "Monitor":
         return {}
+
+      # Daemon-owned execution — see nemo/watches.py. The CLI must NEVER
+      # spawn the watch: as its child, identity and lifecycle could only be
+      # reconstructed from CLI events, which is what kept producing
+      # mis-attributed reports and watches killed by their own notification
+      # (2026-11-06, oc_9540cd47…). The call is denied and its input is
+      # handed to the daemon instead; the model still decides WHAT to watch.
+      armer, host_loop = self._watch_armer, self._host_loop
+      if armer is not None and host_loop is not None:
+        tool_input = hook_input.get("tool_input")
+        if not isinstance(tool_input, dict):
+          return _deny_monitor(
+            "Monitor 的输入无法解析（不是对象），没有挂载任何监控。")
+        try:
+          future = asyncio.run_coroutine_threadsafe(armer(tool_input), host_loop)
+          _, reason = await asyncio.wrap_future(future)
+        except Exception as exc:
+          log.warning("Monitor arming through the daemon failed: %s", exc)
+          return _deny_monitor(
+            f"监控挂载失败：{exc}。不要原样重试，先告诉用户这次没挂成功。")
+        return _deny_monitor(reason)
+
       live = len(self._live_monitors)
       if live < MAX_LIVE_MONITORS:
         return {}
       log.warning(
         "Denied a Monitor: %d already live (%s)",
         live, ", ".join(sorted(self._live_monitors))[:80])
-      return {
-        "hookSpecificOutput": {
-          "hookEventName": "PreToolUse",
-          "permissionDecision": "deny",
-          "permissionDecisionReason": (
-            f"同时最多 {MAX_LIVE_MONITORS} 个后台监控，现在已经有 {live} 个在跑。"
-            "先停掉不需要的（KillShell），或者把多个观察合并成一条 Monitor "
-            "命令，再挂新的。"
-          ),
-        },
-      }
+      return _deny_monitor(
+        f"同时最多 {MAX_LIVE_MONITORS} 个后台监控，现在已经有 {live} 个在跑。"
+        "先停掉不需要的（KillShell），或者把多个观察合并成一条 Monitor "
+        "命令，再挂新的。"
+      )
     except Exception as exc:  # never block tool use on a bookkeeping error
       log.warning("PreToolUse Monitor hook error: %s", exc)
       return {}
@@ -1448,31 +1501,29 @@ class ClaudeCodingAgent(CodingAgent):
       "background task can do the job, say plainly that you cannot schedule it."
       "\n\n"
       "Watching: when the user asks you to watch / monitor / 盯着 something, "
-      "the background task must ALSO emit a short progress line on a fixed "
-      "interval (at most ~10 minutes), not just the terminal event. A monitor "
-      "that only speaks at the very end looks exactly like no monitor at all — "
-      "the user sees silence and concludes nothing is running (2026-10-29: a "
-      "group was told 盯着了 and heard nothing for 31 minutes). Make any "
-      "'stalled' threshold well above the source log's own update cadence "
-      "(a trainer printing every 10 iterations is silent for ~10 minutes even "
-      "when healthy), or it will cry wolf. ONE POLL = ONE REPORT: the card's "
-      "cadence is read from the LAST `sleep` in the command, so emit a "
-      "progress line on every iteration and set that sleep to the report "
-      "interval you actually want. Never gate the echo behind a counter "
-      "(`if [ $((n % 10)) -eq 0 ]`) — a loop that polls every 60s but echoes "
-      "every 10th makes the card promise a report every minute that never "
-      "comes, and the user sits waiting for it (2026-10-30, oc_956058b1…). "
-      "The Monitor's `description` becomes "
-      "the title of the ONE card that watch keeps updating for its whole "
-      "life, so write it as a short, stable title (what is being watched), "
-      "not as a sentence to be read once. At most "
-      f"{MAX_LIVE_MONITORS} Monitors may run at once — a 4th call is denied "
-      "by the harness, so stop an unneeded one (KillShell) or combine the "
-      "watches instead of retrying. Monitors do NOT survive a restart or "
-      "/clear: everything running dies with the process. Nothing will tell "
-      "the user they stopped, so if they ask whether a watch is still live, "
-      "check instead of trusting the old context, and re-arm only when they "
-      "explicitly ask again."
+      "use the Monitor tool. Nemo executes that command ITSELF as a "
+      "daemon-owned process — your Monitor call is intercepted and denied, "
+      "and the denial names the watch id; you still choose the command and "
+      "the title, but the host streams the command's output to ONE 👀 card "
+      "and you must NOT relay poll output yourself. Write the command as a "
+      "loop that prints one short line per poll and sleeps for the interval "
+      "the user should expect: ONE POLL = ONE REPORT, and the card's cadence "
+      "is read from the LAST `sleep` in the command — never gate the echo "
+      "behind a counter (`if [ $((n % 10)) -eq 0 ]`), because the card then "
+      "promises a report every minute that never comes. Make the line "
+      "meaningful on its own; it is appended verbatim. The `description` "
+      "becomes the card's title for the watch's whole life, so write a "
+      "short, stable title of what is being watched, not a sentence. At "
+      f"most {MAX_LIVE_MONITORS} watches may run at once — a further call is "
+      "denied, so stop an unneeded one or combine them instead of "
+      "retrying. To stop a watch, run `touch ~/.nemo/watches/<watch_id>.stop` "
+      "as a Bash command (the deny reason gives the path). Watches survive "
+      "/clear and CLI reconnects — they are not CLI children — but die with "
+      "a daemon restart. When one ends you get ONE automatic turn carrying "
+      "its last output: report if there is news, otherwise say in one line "
+      "that there is nothing new; never repeat work you already did. If the "
+      "user asks whether a watch is still live, check instead of trusting "
+      "old context, and re-arm only when they explicitly ask again."
     )
     # Standing nemo-vision note for text-only models (deepseek/kimi). Computed
     # from the live model so it refreshes on each reconnect / /model switch;

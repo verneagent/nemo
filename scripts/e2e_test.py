@@ -3159,196 +3159,289 @@ def run_steer_lag_test(pid: int, chat_id: str, result: "E2EResult") -> None:
   print()
 
 
+def _watch_card(chat_id: str, title: str, after: str,
+                timeout: int = 180) -> dict | None:
+  """Poll for the 👀 card carrying ``title`` (the model's own description)."""
+  deadline = time.time() + timeout
+  while time.time() < deadline:
+    for card in get_bot_msgs(chat_id, after=after, limit=30):
+      if interactive_card_title(card) == f"👀 {title}":
+        return card
+    time.sleep(3)
+  return None
+
+
+def _log_token(line: str, key: str) -> str:
+  """Value of ``key=value`` in a daemon log line ("" when absent)."""
+  prefix = key + "="
+  for token in line.split():
+    if token.startswith(prefix):
+      return token[len(prefix):]
+  return ""
+
+
+def _watch_appends(chunk: str, msg_id: str = "") -> list[str]:
+  return [
+    line for line in chunk.splitlines()
+    if "Monitor card appended" in line
+    and (not msg_id or msg_id in line)
+  ]
+
+
 def run_monitor_card_tests(pid: int, chat_id: str,
                            result: "E2EResult") -> None:
-  """Phase MM — one Monitor owns ONE card; reports append, never replace.
+  """Phase MM — one card per daemon-owned watch, and reports never cross.
 
-  A watch that fires every few minutes used to post a fresh 🔔 card each
-  time, so a long run buried the conversation. The 👀 marker posted at arm
-  time is now the watch's card: each report the idle drainer delivers is
-  APPENDED to it (same message id, earlier bodies kept) and the footer counts
-  them. This phase arms a Monitor that reports several times and proves the
-  chat still holds exactly ONE card for it.
+  A watch is now a process the DAEMON spawns (nemo/watches.py): the model's
+  Monitor call is denied and its command handed to the host, so a report can
+  only travel along its own pipe. That is the structural answer to the two
+  bugs that kept recurring (2026-11-06, oc_9540cd47…): reports attributed to
+  a predecessor watch, and a watch killed by its own notification.
+
+  This phase reproduces the CONDITIONS that used to break it — two watches
+  live at once, a real user turn landing between their reports — and asserts
+  the pairing directly, from the daemon's own ``task=`` / ``msg=`` log line.
 
   MM01 the 👀 marker appears at arm time (it IS the card).
-  MM02 the daemon appends at least two reports to that SAME message id.
-  MM03 the card in Lark still carries ≥2 reports and a "已汇报 N 次" footer.
-  MM04 no second 👀 card was created — the failure this feature prevents.
-  MM05 the earlier report is still there (accumulation, not overwrite).
-  MM06 when the watch's command exits, its card is marked ended — a dead
-       card must not look live next to a re-armed watch with the same name.
-  MM07 the wrap-up turn the CLI runs when a watch ends lands on that card,
-       not on a stray 🔔 card that also re-registers the dead watch.
+  MM01b the daemon armed the process (``Watch armed id=``), not the CLI.
+  MM02 reports append to that SAME message id.
+  MM03 the report count only grows (accumulation, not overwrite).
+  MM04 exactly one 👀 card for the watch.
+  MM05 a second watch armed mid-run gets its own card (concurrency).
+  MM06 a real user turn interleaved between reports still completes.
+  MM07 pairing: every append carries its OWN watch id + ITS OWN card id.
+  MM08 no report was dropped as unattributable.
+  MM09 when the command exits, its card is marked ended.
   """
-  print(f"{Colors.BOLD}Phase MM: one card per Monitor{Colors.RESET}")
+  print(f"{Colors.BOLD}Phase MM: one card per daemon-owned watch"
+        f"{Colors.RESET}")
   log = LogAnalyzer(pid)
   marker = f"MM_E2E_{int(time.time())}"
   wait_for_idle(pid, chat_id, timeout=30)
   mark = log.mark()
   ts = str(int(time.time() * 1000))
 
-  title = f"MM 进度轮询 {marker}"
-  print("  [MM01] Arming a Monitor that reports several times...")
+  title_a = f"MM 进度轮询 {marker}"
+  print("  [MM01] Arming a watch that reports several times...")
   send_msg(
     "用 Monitor 工具挂一个后台监控，参数如下：\n"
-    f"- description: `{title}`（原样，不要改动）\n"
-    f"- command: `for i in 1 2 3 4 5; do echo {marker}_REPORT_$i; sleep 12; done`\n"
+    f"- description: `{title_a}`（原样，不要改动）\n"
+    f"- command: `for i in 1 2 3 4 5 6; do echo {marker}_A_$i; sleep 10; done`\n"
     "- persistent: true\n"
-    "挂上之后立刻结束本轮，不要自己 sleep 等待、不要轮询、不要做别的事。"
+    "挂上之后立刻结束本轮：不要自己 sleep 等待、不要轮询、不要做别的事。"
     "只回一句「已挂上」。",
     chat_id)
 
-  marker_card = None
-  started = time.time()
-  while time.time() - started < 180:
-    for card in get_bot_msgs(chat_id, after=ts, limit=15):
-      if interactive_card_title(card) == f"👀 {title}":
-        marker_card = card
-        break
-    if marker_card:
-      break
-    time.sleep(3)
-  if not marker_card:
-    result.fail("MM01 monitor marker card", "no 👀 card after arming")
+  card_a = _watch_card(chat_id, title_a, ts)
+  if not card_a:
+    result.fail("MM01 watch marker card", "no 👀 card after arming")
     log.dump_tail(30, "MM01")
     return
-  msg_id = marker_card["message_id"]
-  result.ok("MM01 monitor marker card", f"msg={msg_id}")
-  # The daemon logs task ids truncated to 12 chars.
-  task_prefix = next(
-    (line.split("task=")[1].split()[0] for line in
-     reversed(log.read_since(mark).splitlines())
-     if "Background task started" in line and "tool=Monitor" in line), "")
+  msg_a = card_a["message_id"]
+  result.ok("MM01 watch marker card", f"msg={msg_a}")
 
-  # MM02 — the daemon must append to THAT message id, at least twice.
+  # MM01b — the process must belong to the daemon. The arming line is the
+  # only place its id is named, and the whole refactor is that line existing.
+  watch_a = ""
+  started = time.time()
+  while time.time() - started < 60 and not watch_a:
+    for line in log.read_since(mark).splitlines():
+      if "Watch armed id=" in line:
+        watch_a = _log_token(line, "id")
+    if not watch_a:
+      time.sleep(2)
+  if watch_a:
+    result.ok("MM01b daemon owns the process", f"watch={watch_a}")
+  else:
+    result.fail("MM01b daemon owns the process",
+                "no 'Watch armed id=' line — the CLI may have run the watch")
+    log.dump_tail(30, "MM01b")
+
+  # MM02 — at least two reports appended to THAT message id.
   appended: list[str] = []
-  rolls = 0
   started = time.time()
   while time.time() - started < 240:
-    chunk = log.read_since(mark)
-    appended = [
-      line for line in chunk.splitlines()
-      if "Monitor card appended" in line and msg_id in line
-    ]
-    rolls = chunk.count("Monitor card rolled over")
+    appended = _watch_appends(log.read_since(mark), msg_a)
     if len(appended) >= 2:
       break
     time.sleep(3)
   if len(appended) >= 2:
     result.ok("MM02 reports append to the same card",
-              f"{len(appended)} appends to {msg_id}")
+              f"{len(appended)} appends to {msg_a}")
   else:
-    result.fail(
-      "MM02 reports append to the same card",
-      f"only {len(appended)} append(s) to {msg_id} "
-      f"(rollovers={rolls}) — check the idle drainer path")
+    result.fail("MM02 reports append to the same card",
+                f"only {len(appended)} append(s) to {msg_a}")
     log.dump_tail(40, "MM02")
     return
 
-  # MM03 — the CARD's own content. Lark cannot be asked: get_message drops
-  # interactive card bodies (it returns a title + placeholder image), so the
-  # daemon's append log is the only machine-readable witness of what the card
-  # holds. Assert on the report count it prints.
+  # MM03 — the card's own content is unreadable through Lark (get_message
+  # strips Card V2 bodies), so the daemon's printed report count is the
+  # machine-readable witness; the body itself is pinned by unit tests.
   counts = [
     int(match.group(1))
     for match in (re.search(r"\((\d+) reports", line) for line in appended)
     if match
   ]
-  if counts and counts[-1] >= 2:
-    result.ok("MM03 card holds several reports",
-              f"{counts[-1]} reports in {msg_id}")
+  if counts and counts == sorted(counts) and len(set(counts)) == len(counts):
+    result.ok("MM03 earlier reports are kept", f"counts {counts}")
   else:
-    result.fail("MM03 card holds several reports",
-                f"append lines carried no report count: {appended!r}")
+    result.fail("MM03 earlier reports are kept",
+                f"report counts are not strictly growing: {counts}")
 
-  marker_cards = [
+  cards_a = [
     card for card in get_bot_msgs(chat_id, after=ts, limit=20)
-    if interactive_card_title(card) == f"👀 {title}"
+    if interactive_card_title(card) == f"👀 {title_a}"
   ]
-  if len(marker_cards) == 1:
+  if len(cards_a) == 1:
     result.ok("MM04 exactly one card for the watch", "1 👀 card")
   else:
     result.fail("MM04 exactly one card for the watch",
-                f"{len(marker_cards)} 👀 cards — reports split across cards")
+                f"{len(cards_a)} 👀 cards — reports split across cards")
 
-  # MM05 — accumulation, not overwrite: the report count only ever grows and
-  # the card was never rebuilt from scratch (no "part 2" unless it rolled
-  # over, and MM02 already pinned every append to the SAME message id). The
-  # per-section content itself is asserted by the unit tests, since Lark will
-  # not hand the body back.
-  if counts == sorted(counts) and len(set(counts)) == len(counts):
-    result.ok("MM05 earlier reports are kept",
-              f"monotonic report counts {counts}")
+  # MM05 — arm a SECOND watch while the first is still reporting. Two live
+  # watches is the condition under which attribution used to collapse.
+  title_b = f"MM 并行 {marker}"
+  print("  [MM05] Arming a second watch while the first is live...")
+  ts_b = str(int(time.time() * 1000))
+  send_msg(
+    "再挂一个后台监控（第一个还留着）：\n"
+    f"- description: `{title_b}`（原样，不要改动）\n"
+    f"- command: `for i in 1 2 3 4 5 6; do echo {marker}_B_$i; sleep 10; done`\n"
+    "- persistent: true\n"
+    "挂上之后立刻结束本轮，只回一句「第二个已挂上」。",
+    chat_id)
+  card_b = _watch_card(chat_id, title_b, ts_b)
+  if card_b:
+    msg_b = card_b["message_id"]
+    result.ok("MM05 a second watch gets its own card", f"msg={msg_b}")
   else:
-    result.fail("MM05 earlier reports are kept",
-                f"report counts went backwards: {counts}")
+    msg_b = ""
+    result.fail("MM05 a second watch gets its own card",
+                "no 👀 card for the second watch")
+    log.dump_tail(40, "MM05")
 
-  # MM06 — when the watch's command finally exits, its card must SAY it is
-  # over. A card that just stops changing reads as still-live, and a model
-  # that stops a broken watch and re-arms it under the same description then
-  # leaves two identical 👀 cards with no way to tell which one is running
-  # (2026-10-29, oc_956058b1…). Asserts the daemon's close line for THIS card:
-  # Lark will not hand the patched body back.
+  # MM06 — a REAL user turn while both watches run. This is what used to
+  # shift the fire queue: the turn consumed a notification row the drainer
+  # never saw, and every later report was named after its predecessor.
+  print("  [MM06] Sending a real user turn between reports...")
+  ts_user = str(int(time.time() * 1000))
+  send_msg("用一个短句回答：现在适合专注做什么？不要再挂监控，也不要等。", chat_id)
+  reply, _ = wait_for_response(
+    chat_id, after=ts_user, timeout=180, require_done=True)
+  if reply:
+    result.ok("MM06 an interleaved user turn still completes",
+              f"msg={reply['message_id']}")
+  else:
+    result.fail("MM06 an interleaved user turn still completes",
+                "no Done card for the interleaved turn")
+    log.dump_tail(40, "MM06")
+
+  if msg_b:
+    started = time.time()
+    while time.time() - started < 180:
+      if _watch_appends(log.read_since(mark), msg_b):
+        break
+      time.sleep(3)
+
+  # MM07 — the pairing assertion. Every append line names BOTH the watch and
+  # the card; in the drift bugs the two disagreed.
+  chunk = log.read_since(mark)
+  by_task: dict[str, set[str]] = {}
+  for line in _watch_appends(chunk):
+    by_task.setdefault(_log_token(line, "task"), set()).add(
+      _log_token(line, "msg"))
+  mispaired = [
+    f"{task}: {sorted(msgs)}" for task, msgs in by_task.items()
+    if len(msgs) != 1
+  ]
+  wrong = []
+  if watch_a and by_task.get(watch_a) != {msg_a}:
+    wrong.append(f"{watch_a}: {sorted(by_task.get(watch_a, set()))} != {msg_a}")
+  if msg_b:
+    watch_b = next(
+      (task for task, msgs in by_task.items() if msgs == {msg_b}), "")
+    if not watch_b:
+      wrong.append(f"no appends for the second card {msg_b}")
+  if mispaired or wrong:
+    result.fail("MM07 reports carry their own watch and card",
+                "; ".join(mispaired + wrong))
+  else:
+    result.ok("MM07 reports carry their own watch and card",
+              f"{len(by_task)} watch(es), each on exactly one card")
+
+  # MM08 — a report that cannot find its card is dropped AND surfaced; none
+  # may have occurred.
+  lost = [
+    line for line in chunk.splitlines() if "no card to land on" in line
+  ]
+  if lost:
+    result.fail("MM08 every report finds its card",
+                f"{len(lost)} dropped report(s): {lost[-1].strip()}")
+  else:
+    result.ok("MM08 every report finds its card", "no dropped reports")
+
+  # MM09 — when the command exits, the card must SAY it is over.
   started = time.time()
   closed = ""
-  while time.time() - started < 180:
+  while time.time() - started < 240:
     for line in log.read_since(mark).splitlines():
-      if "Monitor card closed" in line and msg_id in line:
+      if "Monitor card closed" in line and msg_a in line:
         closed = line
     if closed:
       break
     time.sleep(3)
   if "status=completed" in closed:
-    result.ok("MM06 a finished watch's card is marked ended", closed.strip())
+    result.ok("MM09 a finished watch's card is marked ended", closed.strip())
   else:
-    result.fail(
-      "MM06 a finished watch's card is marked ended",
-      f"no 'Monitor card closed … status=completed' line for {msg_id} "
-      f"(last: {closed.strip() or 'none'})")
-    log.dump_tail(40, "MM06")
+    result.fail("MM09 a finished watch's card is marked ended",
+                f"no close line for {msg_a} (last: {closed.strip() or 'none'})")
+    log.dump_tail(40, "MM09")
 
-  # MM07 — ending a watch makes the CLI run one last wrap-up turn, and that
-  # answer arrives tagged with the now dead task id. It must land on the
-  # watch's own card; the generic "🔔 后台自动响应" fallback is DELETED, so a
-  # report that cannot find its card now logs an ERROR instead of inventing
-  # one. Either way no card of its own may appear for a dead watch.
-  time.sleep(20)
-  chunk = log.read_since(mark)
-  stray = [
-    line for line in chunk.splitlines()
-    if ("Background response card sent" in line
-        or "no Monitor card to land on" in line)
-    and task_prefix in line
-  ]
-  if stray:
-    result.fail("MM07 the wrap-up lands on the watch's card",
-                f"posted a separate card for a dead watch: {stray[-1].strip()}")
-  else:
-    result.ok("MM07 the wrap-up lands on the watch's card",
-              "no stray card for the ended task")
+
+def _cli_child_pid(daemon_pid: int) -> int:
+  """The daemon's Claude CLI child — NOT its watch children.
+
+  ``heartbeat children=`` only carries the watch pid, so the CLI is found by
+  cmdline instead of by process-tree position.
+  """
+  out = subprocess.run(
+    ["ps", "-axo", "pid=,ppid=,command="],
+    capture_output=True, text=True, check=False).stdout
+  for line in out.splitlines():
+    parts = line.split(None, 2)
+    if len(parts) < 3:
+      continue
+    pid_text, ppid_text, command = parts
+    if ppid_text != str(daemon_pid) or "claude" not in command:
+      continue
+    try:
+      return int(pid_text)
+    except ValueError:
+      continue
+  return 0
 
 
 def run_monitor_idle_arm_tests(pid: int, chat_id: str,
                                result: "E2EResult") -> None:
-  """Phase MI — a Monitor armed while the CLI is running its own turn.
+  """Phase MI — a daemon-owned watch survives a CLI reconnect.
 
-  The CLI answers a Monitor fire itself, so a watch the model arms in one of
-  those answers never passes through ``run_turn``. Its TaskStarted only
-  reaches the daemon through the idle drainer, and dropping it left the watch
-  with no card: every report it produced became a red "后台报告无法归属" card,
-  once a minute, for the whole run (2026-10-30, oc_956058b1…).
+  Watches used to be CLI children: /clear, /model, /effort and every stall
+  recovery reconnected the SDK and silently killed them, while the transcript
+  still said 盯着了. The process now belongs to the daemon, so the card keeps
+  updating across a reconnect — the whole reason the feature moved.
 
-  MI01 a first watch's 👀 card appears (the normal, in-turn path).
-  MI02 the SECOND watch is armed from the idle drainer (the daemon logs it
-       separately from the turn-path arming).
-  MI03 that watch gets its own 👀 marker card.
-  MI04 its reports APPEND to that card instead of erroring out.
-  MI05 nothing was reported as unattributable during the phase.
+  MI01 the watch is armed and streaming (its 👀 card exists).
+  MI02 at least one report lands before the reconnect.
+  MI03 the CLI subprocess dies and the daemon reconnects with resume.
+  MI04 a report lands AFTER the reconnect, on the SAME card.
+  MI05 no report was dropped as unattributable.
+  MI06 the daemon-stopped watch closes its card (the .stop file works).
 
-  The trigger is a Monitor fire: the model is told to arm the second watch
-  when it sees a specific report, which happens in the CLI-run answer turn.
+  The watch must outlive the reconnect: it runs until stopped, not for a
+  fixed number of ticks. A 150-second command racing a 180-second reconnect
+  wait made MI fail on its own timing, not on the architecture (2026-11-06).
   """
-  print(f"{Colors.BOLD}Phase MI: a Monitor armed from the idle drainer"
+  print(f"{Colors.BOLD}Phase MI: a watch survives a CLI reconnect"
         f"{Colors.RESET}")
   log = LogAnalyzer(pid)
   marker = f"MI_E2E_{int(time.time())}"
@@ -3356,114 +3449,137 @@ def run_monitor_idle_arm_tests(pid: int, chat_id: str,
   mark = log.mark()
   ts = str(int(time.time() * 1000))
 
-  first_title = f"MI 轮询 {marker}"
-  idle_title = f"MI 空闲挂载 {marker}"
-  print("  [MI01] Arming the watch that drives the CLI-side answer turn...")
+  title = f"MI 重连存活 {marker}"
+  title_b = f"MI 触发器 {marker}"
+  print("  [MI01] Arming a long watch plus a short one that wakes a turn...")
   send_msg(
-    "用 Monitor 工具挂一个后台监控：\n"
-    f"- description: `{first_title}`（原样）\n"
-    f"- command: `for i in 1 2 3 4 5 6; do echo {marker}_REPORT_$i; sleep 20; done`\n"
-    "- persistent: true\n\n"
-    "**重要，必须严格遵守**：之后每次这个监控发来报告，你都直接结束本轮，"
-    "只回一句「收到」。**唯独当报告内容是 "
-    f"`{marker}_REPORT_3` 时**，不要只回一句，而是先挂第二个 Monitor：\n"
-    f"- description: `{idle_title}`（原样）\n"
-    "- command: `for i in 1 2 3 4 5; do echo "
-    f"{marker}_IDLE_$i; sleep 20; done`\n"
-    "- persistent: true\n"
-    "然后再回一句「收到，第二个已挂上」。不要自己 sleep、不要轮询。\n\n"
-    "现在先只把第一个 Monitor 挂上，然后立刻结束本轮，回「已挂上」。",
+    "用 Monitor 工具挂两个后台监控（要调用两次 Monitor），参数严格照抄：\n"
+    f"1) description: `{title}`；command: "
+    f"`while true; do echo {marker}_A_TICK; sleep 5; done`；timeout_ms: 900000\n"
+    f"2) description: `{title_b}`；command: "
+    f"`sleep 45; echo {marker}_B_DONE`；timeout_ms: 600000\n"
+    "两个都挂上之后立刻结束本轮，只回一句「已挂上」。",
     chat_id)
 
-  first_card = None
-  started = time.time()
-  while time.time() - started < 180:
-    for card in get_bot_msgs(chat_id, after=ts, limit=20):
-      if interactive_card_title(card) == f"👀 {first_title}":
-        first_card = card
-        break
-    if first_card:
-      break
-    time.sleep(3)
-  if not first_card:
-    result.fail("MI01 first watch armed", "no 👀 card for the first watch")
+  # 300s, not the default 180: a stalled CLI is recovered by the watchdog at
+  # 240s idle, and the phase must survive one such recovery (2026-11-06).
+  card = _watch_card(chat_id, title, ts, timeout=300)
+  if not card:
+    result.fail("MI01 the watch gets its card", "no 👀 card after arming")
     log.dump_tail(30, "MI01")
     return
-  result.ok("MI01 first watch armed", f"msg={first_card['message_id']}")
+  msg_id = card["message_id"]
+  result.ok("MI01 the watch gets its card", f"msg={msg_id}")
 
-  # MI02 — the second arming must come through the drainer. The distinct log
-  # line is the whole point: the card looks identical either way.
-  idle_line = ""
+  watch_id = ""
   started = time.time()
-  while time.time() - started < 300:
-    for line in log.read_since(mark).splitlines():
-      if ("Background task started from the idle drainer" in line
-          and "tool=Monitor" in line):
-        idle_line = line
-    if idle_line:
-      break
-    time.sleep(3)
-  if not idle_line:
-    result.fail(
-      "MI02 armed from the idle drainer",
-      "the model never armed a second Monitor in a CLI-run turn")
-    log.dump_tail(50, "MI02")
-    return
-  idle_task = next(
-    (tok.split("=")[1] for tok in idle_line.split() if tok.startswith("task=")),
-    "")
-  result.ok("MI02 armed from the idle drainer", idle_line.strip())
+  while time.time() - started < 30 and not watch_id:
+    armed = re.search(
+      rf"Watch armed id=(w\w+).*{re.escape(marker)}_A_TICK",
+      log.read_since(mark))
+    watch_id = armed.group(1) if armed else ""
+    if not watch_id:
+      time.sleep(1)
 
-  # MI03 — the idle arming posts its own marker card, i.e. the host really
-  # learned about the watch rather than merely logging it.
-  idle_card = None
+  def _stop_watch() -> None:
+    if watch_id:
+      try:
+        stop = os.path.expanduser(f"~/.nemo/watches/{watch_id}.stop")
+        open(stop, "w", encoding="utf-8").close()
+      except OSError as exc:
+        print(f"  stop file failed: {exc}")
+
   started = time.time()
   while time.time() - started < 120:
-    for card in get_bot_msgs(chat_id, after=ts, limit=30):
-      if interactive_card_title(card) == f"👀 {idle_title}":
-        idle_card = card
-        break
-    if idle_card:
+    if _watch_appends(log.read_since(mark), msg_id):
       break
     time.sleep(3)
-  if not idle_card:
-    result.fail("MI03 the idle watch gets its own card",
-                "no 👀 card for the drainer-armed watch")
-    log.dump_tail(40, "MI03")
-    return
-  idle_msg = idle_card["message_id"]
-  result.ok("MI03 the idle watch gets its own card", f"msg={idle_msg}")
-
-  # MI04 — its reports land on that card. This is what the bug destroyed.
-  appended: list[str] = []
-  started = time.time()
-  while time.time() - started < 180:
-    appended = [
-      line for line in log.read_since(mark).splitlines()
-      if "Monitor card appended" in line and idle_msg in line
-    ]
-    if appended:
-      break
-    time.sleep(3)
-  if appended:
-    result.ok("MI04 its reports append to that card",
-              f"{len(appended)} append(s) to {idle_msg}")
+  if _watch_appends(log.read_since(mark), msg_id):
+    result.ok("MI02 it reports before the reconnect", "≥1 append")
   else:
-    result.fail("MI04 its reports append to that card",
-                f"no append to {idle_msg} — reports went elsewhere")
+    result.fail("MI02 it reports before the reconnect", "no append")
+    log.dump_tail(30, "MI02")
+    _stop_watch()
+    return
+
+  # MI03 — make the CLI really go away. /effort used to be the trigger, but
+  # it needs an inbound relay message and the remote relay intermittently
+  # accepts webhooks without delivering them (ok:true, empty queue), which
+  # made this phase fail on the harness instead of the code (2026-11-06).
+  # Killing the CLI child tests the exact incident: the SDK subprocess dies,
+  # the daemon reconnects with resume, and the watch must not notice.
+  print("  [MI03] Killing the CLI subprocess (the daemon must reconnect)...")
+  cli_pid = _cli_child_pid(pid)
+  mark_rc = log.mark()
+  if not cli_pid:
+    result.fail("MI03 the CLI reconnected", "no CLI child pid in heartbeats")
+    log.dump_tail(40, "MI03")
+    _stop_watch()
+    return
+  try:
+    os.kill(cli_pid, signal.SIGKILL)
+  except OSError as exc:
+    result.fail("MI03 the CLI reconnected", f"kill {cli_pid} failed: {exc}")
+    log.dump_tail(40, "MI03")
+    _stop_watch()
+    return
+  reconnected = log.wait_for_since(
+    r"Reconnecting|SDK client connected|SDK turn disconnected", mark_rc,
+    timeout=180)
+  if reconnected:
+    result.ok("MI03 the CLI reconnected", f"killed cli pid={cli_pid}")
+  else:
+    result.fail("MI03 the CLI reconnected",
+                f"no reconnect after killing cli pid={cli_pid}")
+    log.dump_tail(40, "MI03")
+    _stop_watch()
+    return
+
+  # MI04 — the watch must still be ours after the CLI went away.
+  mark_after = log.mark()
+  started = time.time()
+  after_rc: list[str] = []
+  while time.time() - started < 180:
+    after_rc = _watch_appends(log.read_since(mark_after), msg_id)
+    if after_rc:
+      break
+    time.sleep(3)
+  if after_rc:
+    result.ok("MI04 it keeps reporting after the reconnect",
+              f"{len(after_rc)} append(s) to {msg_id}")
+  else:
+    result.fail("MI04 it keeps reporting after the reconnect",
+                f"no append to {msg_id} after the reconnect — the watch "
+                "died with the CLI")
     log.dump_tail(40, "MI04")
 
-  # MI05 — nothing may have been reported as unattributable.
-  chunk = log.read_since(mark)
   lost = [
-    line for line in chunk.splitlines()
-    if "no Monitor card to land on" in line
+    line for line in log.read_since(mark).splitlines()
+    if "no card to land on" in line
   ]
   if lost:
     result.fail("MI05 no unattributable report",
                 f"{len(lost)} dropped report(s): {lost[-1].strip()}")
   else:
     result.ok("MI05 no unattributable report", "every report found its card")
+
+  # MI06 — the stop file is the documented way to end a watch.
+  mark_stop = log.mark()
+  _stop_watch()
+  seen = log.wait_for_since(
+    rf"Monitor card closed .*task={re.escape(watch_id)}", mark_stop,
+    timeout=60) if watch_id else False
+  closed = ""
+  if seen:
+    for line in log.read_since(mark_stop).splitlines():
+      if "Monitor card closed" in line and watch_id in line:
+        closed = line.strip()
+  if closed:
+    result.ok("MI06 the stop file ends the watch", closed[-80:])
+  else:
+    result.fail("MI06 the stop file ends the watch",
+                f"watch {watch_id or '?'} did not close after .stop")
+    log.dump_tail(40, "MI06")
 
 
 def run_idle_notification_tests(pid: int, chat_id: str,
@@ -3760,9 +3876,12 @@ def main():
                       help="Run only the idle background-task notification test "
                            "(Phase ID)")
   parser.add_argument("--monitor", action="store_true",
-                      help="Run only the one-card-per-Monitor test (Phase MM)")
+                      help="Run only the daemon-owned watch test (Phase MM: "
+                           "one card per watch, two live at once, report "
+                           "pairing)")
   parser.add_argument("--monitor-idle", action="store_true",
-                      help="Run only the drainer-armed Monitor test (Phase MI)")
+                      help="Run only the watch reconnect-survival test "
+                           "(Phase MI)")
   parser.add_argument("--verbose", "-v", action="store_true",
                       help="Verbose nemo logging")
   args = parser.parse_args()

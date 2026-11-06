@@ -1285,14 +1285,15 @@ def test_build_agent_prompt_forbids_repl_only_cron_tools():
   assert "Monitor" in prompt
 
 
-def test_build_agent_prompt_requires_a_heartbeat_when_watching():
-  """'盯着了' must not mean 'silent until the end' (2026-10-29).
+def test_build_agent_prompt_ties_a_watch_to_the_daemon_that_runs_it():
+  """The prompt must describe the executor the hook actually enforces.
 
-  A group was told the work was being watched and then heard nothing for 31
-  minutes: the Monitor only echoed on the terminal sentinel, so no event ever
-  reached the drainer while the training was healthy. The prompt must demand
-  a periodic progress line in addition to the terminal event, and warn that a
-  stall threshold below the log's own cadence cries wolf."""
+  A watch is now a daemon-owned process (nemo/watches.py): the Monitor call is
+  denied, the host streams the output, and the stop path is a file touch. A
+  prompt still telling the model to KillShell a CLI task would leave every
+  watch unstoppable, and one that omitted the streaming semantics would make
+  the model relay polls the card already shows (2026-11-06, oc_9540cd47…).
+  """
   from unittest import mock
   from nemo.agent_factory import MediaVision
   from nemo.claude_agent import ClaudeCodingAgent
@@ -1303,9 +1304,11 @@ def test_build_agent_prompt_requires_a_heartbeat_when_watching():
                   return_value=MediaVision(image=True, video=False)), \
        mock.patch("nemo.vision_cli.helper_available", return_value=True):
     prompt = agent._build_agent_prompt()
-  assert "progress line" in prompt
-  assert "looks exactly like no monitor at all" in prompt
-  assert "update cadence" in prompt
+  assert "daemon-owned process" in prompt
+  assert "intercepted and denied" in prompt
+  assert "must NOT relay poll output" in prompt
+  assert "touch ~/.nemo/watches/" in prompt
+  assert "survive /clear and CLI reconnects" in prompt
 
 
 def test_build_agent_prompt_ties_the_report_cadence_to_the_echo():
@@ -1508,6 +1511,62 @@ def test_pre_tool_use_denies_the_fourth_monitor():
   assert "3" in hook["permissionDecisionReason"]
   # Tell the model HOW to free a slot, not just that it failed.
   assert "KillShell" in hook["permissionDecisionReason"]
+
+
+def test_a_monitor_call_is_denied_and_handed_to_the_daemon():
+  """The CLI must never spawn a watch (nemo/watches.py).
+
+  As a CLI child, a watch's identity and lifecycle could only be
+  reconstructed from CLI events — that is what produced mis-attributed
+  reports and watches killed by their own notification (2026-11-06,
+  oc_9540cd47…). The hook denies the call and hands its input to the host,
+  which spawns the process itself; the model still decides WHAT to watch.
+  """
+  async def main() -> tuple[dict[str, object], list[dict[str, object]]]:
+    from nemo.claude_agent import ClaudeCodingAgent
+    agent = ClaudeCodingAgent.__new__(ClaudeCodingAgent)
+    agent._live_monitors = set()
+    seen: list[dict[str, object]] = []
+    tool_input = {
+      "command": "while true; do date; sleep 10; done",
+      "description": "构建进度", "timeout_ms": 600000,
+    }
+
+    async def armer(payload: dict[str, object]) -> tuple[bool, str]:
+      seen.append(payload)
+      return True, "已由 Nemo 直接接管执行：watch wdeadbeef"
+
+    agent.set_watch_armer(armer, asyncio.get_running_loop())
+    out = await agent._on_pre_tool_use(
+      {"tool_name": "Monitor", "tool_input": tool_input}, "tu_mon", None)
+    return out, seen
+
+  out, seen = asyncio.run(main())
+  hook = out["hookSpecificOutput"]
+  assert hook["permissionDecision"] == "deny"
+  assert "watch wdeadbeef" in hook["permissionDecisionReason"]
+  assert seen == [{
+    "command": "while true; do date; sleep 10; done",
+    "description": "构建进度", "timeout_ms": 600000,
+  }]
+
+
+def test_control_without_the_armer_the_cli_would_run_the_watch():
+  """Control for the test above: no armer → the CLI path (allow) is used.
+
+  Without this the denial test could pass while the hook ignored the armer
+  entirely, and the refactor would silently change nothing.
+  """
+  from unittest import mock
+  from nemo.claude_agent import ClaudeCodingAgent
+
+  agent = ClaudeCodingAgent.__new__(ClaudeCodingAgent)
+  agent._live_monitors = set()
+  with mock.patch.object(ClaudeCodingAgent, "_watch_armer", None):
+    out = asyncio.run(agent._on_pre_tool_use(
+      {"tool_name": "Monitor", "tool_input": {"command": "tail -f x"}},
+      "tu_1", None))
+  assert out == {}
 
 
 def test_pre_tool_use_leaves_other_tools_alone():

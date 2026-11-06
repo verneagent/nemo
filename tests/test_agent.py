@@ -207,6 +207,12 @@ class _FakeAgent:
   def set_idle_notifier(self, _handler):
     pass
 
+  def set_watch_armer(self, armer, host_loop):
+    # The host installs this at boot and again after an /agent switch; a
+    # fake that lacked it made every main_loop test raise AttributeError.
+    self.watch_armer = armer
+    self.watch_host_loop = host_loop
+
   async def interrupt(self):
     pass
 
@@ -4798,7 +4804,7 @@ def test_an_unattributable_report_posts_a_red_error_card(caplog):
   # The report did NOT land on any Monitor card…
   assert channel.updated_cards == []
   assert any(
-    rec.levelname == "ERROR" and "no Monitor card to land on" in rec.getMessage()
+    rec.levelname == "ERROR" and "no card to land on" in rec.getMessage()
     for rec in caplog.records)
 
   # …and what the chat gets is a RED error card, not a bell.

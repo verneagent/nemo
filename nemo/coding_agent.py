@@ -9,9 +9,10 @@ depends only on this interface, not on Claude SDK specifics.
 
 from __future__ import annotations
 
+import asyncio
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Callable
+from typing import Awaitable, Callable
 
 from .turn import TurnEvent
 from .types import JsonObject
@@ -111,6 +112,19 @@ class CodingAgent(ABC):
     default is a no-op for adapters whose backend has no equivalent.
     """
     del handler
+
+  def set_watch_armer(
+    self,
+    armer: Callable[[dict[str, object]], Awaitable[tuple[bool, str]]],
+    host_loop: asyncio.AbstractEventLoop,
+  ) -> None:
+    """Take over ``Monitor`` execution (daemon-owned watch processes).
+
+    The adapter denies the tool call and hands its input to ``armer`` on
+    ``host_loop``; the daemon then runs the command itself. Embedders that
+    expose no such tool keep the no-op default.
+    """
+    del armer, host_loop
 
   async def side_question(self, question: str, sdk_session_id: str) -> str:
     """Answer a read-only, ephemeral side question ("by the way…").

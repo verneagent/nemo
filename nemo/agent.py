@@ -21,6 +21,7 @@ import signal
 import time
 import urllib.error
 import uuid
+from pathlib import Path
 from typing import TYPE_CHECKING, Awaitable, Callable
 
 from . import cards, commands, messages, monitor, shell_command
@@ -38,6 +39,7 @@ from .turn import (
   ProgressEvent, RateLimitNoticeEvent, StaleLeakNoticeEvent, TaskDoneEvent,
   TaskStartedEvent,
 )
+from .watches import Watch, WatchManager
 
 log = logging.getLogger(__name__)
 
@@ -473,6 +475,7 @@ _MONITOR_END_LABELS = {
   "stopped": "⏹ 已停止",
   "failed": "❌ 失败退出",
   "completed": "✅ 已结束",
+  "timeout": "⏱ 已超时",
 }
 
 
@@ -626,6 +629,45 @@ def _idle_prompt_message(
   )
 
 
+def _watch_done_message(chat_id: str, watch: Watch) -> IncomingMessage:
+  """The one turn a finished daemon-owned watch gets.
+
+  The watch streams its own reports to the card, so the model is woken
+  ONCE — when the process is gone. Either it has something the user needs to
+  hear, or it says nothing new; both need a turn, and neither needs the
+  report stream (2026-11-06: routing the reports themselves through turns is
+  what made their identity depend on CLI bookkeeping).
+  """
+  now = time.time()
+  tail = "\n".join(watch.tail) if watch.tail else "（没有输出）"
+  # A fenced block would end early on a line that itself contains ```.
+  tail = tail.replace("```", "'''")
+  lines = [
+    f"{_IDLE_PROMPT_PREFIX} 后台监控 `{watch.description}` "
+    f"（watch {watch.watch_id}）已结束，状态：{watch.status or 'unknown'}。",
+    "",
+    "最近输出：",
+    "```",
+    tail,
+    "```",
+    "",
+    "这是 Nemo 直接执行的监控（不依赖 CLI）。请自行判断是否需要跟进——",
+    "- 有结果要汇报、或有后续动作要做，就直接做，然后给用户一段简短的更新；",
+    "- 如果无事可做（例如已经汇报过），只回一句极简说明，不要重复已经做过的工作。",
+    "不要复述这条通知本身。",
+  ]
+  return IncomingMessage(
+    event_type="im.message.receive_v1",
+    chat_id=chat_id,
+    sender_id="",  # synthetic — not from a real user
+    message_id=f"watch_{watch.watch_id}_{int(now)}",
+    msg_type="text",
+    text="\n".join(lines),
+    create_time=str(int(now * 1000)),
+    is_internal=True,
+  )
+
+
 def _idle_budget_card(
   event: BackgroundTaskDoneEvent, budget: IdleTurnBudget,
 ) -> JsonObject:
@@ -719,33 +761,47 @@ async def _announce_monitor_started(
     return
   if event.task_id:
     announced.add(event.task_id)
-  body = event.description.strip() or "后台监控"
-  # Say how often it actually looks. The Monitor tool has no interval field,
-  # so the cadence comes from the command's own sleep; without it "已挂上"
-  # still left the user guessing when a result might appear.
-  note = cards.monitor_cadence(event.command, event.timeout_ms)
   try:
-    # The description is the model's own words for this watch, so it makes a
-    # meaningful title — and it stays fixed for the card's life, which is
-    # what makes one scrolling card legible.
-    card_title = f"👀 {body}"
-    card = cards.build_sections_card(
-      [f"<font color='grey'>task {event.task_id}</font>"],
-      title=card_title, color="blue", note=note)
-    msg_id = await channel.send_card(chat_id, card)
-    _register_msg(msg_id, chat_id)
-    record_sent(msg_id, card_title)
-    # This marker IS the watch's card: every report appends to it, so the
-    # chat keeps one live card per Monitor instead of a stream of cards.
-    monitors.register(
-      event.task_id, msg_id, card_title, note,
-      [f"<font color='grey'>task {event.task_id}</font>"])
-    log.info("Background-task marker card sent: %s (task=%s)",
-             msg_id, event.task_id)
+    await _post_monitor_marker(
+      channel, chat_id, monitors, label="task", item_id=event.task_id,
+      description=event.description, command=event.command,
+      timeout_ms=event.timeout_ms, record_sent=record_sent)
+    log.info("Background-task marker card sent: task=%s", event.task_id)
   except Exception as e:
     # Never fail a turn over a cosmetic card.
     log.warning("Background-task marker card failed (task=%s): %s",
                 event.task_id, e)
+
+
+async def _post_monitor_marker(
+  channel: LarkChannel, chat_id: str, monitors: MonitorCards, *,
+  label: str, item_id: str, description: str, command: str,
+  timeout_ms: int, record_sent: Callable[[str, str], None],
+) -> None:
+  """Send the 👀 card a watch's reports append to, and register it.
+
+  This marker IS the watch's card: every report appends to it, so the chat
+  keeps one live card per watch instead of a stream of cards. ``label`` is
+  the id's kind in the grey header — "watch" for a daemon-owned process,
+  "task" for the legacy CLI-owned path.
+  """
+  body = description.strip() or "后台监控"
+  # Say how often it actually looks. The Monitor tool has no interval field,
+  # so the cadence comes from the command's own sleep; without it "已挂上"
+  # still left the user guessing when a result might appear.
+  note = cards.monitor_cadence(command, timeout_ms)
+  # The description is the model's own words for this watch, so it makes a
+  # meaningful title — and it stays fixed for the card's life, which is what
+  # makes one scrolling card legible.
+  card_title = f"👀 {body}"
+  first = f"<font color='grey'>{label} {item_id}</font>"
+  card = cards.build_sections_card(
+    [first], title=card_title, color="blue", note=note)
+  msg_id = await channel.send_card(chat_id, card)
+  _register_msg(msg_id, chat_id)
+  record_sent(msg_id, card_title)
+  monitors.register(item_id, msg_id, card_title, note, [first])
+  log.info("Monitor marker card sent: %s (%s=%s)", msg_id, label, item_id)
 
 
 async def _deliver_idle_card(
@@ -778,15 +834,16 @@ async def _deliver_idle_card(
     else:
       label = task_id[:12] or "未归属"
       log.error(
-        "Idle report has no Monitor card to land on — dropped. chat=%s "
-        "task=%s. The SDK reported a task the card registry does not know; "
-        "either attribution failed (several watches live) or a card was "
-        "never registered.", chat_id, label)
+        "Monitor report has no card to land on — dropped. chat=%s "
+        "task=%s. The card registry does not know this watch; a report only "
+        "reaches its own card now, so this means the card was never "
+        "registered or it was cleared while the watch kept running.",
+        chat_id, label)
       await _send_idle_error_card(
         channel, chat_id,
-        f"任务 `{label}` 的报告找不到对应的监控卡片，已丢弃。",
-        "这通常意味着监控卡片的归属判断失效（同时挂了多个监控）、"
-        "或卡片从未注册。\n\n报告内容：\n\n"
+        f"监控 `{label}` 的报告找不到对应的卡片，已丢弃。",
+        "这通常意味着卡片注册失败，或卡片登记在监控仍在运行时被清掉了。"
+        "\n\n报告内容：\n\n"
         f"{_truncate_for_preview(text, 600)}")
     return
 
@@ -2432,6 +2489,62 @@ async def main_loop(
   # own must not post a second marker for a watch the turn path announced.
   _announced_tasks: set[str] = set()
 
+  # Daemon-owned watches (nemo/watches.py). The Claude adapter's Monitor
+  # PreToolUse hook denies the tool call and hands its command HERE, so the
+  # process, its card, and its reports all belong to this process: identity
+  # is the spawn and lifecycle is the exit, instead of being reconstructed
+  # from CLI events (which is what kept mis-attributing reports and letting
+  # a watch be killed by its own notification, 2026-11-06, oc_9540cd47…).
+  _watch_manager = WatchManager(
+    on_start=lambda w: _start_watch_card(w),
+    on_report=lambda w, text: _deliver_idle_card(
+      channel, chat_id, _monitor_cards, w.watch_id, text),
+    on_end=lambda w: _close_monitor_card(
+      channel, _monitor_cards, w.watch_id, w.status),
+    on_finished=lambda w: _finish_watch(w),
+    spawn_cwd=project_dir,
+    stop_dir=Path(os.path.expanduser("~/.nemo/watches")),
+  )
+
+  async def _start_watch_card(watch: Watch) -> None:
+    await _post_monitor_marker(
+      channel, chat_id, _monitor_cards, label="watch",
+      item_id=watch.watch_id, description=watch.description,
+      command=watch.command, timeout_ms=watch.timeout_ms,
+      record_sent=lambda mid, text: db.record_sent(
+        mid, text=text, chat_id=chat_id))
+    try:
+      db.record_monitor(chat_id, watch.watch_id, watch.description)
+    except Exception as e:
+      log.warning("Failed to record watch %s: %s", watch.watch_id, e)
+
+  def _finish_watch(watch: Watch) -> None:
+    db.clear_monitor(watch.watch_id)
+    if watch.status == "stopped":
+      # Whoever stopped it already knows — waking the model would only add
+      # an "已停止" turn nobody asked for.
+      return
+    channel.push_back(_watch_done_message(chat_id, watch))
+
+  async def _arm_watch(tool_input: dict[str, object]) -> tuple[bool, str]:
+    """Host side of the Monitor hook — runs on the main loop."""
+    command = tool_input.get("command")
+    if not isinstance(command, str):
+      return False, "Monitor 的 command 缺失或不是字符串，没有挂载任何监控。"
+    description = tool_input.get("description")
+    raw_timeout = tool_input.get("timeout_ms")
+    timeout_ms = (
+      raw_timeout if isinstance(raw_timeout, int)
+      and not isinstance(raw_timeout, bool) else 0)
+    return await _watch_manager.arm(
+      chat_id=chat_id,
+      description=description if isinstance(description, str) else "",
+      command=command,
+      timeout_ms=timeout_ms,
+    )
+
+  coding_agent.set_watch_armer(_arm_watch, main_loop_ref)
+
   def _announce_started_on_loop(event: TaskStartedEvent) -> None:
     """Announce an arming surfaced by the idle drainer.
 
@@ -2567,17 +2680,18 @@ async def main_loop(
   signal.signal(signal.SIGTERM, handle_sig)
 
   async def _restart_client(resume: str = ""):
-    # The reconnect closes the CLI, and every Monitor it spawned dies with
-    # it. Forget the persisted rows too — otherwise the next daemon start
-    # would announce watches that ended here, and a /clear is supposed to
-    # leave the chat with nothing running.
-    try:
-      db.clear_monitors(chat_id)
-    except Exception as e:
-      log.warning("Failed to clear recorded monitors: %s", e)
-    # The reconnect kills every Monitor child process, so their cards stop
-    # being live too — a later fire can no longer belong to them.
-    _monitor_cards.clear()
+    if not _watch_manager.live_ids():
+      # The reconnect closes the CLI, and every Monitor the CLI spawned dies
+      # with it. Forget the persisted rows too — otherwise the next daemon
+      # start would announce watches that ended here, and a /clear is
+      # supposed to leave the chat with nothing running. Daemon-owned
+      # watches are NOT CLI children: they keep running across a reconnect,
+      # so their cards and rows must survive it.
+      try:
+        db.clear_monitors(chat_id)
+      except Exception as e:
+        log.warning("Failed to clear recorded monitors: %s", e)
+      _monitor_cards.clear()
     await coding_agent.reset(project_dir, model, resume=resume)
 
   def _is_own_message(mid: str) -> bool:
@@ -3114,6 +3228,9 @@ async def main_loop(
             _idle_notifier_for(
               channel, chat_id, _idle_budget, _idle_send_tasks, main_loop_ref,
               _monitor_cards, db.clear_monitor, _announce_started_on_loop))
+          # The rebuilt adapter needs the watch armer too, or its Monitor
+          # calls would fall through to the CLI again.
+          coding_agent.set_watch_armer(_arm_watch, main_loop_ref)
           log.info("Agent switch to %s (model=%s, resume=%s)",
                    agent, model,
                    _sdk_session_id[:8] if _sdk_session_id else "none")
@@ -4644,7 +4761,10 @@ async def main_loop(
   await fork_mgr.shutdown()
   # Close SDK, event stream, and Lark API calls all concurrently
   loop = asyncio.get_event_loop()
-  cleanup: list = [shell_manager.close(), coding_agent.stop(), channel.stop()]
+  cleanup: list = [
+    shell_manager.close(), coding_agent.stop(), channel.stop(),
+    _watch_manager.close(),
+  ]
   cleanup.append(channel.release_workspace())
   cleanup.append(channel.update_status(
     _display_model(model, _endpoint_key, agent), "stopped", agent))
