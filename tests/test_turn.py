@@ -385,6 +385,119 @@ def test_stale_leak_raises_for_reconnect_resume():
   assert stale == set(), f"stale_tasks must be cleared on leak, got {stale}"
 
 
+def _arming_turn_messages():
+  return [
+    FakeAssistantMessage(content=[FakeToolUseBlock(
+      id="tu_mon", name="Monitor",
+      input={"command": "while true; do echo tick; sleep 60; done",
+             "timeout_ms": 900000})]),
+    FakeTaskStartedMessage(
+      task_id="task_mon", task_type="local_bash",
+      description="watch", tool_use_id="tu_mon"),
+    FakeAssistantMessage(content=[FakeTextBlock(text="盯着了")]),
+    FakeResultMessage(),
+  ]
+
+
+def test_a_monitor_is_never_promoted_to_stale():
+  """A watch is armed to outlive its turn; its id must not trip the #788 guard.
+
+  ``_promote_pending_to_stale`` recorded EVERY still-pending task id, so the
+  very notification a watch sends looked like a stale leak: the turn raised
+  StaleLeakError, the reconnect killed the CLI subprocess — and the watch
+  died with it, mid-conversation (2026-11-06, oc_9540cd47…). A plain
+  background command must still be promoted; it keeps the #788 protection.
+  """
+  from nemo.claude_turn import _promote_pending_to_stale
+
+  pending = {"task_mon", "task_bash"}
+  stale: set[str] = set()
+
+  ids = _promote_pending_to_stale(pending, stale, {"task_mon"})
+
+  # Every pending id is still reported (callers log it and STOP orphans on an
+  # abandoned turn).
+  assert ids == ["task_bash", "task_mon"]
+  assert stale == {"task_bash"}, "a Monitor id entered stale_tasks"
+  assert pending == set()
+
+
+def test_a_watch_reporting_mid_turn_does_not_kill_the_turn_or_the_watch():
+  """End-to-end shape of the same bug, through two real turns."""
+  from nemo.turn import DoneEvent, TaskDoneEvent
+
+  stale: set[str] = set()
+
+  async def _arm():
+    with mock.patch.dict("sys.modules", _sdk_modules()):
+      await run_turn(FakeClient(_arming_turn_messages()), "watch it",
+                     lambda _e: None, stale_tasks=stale)
+
+  asyncio.run(_arm())
+  assert stale == set(), "the freshly armed watch was stored as stale"
+
+  events: list = []
+
+  async def _fire():
+    with mock.patch.dict("sys.modules", _sdk_modules()):
+      await run_turn(
+        FakeClient([
+          FakeTaskNotificationMessage(task_id="task_mon", status="completed"),
+          FakeAssistantMessage(content=[FakeTextBlock(text="finished")]),
+          FakeResultMessage(),
+        ]),
+        "next question", events.append, stale_tasks=stale)
+
+  asyncio.run(_fire())
+
+  # The turn answered instead of reconnecting, and the completion still closed
+  # the watch's card with its real status.
+  assert any(isinstance(e, DoneEvent) for e in events)
+  assert any(
+    isinstance(e, TaskDoneEvent) and e.task_id == "task_mon"
+    and e.status == "completed" for e in events)
+
+
+def test_control_promoting_a_monitor_makes_its_own_report_fatal():
+  """Control: the exclusion IS the fix.
+
+  Restore the pre-fix "promote everything" behaviour and the same watch
+  report raises StaleLeakError, i.e. kills the CLI (and every watch).
+  """
+  from nemo import claude_turn as _ct
+  from nemo.claude_turn import StaleLeakError
+
+  def _pre_fix_promote(pending, stale, watches=set()):
+    ids = sorted(pending)
+    stale.update(ids)
+    pending.clear()
+    return ids
+
+  stale: set[str] = set()
+
+  async def _arm():
+    with mock.patch.dict("sys.modules", _sdk_modules()), \
+         mock.patch.object(_ct, "_promote_pending_to_stale",
+                           _pre_fix_promote):
+      await run_turn(FakeClient(_arming_turn_messages()), "watch it",
+                     lambda _e: None, stale_tasks=stale)
+
+  asyncio.run(_arm())
+  assert stale == {"task_mon"}
+
+  async def _fire():
+    with mock.patch.dict("sys.modules", _sdk_modules()):
+      await run_turn(
+        FakeClient([
+          FakeTaskNotificationMessage(task_id="task_mon", status="completed"),
+          FakeResultMessage(),
+        ]),
+        "next question", lambda _e: None, stale_tasks=stale)
+
+  with pytest.raises(StaleLeakError):
+    asyncio.run(_fire())
+
+
 def test_stale_leak_detected_after_some_clean_output():
   """The leak guard fires wherever the stale appears — even after some
   legitimate output — still raising StaleLeakError and stopping the turn.

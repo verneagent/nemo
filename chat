@@ -1,0 +1,10 @@
+--- pid - ---
+   1 oc_b2f29117566009876396b0887fd97ce3
+   1 oc_a5b32be28eaca3155340637d697e2d2d
+   1 oc_8f0101c252e31b17309b1cb982f5596f
+   1 oc_45fcf76e6f296233ca53bf3d768360d2
+   1 oc_41c35b8b4163bb689e24ad7644a95e12
+   1 77029       00:00 sed -E s/.*nemo --chat-id ([a-z0-9_]+).*/\1/
+
+--- system launchd nemo labels ---
+(sudo needs password)

@@ -770,6 +770,19 @@ class ClaudeCodingAgent(CodingAgent):
         steer_probe=self.steer_continuation_batches)
     finally:
       self._current_on_event = None
+      # A host-driven turn swallows notification rows the idle drainer will
+      # NEVER see: the completion nemo pushes back as a real turn writes one
+      # into the transcript, and a user turn that lands while a background
+      # task finishes gets one injected into its context. Those rows used to
+      # sit at the head of the fire queue forever, so every later report was
+      # attributed to its PREDECESSOR's watch — the armed 👀 card never
+      # updated while a long-dead watch's card kept growing (2026-11-06,
+      # oc_9540cd47…: three reports landed on two finished cards, none on the
+      # one the user was watching). Fires only reach the drainer BETWEEN
+      # turns, so re-baselining at EOF here is exact: the next fire's row is
+      # written after this point, and anything before it belonged to a turn
+      # that already consumed it.
+      self._reset_idle_fire_cursor()
 
   def _idle_sink(self, event: TurnEvent) -> None:
     """Drainer sink: track task state, then hand the event to the host."""

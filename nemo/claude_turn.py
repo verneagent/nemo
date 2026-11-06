@@ -619,6 +619,7 @@ class _TurnResult:
 
 def _promote_pending_to_stale(
   pending_tasks: set[str], stale_tasks: set[str],
+  watches: set[str] = set(),
 ) -> list[str]:
   """Remember a turn's still-pending background task ids as stale (SDK #788).
 
@@ -636,10 +637,21 @@ def _promote_pending_to_stale(
   ``BackgroundTaskDoneEvent`` — that is the only path by which a model that
   promised "跑完我会主动汇报" can actually be woken to say so.
 
-  Returns the promoted ids.
+  ``watches`` (Monitor task ids) are deliberately EXCLUDED from the stale
+  set. A watch is armed precisely to outlive its turn and to report back
+  many times, so "a notification for an id from an earlier turn" is its
+  normal operation, not the #788 leak. Treating it as a leak reconnects the
+  CLI — whose children die with it — so the watch was killed by the very
+  notification it sent, taking every other live watch and the user's
+  in-flight answer with it (2026-11-06, oc_9540cd47…: a `while [ ! -f
+  *.exit ]` watch finished mid-turn and the reconnect silently ended it).
+  Ordinary background commands keep the #788 protection.
+
+  Returns every pending id (watches included): the callers use the result
+  for logging and, on an ABANDONED turn, to stop what is left running.
   """
   ids = sorted(pending_tasks)
-  stale_tasks.update(ids)
+  stale_tasks.update(i for i in ids if i not in watches)
   pending_tasks.clear()
   return ids
 
@@ -792,6 +804,10 @@ async def _single_turn(
   usage: JsonObject = {}
   sdk_session_id = ""
   pending_tasks: set[str] = set()
+  # Task ids spawned by the Monitor tool THIS turn. They are watches, not
+  # leaks: excluded from stale_tasks so their notifications never trigger the
+  # #788 reconnect (which kills the CLI's children, i.e. the watches).
+  watch_tasks: set[str] = set()
   # tool_use_id → tool name, filled from the assistant's tool_use blocks.
   # A TaskStartedMessage only carries tool_use_id + task_type, and task_type
   # cannot distinguish the Monitor tool from a plain Bash command (both are
@@ -1146,6 +1162,9 @@ async def _single_turn(
 
     elif isinstance(message, TaskStartedMessage):
       pending_tasks.add(message.task_id)
+      spawned_by = tool_names.get(message.tool_use_id or "", "")
+      if spawned_by == "Monitor":
+        watch_tasks.add(message.task_id)
       monitor = monitor_inputs.get(message.tool_use_id or "", {})
       command = monitor.get("command", "")
       timeout_ms = monitor.get("timeout_ms", 0)
@@ -1153,7 +1172,7 @@ async def _single_turn(
         task_id=message.task_id,
         description=message.description or "",
         task_type=message.task_type or "",
-        tool_name=tool_names.get(message.tool_use_id or "", ""),
+        tool_name=spawned_by,
         command=command if isinstance(command, str) else "",
         timeout_ms=timeout_ms if isinstance(timeout_ms, int) else 0,
       ))
@@ -1193,7 +1212,7 @@ async def _single_turn(
         err_sample = (non_retryable_error_text or result_text)[:500]
         log.warning("Non-retryable API error in turn result: %r", err_sample[:200])
         await _stop_tasks(
-          client, _promote_pending_to_stale(pending_tasks, stale_tasks),
+          client, _promote_pending_to_stale(pending_tasks, stale_tasks, watch_tasks),
           stop_task_disabled)
         on_event(ErrorEvent(message=err_sample))
         raise NonRetryableAPIError(err_sample)
@@ -1207,7 +1226,7 @@ async def _single_turn(
         # consistent. The attempt is abandoned, so these are genuine orphans:
         # mark them stale AND stop them (nothing will wait for a result now).
         await _stop_tasks(
-          client, _promote_pending_to_stale(pending_tasks, stale_tasks),
+          client, _promote_pending_to_stale(pending_tasks, stale_tasks, watch_tasks),
           stop_task_disabled)
         raise TransientAPIError(err_sample)
 
@@ -1220,7 +1239,7 @@ async def _single_turn(
       # BackgroundTaskDoneEvent, which the host turns into a real follow-up
       # turn. Stopping them here made every completion arrive as
       # ``status=stopped`` — a notification about the reaping itself.
-      promoted = _promote_pending_to_stale(pending_tasks, stale_tasks)
+      promoted = _promote_pending_to_stale(pending_tasks, stale_tasks, watch_tasks)
       if promoted:
         log.info(
           "turn completed with %d background task(s) still running %s — "

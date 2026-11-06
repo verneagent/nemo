@@ -1653,6 +1653,74 @@ def test_fire_cursor_rebaselines_when_the_session_changes(
   assert agent._next_idle_fire_task_id("sess-2") == "bmon_now"
 
 
+def _host_turn_agent(tmp_path, monkeypatch):
+  """A fire-cursor agent wired just enough to run a real host-driven turn."""
+  from unittest import mock
+
+  agent = _fire_agent(tmp_path, monkeypatch)
+  agent._model = "m"
+  agent._options = "STATIC"
+  agent._stale_tasks = set()
+  agent._live_monitors = set()
+  agent._current_on_event = None
+
+  async def fake_rwrc(prompt, on_event, stale_tasks=None, options=None,
+                      options_factory=None, max_attempts=3, is_paused=None,
+                      steer_probe=None):
+    # The CLI injects a background notification into this turn's context: the
+    # row is written BEFORE the turn runs and is consumed by the turn, so the
+    # idle drainer never sees it.
+    _append_transcript(agent._latest_session_id,
+                       [_notification_row("swallowed_by_turn")])
+    return (0.0, {})
+
+  agent._sdk = mock.MagicMock()
+  agent._sdk.run_turn_with_reconnect = fake_rwrc
+  return agent
+
+
+def test_a_host_turn_discards_rows_the_idle_drainer_never_saw(
+    tmp_path, monkeypatch,
+):
+  """The next fire must not be named after a row a USER/PUSHED turn ate.
+
+  A completion nemo pushes back as a real turn writes a notification row, and
+  a user turn that lands while a task finishes swallows one. Those rows used
+  to stay at the head of the fire queue, so every later report was attributed
+  to its predecessor's watch and the armed 👀 card stopped updating while a
+  long-dead watch's card grew instead (2026-11-06, oc_9540cd47…).
+  """
+  agent = _host_turn_agent(tmp_path, monkeypatch)
+  sid = agent._idle_fire_session
+
+  asyncio.run(agent.run_turn("hi", on_event=lambda _e: None))
+
+  _append_transcript(sid, [_notification_row("bmon_live")])
+  assert agent._next_idle_fire_task_id(sid) == "bmon_live"
+
+
+def test_control_without_the_post_turn_baseline_the_row_is_handed_on(
+    tmp_path, monkeypatch,
+):
+  """Control: the post-turn re-baseline IS the fix.
+
+  With it patched out, the row the host turn swallowed stays queued and is
+  handed to the next report — the pre-fix misattribution.
+  """
+  from unittest import mock
+
+  from nemo.claude_agent import ClaudeCodingAgent
+
+  agent = _host_turn_agent(tmp_path, monkeypatch)
+  sid = agent._idle_fire_session
+
+  with mock.patch.object(ClaudeCodingAgent, "_reset_idle_fire_cursor"):
+    asyncio.run(agent.run_turn("hi", on_event=lambda _e: None))
+
+  _append_transcript(sid, [_notification_row("bmon_live")])
+  assert agent._next_idle_fire_task_id(sid) == "swallowed_by_turn"
+
+
 def test_control_without_the_notification_row_parser_nothing_is_attributed(
     tmp_path, monkeypatch,
 ):
