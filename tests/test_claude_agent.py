@@ -1481,8 +1481,10 @@ def test_side_question_still_collects_text_via_shared_helper(tmp_path, monkeypat
 
 def _monitor_agent():
   from nemo.claude_agent import ClaudeCodingAgent
+  from nemo.coding_agent import EndpointConfig
   agent = ClaudeCodingAgent.__new__(ClaudeCodingAgent)
   agent._live_monitors = set()
+  agent._endpoint = EndpointConfig()
   return agent
 
 
@@ -1566,6 +1568,65 @@ def test_control_without_the_armer_the_cli_would_run_the_watch():
     out = asyncio.run(agent._on_pre_tool_use(
       {"tool_name": "Monitor", "tool_input": {"command": "tail -f x"}},
       "tu_1", None))
+  assert out == {}
+
+
+def test_websearch_is_denied_on_a_gateway_endpoint(monkeypatch):
+  """WebSearch is an Anthropic server tool; gateways answer it with FABRICATED
+  results (2026-11-08: echoed tool calls / a submodel saying it has no search
+  tool, both shaped exactly like real results). Deny and name the replacement.
+  """
+  from nemo.coding_agent import EndpointConfig
+
+  monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
+  agent = _monitor_agent()
+  agent._endpoint = EndpointConfig(
+    base_url="https://opencode.ai/zen/go", api_key="k")
+  out = asyncio.run(agent._on_pre_tool_use(
+    {"tool_name": "WebSearch", "tool_input": {"query": "x"}}, "tu_ws", None))
+  hook = out["hookSpecificOutput"]
+  assert hook["permissionDecision"] == "deny"
+  assert "nemo-search" in hook["permissionDecisionReason"]
+  assert "伪造" in hook["permissionDecisionReason"]
+
+
+def test_websearch_is_allowed_on_anthropics_own_api(monkeypatch):
+  from nemo.coding_agent import EndpointConfig
+
+  monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
+  agent = _monitor_agent()  # no base_url → the CLI's default (Anthropic)
+  call = {"tool_name": "WebSearch", "tool_input": {"query": "x"}}
+  assert asyncio.run(agent._on_pre_tool_use(call, "tu_1", None)) == {}
+  agent._endpoint = EndpointConfig(base_url="https://api.anthropic.com")
+  assert asyncio.run(agent._on_pre_tool_use(call, "tu_1", None)) == {}
+
+
+def test_a_shell_exported_base_url_also_disables_websearch(monkeypatch):
+  """_build_env lets ANTHROPIC_BASE_URL through when no endpoint is set."""
+  monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://api.deepseek.com/anthropic")
+  agent = _monitor_agent()
+  out = asyncio.run(agent._on_pre_tool_use(
+    {"tool_name": "WebSearch", "tool_input": {"query": "x"}}, "tu_ws", None))
+  assert out["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+
+def test_control_without_the_endpoint_guard_websearch_would_pass(monkeypatch):
+  """Control: the denial comes from the endpoint check, not from the tool name.
+
+  With the guard patched to "Anthropic", the same gateway request is allowed
+  — i.e. removing the guard silently restores the fabricated-results bug.
+  """
+  from unittest import mock
+  from nemo.claude_agent import ClaudeCodingAgent
+  from nemo.coding_agent import EndpointConfig
+
+  monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
+  agent = _monitor_agent()
+  agent._endpoint = EndpointConfig(base_url="https://opencode.ai/zen/go")
+  with mock.patch.object(
+      ClaudeCodingAgent, "_upstream_is_anthropic", return_value=True):
+    out = asyncio.run(agent._on_pre_tool_use(
+      {"tool_name": "WebSearch", "tool_input": {"query": "x"}}, "tu_ws", None))
   assert out == {}
 
 

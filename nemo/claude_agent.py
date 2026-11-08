@@ -235,7 +235,7 @@ _CRON_DISALLOWED_TOOLS = [
 MAX_LIVE_MONITORS = 3
 
 
-def _deny_monitor(reason: str) -> dict[str, object]:
+def _deny_tool(reason: str) -> dict[str, object]:
   """A PreToolUse denial whose reason the model reads verbatim."""
   return {
     "hookSpecificOutput": {
@@ -842,6 +842,40 @@ class ClaudeCodingAgent(CodingAgent):
     elif isinstance(event, BackgroundTaskDoneEvent):
       self._live_monitors.discard(event.task_id)
 
+  def _upstream_is_anthropic(self) -> bool:
+    """True when the request goes to Anthropic's own API.
+
+    Mirrors ``_build_env``: an explicit endpoint wins, otherwise a
+    shell-exported ``ANTHROPIC_BASE_URL`` is what the CLI will use.
+    """
+    base = self._endpoint.base_url or os.environ.get("ANTHROPIC_BASE_URL", "")
+    return not base.strip() or "anthropic.com" in base.lower()
+
+  def _on_websearch_call(self) -> dict[str, object]:
+    """Deny ``WebSearch`` on endpoints that do not implement it.
+
+    ``WebSearch`` is Anthropic's server tool (``web_search_20250305`` /
+    ``web_search_20260209``) — the search runs on the API backend. Any
+    other ``ANTHROPIC_BASE_URL`` is a gateway that may not implement it,
+    and the failure mode is not an error but FABRICATED results: one query
+    came back as the tool call echoed verbatim, another as a submodel's
+    prose ("I don't have a web search tool available here") — both shaped
+    exactly like real results (2026-11-08, opencode.ai/zen/go). A silent
+    wrong answer is worse than a denial, so the call is refused and the
+    reason names the client-side replacement.
+    """
+    if self._upstream_is_anthropic():
+      return {}
+    log.info("Denied WebSearch: endpoint %s is not Anthropic",
+             self._endpoint.base_url or os.environ.get(
+               "ANTHROPIC_BASE_URL", "(unset)"))
+    return _deny_tool(
+      "WebSearch 是 Anthropic 的服务端工具，当前模型上游没有实现它，"
+      "调用会返回伪造的搜索结果（看起来和真结果一模一样）。"
+      "改用客户端搜索：`nemo-search \"<query>\"`，需要读具体页面时用 "
+      "WebFetch。"
+    )
+
   async def _on_pre_tool_use(
     self,
     hook_input: object,
@@ -859,7 +893,10 @@ class ClaudeCodingAgent(CodingAgent):
     try:
       if not isinstance(hook_input, dict):
         return {}
-      if hook_input.get("tool_name") != "Monitor":
+      tool_name = hook_input.get("tool_name")
+      if tool_name == "WebSearch":
+        return self._on_websearch_call()
+      if tool_name != "Monitor":
         return {}
 
       # Daemon-owned execution — see nemo/watches.py. The CLI must NEVER
@@ -879,9 +916,9 @@ class ClaudeCodingAgent(CodingAgent):
           _, reason = await asyncio.wrap_future(future)
         except Exception as exc:
           log.warning("Monitor arming through the daemon failed: %s", exc)
-          return _deny_monitor(
+          return _deny_tool(
             f"监控挂载失败：{exc}。不要原样重试，先告诉用户这次没挂成功。")
-        return _deny_monitor(reason)
+        return _deny_tool(reason)
 
       live = len(self._live_monitors)
       if live < MAX_LIVE_MONITORS:
@@ -889,7 +926,7 @@ class ClaudeCodingAgent(CodingAgent):
       log.warning(
         "Denied a Monitor: %d already live (%s)",
         live, ", ".join(sorted(self._live_monitors))[:80])
-      return _deny_monitor(
+      return _deny_tool(
         f"同时最多 {MAX_LIVE_MONITORS} 个后台监控，现在已经有 {live} 个在跑。"
         "先停掉不需要的（KillShell），或者把多个观察合并成一条 Monitor "
         "命令，再挂新的。"
@@ -1492,6 +1529,13 @@ class ClaudeCodingAgent(CodingAgent):
       "To send an image or file to the user:\n"
       "  nemo-send image /path/to/screenshot.png\n"
       "  nemo-send file /path/to/document.pdf\n\n"
+      "Web search: run `nemo-search \"<query>\"` (optionally `--count N`) and "
+      "read its stdout — one block per result with title, URL and snippet. "
+      "The WebSearch tool only works on Anthropic's own API; on a "
+      "third-party model endpoint it is denied because the gateway answers "
+      "with FABRICATED results that look real. Do not work around that "
+      "denial (no retries, no invented results); use nemo-search, and "
+      "WebFetch when you need the full text of one specific page.\n\n"
       "Scheduling: never use CronCreate / CronList / CronDelete / "
       "ScheduleWakeup. This daemon runs the CLI headless under the Agent SDK, "
       "where the cron scheduler never ticks — the job registers successfully "
@@ -1748,6 +1792,7 @@ class ClaudeCodingAgent(CodingAgent):
         # pays nothing.
         "PreToolUse": [
           HookMatcher(matcher="Monitor", hooks=[self._on_pre_tool_use]),
+          HookMatcher(matcher="WebSearch", hooks=[self._on_pre_tool_use]),
         ],
       },
       can_use_tool=_can_use_tool,
