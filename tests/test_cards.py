@@ -1166,10 +1166,112 @@ def test_askq_card_renders_selected_with_check():
       for col in el.get("columns", []):
         for child in col.get("elements", []):
           label = child.get("text", {}).get("content", "")
-          if label.startswith("✓ Login"):
+          if label.startswith("✓ A · Login"):
             assert child.get("type") == "primary"
             found_check = True
   assert found_check, "expected selected option to render with ✓ and primary type"
+
+
+def test_askq_card_lists_options_and_descriptions_in_body():
+  """Options render as BODY text with their explanations, not only as
+  buttons: the model's lead-in prose lands in the collapsed Thinking
+  panel, so a button-only card left the user asking what each option meant
+  (2026-11-15)."""
+  question = {
+    "question": "「暗的不够暗」指的是哪一层？",
+    "header": "具体哪一层",
+    "multiSelect": False,
+    "options": [
+      {"label": "柱身蓝太亮，想要更深",
+       "description": "柱子本身太亮，压低柱身亮度，让蓝色更沉"},
+      {"label": "没亮的灯还有微光",
+       "description": "本该全灭的那几颗仍然留着一层光"},
+    ],
+  }
+  card = build_ask_user_question_card(
+    questions=[question], chat_id="oc_x", nonce="N")
+
+  body_md = "\n".join(
+    el.get("content", "") for el in card["body"]["elements"]
+    if el.get("tag") == "markdown")
+
+  assert "**A.** 柱身蓝太亮，想要更深" in body_md
+  assert "柱子本身太亮，压低柱身亮度，让蓝色更沉" in body_md
+  assert "**B.** 没亮的灯还有微光" in body_md
+  assert "本该全灭的那几颗仍然留着一层光" in body_md
+  # The question itself stays visible above the option list.
+  assert "「暗的不够暗」指的是哪一层？" in body_md
+
+
+def _askq_buttons(card):
+  """(caption, action, type) for every button in an askq card."""
+  out = []
+  elements = card["body"]["elements"]
+  for el in elements:
+    if el.get("tag") != "column_set":
+      continue
+    for col in el.get("columns", []):
+      for child in col.get("elements", []):
+        out.append((
+          child.get("text", {}).get("content", ""),
+          child.get("value", {}).get("action", ""),
+          child.get("type", ""),
+        ))
+  return out
+
+
+def test_askq_card_buttons_carry_a_short_marker_not_the_full_label():
+  """A long option label must not be the button caption — Lark clips a
+  one-line button, which cut the label off mid-clause. The button shows
+  ``A · <clipped>`` and the body holds the full text."""
+  long_label = "说话跟音量，停顿再呼吸，安静超过半秒才切回呼吸"
+  card = build_ask_user_question_card(
+    questions=[{"question": "灯怎么改？", "header": "灯语义",
+                "options": [{"label": long_label, "description": "两种感觉都要"}],
+                "multiSelect": False}],
+    chat_id="oc_x", nonce="N")
+
+  caption = next(c for c, a, _ in _askq_buttons(card) if a == "askq:N:0:0")
+  assert caption.startswith("A · ")
+  assert caption.endswith("…")
+  from nemo.cards import _display_width
+  assert _display_width(caption) <= 4 + 12, caption
+  assert long_label not in caption
+  # Full label still reachable in the body.
+  body_md = "\n".join(
+    el.get("content", "") for el in card["body"]["elements"]
+    if el.get("tag") == "markdown")
+  assert long_label in body_md
+
+
+def test_askq_card_short_labels_are_not_needlessly_clipped():
+  card = build_ask_user_question_card(
+    questions=[_question("Where?", "Screen", ["Login", "Match"])],
+    chat_id="oc_x", nonce="N")
+  captions = [c for c, _, _ in _askq_buttons(card)]
+  assert "A · Login" in captions
+  assert "B · Match" in captions
+
+
+def test_askq_card_markers_restart_per_question():
+  card = build_ask_user_question_card(
+    questions=[
+      _question("Where?", "Screen", ["Login", "Match"]),
+      _question("Severity?", "How bad?", ["P0", "P3"]),
+    ],
+    chat_id="oc_x", nonce="N")
+  captions = {a: c for c, a, _ in _askq_buttons(card)}
+  assert captions["askq:N:0:0"].startswith("A · ")
+  assert captions["askq:N:1:0"].startswith("A · ")
+  assert captions["askq:N:1:1"].startswith("B · ")
+
+
+def test_askq_card_has_a_tap_or_type_hint():
+  card = build_ask_user_question_card(
+    questions=[_question("Where?", "Screen", ["Login"])],
+    chat_id="oc_x", nonce="N")
+  body = str(card)
+  assert "type your answer in chat" in body
 
 
 def test_askq_card_chat_id_in_buttons():

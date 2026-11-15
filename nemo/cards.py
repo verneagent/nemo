@@ -16,6 +16,7 @@ import json
 import os
 import re
 import time
+import unicodedata
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -587,12 +588,53 @@ def _answered_questions_element(
   return {"tag": "markdown", "content": "\n".join(lines)}
 
 
+def _display_width(text: str) -> int:
+  """Width of ``text`` in display columns (CJK / fullwidth = 2)."""
+  return sum(
+    2 if unicodedata.east_asian_width(c) in ("W", "F") else 1 for c in text)
+
+
+# Lark renders a button caption on ONE line and silently clips what does not
+# fit. AskUserQuestion labels are often a whole clause ("柱身蓝太亮，想要更深"),
+# so with two buttons per row the tail was cut off and unreadable (2026-11-15).
+# Captions are therefore clipped to this many display columns; the FULL label
+# and its explanation live in the card body, keyed by the same A/B/C marker.
+_ASKQ_BUTTON_LABEL_COLUMNS = 12
+
+
+def _clip_display(text: str, columns: int) -> str:
+  """Clip ``text`` to at most ``columns`` display columns, ``…``-terminated."""
+  if _display_width(text) <= columns:
+    return text
+  out: list[str] = []
+  used = 0
+  for ch in text:
+    w = 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+    if used + w > max(1, columns - 1):
+      break
+    out.append(ch)
+    used += w
+  return "".join(out) + "…"
+
+
+def _askq_marker(oidx: int) -> str:
+  """Option marker: A, B, C … (falls back to a number past ``Z``)."""
+  if 0 <= oidx < 26:
+    return chr(ord("A") + oidx)
+  return str(oidx + 1)
+
+
 def _pending_question_elements(
   pending: "PendingQuestion",
   chat_id: str,
+  hint: str = "Tap an option, or type your answer in chat.",
 ) -> list[JsonObject]:
-  """Render an in-flight AskUserQuestion as inline card elements: each
-  question's header + body, a row of option buttons, an "Other" fallback,
+  """Render an in-flight AskUserQuestion as inline card elements.
+
+  Each question renders as: header + question text, then the options as
+  BODY text (``**A.** label — description``) so the explanation of every
+  option is readable without opening the Thinking panel, then one row of
+  SHORT buttons (``A · label`` clipped to fit) plus an "Other" fallback,
   and a Submit button for multi-select. Selected options get a leading
   ``✓`` and a primary button colour so the user can see their picks
   before the loop completes.
@@ -636,21 +678,40 @@ def _pending_question_elements(
     # the click + typed-answer flow has no visible feedback on the card
     # and looks like the bot silently ignored the reply.
     option_labels: set[str] = set()
+    option_lines: list[str] = []
     button_rows: list[tuple[str, str, str]] = []
     for oidx, opt in enumerate(options):
       if not isinstance(opt, dict):
         continue
       label = str(opt.get("label") or opt.get("description") or f"Option {oidx + 1}")
       option_labels.add(label)
+      marker = _askq_marker(oidx)
+
+      # The body carries the full label AND the option's explanation. The
+      # model's own lead-in text lands in the collapsed Thinking panel, so
+      # without this the user had to ask what the options meant.
+      desc = " ".join(str(opt.get("description") or "").split())
+      line = f"**{marker}.** {_escape_md(label)}"
+      if desc and desc != label:
+        line += f" — {_escape_md(desc)}"
+      option_lines.append(line)
+
       check = "✓ " if label in selected_set else ""
       btn_type = "primary" if label in selected_set else "default"
       button_rows.append((
-        f"{check}{label}",
+        f"{check}{marker} · {_clip_display(label, _ASKQ_BUTTON_LABEL_COLUMNS)}",
         f"askq:{nonce}:{qidx}:{oidx}",
         btn_type,
       ))
+
+    if option_lines:
+      elements.append({
+        "tag": "markdown",
+        "content": "\n".join(option_lines),
+      })
+
     button_rows.append((
-      "Other (type below)",
+      "Other (type)",
       f"askq:{nonce}:{qidx}:other",
       "default",
     ))
@@ -674,6 +735,9 @@ def _pending_question_elements(
         [(done_label, f"askq:{nonce}:{qidx}:done", "primary")],
         chat_id,
       ))
+
+  if hint and questions and any(isinstance(q, dict) for q in questions):
+    elements.append(_note_element(hint))
 
   return elements
 
@@ -1516,10 +1580,9 @@ def build_ask_user_question_card(
     answers=dict(answers or {}),
     nonce=nonce,
   )
-  elements = _pending_question_elements(pending, chat_id)
-  elements.append(_note_element(
-    "Tap a button, or type your answer in chat. 10-min timeout."
-  ))
+  elements = _pending_question_elements(
+    pending, chat_id,
+    hint="Tap an option, or type your answer in chat. 10-min timeout.")
 
   return {
     "schema": "2.0",
