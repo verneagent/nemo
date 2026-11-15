@@ -143,6 +143,18 @@ class Channel(ABC):
     id should update their stored id to the returned value."""
     ...
 
+  async def update_progress_card(self, message_id: str, card: JsonObject) -> str:
+    """PATCH a PROGRESS (working-phase) card.
+
+    Semantically weaker than ``update_card``: a progress card is re-rendered
+    on every event, so a refresh may be DROPPED when the transport is
+    transiently failing — the next refresh carries the same, newer state and
+    nothing is lost. Implementations that cannot tell the difference keep the
+    default (a full update). Returns the effective message id, like
+    ``update_card``.
+    """
+    return await self.update_card(message_id, card)
+
   @abstractmethod
   async def send_text(self, chat_id: str, text: str) -> str:
     """Send a plain text message. Returns message_id."""

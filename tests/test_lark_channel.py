@@ -8,7 +8,12 @@ from unittest import mock
 from nemo.agent_factory import MediaVision
 from nemo.channel import IncomingMessage
 from nemo.lark.events import LarkEvent, LarkEventStream
-from nemo.lark_channel import LarkChannel, _to_incoming, _extract_message_text
+from nemo.lark_channel import (
+  EDGE_403_COOLDOWN,
+  LarkChannel,
+  _extract_message_text,
+  _to_incoming,
+)
 
 
 TOKEN = "t-test_token"
@@ -888,6 +893,143 @@ def test_update_card_propagates_non_auth_http_errors():
     except urllib.error.HTTPError as e:
       assert e.code == 500
   mock_send.assert_not_called()
+
+
+def _progress_channel() -> LarkChannel:
+  ch = _build_topic_channel()
+  ch._chat_mode = "group"
+  return ch
+
+
+def test_progress_card_edge_403_drops_refresh_instead_of_posting_duplicate():
+  """A persistent edge 403 on a WORKING card must NOT spawn a replacement.
+
+  The working card is re-rendered on every event, so dropping the refresh
+  loses nothing. Posting a replacement is what turned a single turn into five
+  separate "Working…" cards during a one-minute volc-dcdn block
+  (2026-11-15, oc_9d7ad8e2…).
+  """
+  ch = _progress_channel()
+
+  with mock.patch("nemo.lark_channel.lark_auth.get_token", return_value="t"), \
+       mock.patch("nemo.lark_channel.lark_auth.invalidate"), \
+       mock.patch("nemo.lark_channel.asyncio.sleep", new=_async_noop), \
+       mock.patch("nemo.lark_channel.lark_api.update_card",
+                  side_effect=_make_edge_403()), \
+       mock.patch("nemo.lark_channel.lark_api.send_card") as mock_send, \
+       mock.patch("nemo.lark_channel.lark_api.reply_card") as mock_reply:
+    result = asyncio.run(
+      ch.update_progress_card("om_working", {"title": "Working"}))
+
+  assert result == "om_working"     # same card retained
+  mock_send.assert_not_called()     # no duplicate "Working…" card
+  mock_reply.assert_not_called()
+
+
+def test_control_progress_card_delegating_to_update_card_posts_duplicate():
+  """Control for the progress-card tests above: the PRE-FIX behaviour
+  (working-card refreshes were plain ``update_card`` calls) posts a
+  replacement card on an edge 403. This pins that those assertions actually
+  discriminate — they fail against the old behaviour."""
+  ch = _progress_channel()
+
+  async def _legacy_progress(self, message_id, card):
+    return await LarkChannel.update_card(self, message_id, card)
+
+  with mock.patch("nemo.lark_channel.lark_auth.get_token", return_value="t"), \
+       mock.patch("nemo.lark_channel.lark_auth.invalidate"), \
+       mock.patch("nemo.lark_channel.asyncio.sleep", new=_async_noop), \
+       mock.patch.object(
+         LarkChannel, "update_progress_card", _legacy_progress), \
+       mock.patch("nemo.lark_channel.lark_api.update_card",
+                  side_effect=_make_edge_403()), \
+       mock.patch("nemo.lark_channel.lark_api.send_card",
+                  return_value="om_new") as mock_send:
+    result = asyncio.run(
+      ch.update_progress_card("om_working", {"title": "Working"}))
+
+  assert result == "om_new"          # old behaviour: a duplicate card
+  mock_send.assert_called_once()
+
+
+def test_progress_card_park_skips_http_inside_cooldown():
+  """Once an edge 403 parks a working card, refreshes inside the cooldown must
+  not even hit the network — a burst of progress events would otherwise each
+  burn the full retry window."""
+  ch = _progress_channel()
+  update = mock.Mock(side_effect=_make_edge_403())
+
+  with mock.patch("nemo.lark_channel.lark_auth.get_token", return_value="t"), \
+       mock.patch("nemo.lark_channel.lark_auth.invalidate"), \
+       mock.patch("nemo.lark_channel.asyncio.sleep", new=_async_noop), \
+       mock.patch("nemo.lark_channel.lark_api.update_card", update), \
+       mock.patch("nemo.lark_channel.lark_api.send_card") as mock_send:
+    first = asyncio.run(ch.update_progress_card("om_w", {"title": "a"}))
+    calls_after_first = update.call_count
+    second = asyncio.run(ch.update_progress_card("om_w", {"title": "b"}))
+
+  assert first == second == "om_w"
+  assert calls_after_first > 0
+  assert update.call_count == calls_after_first   # parked: zero HTTP calls
+  mock_send.assert_not_called()
+
+
+def test_progress_card_genuine_lark_403_still_replaces():
+  """A 403 carrying a real Lark X-Request-Id means the message itself is
+  uneditable — the one case where a working card must be replaced."""
+  ch = _progress_channel()
+
+  with mock.patch("nemo.lark_channel.lark_auth.get_token", return_value="t"), \
+       mock.patch("nemo.lark_channel.lark_auth.invalidate"), \
+       mock.patch("nemo.lark_channel.lark_api.update_card",
+                  side_effect=_make_edge_403(request_id="req-real")), \
+       mock.patch("nemo.lark_channel.lark_api.send_card",
+                  return_value="om_new") as mock_send:
+    result = asyncio.run(ch.update_progress_card("om_old", {"title": "x"}))
+
+  assert result == "om_new"
+  mock_send.assert_called_once()
+
+
+def test_progress_card_park_clears_once_the_edge_block_lifts():
+  """The park must expire: after the cooldown a successful refresh resumes
+  normal editing and clears the park."""
+  ch = _progress_channel()
+  clock = {"t": 1000.0}
+  blocked = {"on": True}
+  calls: list[str] = []
+
+  def fake_update(_token, msg_id, _card):
+    calls.append(msg_id)
+    if blocked["on"]:
+      raise _make_edge_403()
+
+  with mock.patch("nemo.lark_channel.lark_auth.get_token", return_value="t"), \
+       mock.patch("nemo.lark_channel.lark_auth.invalidate"), \
+       mock.patch("nemo.lark_channel.asyncio.sleep", new=_async_noop), \
+       mock.patch(
+         "nemo.lark_channel.time.monotonic",
+         side_effect=lambda: clock["t"]), \
+       mock.patch("nemo.lark_channel.lark_api.update_card",
+                  side_effect=fake_update):
+    asyncio.run(ch.update_progress_card("om_w", {"title": "a"}))
+    parked_calls = len(calls)
+    assert ch._edge_park[1] == "om_w"
+
+    # Still inside the cooldown: no HTTP at all.
+    asyncio.run(ch.update_progress_card("om_w", {"title": "b"}))
+    assert len(calls) == parked_calls
+
+    # Block lifts; the park expires and the next refresh goes through.
+    blocked["on"] = False
+    clock["t"] += EDGE_403_COOLDOWN + 1
+    asyncio.run(ch.update_progress_card("om_w", {"title": "c"}))
+    assert len(calls) == parked_calls + 1
+    assert ch._edge_park == (0.0, "")
+
+    # ...and stays un-parked.
+    asyncio.run(ch.update_progress_card("om_w", {"title": "d"}))
+    assert len(calls) == parked_calls + 2
 
 
 def test_send_card_plain_in_non_topic_chat():

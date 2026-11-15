@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import os
+import time
 import urllib.error
 from typing import Callable
 
@@ -28,6 +29,14 @@ ParentLookup = Callable[[str], str | None]
 # blips lasted ~14s; this window rides through them so a transient gateway
 # error never permanently splits a turn into a duplicate card.
 EDGE_403_BACKOFF = (1.0, 2.0, 4.0, 8.0)
+
+# After an edge-403 window is exhausted, a PROGRESS card is parked for this
+# long and its refreshes are dropped instead of posting a replacement card.
+# Without this a one-minute edge block turned a single turn into FIVE
+# "Working…" cards (2026-11-15, oc_9d7ad8e2…: four 403s in 57s, each one
+# ending in "sending as new card"). An edge 403 says nothing is wrong with the
+# message, so a new card cannot fix it — it only splits the turn.
+EDGE_403_COOLDOWN = 15.0
 
 
 def _video_block(path: str, model_sees_video: bool, vision_helper: bool) -> str:
@@ -301,6 +310,10 @@ class LarkChannel(Channel):
   # video" — the common case before the first status refresh.
   _model_sees_images: bool = True
   _model_sees_video: bool = False
+  # (monotonic deadline, message_id) for a progress card parked by an edge-403
+  # window — see update_progress_card. Class-level so channels built via
+  # __new__ (tests) still have it.
+  _edge_park: tuple[float, str] = (0.0, "")
 
   def __init__(self, chat_id: str):
     from .channel import TurnCardCtx
@@ -452,58 +465,120 @@ class LarkChannel(Channel):
         lark_api.reply_card, self._reply_anchor, card, True)
     return self._retry_on_auth_error(lark_api.send_card, chat_id, card)
 
+  @staticmethod
+  def _is_edge_403(err: urllib.error.HTTPError) -> bool:
+    """True when a 403 came from the edge/CDN, not from Lark.
+
+    Lark stamps every application-layer response with an X-Request-Id; an edge
+    block (e.g. volc-dcdn) answers with no request id and a non-JSON body. Only
+    this case is transient — and only this case says the MESSAGE itself is
+    fine, which is why a replacement card must never be the answer to it.
+    """
+    return err.code == 403 and not (getattr(err, "request_id", "") or "")
+
+  async def _patch_card(
+    self, message_id: str, card: JsonObject,
+  ) -> urllib.error.HTTPError | None:
+    """PATCH a card, riding out a transient edge-403 window.
+
+    Returns None on success, otherwise the terminal HTTPError. Never sends a
+    replacement card — whether that makes sense is the caller's decision
+    (see ``update_card`` vs ``update_progress_card``).
+    """
+    try:
+      self._retry_on_auth_error(lark_api.update_card, message_id, card)
+      return None
+    except urllib.error.HTTPError as e:
+      if e.code not in (401, 403):
+        raise
+      if not self._is_edge_403(e):
+        return e
+      # Retry the SAME message id across EDGE_403_BACKOFF: neither a token
+      # refresh nor a brand-new card fixes an edge block, but the block itself
+      # is transient.
+      err = e
+      for delay in EDGE_403_BACKOFF:
+        await asyncio.sleep(delay)
+        try:
+          self._retry_on_auth_error(lark_api.update_card, message_id, card)
+          return None
+        except urllib.error.HTTPError as retry_err:
+          if retry_err.code not in (401, 403):
+            raise
+          err = retry_err
+          # Edge cleared but Lark genuinely rejects the edit — stop retrying.
+          if not self._is_edge_403(retry_err):
+            return err
+      return err
+
+  async def _replace_card(
+    self, message_id: str, card: JsonObject, err: urllib.error.HTTPError,
+  ) -> str:
+    """The message can no longer be PATCHed — post the card again.
+
+    Logs the edge/gateway response (body + request id + Server) so a transient
+    CDN/WAF 403 is distinguishable from a real permission error next time.
+    lark_api wraps non-JSON error bodies in HTTPErrorWithBody; a plain
+    HTTPError (no body captured) just logs the status.
+    """
+    log.warning(
+      "update_card failed after refresh (HTTP %d) — sending as new card; "
+      "lark_request_id=%s server=%s body=%s",
+      err.code,
+      getattr(err, "request_id", "") or "?",
+      getattr(err, "server", "") or "?",
+      (getattr(err, "body_text", "") or "")[:300] or "(none/non-JSON)")
+    # In topic chats, reply to the failed card (not self._reply_anchor, which
+    # may have drifted to a newer inbound message) so the fallback stays in the
+    # same thread as the original.
+    if self._should_thread(self.chat_id):
+      return self._retry_on_auth_error(
+        lark_api.reply_card, message_id, card, True)
+    return await self.send_card(self.chat_id, card)
+
   async def update_card(self, message_id: str, card: JsonObject) -> str:
     # PATCH /im/v1/messages/{id} works identically for threaded replies
     # since they are still plain messages, so no topic-specific routing.
-    try:
-      self._retry_on_auth_error(lark_api.update_card, message_id, card)
+    err = await self._patch_card(message_id, card)
+    if err is None:
+      self._edge_park = (0.0, "")
       return message_id
-    except urllib.error.HTTPError as e:
-      # Token refresh didn't help. Likely causes: message too old to edit
-      # (Lark limits card edits after some hours) or bot lost chat permission.
-      # Send as a new card so the user still sees the response, and return
-      # the new id so callers can retarget subsequent updates in the turn.
-      if e.code not in (401, 403):
-        raise
-      # A 403 carrying no Lark X-Request-Id never reached Lark's application
-      # layer — it's an edge/CDN/WAF block (e.g. volc-dcdn), which is transient
-      # and editable-on-retry. Neither a token refresh nor a brand-new card
-      # fixes it, and falling back to a new card permanently splits the turn.
-      # Retry the SAME message id across EDGE_403_BACKOFF before giving up; only
-      # a genuine Lark 403 (real request id) or an exhausted window falls
-      # through to the duplicate-card fallback below.
-      if e.code == 403 and not (getattr(e, "request_id", "") or ""):
-        for delay in EDGE_403_BACKOFF:
-          await asyncio.sleep(delay)
-          try:
-            self._retry_on_auth_error(lark_api.update_card, message_id, card)
-            return message_id
-          except urllib.error.HTTPError as retry_err:
-            if retry_err.code not in (401, 403):
-              raise
-            e = retry_err
-            # Edge cleared but Lark genuinely rejects the edit — stop retrying.
-            if getattr(retry_err, "request_id", "") or "":
-              break
-            # else: still a transient edge 403, keep riding the window out.
-      # Log the edge/gateway response (body + request id + Server) so we can
-      # tell a transient CDN/WAF 403 apart from a real Lark permission error
-      # next time. lark_api wraps non-JSON error bodies in HTTPErrorWithBody;
-      # a plain HTTPError (no body captured) just logs the status.
+    # Token refresh didn't help. Likely causes: message too old to edit (Lark
+    # limits card edits after some hours) or bot lost chat permission. Send as
+    # a new card so the user still sees the response, and return the new id so
+    # callers can retarget subsequent updates in the turn.
+    return await self._replace_card(message_id, card, err)
+
+  async def update_progress_card(self, message_id: str, card: JsonObject) -> str:
+    """PATCH a working-phase card, DROPPING the refresh during an edge block.
+
+    A working card is re-rendered on every event, so a dropped refresh costs
+    nothing — the next one carries the same, newer state. Posting a
+    replacement card here is what turned one turn into five "Working…" cards
+    during a one-minute edge-403 window (2026-11-15, oc_9d7ad8e2…). An edge
+    403 means the message is fine, so a new card cannot help; park it and let
+    the block clear.
+    """
+    until, parked_id = self._edge_park
+    if parked_id == message_id and time.monotonic() < until:
+      log.debug("progress card refresh skipped: edge-403 park on %s", message_id)
+      return message_id
+    err = await self._patch_card(message_id, card)
+    if err is None:
+      self._edge_park = (0.0, "")
+      return message_id
+    if self._is_edge_403(err):
+      self._edge_park = (time.monotonic() + EDGE_403_COOLDOWN, message_id)
       log.warning(
-        "update_card failed after refresh (HTTP %d) — sending as new card; "
-        "lark_request_id=%s server=%s body=%s",
-        e.code,
-        getattr(e, "request_id", "") or "?",
-        getattr(e, "server", "") or "?",
-        (getattr(e, "body_text", "") or "")[:300] or "(none/non-JSON)")
-      # In topic chats, reply to the failed card (not self._reply_anchor,
-      # which may have drifted to a newer inbound message) so the fallback
-      # stays in the same thread as the original.
-      if self._should_thread(self.chat_id):
-        return self._retry_on_auth_error(
-          lark_api.reply_card, message_id, card, True)
-      return await self.send_card(self.chat_id, card)
+        "progress card refresh dropped — edge 403 with no Lark request id "
+        "(server=%s); parking %s for %.0fs instead of posting a duplicate card",
+        getattr(err, "server", "") or "?",
+        message_id,
+        EDGE_403_COOLDOWN)
+      return message_id
+    # A genuine Lark rejection means this message really is uneditable —
+    # the only case where a progress card must be replaced.
+    return await self._replace_card(message_id, card, err)
 
   async def send_text(self, chat_id: str, text: str) -> str:
     if self._should_thread(chat_id):

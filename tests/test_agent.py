@@ -10,6 +10,7 @@ from unittest import mock
 
 import pytest
 
+import nemo.agent
 from nemo.agent import (
   _IDLE_PROMPT_PREFIX,
   _RECALL_PROMPT_PREFIX,
@@ -121,6 +122,12 @@ class _FakeChannel:
 
   async def send_card(self, _chat_id, _card):
     return "om_reply"
+
+  # The Channel ABC's default implementation delegates to update_card; this
+  # fake isn't a Channel subclass, so it has to spell it out or the working
+  # card's progress refreshes are silently skipped.
+  async def update_progress_card(self, card_id, card):
+    return await self.update_card(card_id, card)
 
   async def send_text(self, _chat_id, _text):
     return "om_text"
@@ -3856,6 +3863,95 @@ def test_compact_events_set_banner_not_thinking_steps(tmp_path):
         assert "🗜" not in repr(el), (
           f"compact glyph leaked into collapsible thinking: {el!r}"
         )
+
+
+def _burst_progress_updates(tmp_path, progress_events: int) -> list:
+  """Run one turn emitting ``progress_events`` progress events back to back.
+
+  Returns every card payload sent/PATCHed during the turn.
+  """
+  payloads: list = []
+
+  class _CapturingChannel(_FakeChannel):
+    async def send_card(self, _chat_id, card):
+      payloads.append(card)
+      return "om_working"
+
+    async def update_card(self, card_id, card):
+      payloads.append(card)
+      return card_id
+
+  class _BusyAgent(_FakeAgent):
+    async def run_turn(self, _prompt, on_event):
+      def _emit():
+        for i in range(progress_events):
+          on_event(ProgressEvent(
+            kind="tool", summary=f"Read {i}", first=(i == 0)))
+        on_event(AnswerEvent("done reading"))
+        on_event(DoneEvent(cost=0.0, usage={"input_tokens": 1}))
+      await asyncio.to_thread(_emit)
+      return 0.0, {"input_tokens": 1}
+
+  channel = _CapturingChannel("oc_test")
+  channel._messages = [
+    IncomingMessage(
+      event_type="im.message.receive_v1",
+      chat_id="oc_test", sender_id="ou_user",
+      message_id="om_msg", msg_type="text", text="hi", create_time="1",
+    ),
+    IncomingMessage(
+      event_type="im.message.receive_v1",
+      chat_id="oc_test", sender_id="ou_user",
+      message_id="om_exit", msg_type="text", text="/exit", create_time="2",
+    ),
+  ]
+  with mock.patch("nemo.agent.load_credentials", return_value={
+    "app_id": "app_id", "app_secret": "app_secret", "email": "u@e.com",
+  }), \
+       mock.patch("nemo.agent.Database", _FakeDB), \
+       mock.patch("nemo.agent.LarkChannel", return_value=channel), \
+       mock.patch("nemo.agent.build_coding_agent", return_value=_BusyAgent()), \
+       mock.patch("nemo.agent._send_response", new=mock.AsyncMock()), \
+       mock.patch("nemo.group_config.load_config", return_value={}), \
+       mock.patch("nemo.config.load_relay_config", return_value=("", "")), \
+       mock.patch("signal.signal"):
+    rc = asyncio.run(main_loop("oc_test", str(tmp_path), "claude-opus-4-6"))
+  assert rc == 0
+  return payloads
+
+
+def _working_patch_count(payloads: list) -> int:
+  return sum(
+    1 for c in payloads
+    if c.get("header", {}).get("title", {}).get("content", "").startswith(
+      "Working"))
+
+
+def test_progress_events_are_coalesced_into_few_working_patches(tmp_path):
+  """A burst of progress events must NOT PATCH the working card once per
+  event.
+
+  Every tool/thinking step re-rendered the card, so one agentic turn issued
+  many PATCHes per second. That burst is what tripped the edge (volc-dcdn
+  403), which then blocked card edits for a minute and split the turn into
+  five separate "Working…" cards (2026-11-15, oc_9d7ad8e2…). Coalescing is
+  safe because the card is re-rendered from turn state: the next event
+  carries the same, newer snapshot.
+  """
+  payloads = _burst_progress_updates(tmp_path, progress_events=30)
+  working = _working_patch_count(payloads)
+  # 1 forced (first event) + 1 coalesced pass + the forced answer refresh.
+  assert working <= 4, f"{working} working-card PATCHes for 30 progress events"
+
+
+def test_control_without_throttle_every_progress_event_patches(tmp_path):
+  """Control for the coalescing test: with the throttle disabled the same
+  turn PATCHes once per progress event. This pins that the test above is
+  actually exercising the throttle (it FAILS if PROGRESS_PATCH_MIN_INTERVAL
+  is effectively ignored)."""
+  with mock.patch.object(nemo.agent, "PROGRESS_PATCH_MIN_INTERVAL", 0.0):
+    payloads = _burst_progress_updates(tmp_path, progress_events=30)
+  assert _working_patch_count(payloads) >= 30
 
 
 def test_stale_leak_notice_leaves_visible_breadcrumb(tmp_path):

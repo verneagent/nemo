@@ -63,6 +63,15 @@ _CODEX_BACKEND_FAILURE_MARKERS = (
 TURN_CARD_ROLLOVER_BYTE_LIMIT = int(
   os.environ.get("NEMO_TURN_CARD_ROLLOVER_BYTE_LIMIT", "22000"))
 
+# Minimum seconds between working-card PATCHes driven by progress events. The
+# card is re-rendered on every event, and an agentic burst (tool call, result,
+# thinking, tool call…) meant several PATCHes per second — the window in which
+# Lark's edge started answering 403 for a full minute (2026-11-15,
+# oc_9d7ad8e2…). Progress refreshes coalesce; answer / notice / Done updates
+# are never throttled.
+PROGRESS_PATCH_MIN_INTERVAL = float(
+  os.environ.get("NEMO_PROGRESS_PATCH_MIN_INTERVAL", "1.0"))
+
 
 @dataclasses.dataclass
 class _TurnCardSegment:
@@ -3700,6 +3709,10 @@ async def main_loop(
       # Set up front before the SDK starts streaming and cleared on the
       # first real progress event so it doesn't linger as stale.
       _turn_status_notice = ""
+      # When the working card was last PATCHed purely from a progress event
+      # (monotonic). Used to coalesce progress refreshes — see
+      # PROGRESS_PATCH_MIN_INTERVAL.
+      _last_progress_patch = 0.0
 
       async def _update_interrupt_card(phase: str) -> None:
         nonlocal _turn_card_id, _turn_interrupt_phase
@@ -3776,11 +3789,25 @@ async def main_loop(
         except Exception as e:
           log.error("Working card error: %s", e)
 
-      def _update_working(**kwargs):
-        """Update the working card with current state."""
-        nonlocal _turn_card_id, _turn_active_start
+      def _update_working(force: bool = True, **kwargs):
+        """Update the working card with current state.
+
+        ``force=False`` marks a refresh driven by a progress event (a tool or
+        thinking step), which is coalesced: the card is re-rendered on EVERY
+        event, and a burst of tool calls used to mean many PATCHes per second.
+        That burst is what tripped the edge (volc-dcdn 403) into blocking card
+        edits for a minute (2026-11-15). A coalesced refresh is never lost —
+        the next event renders the same, newer state — while answer/notice/Done
+        updates must pass ``force=True`` so nothing final is dropped.
+        """
+        nonlocal _turn_card_id, _turn_active_start, _last_progress_patch
         if _turn_interrupt_phase:
           return
+        if not force:
+          now = time.monotonic()
+          if now - _last_progress_patch < PROGRESS_PATCH_MIN_INTERVAL:
+            return
+          _last_progress_patch = now
         if not _turn_card_id:
           # The card-create call on the first progress event failed
           # (transient Lark connection drop, rate-limit blip, etc).
@@ -3863,7 +3890,11 @@ async def main_loop(
             return
 
           prev_id = _turn_card_id
-          _turn_card_id = _await_channel(channel.update_card(_turn_card_id, card))
+          # A progress card, not a final one: the channel may drop this
+          # refresh entirely during a transient edge block, which is fine —
+          # the next event renders the same newer state.
+          _turn_card_id = _await_channel(
+            channel.update_progress_card(_turn_card_id, card))
           if _turn_card_id != prev_id:
             _register_msg(_turn_card_id, chat_id)
             channel.turn_ctx.turn_card_id = _turn_card_id
@@ -3931,7 +3962,11 @@ async def main_loop(
             # so it doesn't linger behind the live progress.
             _turn_status_notice = ""
             _ensure_card()
-          _update_working(current_tool=_turn_current_tool if event.kind == "tool" else None)
+          # Progress refreshes coalesce (force=False); the first one paints the
+          # card and must not be skipped.
+          _update_working(
+            force=event.first,
+            current_tool=_turn_current_tool if event.kind == "tool" else None)
 
         elif isinstance(event, TaskStartedEvent):
           _announce_task_started(event)
