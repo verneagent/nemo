@@ -4117,26 +4117,60 @@ def test_restart_model_arg_passes_plain_default_model_through():
   assert _restart_model_arg("claude-opus-4-7", "", "claude") == "claude-opus-4-7"
 
 
+def _reverse_lookup_presets():
+  """A controlled preset table for the reverse-resolution tests.
+
+  Built through the real flattener, but from an inline schema instead of the
+  machine's ``~/.nemo/models.json``: the two tests below used to read the live
+  config, so they quietly changed meaning whenever that config moved and then
+  failed on a provider-URL edit that had nothing to do with them
+  (opencode.ai/zen/go → inference/anthropic, 2026-11-17). Two providers share
+  the remote id ``deepseek-v4-flash`` — that is the case under test."""
+  from nemo import presets as P
+  return P._flatten_providers({
+    "opencode-go": {
+      "anthropic": {"baseURL": "https://opencode.ai/zen/go",
+                    "apiKey": "sk-oc"},
+      "agents": ["claude"],
+      "models": {
+        "oc-deepseek-v4-flash": {"anthropic": {"remote": "deepseek-v4-flash"}},
+        "oc-deepseek-v4-pro": {"anthropic": {"remote": "deepseek-v4-pro"}},
+      },
+    },
+    "deepseek": {
+      "anthropic": {"baseURL": "https://api.deepseek.com/anthropic",
+                    "apiKey": "sk-ds"},
+      "agents": ["claude"],
+      "models": {
+        "deepseek-v4-flash": {},
+        "deepseek-v4-pro": {"anthropic": {"remote": "deepseek-v4-pro[1m]"}},
+      },
+    },
+  })
+
+
 def test_display_model_reverses_shared_remote_to_distinct_preset_names():
   """The daemon's ``model`` is the resolved remote id, so oc-deepseek-v4-flash
   and official deepseek-v4-flash both hold ``deepseek-v4-flash``. The model
   tab must reverse-resolve via the endpoint URL so providers that share a
   remote id stay distinguishable."""
-  # opencode-go proxy → oc- prefix recovered
-  assert _display_model(
-    "deepseek-v4-flash", "https://opencode.ai/zen/go", "claude") \
-    == "oc-deepseek-v4-flash"
-  assert _display_model(
-    "deepseek-v4-pro", "https://opencode.ai/zen/go", "claude") \
-    == "oc-deepseek-v4-pro"
-  # official DeepSeek endpoint → stays the plain name
-  assert _display_model(
-    "deepseek-v4-flash", "https://api.deepseek.com/anthropic", "claude") \
-    == "deepseek-v4-flash"
-  # [1m] context-length suffix is a remote-side detail, not user-facing
-  assert _display_model(
-    "deepseek-v4-pro[1m]", "https://api.deepseek.com/anthropic", "claude") \
-    == "deepseek-v4-pro"
+  presets = _reverse_lookup_presets()
+  with mock.patch("nemo.presets.load_presets", return_value=presets):
+    # opencode-go proxy → oc- prefix recovered
+    assert _display_model(
+      "deepseek-v4-flash", "https://opencode.ai/zen/go", "claude") \
+      == "oc-deepseek-v4-flash"
+    assert _display_model(
+      "deepseek-v4-pro", "https://opencode.ai/zen/go", "claude") \
+      == "oc-deepseek-v4-pro"
+    # official DeepSeek endpoint → stays the plain name
+    assert _display_model(
+      "deepseek-v4-flash", "https://api.deepseek.com/anthropic", "claude") \
+      == "deepseek-v4-flash"
+    # [1m] context-length suffix is a remote-side detail, not user-facing
+    assert _display_model(
+      "deepseek-v4-pro[1m]", "https://api.deepseek.com/anthropic", "claude") \
+      == "deepseek-v4-pro"
 
 
 def test_display_model_passes_plain_default_model_through():
@@ -4194,6 +4228,8 @@ def test_ctx_model_holds_display_name_so_model_commands_distinguish(tmp_path):
     "OPENCODE_GO_API_KEY": "sk-test-oc",
     "DEEPSEEK_API_KEY": "sk-test",
   }), \
+       mock.patch("nemo.presets.load_presets",
+                  return_value=_reverse_lookup_presets()), \
        mock.patch("nemo.agent.load_credentials", return_value={
          "app_id": "a", "app_secret": "s", "email": "u@e.com",
        }), \
