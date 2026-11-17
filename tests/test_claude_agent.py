@@ -1334,6 +1334,37 @@ def test_build_agent_prompt_ties_the_report_cadence_to_the_echo():
   assert "% 10" in prompt  # names the exact shape it forbids
 
 
+def test_build_agent_prompt_forbids_promising_a_watch_it_did_not_arm():
+  """A narrated watch that was never armed is a lie (2026-11-17, oc_283ee413…).
+
+  Asked to add a merge label, the model finished with "我盯着，有结果告诉你"
+  having called no tool that could ever wake it; nothing was watching, and the
+  user only got an answer after asking again ("你给我盯一下"), which armed the
+  first and only watch of that conversation. Nothing in the daemon can detect
+  the intent behind a sentence, so the contract lives in the prompt: arming is
+  the announcement, and `Monitor` being a deferred tool (ToolSearch first) is
+  named so the extra call is not what talk itself out of it."""
+  from unittest import mock
+  from nemo.agent_factory import MediaVision
+  from nemo.claude_agent import ClaudeCodingAgent
+  agent = ClaudeCodingAgent.__new__(ClaudeCodingAgent)
+  agent._model = "oc-deepseek-v4.1-flash"
+  agent._system_prompt = ""
+  with mock.patch("nemo.agent_factory.model_media_vision",
+                  return_value=MediaVision(image=True, video=False)), \
+       mock.patch("nemo.vision_cli.helper_available", return_value=True):
+    prompt = agent._build_agent_prompt()
+  # The rule, stated as a rule — not merely "use the Monitor tool".
+  assert "a watch you did not arm does not exist" in prompt.lower()
+  # Names the actual sentences the model wrote, so it can recognise itself.
+  assert "我盯着" in prompt
+  assert "有消息告诉你" in prompt
+  # The deferral is a mechanical reason to skip the call; name the way through.
+  assert "ToolSearch" in prompt and "select:Monitor" in prompt
+  # It must say what will happen if it promises anyway: the user hears nothing.
+  assert "nothing wakes you" in prompt.lower()
+
+
 def _options_agent(tmp_path):
   from unittest import mock
   from nemo.claude_agent import ClaudeCodingAgent
