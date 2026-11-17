@@ -215,6 +215,58 @@ def test_anthropic_auth_style_flows_from_models_json(tmp_path):
   assert ds.endpoint_for("claude").anthropic_auth == "bearer"
 
 
+def test_disable_prompt_caching_flag_reaches_the_endpoint(tmp_path):
+  # opencode.ai's pay-as-you-go inference path rejects the cache_control
+  # blocks the claude CLI attaches (400 "Extra inputs are not permitted …
+  # cache_control"), so a provider can opt that endpoint into
+  # DISABLE_PROMPT_CACHING. Other providers must keep their prompt cache.
+  user = tmp_path / "models.json"
+  user.write_text(json.dumps({
+    "providers": {
+      "payg": {
+        "anthropic": {
+          "baseURL": "https://opencode.ai/inference/anthropic",
+          "apiKey": "sk-payg",
+          "auth": "api_key",
+          "disablePromptCaching": True,
+        },
+        "models": {"oc-deepseek-v4.1-flash": {}},
+      },
+      "deepseek": {
+        "anthropic": {"baseURL": "https://api.deepseek.com/anthropic", "apiKey": "k"},
+        "models": {"deepseek-v4-pro": {}},
+      },
+    },
+  }))
+  presets = load_presets(builtin_path="/nonexistent", user_path=str(user))
+  payg = presets["oc-deepseek-v4.1-flash"]
+  assert payg.disable_prompt_caching is True
+  assert payg.endpoint_for("claude").disable_prompt_caching is True
+  # Undeclared providers keep caching on.
+  ds = presets["deepseek-v4-pro"]
+  assert ds.disable_prompt_caching is False
+  assert ds.endpoint_for("claude").disable_prompt_caching is False
+
+
+def test_disable_prompt_caching_rejects_non_bool(tmp_path, caplog):
+  user = tmp_path / "models.json"
+  user.write_text(json.dumps({
+    "providers": {
+      "payg": {
+        "anthropic": {
+          "baseURL": "https://opencode.ai/inference/anthropic",
+          "apiKey": "sk-payg",
+          "disablePromptCaching": "yes",
+        },
+        "models": {"m1": {}},
+      },
+    },
+  }))
+  presets = load_presets(builtin_path="/nonexistent", user_path=str(user))
+  assert presets["m1"].disable_prompt_caching is False
+  assert "disablePromptCaching must be a boolean" in caplog.text
+
+
 def test_vision_block_provider_default_and_model_override(tmp_path):
   # Provider-level vision is the default; a model's own block overrides it
   # field-by-field; an undeclared provider/model is text-only.
@@ -617,6 +669,30 @@ def test_synthesize_synced_presets_builds_prefixed_inherited_presets():
   assert p.agents == ("opencode", "codex", "claude")
   assert p.supports("opencode") is True
   assert p.supports("codex") is True
+
+
+def test_synthesize_carries_disable_prompt_caching():
+  # Synced presets are synthesized, not flattened, so the flag must be
+  # copied explicitly or every oc-* model loses the endpoint's opt-out.
+  providers = {
+    "opencode-go": {
+      "anthropic": {
+        "baseURL": "https://opencode.ai/inference/anthropic",
+        "apiKey": "{env:OPENCODE_GO_API_KEY}",
+        "auth": "api_key",
+        "disablePromptCaching": True,
+      },
+      "openai": {
+        "baseURL": "https://opencode.ai/inference/openai/v1",
+        "apiKey": "{env:OPENCODE_GO_API_KEY}",
+      },
+      "sync": {"prefix": "oc-"},
+    },
+  }
+  with mock.patch.dict(os.environ, {"OPENCODE_GO_API_KEY": "sk-go"}):
+    out = _synthesize_synced_presets(providers, lambda *_a: ["m1"], 5.0)
+  assert out["oc-m1"].disable_prompt_caching is True
+  assert out["oc-m1"].endpoint_for("claude").disable_prompt_caching is True
 
 
 def test_synthesize_skips_anthropic_only_provider(caplog):

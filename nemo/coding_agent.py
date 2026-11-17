@@ -39,6 +39,14 @@ class EndpointConfig:
   # adapter reads this; the codex/openai and opencode paths already use
   # the x-api-key form natively.
   anthropic_auth: str = "bearer"
+  # Escape hatch for an Anthropic-compatible gateway that rejects the
+  # `cache_control` blocks the claude CLI attaches to message content: the
+  # claude adapter then exports DISABLE_PROMPT_CACHING=1 for that endpoint
+  # only, so other presets keep their prompt cache. NOT a cost knob — on
+  # opencode.ai this is a no-op (the blocks are accepted and the gateway
+  # prefix-caches on its own, measured 2026-11-17), so verify a real request
+  # 400s before turning it on for a new gateway.
+  disable_prompt_caching: bool = False
 
 
 class CodingAgent(ABC):

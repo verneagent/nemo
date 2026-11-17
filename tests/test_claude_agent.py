@@ -1083,6 +1083,32 @@ def test_build_env_prepends_nemo_script_dir(tmp_path, monkeypatch):
   assert env2["PATH"].count(str(script_dir)) == 1
 
 
+def test_build_env_disables_prompt_caching_only_for_opted_in_endpoints(tmp_path):
+  """opencode.ai's pay-as-you-go inference path 400s on the CLI's
+  cache_control blocks; the preset opts that endpoint into
+  DISABLE_PROMPT_CACHING while other providers keep their prompt cache."""
+  from nemo.claude_agent import ClaudeCodingAgent
+  from nemo.coding_agent import EndpointConfig
+
+  agent = ClaudeCodingAgent.__new__(ClaudeCodingAgent)
+  agent._chat_id = "oc_chat"
+  agent._read_only = False
+  agent._scratch_dir = ""
+  agent._endpoint = EndpointConfig(
+    base_url="https://opencode.ai/inference/anthropic",
+    api_key="sk-payg",
+    anthropic_auth="api_key",
+    disable_prompt_caching=True,
+  )
+  env = agent._build_env(str(tmp_path), "deepseek-v4.1-flash")
+  assert env["DISABLE_PROMPT_CACHING"] == "1"
+  # Control: the default endpoint config must NOT disable caching.
+  agent._endpoint = EndpointConfig(
+    base_url="https://api.deepseek.com/anthropic", api_key="k")
+  assert "DISABLE_PROMPT_CACHING" not in agent._build_env(
+    str(tmp_path), "deepseek-v4-pro")
+
+
 def _fake_cli(path, version: str):
   """Write an executable stub that prints `<version> (Claude Code)`."""
   path.parent.mkdir(parents=True, exist_ok=True)

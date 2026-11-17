@@ -1653,6 +1653,13 @@ class ClaudeCodingAgent(CodingAgent):
       else:
         env["ANTHROPIC_AUTH_TOKEN"] = self._endpoint.api_key
         env.pop("ANTHROPIC_API_KEY", None)
+    if self._endpoint.disable_prompt_caching:
+      # Per-endpoint escape hatch: a gateway that rejects the `cache_control`
+      # blocks the CLI attaches to message content gets them stripped. Cost is
+      # NOT the reason to set it — a gateway that prefix-caches keeps doing so
+      # with the flag on (opencode.ai, 2026-11-17: 16.6k tokens cached either
+      # way), so this exists only for an endpoint that 400s on the blocks.
+      env["DISABLE_PROMPT_CACHING"] = "1"
 
     # When pointing at a third-party Anthropic-compatible endpoint, the
     # remote almost certainly does not understand the canonical Claude

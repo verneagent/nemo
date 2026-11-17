@@ -166,6 +166,12 @@ class Preset:
   # ``anthropic.auth`` block. Gateways like opencode.ai/zen/go only accept
   # ``x-api-key``, which the claude adapter reads off ``anthropic_auth``.
   anthropic_auth: str = "bearer"
+  # From the ``anthropic.disablePromptCaching`` flag: a per-endpoint escape
+  # hatch for a gateway that rejects the CLI's ``cache_control`` blocks, which
+  # makes the adapter export DISABLE_PROMPT_CACHING=1 for it. Not a cost knob:
+  # opencode.ai accepts the blocks and prefix-caches without them (measured
+  # 2026-11-17), so enabling it there changes neither hit rate nor bill.
+  disable_prompt_caching: bool = False
   # OpenAI-protocol endpoint. Empty → not callable via --agent codex
   # (or via opencode against an openai/* model).
   openai_url: str = ""
@@ -230,7 +236,11 @@ class Preset:
     api_key = self.api_key_literal or (
       os.environ.get(self.api_key_env, "") if self.api_key_env else "")
     return EndpointConfig(
-      base_url=base, api_key=api_key, anthropic_auth=self.anthropic_auth)
+      base_url=base,
+      api_key=api_key,
+      anthropic_auth=self.anthropic_auth,
+      disable_prompt_caching=self.disable_prompt_caching,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -261,6 +271,29 @@ def _parse_api_key(raw: object, *, where: str) -> tuple[str, str]:
   if m:
     return m.group(1), ""
   return "", raw
+
+
+def _parse_flag(raw: object, *, where: str) -> bool:
+  """Parse an optional boolean. Missing → False; non-bool → warn + False."""
+  if raw is None:
+    return False
+  if isinstance(raw, bool):
+    return raw
+  log.warning("%s must be a boolean, got %s — ignoring",
+              where, type(raw).__name__)
+  return False
+
+
+def _protocol_flag(provider_data: dict, key: str, flag: str) -> bool:
+  """Read an optional boolean out of one protocol section.
+
+  e.g. ``anthropic.disablePromptCaching`` — a per-endpoint adapter knob that
+  has no business being provider-wide.
+  """
+  raw = provider_data.get(key)
+  if not isinstance(raw, dict):
+    return False
+  return _parse_flag(raw.get(flag), where=f"provider.{key}.{flag}")
 
 
 def _protocol_block(provider_data: dict, key: str) -> tuple[str, str, str, str]:
@@ -364,6 +397,8 @@ def _flatten_providers(providers: dict) -> dict[str, Preset]:
         "got %r — using bearer", provider_name, anthropic_auth)
       anthropic_auth = ""
     anthropic_auth = anthropic_auth or "bearer"
+    disable_prompt_caching = _protocol_flag(
+      pdata, "anthropic", "disablePromptCaching")
     if not anthropic_url and not openai_url:
       # Provider declares models but no protocol blocks — flattening
       # would produce Presets with empty URLs that supports() rejects
@@ -410,6 +445,7 @@ def _flatten_providers(providers: dict) -> dict[str, Preset]:
         anthropic_url=anthropic_url,
         anthropic_remote=_model_remote(mdata, "anthropic") or model_name,
         anthropic_auth=anthropic_auth,
+        disable_prompt_caching=disable_prompt_caching,
         openai_url=openai_url,
         openai_remote=_model_remote(mdata, "openai") or model_name,
         sees_image=sees_image,
@@ -517,6 +553,8 @@ def _synthesize_synced_presets(
       continue
     anthropic_url, ant_key_env, ant_key_lit, ant_auth = _protocol_block(
       pdata, "anthropic")
+    ant_disable_caching = _protocol_flag(
+      pdata, "anthropic", "disablePromptCaching")
     prov_agents = _parse_agents(pdata.get("agents"), ())
     for mid in ids:
       out.setdefault(prefix + mid, Preset(
@@ -526,6 +564,7 @@ def _synthesize_synced_presets(
         anthropic_url=anthropic_url,
         anthropic_remote=mid,
         anthropic_auth=ant_auth or "bearer",
+        disable_prompt_caching=ant_disable_caching,
         openai_url=openai_url,
         openai_remote=mid,
         agents=prov_agents,
